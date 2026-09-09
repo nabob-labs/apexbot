@@ -20,7 +20,7 @@
 [workspace.package]
 version = "0.6.0-alpha.9"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 rust-version = "1.97"
 repository = "https://github.com/nabob-labs/apexbot.git"
 authors = ["nabob-labs"]
