@@ -18,7 +18,7 @@ pip install apexbot
 **From source:**
 
 ```bash
-git clone https://github.com/BowTiedDevil/apexbot.git
+git clone https://github.com/nabob-labs/apexbot.git
 cd apexbot
 uv sync    # or: pip install -e .
 ```

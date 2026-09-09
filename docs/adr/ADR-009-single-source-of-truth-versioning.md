@@ -41,8 +41,8 @@ version = "0.6.0-alpha.3"
 edition = "2021"
 license = "MIT"
 publish = false
-repository = "https://github.com/BowTiedDevil/apexbot"
-authors = ["BowTiedDevil <devil@bowtieddevil.com>"]
+repository = "https://github.com/nabob-labs/apexbot"
+authors = ["nabob-labs"]
 ```
 
 Every member crate's `[package]` table then writes the inherited fields as

@@ -97,7 +97,7 @@ impl AavePriceOracle {
     /// are sequential — matching the Python oracle's loop; concurrent fetching
     /// is a consumer-tier concern.
     ///
-    /// [`OraclePriceFetcher.fetch`]: https://github.com/BowTiedDevil/apexbot/blob/main/src/apexbot/aave/analysis/orchestrator.py
+    /// [`OraclePriceFetcher.fetch`]: https://github.com/nabob-labs/apexbot/blob/main/src/apexbot/aave/analysis/orchestrator.py
     pub async fn fetch_prices(
         &self,
         assets: &[Address],

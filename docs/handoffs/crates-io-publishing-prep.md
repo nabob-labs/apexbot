@@ -161,7 +161,7 @@ Work in a branch; each step ends with the G1 dry-run re-run (it's the local orac
 ## 9. Open decisions (need a human before T6)
 
 - **D1 — Publish alphas now, or hold until 0.7/1.0?** `0.6.0-alpha.5` is a valid crates.io prerelease; publishing now claims names early and lets external math-crate users iterate. Holding means 0 registry surface during alpha. (Astral/polars both publish pre-1.0 freely; polars has been on 0.x for years.)
-- **D2 — crates.io owner for OIDC.** The crates must be owned by a GitHub-linked owner (the `BowTiedDevil` account or a team/org) for `crates-io-auth-action` OIDC to mint tokens; otherwise fall back to a `CARGO_REGISTRY_TOKEN` secret (weaker, but works).
+- **D2 — crates.io owner for OIDC.** The crates must be owned by a GitHub-linked owner (the `nabob-labs` account or a team/org) for `crates-io-auth-action` OIDC to mint tokens; otherwise fall back to a `CARGO_REGISTRY_TOKEN` secret (weaker, but works).
 - **D3 — Option A vs C** (§6). Recommendation: A, with T2's green slice optionally shipped early as C.
 - **D4 — `deployments.json` canonical placement** (T1 option A vs B).
 

@@ -11,7 +11,7 @@ name = "apexbot"
 # normalizes the semver form to PEP 440 (e.g. 0.6.0-alpha.3 -> 0.6.0a3).
 dynamic = ["version"]
 authors = [
-    { name="BowTiedDevil", email="devil@bowtieddevil.com" },
+    { name="nabob-labs" },
 ]
 description = "Python + Rust building blocks for Uniswap (V2, V3, V4), Curve V1, Solidly V2, Balancer V2 & Aave V3 arbitrage and liquidation bots on EVM-compatible blockchains"
 readme = "README.md"
@@ -39,10 +39,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://www.degencode.com"
-Repository = "https://github.com/BowTiedDevil/apexbot"
-Tracker = "https://github.com/BowTiedDevil/apexbot/issues"
-Twitter = "https://twitter.com/BowTiedDevil"
+Homepage = "https://www.apexbot.com"
+Repository = "https://github.com/nabob-labs/apexbot.git"
+Tracker = "https://github.com/nabob-labs/apexbot/issues"
 
 [project.scripts]
 apexbot = "apexbot.cli:cli"

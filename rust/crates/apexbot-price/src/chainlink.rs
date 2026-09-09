@@ -15,7 +15,7 @@
 //! Python `abi_decode` performs too — so the two implementations agree by
 //! construction).
 //!
-//! [`apexbot.chainlink.price_feed.ChainlinkPriceContract`]: https://github.com/BowTiedDevil/apexbot/blob/main/src/apexbot/chainlink/price_feed.py
+//! [`apexbot.chainlink.price_feed.ChainlinkPriceContract`]: https://github.com/nabob-labs/apexbot/blob/main/src/apexbot/chainlink/price_feed.py
 
 use crate::decode::{as_int, as_u128, as_uint};
 use crate::error::{PriceError, PriceResult};
