@@ -1,0 +1,38 @@
+{
+  "BalancerSwapOracleHarness.sol/BalancerSwapOracleHarness.json": {
+    "sha256": "7552ea194c85b6eab8ec26e2e13400aaf0fad0b9b7a940edb1f2c9ad1466db44",
+    "source": "src-balancer/BalancerSwapOracleHarness.sol"
+  },
+  "CurveSwapOracleHarness.sol/CurveSwapOracleHarness.json": {
+    "sha256": "826b8f3e10ccab1ff7ef72b3260d5424716fe238aac6d5c074a0d1d6156a2e8a",
+    "source": "src-curve/CurveSwapOracleHarness.sol"
+  },
+  "PancakeV2SwapOracleHarness.sol/PancakeV2SwapOracleHarness.json": {
+    "sha256": "33a17f7a854703cd3d2b363cf9f7a79431a24fa844c346ebbf3f6f7cf32e4b0a",
+    "source": "src-pancake-v2/PancakeV2SwapOracleHarness.sol"
+  },
+  "PancakeV3SwapOracleHarness.sol/PancakeV3SwapOracleHarness.json": {
+    "sha256": "4eff20429bc5f8a4c92f4e396d94858b7f85587b0449726cff9bafec126344ea",
+    "source": "src-pancake-v3/PancakeV3SwapOracleHarness.sol"
+  },
+  "SwapMathV3Harness.sol/SwapMathV3Harness.json": {
+    "sha256": "46a4d9190ab401ef7d98a071d89be9db48e9077d4bf389786fd467c40cda9a13",
+    "source": "src-v3/SwapMathV3Harness.sol"
+  },
+  "SwapMathV4Harness.sol/SwapMathV4Harness.json": {
+    "sha256": "e1e8dd468a36fd475ddafb42fb07d94bd36a4d024e4468ab4d279b62b3c442da",
+    "source": "src-v4/SwapMathV4Harness.sol"
+  },
+  "V2SwapOracleHarness.sol/V2SwapOracleHarness.json": {
+    "sha256": "3a23262e2c90d0c520fca826018576e17f41cd859275d8ccbd6276c635b37b0c",
+    "source": "src-v2/V2SwapOracleHarness.sol"
+  },
+  "V3SwapOracleHarness.sol/V3SwapOracleHarness.json": {
+    "sha256": "31fae1873b921b47f0aef058a8842d6a161419cf5cd88225f5ceaf762b947efb",
+    "source": "src-v3/V3SwapOracleHarness.sol"
+  },
+  "V4SwapOracleHarness.sol/V4SwapOracleHarness.json": {
+    "sha256": "a5c362fe2ae2aff407449a533172031627b2d39fb097c6f1c981cb012b0748d3",
+    "source": "src-v4/V4SwapOracleHarness.sol"
+  }
+}

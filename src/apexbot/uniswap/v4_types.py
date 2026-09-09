@@ -1,0 +1,83 @@
+"""Uniswap V4-specific data types and state definitions."""
+
+from __future__ import annotations
+
+import dataclasses
+from typing import TYPE_CHECKING
+
+from apexbot.types.abstract import AbstractPoolState
+from apexbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
+from apexbot.uniswap.v3_types import (
+    BitmapWord,
+    Liquidity,
+    Pip,
+    SqrtPriceX96,
+    Tick,
+)
+
+if TYPE_CHECKING:
+    from apexbot.types.aliases import BlockNumber
+    from apexbot.types.chain import ChecksummedAddress
+
+type FeeToProtocol = int
+type SwapFee = int
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class UniswapV4PoolState(AbstractPoolState):
+    """UniswapV4PoolState class."""
+
+    liquidity: Liquidity
+    sqrt_price_x96: SqrtPriceX96
+    tick: Tick
+    tick_bitmap: dict[BitmapWord, BitmapAtWord]
+    tick_data: dict[Tick, LiquidityAtTick]
+    id: bytes
+    block: BlockNumber | None
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class UniswapV4PoolKey:
+    """UniswapV4PoolKey class."""
+
+    currency0: ChecksummedAddress
+    currency1: ChecksummedAddress
+    fee: Pip
+    tick_spacing: int
+    hooks: ChecksummedAddress
+
+
+@dataclasses.dataclass(slots=True)
+class UniswapV4LiquidityEvent:
+    """UniswapV4LiquidityEvent class."""
+
+    block_number: BlockNumber
+    liquidity: Liquidity
+    tick_lower: Tick
+    tick_upper: Tick
+    tx_index: int
+    log_index: int
+
+
+@dataclasses.dataclass(slots=True, frozen=True, eq=False)
+class UniswapV4PoolExternalUpdate:
+    """UniswapV4PoolExternalUpdate class."""
+
+    block_number: BlockNumber
+    liquidity: Liquidity
+    sqrt_price_x96: SqrtPriceX96
+    tick: Tick
+
+
+@dataclasses.dataclass(slots=True, frozen=True, eq=False)
+class UniswapV4PoolLiquidityMappingUpdate:
+    """UniswapV4PoolLiquidityMappingUpdate class."""
+
+    block_number: BlockNumber
+    liquidity: Liquidity
+    tick_lower: Tick
+    tick_upper: Tick
+
+
+type InitializedTickMap = dict[BitmapWord, BitmapAtWord]
+type LiquidityMap = dict[Tick, LiquidityAtTick]

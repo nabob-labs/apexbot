@@ -1,0 +1,283 @@
+# apexbot Grafana-managed alert rules (ADR-040 epic DO5Q5E, task UI7QNH).
+#
+# SUPERSEDES apexbot-alerts.yml (Prometheus-managed) AFTER the operator
+# mounts this file via Grafana file provisioning:
+#
+#   placement (docker): <grafana-cfg-dir>/provisioning/alerting/apexbot-grafana-rules.yml
+#   grafana.ini: [unified_alerting] enabled = true (default in Grafana >= 9.4)
+#
+# The rules evaluate the SAME expressions against the SAME Prometheus
+# datasource; the datasource UID below must match the operator's Prometheus
+# datasource (the dashboard's DS_PROMETHEUS variable default). Edit
+# GATE-POWERED DATASOURCE UID once below (or sed it at deploy time), then
+# reload. After provisioning is verified in the Alerting UI, delete
+# apexbot-alerts.yml (the hard cutover - do not run both surfaces at once,
+# every alert would double-fire).
+
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: apexbot-critical
+    folder: apexbot
+    interval: 30s
+    rules:
+      - uid: apexbot-process-down
+        title: ApexbotProcessDown
+        condition: C
+        for: 2m
+        annotations:
+          summary: apexbot process DOWN - desync abort or crash
+          description: >-
+            The apexbot scrape target stopped answering (or its series
+            vanished) for 2m. Covers the desync abort (ADR-040 exit stance /
+            fatal buckets) and any crash - the signal that had NO owner before
+            (ApexbotHeaderStall deliberately ignores down targets).
+        data:
+          - refId: A
+            relativeTimeRange: { from: 5m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'count(up{job="apexbot"} == 1) == 0 or absent(apexbot_blocks_observed_total)'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-header-stall
+        title: ApexbotHeaderStall
+        condition: C
+        for: 2m
+        annotations:
+          summary: apexbot header stall - bot is blind
+          description: >-
+            No blocks observed for 2m while the scrape target is UP - the WS
+            feed or the pump is dead while the chain advances.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 5m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'rate(apexbot_blocks_observed_total{init!="true"}[1m]) == 0 and on() up{job="apexbot"} == 1'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-drainer-stall
+        title: ApexbotDrainerStall
+        condition: C
+        for: 5m
+        annotations:
+          summary: apexbot drainer stall - detached solve stragglers at cap
+          description: >-
+            Successor of the retired apexbot_drain_queue_depth gauge
+            (DispatchOwner queue, removed SZJUKL): the detached-solve straggler
+            backlog sits AT CAP 8 - the sidecar merge is wedged and solves are
+            not landing. Healthy runs sit at 0 and drop stragglers stale.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 5m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'apexbot_detached_in_flight >= 8'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-state-head-divergence
+        title: ApexbotStateHeadDivergence
+        condition: C
+        for: 1m
+        annotations:
+          summary: apexbot state head divergence (freeze signature)
+        data:
+          - refId: A
+            relativeTimeRange: { from: 5m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'abs(apexbot_state_head_lag_blocks{init!="true"}) >= 3'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+
+  - orgId: 1
+    name: apexbot-warning
+    folder: apexbot
+    interval: 1m
+    rules:
+      - uid: apexbot-errors-any
+        title: ApexbotErrorRate
+        condition: C
+        for: 0m
+        annotations:
+          summary: apexbot recorded failures (any kind)
+          description: >-
+            At least one failure recorded in 5m. The kind label is the CLOSED
+            SET telemetry::error_kind (ws_completeness sim_failure
+            submit_failure monitor_failure verify_mismatch drain_stall
+            drain_dead); an active quarantine ALSO surfaces via
+            ApexbotDesyncQuarantine (apexbot_engine_quarantined_pools).
+        data:
+          - refId: A
+            relativeTimeRange: { from: 15m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'sum(rate(apexbot_errors_total[5m])) > 0'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-desync-quarantine
+        title: ApexbotDesyncQuarantine
+        condition: C
+        for: 0m
+        annotations:
+          summary: solver-state desync quarantined a pool
+          description: >-
+            A quarantine-excluded pool was active in the last 30m (ADR-040
+            containment via the resolve-seam quarantine gate, gauge
+            apexbot_engine_quarantined_pools). The retired
+            apexbot_quarantine_events_total counter and the
+            solver_state_desync errors kind are gone: the ADR-021 publish
+            tripwire was retired with MROOY7 task 2UVG3E. Urgent root-cause
+            work: enable APEXBOT_SIM_DIVERGENCE_LOG for the engine-vs-RPC
+            divergence dump. The bot keeps trading its other paths.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 15m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'max_over_time(apexbot_engine_quarantined_pools[30m]) > 0'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-submit-failures
+        title: ApexbotSubmitFailures
+        condition: C
+        for: 0m
+        annotations:
+          summary: apexbot submit failures
+        data:
+          - refId: A
+            relativeTimeRange: { from: 30m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: 'sum(rate(apexbot_submit_outcomes_total{outcome="skipped_broadcast_failed"}[10m])) > 0'
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-monitor-expiry-spike
+        title: ApexbotMonitorExpirySpike
+        condition: C
+        for: 5m
+        annotations:
+          summary: apexbot monitor expiry spike
+        data:
+          - refId: A
+            relativeTimeRange: { from: 45m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: >-
+                sum(rate(apexbot_monitor_outcomes_total{outcome="expired"}[15m]))
+                / clamp_min(sum(rate(apexbot_monitor_outcomes_total[15m])), 0.001) > 0.5
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1.0005] }
+      - uid: apexbot-profit-efficiency-drop
+        title: ApexbotProfitEfficiencyDrop
+        condition: C
+        for: 10m
+        annotations:
+          summary: apexbot profit efficiency drop
+        data:
+          - refId: A
+            relativeTimeRange: { from: 30m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: >-
+                apexbot_profit_missed_total
+                / clamp_min(apexbot_profit_realized_total + apexbot_profit_missed_total, 1) > 0.8
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1.0005] }
+      - uid: apexbot-simulate-error-rate
+        title: ApexbotSimulateErrorRate
+        condition: C
+        for: 5m
+        annotations:
+          summary: apexbot simulate error rate high
+        data:
+          - refId: A
+            relativeTimeRange: { from: 30m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: >-
+                sum(rate(apexbot_simulate_verdicts_total{outcome="error"}[10m]))
+                / clamp_min(sum(rate(apexbot_simulate_verdicts_total[10m])), 0.001) > 0.1
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1.0005] }

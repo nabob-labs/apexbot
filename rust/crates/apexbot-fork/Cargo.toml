@@ -1,0 +1,40 @@
+[package]
+name = "apexbot-fork"
+description = "Pure-Rust Anvil fork lifecycle + dev-RPC core (alloy node-bindings)."
+keywords = ["anvil", "fork", "rpc", "evm"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# NOTE: `"node-bindings"` MUST be explicit — alloy's `full` feature array
+# (v2.1.1) includes `provider-ipc` + `provider-anvil-api` but NOT
+# `node-bindings`. Without it, `alloy::node_bindings::Anvil` is unresolved
+# (cfg-gated re-export in alloy/src/lib.rs). Verified by the IPC spike.
+alloy = { version = "^2.4", features = ["full", "node-bindings", "transport-throttle"] }
+apexbot-core.workspace = true
+thiserror = { version = "^2.0" }
+tokio = { version = "^1.53", features = ["rt-multi-thread", "time", "macros", "sync"] }
+
+[features]
+default = []
+# Test-only constructors visible to downstream crates' tests.
+test-utils = []
+
+[dev-dependencies]
+# Teardown tests observe the alloy pubsub service's own events
+# (reconnect attempts / clean "request channel closed" shutdown).
+# default-features = false on every tracing crate: with default features,
+# `tracing-subscriber/tracing-log` + the `tracing` log bridge would unify
+# into the `apexbot_rs` build in `cargo test --workspace` (feature
+# unification across primary packages), which double-installs the global
+# `log` logger inside `python_log_layer::init_logging_subscriber` and
+# panics `logging_parity` with `SetLoggerError`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-core = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }

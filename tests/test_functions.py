@@ -1,0 +1,235 @@
+import pytest
+
+from apexbot.calculations.evm_math import next_base_fee
+from apexbot.checksum_cache import get_checksum_address
+from apexbot.contract.addresses import create2_address
+from apexbot.crypto import keccak256
+from apexbot.exceptions import ApexbotValueError
+from apexbot.fork import AnvilFork
+from apexbot.provider.block_helpers import get_number_for_block_identifier
+from apexbot.provider.call_helpers import (
+    encode_function_calldata,
+    extract_argument_types_from_function_prototype,
+    raw_call,
+)
+from apexbot.types.aliases import BlockNumber
+from apexbot.utils.bytes import to_bytes
+
+
+def test_extract_argument_types_from_function_prototype():
+    assert extract_argument_types_from_function_prototype("func()") == []
+    assert extract_argument_types_from_function_prototype("func(uint256)") == [
+        "uint256",
+    ]
+    assert extract_argument_types_from_function_prototype("func(uint256,address)") == [
+        "uint256",
+        "address",
+    ]
+    assert extract_argument_types_from_function_prototype("func(uint256,address,bytes)") == [
+        "uint256",
+        "address",
+        "bytes",
+    ]
+    assert extract_argument_types_from_function_prototype("func(uint256,address,bytes[])") == [
+        "uint256",
+        "address",
+        "bytes[]",
+    ]
+
+
+def test_encode_function_calldata():
+    assert (
+        encode_function_calldata(function_prototype="factory()", function_arguments=[])
+        == to_bytes("0xc45a01550ceb4bc5c6b2e6f722b5033a03078f9bd6673457375ba94c26ac1cf0")[:4]
+    )
+    assert encode_function_calldata(
+        function_prototype="transfer(address,uint256)",
+        function_arguments=[
+            "0xA69babEF1cA67A37Ffaf7a485DfFF3382056e78C",
+            26535330612692929974,
+        ],
+    ) == to_bytes(
+        "0xa9059cbb000000000000000000000000a69babef1ca67a37ffaf7a485dfff3382056e78c00000000000000000000000000000000000000000000000170406e9a1f1c4db6",
+    )
+
+
+@pytest.mark.online_rpc
+def test_low_level_call_for_factory_address(fork_mainnet_full: AnvilFork):
+    provider = fork_mainnet_full.provider
+
+    pool_address = get_checksum_address("0xCBCdF9626bC03E24f779434178A73a0B4bad62eD")
+
+    function_prototype = "factory()"
+
+    (result,) = raw_call(
+        provider=provider,
+        block_identifier=fork_mainnet_full.provider.get_block_number(),
+        address=pool_address,
+        calldata=encode_function_calldata(
+            function_prototype=function_prototype,
+            function_arguments=extract_argument_types_from_function_prototype(function_prototype),
+        ),
+        return_types=["address"],
+    )
+    assert get_checksum_address(result) == get_checksum_address(
+        "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+    )
+
+
+def test_create2():
+    """Tests taken from https://eips.ethereum.org/EIPS/eip-1014"""
+    assert (
+        create2_address(
+            deployer="0x0000000000000000000000000000000000000000",
+            salt="0x0000000000000000000000000000000000000000000000000000000000000000",
+            init_code_hash=keccak256(bytes.fromhex("00")),
+        )
+        == "0x4D1A2e2bB4F88F0250f26Ffff098B0b30B26BF38"
+    )
+    assert (
+        create2_address(
+            deployer="0xdeadbeef00000000000000000000000000000000",
+            salt="0x0000000000000000000000000000000000000000000000000000000000000000",
+            init_code_hash=keccak256(bytes.fromhex("00")),
+        )
+        == "0xB928f69Bb1D91Cd65274e3c79d8986362984fDA3"
+    )
+    assert (
+        create2_address(
+            deployer="0xdeadbeef00000000000000000000000000000000",
+            salt="0x000000000000000000000000feed000000000000000000000000000000000000",
+            init_code_hash=keccak256(bytes.fromhex("00")),
+        )
+        == "0xD04116cDd17beBE565EB2422F2497E06cC1C9833"
+    )
+    assert (
+        create2_address(
+            deployer="0x0000000000000000000000000000000000000000",
+            salt="0x0000000000000000000000000000000000000000000000000000000000000000",
+            init_code_hash=keccak256(bytes.fromhex("deadbeef")),
+        )
+        == "0x70f2b2914A2a4b783FaEFb75f459A580616Fcb5e"
+    )
+    assert (
+        create2_address(
+            deployer="0x00000000000000000000000000000000deadbeef",
+            salt="0x00000000000000000000000000000000000000000000000000000000cafebabe",
+            init_code_hash=keccak256(bytes.fromhex("deadbeef")),
+        )
+        == "0x60f3f640a8508fC6a86d45DF051962668E1e8AC7"
+    )
+    assert (
+        create2_address(
+            deployer="0x00000000000000000000000000000000deadbeef",
+            salt="0x00000000000000000000000000000000000000000000000000000000cafebabe",
+            init_code_hash=keccak256(
+                bytes.fromhex(
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+                )
+            ),
+        )
+        == "0x1d8bfDC5D46DC4f61D6b6115972536eBE6A8854C"
+    )
+
+
+@pytest.mark.online_rpc
+def test_converting_block_identifier_to_int(fork_mainnet_full: AnvilFork):
+    """Check that every supported block-identifier input converts to a block number"""
+    provider = fork_mainnet_full.provider
+
+    # Known string literals
+    latest_block = get_number_for_block_identifier("latest", provider)
+    earliest_block = get_number_for_block_identifier("earliest", provider)
+    pending_block = get_number_for_block_identifier("pending", provider)
+    safe_block = get_number_for_block_identifier("safe", provider)
+    finalized_block = get_number_for_block_identifier("finalized", provider)
+
+    assert BlockNumber.__value__ is int
+    assert isinstance(latest_block, BlockNumber.__value__)
+    assert isinstance(earliest_block, BlockNumber.__value__)
+    assert isinstance(pending_block, BlockNumber.__value__)
+    assert isinstance(safe_block, BlockNumber.__value__)
+    assert isinstance(finalized_block, BlockNumber.__value__)
+
+    assert latest_block != earliest_block != pending_block != safe_block != finalized_block
+
+    # BlockNumber
+    assert isinstance(
+        get_number_for_block_identifier(1, provider),
+        BlockNumber.__value__,
+    )
+
+    # Hash32
+    assert isinstance(
+        get_number_for_block_identifier(((1).to_bytes(length=32, byteorder="big")), provider),
+        BlockNumber.__value__,
+    )
+
+    # HexStr
+    assert isinstance(
+        get_number_for_block_identifier(
+            ("0x" + (128).to_bytes(32, byteorder="big").hex()),
+            provider,
+        ),
+        BlockNumber.__value__,
+    )
+
+    # bytes
+    assert isinstance(get_number_for_block_identifier(to_bytes(1), provider), BlockNumber.__value__)
+
+    # int
+    assert isinstance(get_number_for_block_identifier(1, provider), BlockNumber.__value__)
+
+    for invalid_tag in ["Latest", "latest ", "next", "previous"]:
+        with pytest.raises(ApexbotValueError):
+            get_number_for_block_identifier(invalid_tag, provider)
+
+    with pytest.raises(ApexbotValueError):
+        get_number_for_block_identifier(1.0, provider)
+
+
+def test_fee_calcs():
+    base_fee = 100 * 10**9
+
+    # EIP-1559 target is 50% full blocks, so a 50% full block should return the same base fee
+    assert (
+        next_base_fee(
+            parent_base_fee=base_fee,
+            parent_gas_used=15_000_000,
+            parent_gas_limit=30_000_000,
+        )
+        == base_fee
+    )
+
+    # Fee should be higher
+    assert (
+        next_base_fee(
+            parent_base_fee=base_fee,
+            parent_gas_used=20_000_000,
+            parent_gas_limit=30_000_000,
+        )
+        == 104166666666
+    )
+
+    # Fee should be lower
+    assert (
+        next_base_fee(
+            parent_base_fee=base_fee,
+            parent_gas_used=10_000_000,
+            parent_gas_limit=30_000_000,
+        )
+        == 95833333334
+    )
+
+    min_base_fee = 95 * 10**9
+
+    # Enforce minimum fee
+    assert (
+        next_base_fee(
+            parent_base_fee=base_fee,
+            parent_gas_used=0,
+            parent_gas_limit=30_000_000,
+            min_base_fee=min_base_fee,
+        )
+        == min_base_fee
+    )

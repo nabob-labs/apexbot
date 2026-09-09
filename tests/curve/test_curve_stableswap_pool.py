@@ -1,0 +1,465 @@
+import itertools
+from typing import cast
+
+import pytest
+
+from apexbot.abi import AbiDecodeError
+from apexbot.abi import decode as abi_decode
+from apexbot.abi import encode as abi_encode
+from apexbot.checksum_cache import get_checksum_address
+from apexbot.crypto import function_selector, keccak256
+from apexbot.curve.abi import CURVE_V1_FACTORY_ABI, CURVE_V1_POOL_ABI, CURVE_V1_REGISTRY_ABI
+from apexbot.curve.curve_stableswap_liquidity_pool import CurveStableswapPool
+from apexbot.exceptions import ContractLogicError
+from apexbot.exceptions.arbitrage import NoLiquidity
+from apexbot.exceptions.pool import (
+    BrokenPool,
+    EVMRevertError,
+    InvalidSwapInputAmount,
+    MissingCurveData,
+)
+from apexbot.fork import AnvilFork
+from apexbot.provider import AlloyProvider
+from apexbot.types.rpc_types import TxParams
+from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.helpers.bot_factory import make_bot_with_provider
+from tests.helpers.contract_compat import ContractCompat, make_contract
+
+pytestmark = pytest.mark.online_rpc
+
+Timestamp = int
+
+CRYPTO_POOL_ADDRESSES = {"0x80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5"}
+CURVE_V1_FACTORY_ADDRESS = get_checksum_address("0x127db66E7F0b16470Bec194d0f496F9Fa065d0A9")
+CURVE_V1_REGISTRY_ADDRESS = get_checksum_address("0x90E00ACe148ca3b23Ac1bC8C240C2a7Dd9c2d7f5")
+FRXETH_WETH_CURVE_POOL_ADDRESS = get_checksum_address("0x9c3B46C0Ceb5B9e304FCd6D88Fc50f7DD24B31Bc")
+TRIPOOL_ADDRESS = get_checksum_address("0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7")
+
+
+def _build_pool(fork: AnvilFork, address: str) -> CurveStableswapPool:
+    """Helper to build a Curve pool using the Bot builder."""
+    bot = make_bot_with_provider(fork.provider)
+    return bot.build_pool(address)
+
+
+@pytest.fixture
+def tripool(fork_mainnet_full: AnvilFork) -> CurveStableswapPool:
+    return _build_pool(fork_mainnet_full, TRIPOOL_ADDRESS)
+
+
+def _test_calculations(lp: CurveStableswapPool, provider: AlloyProvider):
+    state_block = lp.update_block
+    contract_compat = ContractCompat(lp.address, CURVE_V1_POOL_ABI, provider)
+
+    for token_in_index, token_out_index in itertools.permutations(range(len(lp.tokens)), 2):
+        token_in = lp.tokens[token_in_index]
+        token_out = lp.tokens[token_out_index]
+
+        for amount_multiplier in [0.01, 0.05, 0.25]:
+            amount = int(amount_multiplier * lp.balances[lp.tokens.index(token_in)])
+
+            try:
+                calc_amount = lp.calculate_tokens_out_from_tokens_in(
+                    token_in=token_in,
+                    token_out=token_out,
+                    token_in_quantity=amount,
+                )
+            except (
+                InvalidSwapInputAmount,
+                NoLiquidity,
+                EVMRevertError,
+                ContractLogicError,
+                AbiDecodeError,
+            ):
+                continue
+            except Exception:
+                print(
+                    f"Failure simulating swap (in-pool) at block {state_block} for {lp.address}. "
+                    f"Reproduce with test_single_pool @ {lp.address}",
+                )
+                raise
+
+            try:
+                if lp.address == "0x80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5":
+                    tx = TxParams(
+                        to=lp.address,
+                        data=function_selector("get_dy(uint256,uint256,uint256)")
+                        + abi_encode(
+                            types=["uint256", "uint256", "uint256"],
+                            args=[token_in_index, token_out_index, amount],
+                        ),
+                    )
+
+                    contract_amount, *_ = abi_decode(
+                        data=provider.call_raw(tx),
+                        types=["uint256"],
+                    )
+                else:
+                    contract_amount = contract_compat.functions.get_dy(
+                        token_in_index,
+                        token_out_index,
+                        amount,
+                    ).call()
+            except (ContractLogicError, AbiDecodeError):
+                # The on-chain contract reverts for broken/unsupported pools
+                continue
+
+            assert calc_amount == contract_amount, (
+                f"Swap mismatch at block {state_block} for {lp.address}: "
+                f"{amount} {token_in} for {token_out} — "
+                f"got {calc_amount}, expected {contract_amount}. "
+                f"Reproduce with test_single_pool @ {lp.address}"
+            )
+
+    if lp.base_pool is not None:
+        assert lp.base_pool is not None
+        for token_in, token_out in itertools.permutations(lp.tokens_underlying, 2):
+            token_in_index = lp.tokens_underlying.index(token_in)
+            token_out_index = lp.tokens_underlying.index(token_out)
+
+            for amount_multiplier in [0.10, 0.25, 0.50]:
+                if token_in in lp.tokens:
+                    amount = int(amount_multiplier * lp.balances[lp.tokens.index(token_in)])
+                else:
+                    amount = int(
+                        amount_multiplier
+                        * lp.base_pool.balances[lp.base_pool.tokens.index(token_in)],
+                    )
+
+                try:
+                    calc_amount = lp.calculate_tokens_out_from_tokens_in(
+                        token_in=token_in,
+                        token_out=token_out,
+                        token_in_quantity=amount,
+                    )
+                except (InvalidSwapInputAmount, NoLiquidity, EVMRevertError, ContractLogicError):
+                    continue
+
+                try:
+                    contract_amount = contract_compat.functions.get_dy_underlying(
+                        token_in_index,
+                        token_out_index,
+                        amount,
+                    ).call()
+                except (ContractLogicError, AbiDecodeError):
+                    continue
+
+                assert calc_amount == contract_amount, (
+                    f"Metapool swap mismatch at block {state_block} for {lp.address}: "
+                    f"{amount} {token_in} for {token_out} — "
+                    f"got {calc_amount}, expected {contract_amount}. "
+                    f"Reproduce with test_single_pool @ {lp.address}"
+                )
+
+
+def test_create_pool(fork_mainnet_full: AnvilFork):
+    _build_pool(fork_mainnet_full, TRIPOOL_ADDRESS)
+
+
+def test_tripool(
+    tripool: CurveStableswapPool,
+    fork_mainnet_full: AnvilFork,
+):
+    _test_calculations(lp=tripool, provider=fork_mainnet_full.provider)
+
+
+@pytest.mark.parametrize(
+    "fork_mainnet_archive",
+    [18849426],
+    indirect=True,
+)
+def test_pool_state_at_different_blocks(fork_mainnet_archive: AnvilFork):
+    # Build the pool at a known historical block
+    block_number = fork_mainnet_archive.provider.get_block_number()
+
+    tripool = _build_pool(fork_mainnet_archive, TRIPOOL_ADDRESS)
+
+    assert fork_mainnet_archive.provider.get_block_number() == block_number
+    assert tripool.update_block == block_number
+
+    expected_balances = (75010632422398781503259123, 76382820384826, 34653521595900)
+    assert tripool.balances == expected_balances
+
+    fork = AnvilFork(
+        fork_url=fork_mainnet_archive.fork_url,
+        fork_block=block_number + 1,
+    )
+    tripool = _build_pool(fork, TRIPOOL_ADDRESS)
+    assert tripool.update_block == block_number + 1
+    assert tripool.balances == (75010632422398781503259123, 76437030384826, 34599346168546)
+
+
+@pytest.mark.parametrize(
+    "fork_mainnet_archive",
+    [18849426],
+    indirect=True,
+)
+def test_bot_update_curve_pool(fork_mainnet_archive: AnvilFork):
+    """bot.update(pool) fetches fresh balances and applies them via external_update."""
+    block_number = fork_mainnet_archive.provider.get_block_number()
+    bot = make_bot_with_provider(fork_mainnet_archive.provider)
+
+    tripool = bot.build_pool(TRIPOOL_ADDRESS)
+    assert tripool.update_block == block_number
+    initial_balances = tripool.balances
+
+    # Advance the fork by one block
+    fork = AnvilFork(
+        fork_url=fork_mainnet_archive.fork_url,
+        fork_block=block_number + 1,
+    )
+    # Rebuild bot with the advanced fork
+    advanced_bot = make_bot_with_provider(fork.provider)
+
+    # The original pool still has old balances
+    assert tripool.balances == initial_balances
+
+    # Update the pool via bot.update()
+    changed = advanced_bot.update(tripool)
+    assert changed is True
+    assert tripool.update_block == block_number + 1
+
+    # Verify balances match what a fresh build would give
+    fresh_pool = advanced_bot.build_pool(TRIPOOL_ADDRESS)
+    assert tripool.balances == fresh_pool.balances
+
+    # Updating again at the same block should return False
+    changed = advanced_bot.update(tripool)
+    assert changed is False
+
+
+@pytest.mark.parametrize(
+    "fork_mainnet_archive",
+    [14_900_000],
+    indirect=True,
+)
+def test_a_ramping(fork_mainnet_archive: AnvilFork):
+    # A range:      5000 -> 2000
+    # A time :      1653559305 -> 1654158027
+    initial_a = 5000
+    final_a = 2000
+
+    initial_a_time = 1653559305
+    final_a_time = 1654158027
+
+    tripool = _build_pool(fork_mainnet_archive, TRIPOOL_ADDRESS)
+    tripool._create_timestamp = cast("Timestamp", 0)  # defeat the timestamp optimization
+
+    assert tripool._a(timestamp=initial_a_time) == initial_a
+    assert tripool._a(timestamp=final_a_time) == final_a
+    assert tripool._a(timestamp=(initial_a_time + final_a_time) // 2) == (initial_a + final_a) // 2
+
+
+@pytest.mark.parametrize(
+    "fork_mainnet_archive",
+    [None],  # Provide block number here if testing against a specific block
+    indirect=True,
+)
+def test_single_pool(
+    fork_mainnet_archive: AnvilFork,
+):
+    pool_address = ""
+    if not pool_address:
+        return
+
+    lp = _build_pool(fork_mainnet_archive, pool_address)
+    _test_calculations(lp=lp, provider=fork_mainnet_archive.provider)
+
+
+def test_tricrypto_pool(fork_mainnet_full: AnvilFork):
+    """Tricrypto (WETH-wBTC-USDT) has a lot of one-off functions, so always test it"""
+    pool_address = "0x80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5"
+    lp = _build_pool(fork_mainnet_full, pool_address)
+    _test_calculations(lp=lp, provider=fork_mainnet_full.provider)
+
+
+def test_metapool_with_valid_base_cache():
+    """Regression test: virtual_price must resolve correctly when the
+    base cache has not expired.
+
+    At block 25144000 the RAI/3Crv metapool's base_cache_updated is only ~180s old
+    (vs the 600s expiry), so the contract uses its cached virtual_price. Our pool
+    must do the same — PerBlockCache.get_cached_virtual_price() resolves this
+    internally without side-effect mirrors.
+    """
+    pool_address = "0x618788357D0EBd8A37e763ADab3bc575D54c2C7d"
+    block = 25_144_000
+
+    fork = AnvilFork(
+        fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+        fork_block=block,
+    )
+    lp = _build_pool(fork, pool_address)
+    assert lp.update_block == block
+
+    # Verify the base cache has not expired at this block
+    block_timestamp = lp._data_provider.block_timestamp(block)
+    base_cache_updated = lp._cache.get_cached_base_cache_updated(block)
+    assert block_timestamp <= base_cache_updated + lp._cache.BASE_CACHE_EXPIRES
+
+    _test_calculations(lp=lp, provider=fork.provider)
+
+
+def test_metapool_over_multiple_blocks_to_verify_cache_behavior():
+    pool_address = "0x618788357D0EBd8A37e763ADab3bc575D54c2C7d"
+    start_block = 18_850_000
+    end_block = 18_850_500
+
+    # Pool has a 10 minute base rate cache expiry, so choose a 30 block interval (5 minutes)
+    # to capture calcs at both cached and cache-expired states
+    span = 30
+
+    fork = AnvilFork(
+        fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+        fork_block=18_850_000,
+    )
+    lp = _build_pool(fork, pool_address)
+    assert lp.update_block == start_block
+
+    for block in range(start_block + span, end_block, span):
+        fork = AnvilFork(
+            fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+            fork_block=block,
+        )
+        # Auto-update is handled by rebuilding the pool with the new block
+        lp = _build_pool(fork, pool_address)
+        assert lp.update_block == block
+        _test_calculations(lp=lp, provider=fork.provider)
+
+
+def test_base_pool(fork_mainnet_full: AnvilFork):
+    basepool = _build_pool(fork_mainnet_full, TRIPOOL_ADDRESS)
+    provider = fork_mainnet_full.provider
+
+    # Compare withdrawal calc for all tokens in the pool
+    for token_index, token in enumerate(basepool.tokens):
+        print(f"Testing {token} withdrawal")
+        for amount_multiplier in [0.01, 0.10, 0.25]:
+            token_in_amount = int(amount_multiplier * basepool.balances[token_index])
+            print(f"Withdrawing {token_in_amount} {token}")
+            calc_amount, *_ = basepool.calc_withdraw_one_coin(
+                _token_amount=token_in_amount,
+                i=token_index,
+            )
+
+            amount_contract, *_ = abi_decode(
+                types=["uint256"],
+                data=provider.call_raw(
+                    TxParams(
+                        to=basepool.address,
+                        data=function_selector("calc_withdraw_one_coin(uint256,int128)")
+                        + abi_encode(
+                            types=["uint256", "int128"],
+                            args=[token_in_amount, token_index],
+                        ),
+                    ),
+                ),
+            )
+            assert calc_amount == amount_contract
+
+    for token_index, token in enumerate(basepool.tokens):
+        print(f"Testing {token} calc token amount")
+
+        amount_array = [0] * len(basepool.tokens)
+
+        for amount_multiplier in [0.01, 0.10, 0.25]:
+            token_in_amount = int(amount_multiplier * basepool.balances[token_index])
+            amount_array[token_index] = token_in_amount
+            print(f"{token_in_amount=}")
+            calc_token_amount = basepool.calc_token_amount(
+                amounts=amount_array,
+                deposit=True,
+            )
+
+            calc_token_amount_contract, *_ = abi_decode(
+                types=["uint256"],
+                data=provider.call_raw(
+                    TxParams(
+                        to=basepool.address,
+                        data=keccak256(
+                            text=f"calc_token_amount(uint256[{len(basepool.tokens)}],bool)",
+                        )[:4]
+                        + abi_encode(
+                            types=[f"uint256[{len(basepool.tokens)}]", "bool"],
+                            args=[amount_array, True],
+                        ),
+                    ),
+                ),
+            )
+            assert calc_token_amount == calc_token_amount_contract
+
+
+def test_factory_stableswap_pools(fork_mainnet_full: AnvilFork):
+    """Test the user-deployed pools deployed by the factory"""
+    stableswap_factory = ContractCompat(
+        CURVE_V1_FACTORY_ADDRESS, CURVE_V1_FACTORY_ABI, fork_mainnet_full.provider
+    )
+    pool_count = stableswap_factory.functions.pool_count().call()
+
+    pool_addresses = [
+        stableswap_factory.functions.pool_list(i).call() for i in range(pool_count)
+    ]
+
+    for i, pool_address in enumerate(pool_addresses, start=1):
+        print(f"Testing factory pool {i}/{pool_count} @ {pool_address}")
+
+        try:
+            lp = _build_pool(fork_mainnet_full, pool_address)
+            _test_calculations(lp=lp, provider=fork_mainnet_full.provider)
+        except (BrokenPool, NoLiquidity):
+            continue
+        except Exception as e:
+            block_number = fork_mainnet_full.provider.get_block_number()
+            msg = (
+                f"{type(e).__name__}: {e} — "
+                f"pool {i}/{pool_count} @ {pool_address}, block {block_number}. "
+                f'Reproduce: set pool_address="{pool_address}" in test_single_pool '
+                f"with @pytest.mark.parametrize('fork_mainnet_archive', [{block_number}], "
+                f"indirect=True)"
+            )
+            print(msg)
+            raise AssertionError(msg) from e
+
+
+def test_base_registry_pools(fork_mainnet_full: AnvilFork):
+    """Test the custom pools deployed by Curve"""
+    registry = make_contract(
+        fork_mainnet_full.http_url, CURVE_V1_REGISTRY_ADDRESS, CURVE_V1_REGISTRY_ABI
+    )
+    pool_count = registry.functions.pool_count().call()
+
+    pool_addresses = [
+        registry.functions.pool_list(i).call() for i in range(pool_count)
+    ]
+
+    for i, pool_address in enumerate(pool_addresses, start=1):
+        print(f"Testing registry pool {i}/{pool_count} @ {pool_address}")
+        try:
+            lp = _build_pool(fork_mainnet_full, pool_address)
+        except MissingCurveData:
+            print("  Skipping pool with missing data")
+            continue
+        except Exception as e:
+            block_number = fork_mainnet_full.provider.get_block_number()
+            msg = (
+                f"{type(e).__name__}: {e} — "
+                f"registry pool {i}/{pool_count} @ {pool_address}, block {block_number}. "
+                f'Reproduce: set pool_address="{pool_address}" in test_single_pool '
+                f"with @pytest.mark.parametrize('fork_mainnet_archive', [{block_number}], "
+                f"indirect=True)"
+            )
+            print(msg)
+            raise AssertionError(msg) from e
+        try:
+            _test_calculations(lp=lp, provider=fork_mainnet_full.provider)
+        except Exception as e:
+            block_number = fork_mainnet_full.provider.get_block_number()
+            msg = (
+                f"{type(e).__name__}: {e} — "
+                f"registry pool {i}/{pool_count} @ {pool_address}, block {block_number}. "
+                f'Reproduce: set pool_address="{pool_address}" in test_single_pool '
+                f"with @pytest.mark.parametrize('fork_mainnet_archive', [{block_number}], "
+                f"indirect=True)"
+            )
+            print(msg)
+            raise AssertionError(msg) from e

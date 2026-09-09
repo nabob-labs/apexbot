@@ -1,0 +1,459 @@
+import dataclasses
+import pathlib
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+import hypothesis
+import hypothesis.strategies
+import pydantic_core
+import pytest
+
+from apexbot.checksum_cache import get_checksum_address
+from apexbot.constants import MAX_INT128, ZERO_ADDRESS
+from apexbot.exceptions import ContractLogicError
+from apexbot.exceptions.pool import (
+    HookedPoolResult,
+    IncompleteSwap,
+    LiquidityPoolError,
+)
+from apexbot.fork import AnvilFork
+from apexbot.uniswap.v4_liquidity_pool import UniswapV4Pool
+from apexbot.utils.bytes import to_bytes
+from tests.golden.recorded_pool import load_pool
+from tests.helpers.bot_factory import make_bot_with_provider
+from tests.helpers.contract_compat import ContractCompat, make_contract
+
+if TYPE_CHECKING:
+    from apexbot.types.chain import HexStr
+
+
+USDC_CONTRACT_ADDRESS = get_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+NATIVE_CURRENCY_ADDRESS = ZERO_ADDRESS
+ETH_USDC_V4_POOL_ID = cast(
+    "HexStr", "0x21c67e77068de97969ba93d4aab21826d33ca12bb9f565d8496e8fda8a82ca27"
+)
+ETH_USDC_V4_POOL_FEE = 500
+ETH_USDC_V4_POOL_TICK_SPACING = 10
+V4_POOL_MANAGER_ADDRESS = get_checksum_address("0x000000000004444c5dc75cB358380D2e3dE08A90")
+STATE_VIEW_ADDRESS = get_checksum_address("0x7fFE42C4a5DEeA5b0feC41C94C136Cf115597227")
+
+UNISWAP_V4_QUOTER_ADDRESS = get_checksum_address("0x52F0E24D1c21C8A0cB1e5a5dD6198556BD9E1203")
+UNISWAP_V4_QUOTER_ABI = """
+[{"inputs":[{"internalType":"contract IPoolManager","name":"_poolManager","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[{"internalType":"PoolId","name":"poolId","type":"bytes32"}],"name":"NotEnoughLiquidity","type":"error"},{"inputs":[],"name":"NotPoolManager","type":"error"},{"inputs":[],"name":"NotSelf","type":"error"},{"inputs":[{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"QuoteSwap","type":"error"},{"inputs":[],"name":"UnexpectedCallSuccess","type":"error"},{"inputs":[{"internalType":"bytes","name":"revertData","type":"bytes"}],"name":"UnexpectedRevertBytes","type":"error"},{"inputs":[{"components":[{"internalType":"Currency","name":"exactCurrency","type":"address"},{"components":[{"internalType":"Currency","name":"intermediateCurrency","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct PathKey[]","name":"path","type":"tuple[]"},{"internalType":"uint128","name":"exactAmount","type":"uint128"}],"internalType":"struct IV4Quoter.QuoteExactParams","name":"params","type":"tuple"}],"name":"_quoteExactInput","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"Currency","name":"currency0","type":"address"},{"internalType":"Currency","name":"currency1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"}],"internalType":"struct PoolKey","name":"poolKey","type":"tuple"},{"internalType":"bool","name":"zeroForOne","type":"bool"},{"internalType":"uint128","name":"exactAmount","type":"uint128"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct IV4Quoter.QuoteExactSingleParams","name":"params","type":"tuple"}],"name":"_quoteExactInputSingle","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"Currency","name":"exactCurrency","type":"address"},{"components":[{"internalType":"Currency","name":"intermediateCurrency","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct PathKey[]","name":"path","type":"tuple[]"},{"internalType":"uint128","name":"exactAmount","type":"uint128"}],"internalType":"struct IV4Quoter.QuoteExactParams","name":"params","type":"tuple"}],"name":"_quoteExactOutput","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"Currency","name":"currency0","type":"address"},{"internalType":"Currency","name":"currency1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"}],"internalType":"struct PoolKey","name":"poolKey","type":"tuple"},{"internalType":"bool","name":"zeroForOne","type":"bool"},{"internalType":"uint128","name":"exactAmount","type":"uint128"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct IV4Quoter.QuoteExactSingleParams","name":"params","type":"tuple"}],"name":"_quoteExactOutputSingle","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"poolManager","outputs":[{"internalType":"contract IPoolManager","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"components":[{"internalType":"Currency","name":"exactCurrency","type":"address"},{"components":[{"internalType":"Currency","name":"intermediateCurrency","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct PathKey[]","name":"path","type":"tuple[]"},{"internalType":"uint128","name":"exactAmount","type":"uint128"}],"internalType":"struct IV4Quoter.QuoteExactParams","name":"params","type":"tuple"}],"name":"quoteExactInput","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"Currency","name":"currency0","type":"address"},{"internalType":"Currency","name":"currency1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"}],"internalType":"struct PoolKey","name":"poolKey","type":"tuple"},{"internalType":"bool","name":"zeroForOne","type":"bool"},{"internalType":"uint128","name":"exactAmount","type":"uint128"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct IV4Quoter.QuoteExactSingleParams","name":"params","type":"tuple"}],"name":"quoteExactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"Currency","name":"exactCurrency","type":"address"},{"components":[{"internalType":"Currency","name":"intermediateCurrency","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct PathKey[]","name":"path","type":"tuple[]"},{"internalType":"uint128","name":"exactAmount","type":"uint128"}],"internalType":"struct IV4Quoter.QuoteExactParams","name":"params","type":"tuple"}],"name":"quoteExactOutput","outputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"components":[{"internalType":"Currency","name":"currency0","type":"address"},{"internalType":"Currency","name":"currency1","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"contract IHooks","name":"hooks","type":"address"}],"internalType":"struct PoolKey","name":"poolKey","type":"tuple"},{"internalType":"bool","name":"zeroForOne","type":"bool"},{"internalType":"uint128","name":"exactAmount","type":"uint128"},{"internalType":"bytes","name":"hookData","type":"bytes"}],"internalType":"struct IV4Quoter.QuoteExactSingleParams","name":"params","type":"tuple"}],"name":"quoteExactOutputSingle","outputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"gasEstimate","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes","name":"data","type":"bytes"}],"name":"unlockCallback","outputs":[{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function"}]
+"""  # ruff: ignore[line-too-long]
+
+TOKEN_AMOUNT_MULTIPLIERS = [
+    0.000000001,
+    0.00000001,
+    0.0000001,
+    0.000001,
+    0.00001,
+    0.0001,
+    0.001,
+    0.01,
+    0.1,
+]
+
+SNAPSHOT_BLOCK = 21883665
+
+
+_V4_ETH_USDC_BLOCK = 25_706_703
+_V4_ETH_USDC_GOLDEN = Path(f"tests/golden/data/uniswap/v4/eth_usdc/{_V4_ETH_USDC_BLOCK}.json")
+
+
+@pytest.fixture
+def eth_usdc_v4() -> UniswapV4Pool:
+    """I/O-free ETH/USDC V4 pool recorded at ``_V4_ETH_USDC_BLOCK`` (no RPC)."""
+    pool = load_pool(_V4_ETH_USDC_GOLDEN, chain_id=1, block=_V4_ETH_USDC_BLOCK)
+    assert isinstance(pool, UniswapV4Pool)
+    return pool
+
+
+@pytest.fixture
+def testing_pools() -> list[dict[str, Any]]:
+    pools: list[dict[str, Any]] = pydantic_core.from_json(
+        pathlib.Path("tests/uniswap/v4/first_200_uniswap_v4_pools.json").read_bytes()
+    )
+    assert len(pools) == 200
+    return pools
+
+
+@pytest.fixture
+def liquidity_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = pydantic_core.from_json(
+        pathlib.Path("tests/uniswap/v4/mainnet_v4_liquidity_snapshot.json").read_bytes()
+    )
+
+    return snapshot
+
+
+def _test_pool_exact_input(
+    pool: dict[str, Any],
+    fork: AnvilFork,
+    quoter: ContractCompat,
+    snapshot: dict[str, Any] | None = None,
+):
+
+    pool_id: HexStr = pool["pool_id"]
+
+    bot = make_bot_with_provider(fork.provider)
+    lp = bot.managed_pools.get(
+        chain_id=fork.provider.get_chain_id(),
+        pool_manager_address=V4_POOL_MANAGER_ADDRESS,
+        pool_id=pool_id,
+    )
+    if lp is None:
+        try:
+            lp = bot.build_managed_pool(
+                V4_POOL_MANAGER_ADDRESS,
+                pool_id,
+                state_view_address=STATE_VIEW_ADDRESS,
+                tokens=[pool["token0"], pool["token1"]],
+                fee=pool["fee"],
+                tick_spacing=pool["tick_spacing"],
+                hook_address=pool["hooks"],
+                tick_bitmap=snapshot[pool_id]["tick_bitmap"]
+                if snapshot is not None and pool_id in snapshot
+                else None,
+                tick_data=snapshot[pool_id]["tick_data"]
+                if snapshot is not None and pool_id in snapshot
+                else None,
+            )
+        except Exception as exc:
+            print(f"Caught exception {exc} building pool id {pool['pool_id']}")
+            raise
+
+    assert isinstance(lp, UniswapV4Pool)
+
+    max_reserves_token0 = 1 * 10**lp.token0.decimals
+    max_reserves_token1 = 1 * 10**lp.token1.decimals
+
+    if max_reserves_token0 == 0 or max_reserves_token1 == 0:
+        return
+
+    for token_mult in TOKEN_AMOUNT_MULTIPLIERS:
+        token0_in_amount = max(1, int(token_mult * max_reserves_token0))
+
+        try:
+            quoter_amount_out, _ = quoter.functions.quoteExactInputSingle((
+                dataclasses.astuple(lp.pool_key),  # poolKey
+                True,  # zeroForOne
+                token0_in_amount,  # exactAmount
+                b"",  # hookData
+            )).call()
+        except ContractLogicError:
+            continue
+
+        if quoter_amount_out == 0:
+            continue
+
+        try:
+            helper_amount_out = lp.calculate_tokens_out_from_tokens_in(
+                token_in=lp.token0,
+                token_in_quantity=token0_in_amount,
+            )
+        except IncompleteSwap as exc:
+            helper_amount_out = exc.amount_out
+        except HookedPoolResult:
+            # The result might not match because a swap hook is not modeled
+            continue
+        except LiquidityPoolError as exc:
+            if exc.message is not None and (
+                "PriceLimitAlreadyExceeded" in exc.message or "PriceLimitOutOfBounds" in exc.message
+            ):
+                continue
+            raise
+
+        assert helper_amount_out == quoter_amount_out, (
+            f"Failed calc with {token_mult}x mult, token0 in, {lp.pool_id=} {lp.pool_key.hooks=}"
+        )
+
+    for token_mult in TOKEN_AMOUNT_MULTIPLIERS:
+        token1_in_amount = max(1, int(token_mult * max_reserves_token1))
+
+        try:
+            quoter_amount_out, _ = quoter.functions.quoteExactInputSingle((
+                dataclasses.astuple(lp.pool_key),  # poolKey
+                False,  # zeroForOne
+                token1_in_amount,  # exactAmount
+                b"",  # hookData
+            )).call()
+        except ContractLogicError:
+            continue
+
+        if quoter_amount_out == 0:
+            continue
+
+        try:
+            helper_amount_out = lp.calculate_tokens_out_from_tokens_in(
+                token_in=lp.token1,
+                token_in_quantity=token1_in_amount,
+            )
+        except IncompleteSwap as exc:
+            helper_amount_out = exc.amount_out
+        except HookedPoolResult:
+            # The result might not match because a swap hook is not modeled
+            continue
+        except LiquidityPoolError as exc:
+            if exc.message is not None and (
+                "PriceLimitAlreadyExceeded" in exc.message or "PriceLimitOutOfBounds" in exc.message
+            ):
+                continue
+            raise
+
+        assert helper_amount_out == quoter_amount_out, (
+            f"Failed calc with {token_mult}x mult, token1 in, {lp.pool_id=} {lp.pool_key.hooks=}"
+        )
+
+
+def _test_pool_exact_output(
+    pool: dict[str, Any],
+    fork: AnvilFork,
+    quoter: ContractCompat,
+    snapshot: dict[str, Any] | None = None,
+):
+    pool_id: HexStr = pool["pool_id"]
+
+    bot = make_bot_with_provider(fork.provider)
+    lp = bot.managed_pools.get(
+        chain_id=fork.provider.get_chain_id(),
+        pool_manager_address=V4_POOL_MANAGER_ADDRESS,
+        pool_id=pool_id,
+    )
+    if lp is None:
+        try:
+            lp = bot.build_managed_pool(
+                V4_POOL_MANAGER_ADDRESS,
+                pool_id,
+                state_view_address=STATE_VIEW_ADDRESS,
+                tokens=[pool["token0"], pool["token1"]],
+                fee=pool["fee"],
+                tick_spacing=pool["tick_spacing"],
+                hook_address=pool["hooks"],
+                tick_bitmap=snapshot[pool_id]["tick_bitmap"]
+                if snapshot is not None and pool_id in snapshot
+                else None,
+                tick_data=snapshot[pool_id]["tick_data"]
+                if snapshot is not None and pool_id in snapshot
+                else None,
+            )
+        except Exception as exc:
+            print(f"Caught exception {exc} building pool id {pool['pool_id']}")
+            raise
+
+    assert isinstance(lp, UniswapV4Pool)
+
+    max_reserves_token0 = 1 * 10**lp.token0.decimals
+    max_reserves_token1 = 1 * 10**lp.token1.decimals
+
+    if max_reserves_token0 == 0 or max_reserves_token1 == 0:
+        return
+
+    for token_mult in TOKEN_AMOUNT_MULTIPLIERS:
+        token0_out_amount = int(token_mult * max_reserves_token0)
+
+        try:
+            quoter_amount_in, _ = quoter.functions.quoteExactOutputSingle((
+                dataclasses.astuple(lp.pool_key),  # poolKey
+                False,  # zeroForOne
+                token0_out_amount,  # exactAmount
+                b"",  # hookData
+            )).call()
+        except ContractLogicError:
+            continue
+
+        if quoter_amount_in == 0:
+            continue
+
+        try:
+            helper_amount_in = lp.calculate_tokens_in_from_tokens_out(
+                token_out=lp.token0,
+                token_out_quantity=token0_out_amount,
+            )
+        except IncompleteSwap as exc:
+            helper_amount_in = exc.amount_in
+        except HookedPoolResult:
+            # The result might not match because a swap hook is not modeled
+            continue
+        except LiquidityPoolError as exc:
+            if exc.message is not None and (
+                "PriceLimitAlreadyExceeded" in exc.message or "PriceLimitOutOfBounds" in exc.message
+            ):
+                continue
+            raise
+
+        assert helper_amount_in == quoter_amount_in, (
+            f"Failed calc with {token_mult}x mult, token0 out, {lp.pool_id=} {lp.pool_key.hooks=}"
+        )
+
+    for token_mult in TOKEN_AMOUNT_MULTIPLIERS:
+        token1_out_amount = int(token_mult * max_reserves_token1)
+
+        try:
+            quoter_amount_in, _ = quoter.functions.quoteExactOutputSingle((
+                dataclasses.astuple(lp.pool_key),  # poolKey
+                True,  # zeroForOne
+                token1_out_amount,  # exactAmount
+                b"",  # hookData
+            )).call()
+        except ContractLogicError:
+            continue
+
+        if quoter_amount_in == 0:
+            continue
+
+        try:
+            helper_amount_in = lp.calculate_tokens_in_from_tokens_out(
+                token_out=lp.token1,
+                token_out_quantity=token1_out_amount,
+            )
+        except IncompleteSwap as exc:
+            helper_amount_in = exc.amount_in
+        except HookedPoolResult:
+            # The result might not match because a swap hook is not modeled
+            continue
+        except LiquidityPoolError as exc:
+            if exc.message is not None and (
+                "PriceLimitAlreadyExceeded" in exc.message or "PriceLimitOutOfBounds" in exc.message
+            ):
+                continue
+            raise
+
+        assert helper_amount_in == quoter_amount_in, (
+            f"Failed calc with {token_mult}x mult, token1 out, {lp.pool_id=} {lp.pool_key.hooks=}"
+        )
+
+
+def test_pool_creation(eth_usdc_v4: UniswapV4Pool):
+    assert eth_usdc_v4.pool_id == to_bytes(ETH_USDC_V4_POOL_ID)
+    assert eth_usdc_v4.address == V4_POOL_MANAGER_ADDRESS
+    assert eth_usdc_v4.tokens[0].address == NATIVE_CURRENCY_ADDRESS
+    assert eth_usdc_v4.tokens[1].address == USDC_CONTRACT_ADDRESS
+
+
+def test_pool_liquidity_checks(eth_usdc_v4: UniswapV4Pool):
+    assert eth_usdc_v4.liquidity > 0
+
+
+def test_pool_sqrt_price_checks(eth_usdc_v4: UniswapV4Pool):
+    assert eth_usdc_v4.sqrt_price_x96 > 0
+
+
+@pytest.mark.slow
+@pytest.mark.ethereum
+@hypothesis.given(
+    amount=hypothesis.strategies.integers(
+        min_value=1,
+        max_value=MAX_INT128,
+    )
+)
+@hypothesis.settings(
+    suppress_health_check=[
+        hypothesis.HealthCheck.function_scoped_fixture,
+    ],
+    deadline=None,
+)
+def test_cached_calculations(
+    amount: int,
+    eth_usdc_v4: UniswapV4Pool,
+    fork_mainnet_full: AnvilFork,
+) -> None:
+    quoter = make_contract(
+        fork_mainnet_full.http_url, UNISWAP_V4_QUOTER_ADDRESS, UNISWAP_V4_QUOTER_ABI
+    )
+
+    for token_in, token_out in [
+        (eth_usdc_v4.token0, eth_usdc_v4.token1),
+        (eth_usdc_v4.token1, eth_usdc_v4.token0),
+    ]:
+        try:
+            quoter_amount_in, _ = quoter.functions.quoteExactOutputSingle((
+                dataclasses.astuple(eth_usdc_v4.pool_key),  # poolKey
+                token_in is eth_usdc_v4.token0,  # zeroForOne
+                amount,  # exactAmount
+                b"",  # hookData
+            )).call()
+        except ContractLogicError:
+            continue
+
+        try:
+            quoter_amount_out, _ = quoter.functions.quoteExactInputSingle((
+                dataclasses.astuple(eth_usdc_v4.pool_key),  # poolKey
+                token_in is eth_usdc_v4.token0,  # zeroForOne
+                amount,  # exactAmount
+                b"",  # hookData
+            )).call()
+        except ContractLogicError:
+            continue
+
+        try:
+            amount_out = eth_usdc_v4.calculate_tokens_out_from_tokens_in(
+                token_in=token_in,
+                token_in_quantity=amount,
+            )
+        except IncompleteSwap as exc:
+            amount_out = exc.amount_out
+
+        assert amount_out == quoter_amount_out
+
+        try:
+            amount_in = eth_usdc_v4.calculate_tokens_in_from_tokens_out(
+                token_out=token_out,
+                token_out_quantity=amount,
+            )
+        except IncompleteSwap as exc:
+            amount_in = exc.amount_in
+
+        assert amount_in == quoter_amount_in
+
+
+@pytest.mark.slow
+def test_first_200_pools(
+    fork_mainnet_full: AnvilFork,
+    testing_pools,
+):
+    quoter = make_contract(
+        fork_mainnet_full.http_url, UNISWAP_V4_QUOTER_ADDRESS, UNISWAP_V4_QUOTER_ABI
+    )
+
+    for pool in testing_pools:
+        _test_pool_exact_input(
+            pool=pool,
+            fork=fork_mainnet_full,
+            quoter=quoter,
+        )
+        _test_pool_exact_output(
+            pool=pool,
+            fork=fork_mainnet_full,
+            quoter=quoter,
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "fork_mainnet_archive",
+    [SNAPSHOT_BLOCK],
+    indirect=True,
+)
+def test_first_200_pools_with_snapshot(
+    fork_mainnet_archive: AnvilFork,
+    testing_pools,
+    liquidity_snapshot,
+):
+    quoter = make_contract(
+        fork_mainnet_archive.http_url, UNISWAP_V4_QUOTER_ADDRESS, UNISWAP_V4_QUOTER_ABI
+    )
+
+    for pool in testing_pools:
+        _test_pool_exact_input(
+            pool=pool,
+            fork=fork_mainnet_archive,
+            quoter=quoter,
+            snapshot=liquidity_snapshot,
+        )
+        _test_pool_exact_output(
+            pool=pool,
+            fork=fork_mainnet_archive,
+            quoter=quoter,
+            snapshot=liquidity_snapshot,
+        )

@@ -1,0 +1,196 @@
+//! Drain-path profiling guard — the hotpath tracer bullet.
+//!
+//! [hotpath-rs](https://hotpath.rs) instruments functions, channels, locks, and
+//! threads. The `#[hotpath::measure]` attributes sprinkled across the
+//! block-pump → `EngineStages` solve path (the stage-machine driver's inline
+//! instrumentation: they are **no-ops unless the `hotpath` Cargo feature is
+//! enabled** (hotpath's `lib_off.rs` expands them to nothing), so default
+//! builds pay zero compile-time or runtime cost.
+//!
+//! This module owns the **guard lifetime**: hotpath's background measurement
+//! processor only runs while a single `HotpathGuard` is alive, and the report
+//! is generated when that guard is dropped. `apexbot-bot` is a `cdylib`
+//! driven by Python (no Rust `main`), so `#[hotpath::main]` is unavailable —
+//! [`hotpath_guard`] builds the guard programmatically via
+//! `HotpathGuardBuilder` and is held for the pump loop's lifetime by
+//! [`BlockPump::run_with_stream`](crate::bot_core::block_pump::BlockPump::run_with_stream).
+//!
+//! # Operational gating
+//!
+//! Constructing a second `HotpathGuard` panics, and the cdylib is loaded into
+//! a Python process that may spin up several bots / tests. So the guard is
+//! **opt-in via the `APEXBOT_HOTPATH=1` env var** — absent it,
+//! [`hotpath_guard`] returns `None` and no guard is built. Combine with
+//! hotpath's own env vars to shape the report, e.g.:
+//!
+//! ```text
+//! APEXBOT_HOTPATH=1 \
+//! HOTPATH_OUTPUT_FORMAT=json \
+//! HOTPATH_OUTPUT_PATH=hp.json \
+//! HOTPATH_REPORT=functions-timing,threads \
+//! HOTPATH_SHUTDOWN_MS=30000 \
+//! uv run python ...
+//! ```
+//!
+//! `HOTPATH_SHUTDOWN_MS` forces a timed report for a long-running bot (the
+//! guard otherwise only drops when the pump exits). For a live view, run
+//! `hotpath console` ( installed separately via `cargo install hotpath
+//! --features=tui`) while the instrumented bot runs.
+//!
+//! # Why here, why the drain path
+//!
+//! The pump → coordinator → engine-handle path is the canonical
+//! "Rust-is-the-engine" layer (ADR-005 / ADR-006): a tokio task driving WS
+//! `newHeads` + `logs` through the ONE stage seam (`StageHandlers`, SZJUKL) —
+//! solution hooks hold the engine `Mutex` (enqueue-length under the detached
+//! posture) and take the `BotState` `RwLock` internally. It is where
+//! latency = lost MEV, and it combines every hotpath capability relevant
+//! here: tokio runtime, the result-batch mpsc channel, three nested locks,
+//! and CPU-bound solve work. See `docs/architecture/rust-owned-bot.md` for the
+//! component map.
+
+/// The profiling guard type. With the `hotpath` feature off this is hotpath's
+/// no-op `HotpathGuard` (a zero-sized stub from `lib_off.rs`); with it on it
+/// is the real guard whose drop writes the report.
+pub type Guard = hotpath::HotpathGuard;
+
+/// The `HOTPATH_SHUTDOWN_MS` window as a `Duration`, for callers orchestrating
+/// a cooperative timed exit (S53STH): raise the pump shutdown flag at this
+/// deadline, unwind, flush telemetry, then drop the guard.
+/// `None` when unset or unparseable (warn on unparseable — a typo would
+/// otherwise silently disable the timed exit).
+#[cfg(feature = "hotpath")]
+#[must_use]
+pub fn timed_exit_window() -> Option<std::time::Duration> {
+    match std::env::var("HOTPATH_SHUTDOWN_MS") {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+            Err(e) => {
+                tracing::warn!(%raw, %e, "HOTPATH_SHUTDOWN_MS not a millisecond count — timed exit disabled");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Build a hotpath guard for the pump run, iff the operator opted in.
+///
+/// Returns `None` (no guard) unless `APEXBOT_HOTPATH=1` is set, so the
+/// single-guard invariant can't be tripped by default runs, tests, or a
+/// Python process hosting multiple bots. When the `hotpath` Cargo feature is
+/// off the returned guard is a no-op stub — calling this is always safe.
+#[must_use]
+pub fn hotpath_guard(caller_name: &'static str) -> Option<Guard> {
+    // Honor hotpath's own all-off path: when the feature isn't enabled the
+    // builder still exists (no-op) but we skip constructing it anyway so
+    // there's not even a stub object held across the loop. The env gate
+    // applies in both cases.
+    if !crate::bot_core::stance::config().trace.hotpath {
+        return None;
+    }
+    #[cfg(feature = "hotpath")]
+    {
+        let builder = hotpath::HotpathGuardBuilder::new(caller_name);
+        let guard = builder.build();
+        // S53STH: HOTPATH_SHUTDOWN_MS no longer arms hotpath's own
+        // build_with_shutdown thread (which dropped the guard then called
+        // process::exit() while tokio workers were still live - the TLS
+        // teardown abort of incident 2026-08-21). The caller
+        // (`BlockPump::run_with_stream`) reads timed_exit_window(), starts its
+        // own cooperative timer that raises the pump's shutdown flag at the
+        // window, lets the loop unwind through all span guards, flushes OTel,
+        // and only then drops this guard (report) at scope end.
+        if let Ok(raw) = std::env::var("HOTPATH_SHUTDOWN_MS") {
+            tracing::info!(
+                caller_name,
+                window_ms = %raw,
+                "hotpath: profiling active — cooperative timed exit via HOTPATH_SHUTDOWN_MS"
+            );
+        } else {
+            tracing::info!(
+                caller_name,
+                "hotpath: profiling guard active (report on pump exit)"
+            );
+        }
+        Some(guard)
+    }
+    #[cfg(not(feature = "hotpath"))]
+    {
+        // Feature off: the builder is a no-op stub, but constructing it would
+        // still mislead the operator (they set APEXBOT_HOTPATH=1 without
+        // enabling the Cargo feature). Surface that instead of silently
+        // profiling nothing.
+        let _ = caller_name;
+        tracing::warn!(
+            "hotpath: APEXBOT_HOTPATH=1 set but the hotpath Cargo feature is not \
+             enabled on apexbot-bot — rebuild with --features hotpath"
+        );
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test for the guard lifecycle. Ignored by default — it touches the
+    /// process-global `APEXBOT_HOTPATH` env var AND hotpath's singleton guard,
+    /// so it must run alone. Run with:
+    ///
+    /// ```text
+    /// APEXBOT_HOTPATH=1 \
+    /// cargo test -p apexbot-bot --features hotpath profiling:: -- --ignored --nocapture
+    /// ```
+    ///
+    /// Without the env var (or without the feature) `hotpath_guard` returns
+    /// `None`; with both it returns a guard whose drop writes a report.
+    #[test]
+    #[ignore = "touches global env + hotpath guard singleton; run alone"]
+    fn guard_constructs_only_when_opted_in() {
+        // Env var unset → no guard.
+        std::env::remove_var("APEXBOT_HOTPATH");
+        std::env::remove_var("HOTPATH_SHUTDOWN_MS");
+        assert!(hotpath_guard("smoke").is_none());
+
+        // Opt in, no timed shutdown → guard returned (held by caller; report
+        // on drop at scope end).
+        std::env::set_var("APEXBOT_HOTPATH", "1");
+        std::env::remove_var("HOTPATH_SHUTDOWN_MS");
+        let guard = hotpath_guard("smoke");
+        #[cfg(feature = "hotpath")]
+        {
+            assert!(guard.is_some(), "opted-in + feature on → guard built");
+        }
+        #[cfg(not(feature = "hotpath"))]
+        {
+            assert!(guard.is_none(), "feature off → no guard even if opted in");
+        }
+        // Guard (if any) drops at scope end — when the `hotpath` feature is
+        // on this writes the report; the no-op stub when off has nothing to drop.
+    }
+
+    /// `HOTPATH_SHUTDOWN_MS` switches the builder to the autonomous
+    /// background-thread shutdown path — hotpath owns the guard, so
+    /// `hotpath_guard` returns `None` (the caller holds nothing). Ignored:
+    /// would exit the process after the timeout.
+    #[test]
+    #[ignore = "would trigger process exit via HOTPATH_SHUTDOWN_MS; run alone"]
+    fn guard_uses_timed_shutdown_when_env_set() {
+        std::env::set_var("APEXBOT_HOTPATH", "1");
+        std::env::set_var("HOTPATH_SHUTDOWN_MS", "999999"); // far future; test just checks the branch
+        let guard = hotpath_guard("smoke_shutdown");
+        #[cfg(feature = "hotpath")]
+        {
+            assert!(
+                guard.is_none(),
+                "HOTPATH_SHUTDOWN_MS set → hotpath owns the guard, caller holds nothing"
+            );
+        }
+        #[cfg(not(feature = "hotpath"))]
+        {
+            assert!(guard.is_none());
+        }
+        std::env::remove_var("HOTPATH_SHUTDOWN_MS");
+    }
+}

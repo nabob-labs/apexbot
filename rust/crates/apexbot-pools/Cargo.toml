@@ -1,0 +1,36 @@
+[package]
+name = "apexbot-pools"
+description = "Value-only pool identity/state structs + stateless swap simulation for the apexbot pool families."
+keywords = ["mev", "pools", "uniswap", "swap"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.4" }
+thiserror = { version = "^2.0" }
+parking_lot = { version = "^0.12" }
+# Hot map type for tick liquidity (foldhash; see workspace.dependencies note).
+hashbrown.workspace = true
+apexbot-decoders.workspace = true
+apexbot-uniswap.workspace = true
+apexbot-math.workspace = true
+
+[dev-dependencies]
+proptest = "^1.11"
+serde_json = "^1.0"
+hex = "^0.4"
+# revm drives the Tier-3b end-to-end `Pool.swap` oracle: it deploys real
+# v3-core/v4-core bytecode into an offline CacheDB and calls swap, so the Rust
+# `v3_simulate_swap` / `v4_simulate_swap` are compared against the canonical
+# on-chain swap logic byte-for-byte (ergo epic UP5NH6, task 2LTKVO). A
+# dev-dep only — does NOT pull revm into the core lib build (cargo tree on
+# default features excludes dev-deps), so the no-pyo3-in-cores invariant is
+# unaffected.
+revm = { version = "^43.0", default-features = true }
+

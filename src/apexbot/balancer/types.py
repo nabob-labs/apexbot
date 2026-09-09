@@ -1,0 +1,34 @@
+"""Balancer-specific data types and enums (pool state, rate provider)."""
+
+import dataclasses
+
+from apexbot.types.abstract import AbstractPoolState
+from apexbot.types.aliases import BlockNumber
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class BalancerV2PoolState(AbstractPoolState):
+    """BalancerV2PoolState class."""
+
+    balances: tuple[int, ...]
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class BalancerV2WeightedPoolExternalUpdate:
+    """State update for a Balancer V2 weighted pool."""
+
+    block_number: BlockNumber
+    balances: tuple[int, ...]
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class BalancerV2StablePoolExternalUpdate:
+    """State update for a Balancer V2 stable pool.
+
+    amp is currently omitted — stable pools treat amp as immutable after
+    construction in this plan. A future slice may add amp tracking to
+    support A ramping.
+    """
+
+    block_number: BlockNumber
+    balances: tuple[int, ...]

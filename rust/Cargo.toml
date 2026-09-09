@@ -1,0 +1,214 @@
+# apexbot Rust workspace — pure virtual manifest.
+#
+# The workspace root holds ONLY the `[workspace]` declaration + the `[profile.*]`
+# blocks (Cargo only honors `[profile]` at the workspace root — keep them here).
+# The seven pyo3-free core crates + the `apexbot_rs` PyO3 binding layer are all
+# workspace *members* nested under `crates/`, mirroring the `polars` repo layout
+# where `polars-python` sits as a peer of `polars-core`/`-ops`/`-plan`/etc.
+# (ergo UG6FKN follow-up / ADR-005 deferral: the binding layer was lifted out of
+# the workspace root into `crates/apexbot-python/`.)
+#
+# Cores are pyo3-free under their default features; `apexbot-python` enables each
+# core's `pyo3` feature so the `From<Error> for PyErr` conversions are available
+# at the binding layer. Verify with `just check-no-pyo3-in-cores`.
+
+# Shared package metadata inherited by every member crate via `<field>.workspace
+# = true` (ADR-009 single-source-of-truth versioning). The version literal here
+# is the *only* version in the Rust tree; the binding crate `apexbot_rs`
+# (`crates/apexbot-python/`) inherits it, and maturin reads that crate's
+# version to set the published wheel's — so one edit moves both halves.
+[workspace.package]
+version = "0.6.0-alpha.9"
+edition = "2021"
+license = "MIT"
+rust-version = "1.97"
+repository = "https://github.com/nabob-labs/apexbot.git"
+authors = ["nabob-labs"]
+
+# Single source of truth for lint policy across all workspace members
+# (ADR: centralize per-crate [lints] duplication). Every member inherits these
+# via `[lints] workspace = true`, so adjusting a clippy group or adding a lint
+# is a one-line edit here instead of a 27-file sweep. This is the in-tree
+# POLICY; the push gate's `cargo clippy -- --deny warnings` is what escalates
+# the warn-level groups to hard failure at push/CI time.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Panic safety - must handle errors, not crash
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+
+# The "no cheating" rule
+# NOTE: allow_attributes_without_reason would ALSO demand a reason on every #[expect]
+# (882 expects, only 19 reasoned) - too costly. keep allow_attributes (outer) + a CI rg guard for inner #![allow].
+allow_attributes = "deny"
+
+# Code hygiene - no debug leftovers
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Prevents deadlocks
+await_holding_lock = "deny"
+
+# Libraries shouldn't exit
+exit = "deny"
+
+[workspace.dependencies]
+# Internal path deps carry explicit version requirements here so the 26
+# publishable crates pass cargo publish manifest validation. Keep these
+# version literals in sync with [workspace.package].version (lockstep, ADR-009).
+apexbot-aave = { version = "0.6.0-alpha.9", path = "crates/apexbot-aave" }
+apexbot-abi = { version = "0.6.0-alpha.9", path = "crates/apexbot-abi" }
+apexbot-arbitrage = { version = "0.6.0-alpha.9", path = "crates/apexbot-arbitrage" }
+apexbot-bot = { version = "0.6.0-alpha.9", path = "crates/apexbot-bot" }
+apexbot-core = { version = "0.6.0-alpha.9", path = "crates/apexbot-core" }
+apexbot-config = { version = "0.6.0-alpha.9", path = "crates/apexbot-config" }
+apexbot-db = { version = "0.6.0-alpha.9", path = "crates/apexbot-db" }
+apexbot-decoders = { version = "0.6.0-alpha.9", path = "crates/apexbot-decoders" }
+apexbot-execution = { version = "0.6.0-alpha.9", path = "crates/apexbot-execution" }
+apexbot-executor = { version = "0.6.0-alpha.9", path = "crates/apexbot-executor" }
+apexbot-fork = { version = "0.6.0-alpha.9", path = "crates/apexbot-fork" }
+apexbot-ingestion = { version = "0.6.0-alpha.9", path = "crates/apexbot-ingestion" }
+apexbot-math = { version = "0.6.0-alpha.9", path = "crates/apexbot-math" }
+apexbot-order-index = { version = "0.6.0-alpha.9", path = "crates/apexbot-order-index" }
+apexbot-pathfinding = { version = "0.6.0-alpha.9", path = "crates/apexbot-pathfinding" }
+apexbot-pool-updater = { version = "0.6.0-alpha.9", path = "crates/apexbot-pool-updater" }
+apexbot-pools = { version = "0.6.0-alpha.9", path = "crates/apexbot-pools" }
+apexbot-price = { version = "0.6.0-alpha.9", path = "crates/apexbot-price" }
+apexbot-rpc = { version = "0.6.0-alpha.9", path = "crates/apexbot-rpc" }
+apexbot-simulation = { version = "0.6.0-alpha.9", path = "crates/apexbot-simulation" }
+apexbot-solvers = { version = "0.6.0-alpha.9", path = "crates/apexbot-solvers" }
+apexbot-submission = { version = "0.6.0-alpha.9", path = "crates/apexbot-submission" }
+apexbot-uniswap = { version = "0.6.0-alpha.9", path = "crates/apexbot-uniswap" }
+# hashbrown: foldhash-based HashMap/HashSet for the hot maps (small int/string
+# keys generated in-process — no DoS surface). 0.17.1 + foldhash 0.2.0 already
+# resolve transitively (indexmap 2.14 / lru 0.18), so this direct dependency
+# unifies the graph instead of growing it. default-hasher = foldhash.
+hashbrown = { version = "0.17", features = ["default-hasher"] }
+# zstd: decode-only use for the committed .jsonl.zst capture fixtures
+# (apexbot-solvers/src/capture_fixture.rs). arrays avoids building the
+# legacy/mt C code paths we never touch.
+zstd = { version = "0.14", default-features = false, features = ["arrays"] }
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/apexbot",
+    "crates/apexbot-aave",
+    "crates/apexbot-abi",
+    "crates/apexbot-bot",
+    "crates/apexbot-config",
+    "crates/apexbot-core",
+    "crates/apexbot-db",
+    "crates/apexbot-decoders",
+    "crates/apexbot-execution",
+    "crates/apexbot-execution-sample",
+    "crates/apexbot-executor",
+    "crates/apexbot-fork",
+    "crates/apexbot-ingestion",
+    "crates/apexbot-math",
+    "crates/apexbot-pathfinding",
+    "crates/apexbot-pool-updater",
+    "crates/apexbot-pools",
+    "crates/apexbot-price",
+    "crates/apexbot-python",
+    "crates/apexbot-rpc",
+    "crates/apexbot-simulation",
+    "crates/apexbot-arbitrage",
+    "crates/apexbot-solvers",
+    "crates/apexbot-submission",
+    "crates/apexbot-uniswap",
+    "crates/apexbot-order-index",
+]
+
+# Release profile.
+#
+# IMPORTANT framing for the two first-class consumers (see AGENTS.md): Cargo
+# only honors `[profile.*]` from the top-level package being built — profile
+# settings in the manifests of *dependencies* are ignored entirely. So every
+# block below tunes ONLY apexbot's own in-repo builds (the `apexbot_rs`
+# cdylib and in-workspace `cargo test`/`clippy`).
+#
+# The pure-Rust consumer (`cargo add apexbot`, building the umbrella crate
+# into their own binary — see `examples/standalone_consumer.rs`) is entirely
+# unaffected: their build reads *their* workspace's `[profile.release]`, which
+# applies uniformly across the whole dependency graph including these crates.
+# Their binary's LTO/codegen is theirs to own, not this file's.
+#
+# Within this workspace, the only shipped runtime artifact is the `apexbot_rs`
+# cdylib (the Python extension, built from `crates/apexbot-python`), and it
+# gets the heavy optimizations — `lto = "thin"` + `strip` + `codegen-units = 1`.
+# `lto`/`strip` are profile-level (Cargo has no per-package `lto`), so they
+# apply workspace-wide, but the final thin-LTO link only spans codegen units
+# that survive into the cdylib.
+#
+# The pure-Rust core crates (`apexbot-core`, `-concentrated-liquidity-math`, `-abi`, `-rpc`,
+# `-bot`) get per-package overrides below: more `codegen-units` for faster
+# compilation during a cdylib release build. They are libraries consumed (and
+# inlined at the final link) by the cdylib, so the looser per-package codegen
+# does not meaningfully hurt runtime — the cdylib's thin LTO re-converges.
+#
+# If a Rust bot is ever shipped as a *binary built inside this workspace* (no
+# `[[bin]]` target exists today — all members are libraries), revisit this:
+# the per-package loosening and the cdylib-singular framing would then apply
+# to that second shipped artifact. Downstream consumers building it from the
+# umbrella are unaffected regardless.
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[profile.release.package.apexbot-core]
+codegen-units = 16
+[profile.release.package.apexbot-math]
+codegen-units = 16
+[profile.release.package.apexbot-pools]
+codegen-units = 16
+[profile.release.package.apexbot-price]
+codegen-units = 16
+[profile.release.package.apexbot-abi]
+codegen-units = 16
+[profile.release.package.apexbot-rpc]
+codegen-units = 16
+[profile.release.package.apexbot-fork]
+codegen-units = 16
+[profile.release.package.apexbot-bot]
+codegen-units = 16
+[profile.release.package.apexbot-decoders]
+codegen-units = 16
+[profile.release.package.apexbot-uniswap]
+codegen-units = 16
+[profile.release.package.apexbot-pathfinding]
+codegen-units = 16
+[profile.release.package.apexbot-db]
+codegen-units = 16
+[profile.release.package.apexbot-executor]
+codegen-units = 16
+[profile.release.package.apexbot-submission]
+codegen-units = 16
+
+# Dev profile (default for `cargo test` / `just dev`): keep compilation fast.
+# No LTO, relaxed debug-info so the pure-Rust cores (`cargo test -p <crate>`)
+# rebuild quickly during the red-green loop.
+[profile.dev]
+# More codegen units for faster incremental dev builds across all crates.
+opt-level = 1
+# "Relaxed debug-info" (per the comment above, but it was omitted until the
+# 422G rust/target incident): line tables keep `RUST_BACKTRACE`, perf, and
+# flamegraphs resolving to file:line while dropping the variable/type DWARF
+# that bloated every test binary to ~0.5 GiB x hundreds of hash variants.
+# Ad-hoc deep debugging a single suite: RUSTFLAGS="-C debuginfo=2 cargo test ...
+# (Rust >= 1.71 syntax: "line-tables-only"; older spellings: -C debuginfo=1.)
+debug = "line-tables-only"

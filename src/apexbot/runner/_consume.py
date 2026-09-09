@@ -1,0 +1,269 @@
+"""Block-stream + result-batch consumption for the settlement-arbitrage ``BotRunner``.
+
+Extracted from ``examples/eth_backrun_v2_v3_v4_rust.py`` (epic 5TSYKN, task
+CXWQDI). Owns the permanent main loop: :func:`consume_result_batches` awaits
+the block clock (``bot.block_stream()``) and the result batches
+(``engine``) concurrently, driving the dispatcher's block clock and dispatching
+profitable results through the Rust seam.
+
+The single-consumer pump block stream is consumed directly here (no tee): the
+redundant Python recurring liquidity-map re-verify and its block-stream fan-out
+were removed — pools are verified by the Rust two-step seed/drain gate and the
+Rust solve-time solver-state verifier, not a Python whole-batch re-check.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, cast
+
+from apexbot.calculations import next_base_fee
+from apexbot.diagnostics import mark_progress
+from apexbot.dispatch import fetch_fee_history
+from apexbot.logging import logger as bot_logger
+from apexbot.runner._dispatch import _dispatch_profitable
+from apexbot.runner._driver_constants import FEE_PERCENTILES
+from apexbot.runner._sim_submit_pipeline import SimSubmitPipeline
+
+if TYPE_CHECKING:
+    from apexbot.runner.bot_runner import _SessionState
+
+
+async def consume_result_batches(
+    session: _SessionState,
+    *,
+    block_stream: AsyncIterator[dict[str, int]],
+    result_iter: AsyncIterator[dict[str, object]] | None = None,
+    allow_quiet_end: bool = False,
+) -> None:
+    """Consume the block stream (clock) + result batches (dispatch) in parallel.
+
+    Epic 6W35AI: the block clock comes from the forwarded ``newHeads`` stream
+    (``bot.block_stream()``), NOT from ``ResultBatch.solve_block``. The
+    result batch's ``solve_block`` lagged by the send debounce + only advanced
+    when a batch was actually sent, so the bot's ``[block: N]`` froze behind
+    the pump's ``current_block``. The block stream ticks once per accepted
+    ``WsEvent::BlockHeader`` - the authoritative clock.
+
+    The block stream is always injected - the coordinator owns the once-only
+    ``Bot.block_stream()`` handle (ADR-027) and passes it in. The result
+    iterator is injectable for testing; production pulls it from the engine.
+    """
+    bot_logger.info("[consumer] Starting - block stream + result batches from Rust pump")
+    # SIMPIPE option A: K-way concurrent sims + single ordered submitter
+    # (created here - the session owns the instance lifetime).
+    pipeline = session.sim_submit_pipeline
+    if pipeline is None:
+        pipeline = SimSubmitPipeline(session)
+        session.sim_submit_pipeline = pipeline
+
+    if result_iter is None:
+        result_iter = aiter(session.engine_registry.engine)
+
+    block_fut = cast(
+        "asyncio.Task[dict[str, int]] | None", asyncio.ensure_future(anext(block_stream))
+    )
+    result_fut = cast(
+        "asyncio.Task[dict[str, object]] | None", asyncio.ensure_future(anext(result_iter))
+    )
+    block_ended = False
+    result_ended = False
+
+    while block_fut is not None or result_fut is not None:
+        pending = {f for f in (block_fut, result_fut) if f is not None}
+        done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+        for fut in done:
+            if fut is block_fut:
+                block_fut, block_ended = _reprime(block_stream, fut, "block stream")
+                await _apply_block_if_ready(fut, session)
+            elif fut is result_fut:
+                result_fut, result_ended = _reprime(result_iter, fut, "result stream")
+                await _apply_result_if_ready(fut, session, pipeline)
+        # SIMPIPE loud-abort: a failed sim/submit leaf surfaces here (the
+        # same kernel the consumer loop already brings down the run with).
+        if pipeline is not None:
+            pipeline.raise_if_failed()
+        # ergo 66H3KJ: mark main-loop forward progress for the Rust stuck-
+        # watchdog (start_gil_probe). A stale timestamp here means the loop
+        # is parked mid-`_apply_result_if_ready` (the dispatch deadlock site).
+        mark_progress()
+
+    # Incident 2026-08-20 (silent pump death): the Rust pump's delivery
+    # channels (block clock + result batches) are owned by the engine, which
+    # OUTLIVES the pump task. When the pump's WS subscription dies the Rust
+    # side drops them (pump is STOPPED - ERROR log), which ends BOTH of these
+    # streams. A settlement bot whose block clock is dead must abort loudly -
+    # a quiet return here let the process sit as if the run were normal:
+    # operators read it as a "GIL deadlock". Cancellation (explicit stop)
+    # raises CancelledError inside asyncio.wait above and never reaches this
+    # point, so this only fires on a natural stream end.
+    if (block_ended or result_ended) and not allow_quiet_end:
+        bot_logger.error(
+            "[consumer] block/result stream ended - the Rust pump stopped "
+            "(WS subscription dead or pump task exited); aborting"
+        )
+        message = (
+            "block/result stream ended: the Rust pump stopped (WS subscription "
+            "dropped or pump task exited - see the Rust 'pump is STOPPED' "
+            "ERROR log). The settlement bot cannot keep trading from a dead "
+            "block clock; aborting loudly."
+        )
+        raise RuntimeError(message)
+
+
+def _reprime(
+    stream: AsyncIterator[Any],
+    fut: asyncio.Task[Any],
+    label: str,
+) -> tuple[asyncio.Task[Any] | None, bool]:
+    """Schedule the next pull; return (task_or_None, stream_ended)."""
+    try:
+        fut.result()
+    except StopAsyncIteration:
+        bot_logger.info("[consumer] %s ended", label)
+        return None, True
+    except BaseException:
+        return None, False
+    return asyncio.ensure_future(anext(stream)), False
+
+
+async def _apply_block_if_ready(fut: asyncio.Task[dict[str, int]], session: _SessionState) -> None:
+    """Drive the block clock from a forwarded ``newHeads`` tick if fut resolved."""
+    if fut.cancelled() or fut.exception() is not None:
+        return
+    dispatcher = session.dispatcher
+    async_w3 = session.async_w3
+    try:
+        block = fut.result()
+    except StopAsyncIteration:
+        return
+
+    block_number = int(block["number"])
+    block_timestamp = int(block["timestamp"])
+    base_fee = int(block.get("base_fee_per_gas") or 0)
+    gas_used = int(block["gas_used"])
+    gas_limit = int(block["gas_limit"])
+
+    base_fee_next = next_base_fee(
+        parent_base_fee=base_fee,
+        parent_gas_used=gas_used,
+        parent_gas_limit=gas_limit,
+    )
+
+    # 7UIYJ6: ``eth_feeHistory`` + hex-decode + ``record_priority_fees`` now
+    # happen in the Rust submit leaf (``fetch_fee_history``). No-op on failure.
+    async_alloy = async_w3.as_async_alloy()
+    if async_alloy is not None:
+        await fetch_fee_history(
+            provider=async_alloy,
+            dispatcher=dispatcher,
+            block_count=1,
+            last_block=block_number,
+            reward_percentiles=[float(p) for p in FEE_PERCENTILES],
+        )
+
+    dispatcher.record_block_time(block_number, block_timestamp)
+    if dispatcher.block_time_count() >= 2:
+        oldest_bn, _oldest_ts = dispatcher.block_times_oldest()
+        if block_number != oldest_bn:
+            latency = time.time() - block_timestamp
+            # 2026-08-22 audit: this is a per-block METRIC, not an event — it
+            # flooded stdout every block. Debug on the console; the scrapeable
+            # latency signal lives in Prometheus (apexbot.submit.latency et al.).
+            bot_logger.debug(
+                f"[block: {block_number}]"
+                f"[latency: {latency:.1f}s]"
+                f"[base fee: {base_fee / 10**9:.5f}, {base_fee_next / 10**9:.5f} next]",
+            )
+
+    dispatcher.advance_block(block_number)
+    session.current_block = block_number
+
+
+async def _apply_result_if_ready(
+    fut: asyncio.Task[dict[str, object]],
+    session: _SessionState,
+    pipeline: SimSubmitPipeline | None = None,
+) -> None:
+    """Dispatch profitable results from a solver result batch if fut resolved.
+
+    SIMPIPE option A: with a pipeline attached, the batch's sim work is
+    backgrounded K-way concurrent and submission happens on the SINGLE ordered
+    submitter (FIFO in batch arrival order - the nonce-serialization contract
+    the serial loop had). Without a pipeline (legacy A/B arm), the serial leaf
+    awaits inline exactly as before.
+    """
+    if fut.cancelled() or fut.exception() is not None:
+        return
+    try:
+        batch = fut.result()
+    except StopAsyncIteration:
+        return
+
+    current_block = session.dispatcher.current_block
+    solve_block = int(cast("Any", batch["solve_block"]))
+
+    results: list[tuple[int, int, int, tuple[int, ...], tuple[int, ...], int, tuple[int, ...]]] = []
+    for item in cast("Any", batch["fresh"]):
+        path_id, opt_input, profit, hop_outs, consumed_ins, state_nonces = item
+        results.append((
+            int(path_id),
+            int(opt_input),
+            int(profit),
+            tuple(int(h) for h in hop_outs),
+            tuple(int(c) for c in consumed_ins),
+            solve_block,
+            tuple(int(n) for n in state_nonces),
+        ))
+    for item in cast("Any", batch["updated"]):
+        path_id, opt_input, profit, hop_outs, consumed_ins, state_nonces = item
+        results.append((
+            int(path_id),
+            int(opt_input),
+            int(profit),
+            tuple(int(h) for h in hop_outs),
+            tuple(int(c) for c in consumed_ins),
+            solve_block,
+            tuple(int(n) for n in state_nonces),
+        ))
+
+    for path_id in cast("Any", batch["removed"]):
+        session.dispatcher.discard_path(int(path_id))
+
+    # SIMPIPE2 T3: the engine's inline-sim payloads (empty dict = the legacy
+    # FFI-sim path for every entry — per-entry presence decides).
+    payloads: dict[int, dict] = {
+        int(pid): payload for pid, payload in cast("Any", batch.get("payloads") or {}).items()
+    }
+
+    if results:
+        if pipeline is not None:
+            await pipeline.enqueue(
+                results,
+                block_timestamp=session.dispatcher.block_timestamp_for(current_block) or 0,
+                base_fee_next=next_base_fee(
+                    parent_base_fee=int(cast("Any", batch.get("base_fee_per_gas") or 0)),
+                    parent_gas_used=int(cast("Any", batch["gas_used"])),
+                    parent_gas_limit=int(cast("Any", batch["gas_limit"])),
+                ),
+                payloads=payloads,
+            )
+        else:
+            operator_nonce = await session.async_w3.get_transaction_count(
+                session.cfg.operator_address
+            )
+            await _dispatch_profitable(
+                session,
+                results,
+                block_timestamp=session.dispatcher.block_timestamp_for(current_block) or 0,
+                base_fee_next=next_base_fee(
+                    parent_base_fee=int(cast("Any", batch.get("base_fee_per_gas") or 0)),
+                    parent_gas_used=int(cast("Any", batch["gas_used"])),
+                    parent_gas_limit=int(cast("Any", batch["gas_limit"])),
+                ),
+                operator_nonce=operator_nonce,
+                payloads=payloads,
+            )

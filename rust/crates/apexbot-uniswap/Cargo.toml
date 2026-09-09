@@ -1,0 +1,19 @@
+[package]
+name = "apexbot-uniswap"
+description = "Pure-Rust Uniswap-protocol domain crate — DEX identity presets + V2 swap callldata encoding."
+keywords = ["uniswap", "dex", "evm", "swap"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.4" }
+apexbot-abi.workspace = true
+apexbot-core.workspace = true
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }

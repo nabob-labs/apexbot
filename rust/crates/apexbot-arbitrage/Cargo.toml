@@ -1,0 +1,82 @@
+[package]
+name = "apexbot-arbitrage"
+description = "The settlement-arbitrage searcher strategy — the 7-call pre/post-balance bundle, gross/net + priority-fee sizing, dispatch fan-out + categorization policy. One example strategy over the apexbot-simulation engine (ADR-019 D4/D7; pyo3-free Rust core)."
+keywords = ["mev", "arbitrage", "evm", "uniswap", "strategy"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The simulation engine (revm executor, BlockSimHandle, overrides, AL, warm
+# cache). This crate is ONE strategy over the engine — it builds the 7-call
+# vector, drives `BlockSimHandle`'s EVM, decodes balances, sizes the priority
+# fee, + runs the fan-out/categorization policy. ADR-019 D4/D7: the engine
+# stays thin + generic; the settlement-arbitrage bundle is this strategy's concern, not the
+# engine's.
+apexbot-simulation.workspace = true
+apexbot-config.workspace = true
+# `BotState` (ADR-003 state owner) — the snapshot surface the dispatch
+# fan-out reads via `BlockSimHandle`.
+apexbot-bot.workspace = true
+# `PathInfo` / `HopInfo` / `EncodeOptions` / `WarmupSlots` / the
+# `compute_simulation_warmup_slots` the candidate + context consume.
+apexbot-executor.workspace = true
+# `PathSuppression` (the dispatcher's per-path suppression ring) +
+# `SubmitCandidate` (the submission seam's input shape — the dispatch joins
+# survivors into it).
+apexbot-submission.workspace = true
+# `AlloyProvider` — the typed RPC provider `SimulateContext` borrows (the
+# cold-miss fallback underneath the engine's CacheDB).
+apexbot-rpc.workspace = true
+# `tick_map_verify::Slot0HeadScalars` (ADR-021 D3 slice 2, X6I3LN) — the
+# shared slot0 head-scalar fact type the [sim-revert-swap] fix-enabler
+# scalars ride, so this log and the solve-time tripwire speak one type
+# language (pyo3-free core crate).
+apexbot-pools.workspace = true
+
+# `V4PoolId` (the V4 swap-event decoder's pool-id type) + `encode_rust`
+# (the pure-Rust ABI encoder for the balance-call calldata).
+apexbot-decoders.workspace = true
+# `encode_rust` / `AbiValue` — the pure-Rust ABI encoder for the 7-call
+# balance-call calldata builders (balanceOf / getEthBalance / ERC6909).
+apexbot-abi.workspace = true
+# `ProviderError` / `ProviderResult` / `AbiDecodeError` — the shared error
+# types `simulate_path_on_evm` + the calldata builders return.
+apexbot-core.workspace = true
+# revm — the EVM trait bounds `simulate_path_on_evm<E: ExecuteEvm +
+# InspectEvm<...>>` carries (the strategy drives the borrowed `&mut E`
+# the engine exposes via `BlockSimHandle::evm_mut`).
+revm = { version = "^43.0", default-features = true, features = ["alloydb", "asyncdb"] }
+alloy = { version = "^2.4" }
+parking_lot = "^0.12"
+thiserror = { version = "^2.0" }
+tracing = { version = "^0.1" }
+# The net-profit order index — used (feature `order-index`) to make the pre-sim
+# top-K selection deterministic by profit instead of trusting the caller's
+# pre-sort (see ADR-024). Optional: default off for direct crate builds only;
+# both consumer paths — the `apexbot` umbrella and the `apexbot_rs` cdylib
+# — enable it (B5L2XA).
+apexbot-order-index = { workspace = true, optional = true }
+
+[features]
+# Deterministic profit-descending (+ id tie-break) pre-sim selection via
+# apexbot-order-index, replacing the "candidates arrive pre-sorted" contract.
+# Default off so a direct crate build keeps the caller's pre-sort contract;
+# both consumer paths (the `apexbot` umbrella + the `apexbot_rs` cdylib)
+# enable it (B5L2XA).
+order-index = ["dep:apexbot-order-index"]
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["registry", "ansi"] }
+# multi-thread flavor for the WrapDatabaseAsync ambient-runtime requirement
+tokio = { version = "^1.53", features = ["macros", "rt", "rt-multi-thread", "time"] }
+apexbot-rpc = { workspace = true, features = ["test-utils"] }
+serde_json = { version = "^1.0" }
+# the delaying transport's Service impl (ULUWNI red test)
+tower = { version = "0.5", default-features = false }
+alloy-json-rpc = "2.4.2"

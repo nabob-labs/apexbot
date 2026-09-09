@@ -1,0 +1,26 @@
+[package]
+name = "apexbot-aave"
+description = "Pure-Rust Aave V3 domain crate: the updater chunk-loop (transactional apply of decoded Aave events under one rusqlite Transaction) + the position-analysis math (health-factor / LTV / eMode / isolation) + the Aave V3 fixed-point math libraries (WadRayMath / PercentageMath). Epic AZGJUN."
+keywords = ["mev", "aave", "lending", "evm"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.4" }
+apexbot-core.workspace = true
+apexbot-config.workspace = true
+apexbot-db.workspace = true
+apexbot-decoders.workspace = true
+apexbot-rpc.workspace = true
+rusqlite = { version = "^0.40" }
+thiserror = { version = "^2.0" }
+tokio = { version = "^1.53", features = ["rt-multi-thread", "macros", "sync"] }
+
+[features]
+default = []

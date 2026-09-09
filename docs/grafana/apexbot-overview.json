@@ -1,0 +1,2873 @@
+{
+ "title": "apexbot observability overview",
+ "uid": "apexbot-overview",
+ "schemaVersion": 39,
+ "refresh": "5s",
+ "time": {
+  "from": "now-30m",
+  "to": "now"
+ },
+ "tags": [
+  "apexbot",
+  "mev"
+ ],
+ "panels": [
+  {
+   "id": 1,
+   "title": "Registered paths",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_engine_registered_paths",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "id": 2,
+   "title": "Solve stragglers in flight",
+   "description": "Successor of the retired apexbot_drain_queue_depth gauge (DispatchOwner era, removed SZJUKL): detached-solve straggers awaiting the sidecar merge. Sits at 0 healthy; sustained non-zero is backpressure, cap 8 = wedged (see the ApexbotDrainerStall alert).",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_detached_in_flight",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "area",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "id": 3,
+   "title": "State head lag (blocks)",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_state_head_lag_blocks",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 1
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": [],
+    "default": {
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "red",
+        "value": -10
+       },
+       {
+        "color": "yellow",
+        "value": -4
+       },
+       {
+        "color": "green",
+        "value": -2
+       },
+       {
+        "color": "yellow",
+        "value": 2
+       },
+       {
+        "color": "red",
+        "value": 6
+       }
+      ]
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "area",
+    "justifyMode": "auto"
+   },
+   "description": "pool_state_head minus the engine clock (pump clock). Healthy runs sit around -1 (pools sit one block behind the still-open current block). A freeze drives it MORE NEGATIVE as the clock advances on headers while pools stop applying - 0/positive is a restart/coverage artifact, not the freeze. See the pump liveness row for the real freeze signal."
+  },
+  {
+   "id": 4,
+   "title": "Solves (last 5m)",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(apexbot_solves_executed_total[5m]))",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "value",
+    "graphMode": "area",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "id": 5,
+   "title": "Block-to-solve (p95 5m)",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 2
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "area",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "id": 6,
+   "title": "Solve (p95 5m)",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 0
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_solve_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 2
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "area",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "id": 7,
+   "type": "row",
+   "title": "Health & accounting (lag & funnel)",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 4
+   },
+   "panels": []
+  },
+  {
+   "id": 8,
+   "title": "Log funnel: received / applied / apply-miss",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 5
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_logs_received_total[1m])",
+     "legendFormat": "received/s",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_logs_applied_total[1m])",
+     "legendFormat": "applied/s",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_logs_received_total[1m]) - rate(apexbot_logs_applied_total[1m])",
+     "legendFormat": "apply-miss/s",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_logs_undecoded_total[1m])",
+     "legendFormat": "undecoded/s",
+     "refId": "D"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_ws_logs_seen_total[1m])",
+     "legendFormat": "ws logs seen/s",
+     "refId": "E"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "lineInterpolation": "linear",
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 9,
+   "title": "State head lag (state - clock)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 5
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_state_head_lag_blocks",
+     "legendFormat": "state head lag (blocks)",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "lineInterpolation": "linear",
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "none"
+      },
+      "thresholdsStyle": {
+       "mode": "line",
+       "colorMode": "var"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 4
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "pool_state_head - engine clock over time. Healthy = -1 (a thin, stable line; it may dip to 0 when a block tombstones, i.e. a coverage gap, and jump positive for a few points after a restart/missed apply). The freeze is a *sustained climb more negative*, paired with rising apply-age and solve stalls - not a single level."
+  },
+  {
+   "id": 10,
+   "title": "Blocks observed (head tracking)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 13
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_blocks_observed_total[5m])",
+     "legendFormat": "blocks rate/s",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_blocks_observed_total",
+     "legendFormat": "cumulative blocks",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "lineInterpolation": "linear",
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 11,
+   "title": "Solve straggler backlog (detached in-flight)",
+   "description": "Successor of the retired apexbot_drain_queue_depth (SZJUKL): per-epoch queue age now rides the apexbot.stage.* SPANS (queue.age_us attr); apexbot_detached_in_flight is the surviving metric backpressure gauge for the sidecar merge.",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 13
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_detached_in_flight",
+     "legendFormat": "detached in-flight stragglers",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "lineInterpolation": "linear",
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "none"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 13,
+   "type": "row",
+   "title": "Latency - the race",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 25
+   },
+   "panels": []
+  },
+  {
+   "id": 14,
+   "title": "Header -> solved latency (p50/p90/p95/p99)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 26
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.90, sum(rate(apexbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p90",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.99, sum(rate(apexbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p99",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 15,
+   "title": "Solve duration (p50/p90/p95/p99)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 26
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_solve_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.90, sum(rate(apexbot_solve_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p90",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_solve_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.99, sum(rate(apexbot_solve_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p99",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 16,
+   "title": "Header -> solved latency distribution",
+   "type": "heatmap",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "refId": "A",
+     "expr": "sum(increase(apexbot_block_header_to_solved_seconds_bucket[5m])) by (le)",
+     "legendFormat": "{{le}}",
+     "format": "heatmap"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "calculate": false,
+    "cellGap": 1,
+    "color": {
+     "mode": "opacity",
+     "scheme": "Oranges",
+     "steps": 64
+    },
+    "yAxis": {
+     "axisLabel": "Latency (s)",
+     "unit": "s",
+     "axisPlacement": "left"
+    },
+    "legend": {
+     "show": true
+    }
+   }
+  },
+  {
+   "id": 17,
+   "title": "Solve duration distribution",
+   "type": "heatmap",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "refId": "A",
+     "expr": "sum(increase(apexbot_solve_duration_seconds_bucket[5m])) by (le)",
+     "legendFormat": "{{le}}",
+     "format": "heatmap"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "calculate": false,
+    "cellGap": 1,
+    "color": {
+     "mode": "opacity",
+     "scheme": "Oranges",
+     "steps": 64
+    },
+    "yAxis": {
+     "axisLabel": "Latency (s)",
+     "unit": "s",
+     "axisPlacement": "left"
+    },
+    "legend": {
+     "show": true
+    }
+   }
+  },
+  {
+   "id": 18,
+   "type": "row",
+   "title": "Pump & pipeline",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 42
+   },
+   "panels": []
+  },
+  {
+   "id": 19,
+   "title": "Pipeline phase durations (p95): decode / apply / publish cycle",
+   "description": "queue-wait column replaced: apexbot_drain_queue_wait_seconds is retired (SZJUKL); per-epoch queue age rides the apexbot.stage.* span attrs (queue.age_us), and apexbot_stage_publish_cycle_seconds owns the cycle view.",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 43
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_log_decode_seconds_bucket[5m])) by (le))",
+     "legendFormat": "log decode",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_state_apply_seconds_bucket[5m])) by (le))",
+     "legendFormat": "state apply",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_stage_publish_cycle_seconds_bucket[5m])) by (le))",
+     "legendFormat": "publish cycle p95",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 20,
+   "title": "Throughput: blocks / logs received / logs applied",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 43
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_blocks_observed_total[1m])",
+     "legendFormat": "blocks/s",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_logs_received_total[1m])",
+     "legendFormat": "logs received/s",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_logs_applied_total[1m])",
+     "legendFormat": "logs applied/s",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_backfills_executed_total[5m])",
+     "legendFormat": "backfills/min",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 21,
+   "type": "row",
+   "title": "Solve & simulate",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 51
+   },
+   "panels": []
+  },
+  {
+   "id": 22,
+   "title": "Solver load: registered paths / solves / candidates",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 52
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_engine_registered_paths",
+     "legendFormat": "registered paths",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_solves_executed_total[1m])",
+     "legendFormat": "solves/min",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_candidates_found_total[1m])",
+     "legendFormat": "candidates/min",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 23,
+   "title": "Simulate: duration p95 + verdict mix",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 52
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_simulate_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "simulate p95",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_simulate_verdicts_total{outcome=\"profitable\"}[5m]))",
+     "legendFormat": "profitable",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_simulate_verdicts_total{outcome=\"not_profitable\"}[5m]))",
+     "legendFormat": "not profitable",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_simulate_verdicts_total{outcome=\"error\"}[5m]))",
+     "legendFormat": "error",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 24,
+   "type": "row",
+   "title": "Submission & P&L",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 60
+   },
+   "panels": []
+  },
+  {
+   "id": 25,
+   "title": "Submit outcomes by reason",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 61
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_submit_outcomes_total[5m])) by (outcome)",
+     "legendFormat": "{{outcome}}",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 26,
+   "title": "Cumulative P&L: realized vs missed",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 61
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_profit_realized_total / 1e9",
+     "legendFormat": "realized (confirmed)",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_profit_missed_total / 1e9",
+     "legendFormat": "missed (found, unsubmitted)",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "gwei",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 27,
+   "title": "Monitor outcomes + submit latency p95",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 69
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_monitor_outcomes_total[5m])) by (outcome)",
+     "legendFormat": "monitor {{outcome}}",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_submit_latency_seconds_bucket[5m])) by (le))",
+     "legendFormat": "submit latency p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 28,
+   "type": "row",
+   "title": "Liveness & errors",
+   "collapsed": false,
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 77
+   },
+   "panels": []
+  },
+  {
+   "id": 29,
+   "title": "Liveness: state head lag (freeze signature)",
+   "description": "Drain-queue target removed: apexbot_drain_queue_depth is retired (SZJUKL). Pump-side liveness is owned by the stage telemetry (apexbot.stage.* spans) and the header-age / apply-age gauges in the next panel.",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 78
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_state_head_lag_blocks",
+     "legendFormat": "state head lag (blocks)",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 30,
+   "title": "Recorded failures by kind",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 78
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_errors_total[5m])) by (kind)",
+     "legendFormat": "{{kind}}",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(apexbot_errors_total[30m])) by (kind)",
+     "legendFormat": "{{kind}} (30m)",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 32,
+   "type": "row",
+   "title": "Pump liveness (freeze detection)",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 86
+   },
+   "panels": [],
+   "collapsed": false
+  },
+  {
+   "id": 33,
+   "title": "Liveness: header age + apply age (sit at 0; a freeze climbs them)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 87
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "expr": "max(apexbot_pump_seconds_since_header)",
+     "legend": "Header age (s) - feed liveness",
+     "refId": "A",
+     "datasource": null
+    },
+    {
+     "expr": "max(apexbot_pump_seconds_since_apply)",
+     "legend": "Apply age (s) - state-advance liveness",
+     "refId": "B",
+     "datasource": null
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "lineInterpolation": "linear",
+      "showPoints": "never",
+      "stacking": {
+       "group": "A",
+       "mode": "none"
+      },
+      "thresholdsStyle": {
+       "mode": "line",
+       "colorMode": "var"
+      }
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "yellow",
+        "value": 4
+       },
+       {
+        "color": "red",
+        "value": 5
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "Seconds since the newest newHeads header (feed liveness) and since the newest log applied to state (apply liveness). Healthy = both pinned at ~0. A feed stall lifts the header age; a drain freeze lifts the apply age while the header age stays low and head-lag goes negative. Red at >=30s is a genuine freeze window."
+  },
+  {
+   "id": 34,
+   "title": "Per-path solver metrics",
+   "type": "row",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 95
+   },
+   "panels": []
+  },
+  {
+   "id": 35,
+   "title": "Per-path solve duration (p50/p90/p95/p99)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 95
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.90, sum(rate(apexbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p90",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.99, sum(rate(apexbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p99",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 36,
+   "title": "Per-path gate duration (p50/p90/p95/p99)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 95
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.90, sum(rate(apexbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p90",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.99, sum(rate(apexbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p99",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 37,
+   "title": "Gate: paths solved vs skipped (rate/min)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 103
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_solves_executed_total[1m])",
+     "legendFormat": "solves/min",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_solve_path_duration_seconds_count[1m]) * 60",
+     "legendFormat": "paths evaluated/min",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 38,
+   "title": "Solve execution (tokio executor + detached cycles)",
+   "type": "row",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 111
+   },
+   "panels": []
+  },
+  {
+   "id": 39,
+   "title": "Engine-Mutex hold per dirty solve (p50/p90/p99)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 112
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_solve_mutex_hold_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.90, sum(rate(apexbot_solve_mutex_hold_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p90",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.99, sum(rate(apexbot_solve_mutex_hold_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p99",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 40,
+   "title": "Detached cycle: stragglers in flight + applied vs stale-dropped",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 112
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_detached_in_flight",
+     "legendFormat": "in-flight stragglers",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_detached_applied_total[1m])",
+     "legendFormat": "applied/s",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_detached_stale_dropped_total[1m])",
+     "legendFormat": "stale dropped/s",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 41,
+   "title": "Solver audit: solver clamps",
+   "description": "The verify-blocks / state-checks series (apexbot_solver_verify_blocks_total / apexbot_solver_state_checks_total) are RETIRED (MROOY7 2UVG3E): the ADR-021 per-solve tripwire is gone and solver-state verification is on-demand (sim-failure-armed divergence probe). Desync containment surfaces via apexbot_errors_total and the apexbot_engine_quarantined_pools gauge; per-block verify context rides the apexbot.epoch / apexbot.stage.* spans.",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 120
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_solver_clamps_total[1m])",
+     "legendFormat": "clamps/s",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 42,
+   "title": "Dispatch economics: mean gross / net (wei) + gas",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 120
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_dispatch_gross_profit_sum[5m]) / rate(apexbot_dispatch_gross_profit_count[5m])",
+     "legendFormat": "mean gross wei",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_dispatch_net_profit_sum[5m]) / rate(apexbot_dispatch_net_profit_count[5m])",
+     "legendFormat": "mean net wei",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(apexbot_dispatch_gas_used_sum[5m]) / rate(apexbot_dispatch_gas_used_count[5m])",
+     "legendFormat": "mean gas",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 43,
+   "title": "Trace view: how to read the solve span tree",
+   "type": "text",
+   "gridPos": {
+    "h": 8,
+    "w": 24,
+    "x": 0,
+    "y": 128
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "mode": "markdown",
+    "content": "## Jaeger drill-down - span tree (stage-table shape, BF43PM/AJIOCU)\n\n    apexbot.epoch                  (trace ROOT per block epoch: epoch.block, epoch.seq,\n    |                                pregap.logs / header_to_first_log_us / log_burst_us / settle_wait_us)\n    +-- apexbot.stage.streaming     (open: first relevant log -> quiesce; queue.age_us at close)\n    +-- apexbot.stage.quiesced      (point: quiesce transition)\n    +-- apexbot.arb.solve           (solver cycle - fanout / lpt / resolve / path / merge children unchanged)\n    +-- apexbot.stage.publish       (point: publish decision; metric apexbot_stage_publish_cycle_seconds)\n    +-- apexbot.stage.finalize      (point: epoch finalized)\n    Rewind epochs hold apexbot.stage.rewind OPEN across the reorg window (metrics\n    apexbot_stage_rewind_total / apexbot_stage_rewind_duration_seconds); the next epoch\n    root carries epoch.seq + 1.\n\n**Jaeger queries** (service `apexbot-bot`, host `host.docker.internal:16686`):\n\n- Epoch waterfall: `operation=apexbot.epoch&limit=20&lookback=1h`\n- Stage transitions: `operation=apexbot.stage.streaming` / `apexbot.stage.publish` / `apexbot.stage.finalize` (attrs `stage.from`, `stage.to`, `queue.age_us`)\n- Phase attribution: the `fanout` / `lpt` / `resolve` / `merge` children of a solve trace (unchanged)\n- Rewind story: read `epoch.seq` across epoch roots - a bumped seq is the reorg generation\n- RETIRED spans (BF43PM/AJIOCU, epic MROOY7): `apexbot.pump.block` / `pump.log_wait` / `pump.apply_stream` are discontinued\n\nThe **Engine-Mutex hold** panel is the metric-level view of the solve arm: under\n`APEXBOT_DETACHED_SOLVES=1` the hold collapses from the in-cycle 5-20ms band to\nenqueue cost (us) while solves continue on the dedicated `apexbot-solve-tokio`\nworkers - a step change in that panel means the stance flipped, not a regression.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
+    "code": {
+     "language": "plaintext",
+     "showLineNumbers": false
+    }
+   }
+  },
+  {
+   "id": 44,
+   "title": "Pre-solve gap decomposition: delivery / burst / settle (p50/p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
+     "legendFormat": "delivery p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
+     "legendFormat": "delivery p95",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_block_log_burst_seconds_bucket[5m])) by (le))",
+     "legendFormat": "burst p50",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_block_log_burst_seconds_bucket[5m])) by (le))",
+     "legendFormat": "burst p95",
+     "refId": "D"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(apexbot_block_settle_wait_seconds_bucket[5m])) by (le))",
+     "legendFormat": "settle p50",
+     "refId": "E"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(apexbot_block_settle_wait_seconds_bucket[5m])) by (le))",
+     "legendFormat": "settle p95",
+     "refId": "F"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": "Decomposition of the block-to-solve gap BEFORE the solver engages (phases recorded at each settle point): header-to-first-log = WS delivery latency; log_burst = diffusion of the block logs across the feed (first-to-last); settle_wait = debounce/quiesce hold after the last log. Jaeger: the same values ride as span fields (header_to_first_log_us, log_burst_us, settle_wait_us) on the apexbot.epoch trace root (retired apexbot.pump.block, BF43PM)."
+   }
+  },
+  {
+   "id": 45,
+   "title": "Pre-solve gap means vs header-to-solved (mean dissolve)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_block_header_to_first_log_seconds_sum[5m])) / sum(rate(apexbot_block_header_to_first_log_seconds_count[5m]))",
+     "legendFormat": "delivery (mean)",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_block_log_burst_seconds_sum[5m])) / sum(rate(apexbot_block_log_burst_seconds_count[5m]))",
+     "legendFormat": "burst (mean)",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_block_settle_wait_seconds_sum[5m])) / sum(rate(apexbot_block_settle_wait_seconds_count[5m]))",
+     "legendFormat": "settle (mean)",
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(apexbot_block_header_to_solved_seconds_sum[5m])) / sum(rate(apexbot_block_header_to_solved_seconds_count[5m]))",
+     "legendFormat": "header-to-solved (mean)",
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": "Mean phase durations vs the total race number. delivery + burst + settle + solve should approximately equal header-to-solved; a residual means unbudgeted time (queue wait, registration, submit queue)."
+   }
+  },
+  {
+   "id": 46,
+   "title": "State-lock pressure (K4ETHF T2)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 144
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le, site) (rate(apexbot_state_lock_wait_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "wait p95 {{site}}",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum by (le, site) (rate(apexbot_state_lock_hold_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "hold p95 {{site}}",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum by (le, site) (rate(apexbot_state_lock_hold_seconds_bucket[$__rate_interval])))",
+     "legendFormat": "hold p50 {{site}}",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   }
+  },
+  {
+   "id": 47,
+   "title": "Process RSS - registry drift watch (FRKBGP)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 160
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_process_rss_bytes / 1073741824",
+     "legendFormat": "RSS (GiB)",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "GiB"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "calcs": [
+      "lastNotNull",
+      "max"
+     ]
+    }
+   }
+  },
+  {
+   "id": 49,
+   "title": "Quarantine transitions (30m)",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 0,
+    "y": 21
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "changes(apexbot_engine_quarantined_pools[30m])",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "area"
+   },
+   "description": "ADR-040 quarantine/release transitions in the last 30m. SUCCESSOR of the retired solver_state_desync errors kind: the ADR-021 per-solve publish tripwire was retired with MROOY7 task 2UVG3E, and containment now lives in the resolve-seam quarantine gate (apexbot_engine_quarantined_pools, maintained by BotState::quarantine_pool / release_pool). The bot keeps trading its other paths; the ApexbotDesyncQuarantine alert pages while any containment is active."
+  },
+  {
+   "id": 50,
+   "title": "Quarantined pools (solve-invisible)",
+   "type": "stat",
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 8,
+    "y": 21
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "apexbot_engine_quarantined_pools",
+     "legendFormat": "__auto",
+     "refId": "A",
+     "instant": true,
+     "range": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "green",
+        "value": null
+       },
+       {
+        "color": "red",
+        "value": 1
+       }
+      ]
+     }
+    }
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "colorMode": "background",
+    "graphMode": "area"
+   },
+   "description": "ADR-040: pools currently quarantine-excluded from solve resolution. PROMETHEUS NAME COUPLING with instruments.rs (apexbot.engine.quarantined_pools)."
+  },
+  {
+   "id": 48,
+   "title": "Alerts (Grafana-managed, ADR-040)",
+   "type": "alertlist",
+   "gridPos": {
+    "h": 4,
+    "w": 8,
+    "x": 16,
+    "y": 21
+   },
+   "options": {
+    "stateFilter": {
+     "firing": true,
+     "pending": true,
+     "noData": true,
+     "error": true,
+     "normal": false,
+     "recovering": false
+    },
+    "maxItems": 10,
+    "sortOrder": 5,
+    "groupMode": "default",
+    "groupBy": [
+     "severity"
+    ],
+    "alertName": "",
+    "alertInstanceLabelFilter": "",
+    "showInstances": true,
+    "showInactiveAlerts": false,
+    "dashboardAlerts": false,
+    "folder": {
+     "uid": "",
+     "title": ""
+    },
+    "datasource": "",
+    "viewMode": "list",
+    "statColorMode": "background",
+    "statThresholds": {
+     "mode": "absolute",
+     "steps": [
+      {
+       "color": "green",
+       "value": null
+      },
+      {
+       "color": "red",
+       "value": 80
+      }
+     ]
+    },
+    "statValueMappings": []
+   }
+  },
+  {
+   "id": 51,
+   "title": "Reorg handling (WAJEQP)",
+   "type": "row",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 168
+   },
+   "collapsed": false,
+   "panels": []
+  },
+  {
+   "id": 53,
+   "title": "Reorg episodes entered",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 169
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(apexbot_reorg_windows_total[5m]))",
+     "legendFormat": "windows/5m",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 55,
+   "title": "Reorg rollback depth at entry (blocks)",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 169
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(apexbot_reorg_depth_blocks_ratio_sum[1h])) / clamp_min(sum(increase(apexbot_reorg_depth_blocks_ratio_count[1h])), 1)",
+     "legendFormat": "mean depth",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  },
+  {
+   "id": 57,
+   "title": "Reorg unwind activity",
+   "type": "timeseries",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 177
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(apexbot_reorg_unwound_pools_total[5m]))",
+     "legendFormat": "unwound pools / 5m",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(apexbot_reorg_recovery_dropped_total[5m]))",
+     "legendFormat": "recovery drops / 5m",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   }
+  }
+ ],
+ "templating": {
+  "list": [
+   {
+    "name": "DS_PROMETHEUS",
+    "type": "datasource",
+    "query": "prometheus",
+    "label": "Prometheus"
+   },
+   {
+    "name": "instance",
+    "label": "Instance",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "${DS_PROMETHEUS}"
+    },
+    "definition": "label_values(apexbot_blocks_observed_total, instance)",
+    "query": {
+     "query": "label_values(apexbot_blocks_observed_total, instance)",
+     "refId": "A"
+    },
+    "includeAll": true,
+    "allValue": ".*",
+    "refresh": 1,
+    "sort": 1,
+    "regex": "",
+    "multi": false,
+    "hide": 0,
+    "current": {},
+    "options": [],
+    "defaultValue": null
+   }
+  ]
+ }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "apexbot-execution-sample"
+description = "TLQ5VH — a standalone-Rust sample user-defined ExecutionStrategy for a FOREIGN contract (not cmd_executor). Implements the apexbot-execution seam (Encode blob + Probe declared reads + Assess gate + Fee default) for a sample `SimpleExecutor` contract, producing a payload shape deliberately distinct from the default adapter. Exercises the seam end-to-end at the Rust layer with no pyo3 and no dependency on apexbot-arbitrage."
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.4", features = ["signers"] }
+thiserror = { version = "^2.0" }
+# The seam itself — `PayloadComposer` / `ExecutionStrategy` + value types.
+apexbot-execution = { path = "../apexbot-execution" }
+# `PathInfo` / `HopInfo` hop descriptors (the seam's Encode input).
+apexbot-executor = { path = "../apexbot-executor" }
+# `SolvePathResult` amounts (the solve-result view's amount side).
+apexbot-solvers = { path = "../apexbot-solvers" }

@@ -1,0 +1,32 @@
+[package]
+name = "apexbot-core"
+description = "Foundational utilities (errors, hex, addresses, runtime) for the apexbot Rust crates."
+keywords = ["mev", "evm", "primitives", "utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.4" }
+tracing = { version = "^0.1" }
+thiserror = { version = "^2.0" }
+tokio = { version = "^1.53", features = ["rt-multi-thread", "sync"] }
+
+# Optional: enables `From<*> for PyErr` conversions in `errors`.
+# Gated (not default) so pure-Rust consumers build without pulling pyo3.
+# The orphan rule forbids placing these impls in a downstream crate where both
+# `PyErr` and the error types are foreign, so they live here with the types.
+pyo3 = { version = "^0.29", features = ["abi3-py312", "serde"], optional = true }
+
+[features]
+default = []
+# Enables `impl From<apexbot_core::errors::*> for pyo3::PyErr`.
+pyo3 = ["dep:pyo3"]
+
+[dev-dependencies]
+proptest = "^1.11"

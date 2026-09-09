@@ -1,0 +1,9 @@
+def start_gil_probe(interval_ms: int, threshold_ms: int, stuck_ms: int) -> None: ...
+def failure_action(kind: str, reason: str | None = None) -> str: ...
+def mark_progress() -> None: ...
+
+__all__ = [
+    "failure_action",
+    "mark_progress",
+    "start_gil_probe",
+]

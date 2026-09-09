@@ -1,0 +1,270 @@
+"""Calculation mixin for Uniswap V2-style constant-product pools.
+
+Provides read-only calculation methods that operate on state held by
+V2PoolState (or a compatible state mixin). All methods are non-mutating
+and delegate to standalone calculation functions where possible.
+
+Pools with different calculation paths (e.g., Aerodrome's stable mode,
+Camelot's k invariant) define their own calc mixin instead of using this one.
+
+See: contract_reference/uniswap/V2/UniswapV2Factory.sol (UniswapV2Pair swap/mint/burn)
+"""
+
+from __future__ import annotations
+
+from fractions import Fraction
+from typing import TYPE_CHECKING
+
+from apexbot.exceptions import ApexbotValueError
+from apexbot.exceptions.pool import (
+    InvalidSwapInputAmount,
+    LiquidityPoolError,
+)
+from apexbot.uniswap.math import calc_exact_in_v2, calc_exact_out_v2
+
+if TYPE_CHECKING:
+    from apexbot.erc20 import Erc20Token
+    from apexbot.types import LiquidityPool
+    from apexbot.uniswap.v2_types import UniswapV2PoolState
+
+
+class UniswapV2PoolCalc:
+    """Calculation methods matching the Uniswap V2 contract.
+
+    All methods operate on state held by the concrete class via V2PoolState.
+    Subclasses override as needed for contract-specific differences.
+
+    Class variables with Uniswap V2 defaults:
+        FEE: Directional fee rate (default 0.3%)
+    """
+
+    # Attributes provided by V2PoolState in the MRO
+    _token0: Erc20Token
+    _token1: Erc20Token
+    _fee_token0: Fraction
+    _fee_token1: Fraction
+
+    # Attributes provided by the concrete pool class in the MRO
+    reserves_token0: int
+    reserves_token1: int
+    state: UniswapV2PoolState
+    tokens: tuple[Erc20Token, Erc20Token]
+    # LiquidityPool handle (set by the concrete UniswapV2Pool companion
+    # in MRO — ADR-005 slice 4). Calc delegation (slice 5) routes the
+    # constant-product math through it on the non-override path.
+    _py_pool: LiquidityPool
+
+    # These can be overridden by subclasses (e.g., PancakeSwap uses different fee)
+    FEE: Fraction = Fraction(3, 1000)
+
+    def calculate_tokens_in_from_tokens_out(
+        self,
+        token_out_quantity: int,
+        token_out: Erc20Token,
+        override_state: UniswapV2PoolState | None = None,
+    ) -> int:
+        """Calculate the required token INPUT for a target OUTPUT at current pool reserves.
+
+        Returns:
+            The required input token amount.
+
+        Raises:
+            InvalidSwapInputAmount: If token_out_quantity is not positive.
+            ApexbotValueError: If token_out is not held by this pool.
+            LiquidityPoolError: If the requested output exceeds available reserves.
+
+        """
+        if token_out_quantity <= 0:  # pragma: no cover
+            raise InvalidSwapInputAmount
+
+        if token_out == self._token1:
+            zero_for_one = True
+        elif token_out == self._token0:
+            zero_for_one = False
+        else:  # pragma: no cover
+            raise ApexbotValueError(
+                message=f"Could not identify token_out: {token_out}! This pool holds: {self._token0} {self._token1}",  # ruff:ignore[line-too-long]
+            )
+
+        if override_state is None:
+            # ADR-005 slice 5: delegate the constant-product math to the Rust
+            # pool handle. Rust reads reserves + fee under a single read guard
+            # (no separate Python state read beforehand — no pump-interleave risk).
+            # Rust returns 0 on overdraw (amount_out >= reserve_out); convert to
+            # the original Python contract's LiquidityPoolError.
+            result = self._py_pool.calculate_tokens_in(
+                zero_for_one=zero_for_one,
+                amount_out=token_out_quantity,
+            )
+            if result == 0:
+                raise LiquidityPoolError(
+                    message=f"Requested amount out ({token_out_quantity}) >= pool reserves",
+                )
+            return result
+
+        # Override path: Python constant-product calc against the override
+        # reserves. simulate_* relies on this for delta + final_state
+        # consistency (one local snapshot both reads).
+        if zero_for_one:
+            reserves_in = override_state.reserves_token0
+            reserves_out = override_state.reserves_token1
+            fee = self._fee_token0
+        else:
+            reserves_in = override_state.reserves_token1
+            reserves_out = override_state.reserves_token0
+            fee = self._fee_token1
+
+        if token_out_quantity > reserves_out - 1:
+            raise LiquidityPoolError(
+                message=f"Requested amount out ({token_out_quantity}) >= pool reserves ({reserves_out})",  # ruff:ignore[line-too-long]
+            )
+
+        return calc_exact_out_v2(
+            reserves_in,
+            reserves_out,
+            token_out_quantity,
+            fee.numerator,
+            fee.denominator,
+        )
+
+    def calculate_tokens_out_from_tokens_in(
+        self,
+        token_in: Erc20Token,
+        token_in_quantity: int,
+        override_state: UniswapV2PoolState | None = None,
+    ) -> int:
+        """Calculate the expected token OUTPUT for a target INPUT at current pool reserves.
+
+        Returns:
+            The expected output token amount.
+
+        Raises:
+            InvalidSwapInputAmount: If token_in_quantity is not positive.
+            ApexbotValueError: If token_in is not held by this pool.
+            LiquidityPoolError: If `uint256` swap math overflows (on-chain revert).
+
+        """
+        if token_in_quantity <= 0:  # pragma: no cover
+            raise InvalidSwapInputAmount
+
+        if token_in == self._token0:
+            zero_for_one = True
+        elif token_in == self._token1:
+            zero_for_one = False
+        else:  # pragma: no cover
+            raise ApexbotValueError(
+                message=f"Could not identify token_in: {token_in}! Pool holds: {self._token0} {self._token1}",  # ruff:ignore[line-too-long]
+            )
+
+        if override_state is None:
+            # ADR-005 slice 5: delegate the constant-product math to the Rust
+            # pool handle. Rust reads reserves + fee under a single read guard
+            # (no separate Python state read beforehand — no pump-interleave).
+            #
+            # cdbc03bb: Rust mirrors on-chain `getAmountOut` SafeMath and
+            # reverts on `uint256` overflow (e.g. `amount_in = 2**256 - 1`
+            # overflows `amount_in * gamma_numer`); the FFI surfaces that
+            # revert as a `ValueError`. Translate it to the original Python
+            # contract's `LiquidityPoolError` (mirrors
+            # `calculate_tokens_in_from_tokens_out`'s overdraw-sentinel
+            # translation below).
+            try:
+                return self._py_pool.calculate_tokens_out(
+                    zero_for_one=zero_for_one,
+                    amount_in=token_in_quantity,
+                )
+            except ValueError as e:
+                raise LiquidityPoolError(
+                    message=(
+                        f"Input amount ({token_in_quantity}) overflows "
+                        "uint256 swap math (on-chain revert)"
+                    ),
+                ) from e
+
+        # Override path: Python constant-product calc against the override
+        # reserves. simulate_* relies on this for delta + final_state
+        # consistency.
+        if zero_for_one:
+            reserves_in = override_state.reserves_token0
+            reserves_out = override_state.reserves_token1
+            fee = self._fee_token0
+        else:
+            reserves_in = override_state.reserves_token1
+            reserves_out = override_state.reserves_token0
+            fee = self._fee_token1
+
+        return calc_exact_in_v2(
+            reserves_in,
+            reserves_out,
+            token_in_quantity,
+            fee.numerator,
+            fee.denominator,
+        )
+
+    def get_absolute_price(
+        self,
+        token: Erc20Token,
+        override_state: UniswapV2PoolState | None = None,
+    ) -> Fraction:
+        """Get the absolute price for the given token, expressed in units of the other.
+
+        Returns:
+            The absolute price as a Fraction.
+
+        """
+        return 1 / self.get_absolute_exchange_rate(token, override_state=override_state)
+
+    def get_absolute_exchange_rate(
+        self,
+        token: Erc20Token,
+        override_state: UniswapV2PoolState | None = None,
+    ) -> Fraction:
+        """Get the absolute exchange rate for the given token.
+
+        Returns:
+            The absolute exchange rate as a Fraction.
+
+        Raises:
+            ApexbotValueError: If the token is not held by this pool.
+
+        """
+        if token not in self.tokens:
+            raise ApexbotValueError(message=f"Unknown token {token}")
+
+        state = self.state if override_state is None else override_state
+
+        return (
+            Fraction(state.reserves_token1, state.reserves_token0)
+            if token == self._token1
+            else Fraction(state.reserves_token0, state.reserves_token1)
+        )
+
+    def get_nominal_price(
+        self,
+        token: Erc20Token,
+        override_state: UniswapV2PoolState | None = None,
+    ) -> Fraction:
+        """Get the nominal price for the given token, corrected for decimals.
+
+        Returns:
+            The nominal price as a Fraction.
+
+        """
+        return 1 / self.get_nominal_exchange_rate(token=token, override_state=override_state)
+
+    def get_nominal_exchange_rate(
+        self,
+        token: Erc20Token,
+        override_state: UniswapV2PoolState | None = None,
+    ) -> Fraction:
+        """Get the nominal exchange rate, corrected for decimal place values.
+
+        Returns:
+            The nominal exchange rate as a Fraction.
+
+        """
+        return self.get_absolute_exchange_rate(token=token, override_state=override_state) * (
+            Fraction(10**self._token1.decimals, 10**self._token0.decimals)
+            if token == self._token0
+            else Fraction(10**self._token0.decimals, 10**self._token1.decimals)
+        )

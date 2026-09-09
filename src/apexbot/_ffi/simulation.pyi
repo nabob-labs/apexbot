@@ -1,0 +1,127 @@
+from collections.abc import Coroutine
+from typing import Any
+
+from apexbot._ffi.provider import AsyncAlloyProvider
+from apexbot._ffi.submission import Dispatcher, SubmitCandidate
+from apexbot.arbitrage.engine_registry import ArbitrageEngine
+
+class SimulateContext:
+    """Session-static config bag for :func:`dispatch_profitable_py`.
+
+    Construct once per session from the :class:`AsyncAlloyProvider` + the
+    executor/WETH/PoolManager/Multicall3 addresses + the inject flag + the
+    executor runtime bytecode. Handed to :func:`dispatch_profitable_py` each
+    block alongside the per-block args.
+    """
+
+    def __init__(
+        self,
+        provider: AsyncAlloyProvider,
+        executor_owner: str,
+        executor_address: str,
+        weth_address: str,
+        pool_manager_address: str,
+        multicall3_address: str,
+        inject_code: bool,
+        executor_runtime_bytecode: bytes,
+        injected_address: str | None = None,
+    ) -> None: ...
+    @property
+    def rpc_url(self) -> str: ...
+    @property
+    def executor_address(self) -> str: ...
+
+class DispatchCandidate:
+    """Pre-simulation candidate builder (engine result + resolved ``PathInfo``).
+
+    NXM2BF: the candidate resolves its ``composers::PathInfo`` from a
+    registered ``path_id`` via ``PyArbitrageEngine.path_info_for_core`` — no
+    Python ``PathInfo`` dataclass is threaded. ``engine`` is the
+    ``ArbitrageEngine`` that owns ``path_id`` (the same engine that produced
+    ``engine_profit`` / ``hop_outputs``).
+    """
+
+    def __init__(
+        self,
+        engine: ArbitrageEngine,
+        path_id: int,
+        optimal_input: int,
+        engine_profit: int,
+        hop_outputs: list[int],
+        consumed_inputs: list[int],
+        solve_block: int,
+        state_nonces: list[int],
+        *,
+        erc6909_profit: bool = False,
+        use_v4_batch: bool = False,
+    ) -> None: ...
+
+class DispatchOutcome:
+    """Read-only outcome of a block's profitable-dispatch fan-out."""
+
+    @property
+    def gas_profitable(self) -> list[SubmitCandidate]: ...
+    @property
+    def gas_unprofitable_count(self) -> int: ...
+    @property
+    def exception_count(self) -> int: ...
+    @property
+    def fail_count(self) -> int: ...
+    @property
+    def candidate_count(self) -> int: ...
+    @property
+    def suppressed_count(self) -> int: ...
+    @property
+    def thin_dropped(self) -> int: ...
+    @property
+    def divergent_dropped(self) -> int: ...
+    @property
+    def fot_dropped(self) -> int: ...
+    @property
+    def fail_buckets(self) -> dict[str, int]: ...
+    @property
+    def failures(self) -> list[dict[str, Any]]: ...
+    @property
+    def path_infos(self) -> dict[int, dict[str, Any]]: ...
+
+def dispatch_profitable_py(
+    candidates: list[DispatchCandidate],
+    context: SimulateContext,
+    dispatcher: Dispatcher,
+    base_fee_next: int,
+    current_block: int,
+    block_timestamp: int,
+    min_profit_net: int,
+    min_profit_margin_bps: int,
+    *,
+    engine: ArbitrageEngine | None = None,
+) -> Coroutine[Any, Any, DispatchOutcome]: ...
+def simulate_in_process_revert_probe(
+    path_id: int,
+    runtime_bytecode: bytes,
+) -> dict[str, Any]:
+    """In-process revm diagnostic probe for a REVERTING path.
+
+    Drives the same ``simulate_in_process_with_db`` core the production
+    dispatch uses, against a recorded failing path, and returns the
+    failure record as a dict (captured swaps, reverting frame, balances).
+    Test/diagnostic surface (tests/standalone_parity); not part of the
+    production dispatch loop.
+    """
+
+def simulate_in_process_success_probe(path_id: int) -> dict[str, Any]:
+    """In-process revm diagnostic probe for a SUCCESSFUL path.
+
+    Twin of simulate_in_process_revert_probe: replays a recorded accepted
+    path through the in-process core and returns the success record dict.
+    Test/diagnostic surface only.
+    """
+
+__all__ = [
+    "DispatchCandidate",
+    "DispatchOutcome",
+    "SimulateContext",
+    "dispatch_profitable_py",
+    "simulate_in_process_revert_probe",
+    "simulate_in_process_success_probe",
+]

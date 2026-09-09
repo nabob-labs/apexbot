@@ -1,0 +1,9 @@
+//! Simulation domain — the in-process revm engine.
+//!
+//! `sim::evm` is the in-process EVM execution core (revm over the
+//! `CacheDB<WarmCodeCache<BotStateDb<WrapDatabaseAsync<AlloyDB>>>` stack),
+//! folded here from the retired `apexbot-evm` crate (ADR-019 D4 — the
+//! accidental two-crate split is resolved by colocation, not a re-export
+//! bridge). The settlement-arbitrage strategy (the dispatch fan-out + the 7-call bundle)
+//! lives in `apexbot-arbitrage` (ADR-019 D4/D7, decision R).
+pub mod evm;

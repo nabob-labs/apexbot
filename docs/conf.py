@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import datetime
+import os
+import tomllib
+from pathlib import Path
+
+# -- Project information -----------------------------------------------------
+
+_repo_root = Path(__file__).resolve().parents[1]
+try:
+    _proj = tomllib.loads((_repo_root / "pyproject.toml").read_text())
+    project = _proj["project"]["name"]
+    author = ", ".join(_proj["project"]["authors"].get(i, {}).get("name", "") for i in range(3)) or "apexbot contributors"
+    # release = the full stored version; version = short major.minor for the
+    # sidebar. pyproject is canonical (ADR-009 single-source-of-truth).
+    release = _proj["project"]["version"]
+    version = ".".join(release.split(".")[:2])
+except Exception:
+    project, author = "apexbot", "apexbot contributors"
+    version = release = "unknown"
+
+copyright = f"{datetime.date.today().year}, apexbot contributors"
+
+# -- Docs channel banner ------------------------------------------------------
+# Build context decides which banner Furo's announcement strip shows. RTD
+# sets READTHEDOCS_VERSION ("latest" = main, "stable" = newest release tag,
+# branch names for preview builds); local builds have it unset and show none.
+_docs_site = "https://apexbot.readthedocs.io"
+_rtd_version = os.environ.get("READTHEDOCS_VERSION", "")
+if _rtd_version == "stable":
+    _announcement = (
+        "📖 Released docs. In-progress work lives in the "
+        f'<a href="{_docs_site}/en/latest/">development docs</a>.'
+    )
+elif _rtd_version:  # "latest", feature-branch builds, PR previews
+    _announcement = (
+        "🚧 Development docs — they may describe unreleased work. "
+        f'For the installed package, see the <a href="{_docs_site}/en/stable/">stable docs</a>.'
+    )
+else:
+    _announcement = None
+
+html_theme_options = {"announcement": _announcement} if _announcement else {}
+
+# -- General configuration ---------------------------------------------------
+
+extensions = [
+    "myst_parser",
+    "sphinx_copybutton",
+    "autoapi.extension",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.viewcode",
+]
+
+# -- API reference (sphinx-autoapi, static parse — no native build needed) ----
+# Documents the Python driver layer from source. ADR-013 makes the `_ffi`
+# seam private, and the compiled `_ffi.abi3.so` isn't importable on RTD
+# anyway (no maturin on the build host), so it stays out of the reference.
+autoapi_type = "python"
+autoapi_dirs = ["../src/apexbot"]
+autoapi_ignore = ["**/test*", "**/__pycache__/*", "**/_ffi/*"]
+autoapi_add_toctree_entry = False
+autoapi_options = ["members", "undoc-members", "imported-members", "show-inheritance"]
+
+# Existing docs/ is plain markdown; MyST renders it as-is.
+myst_heading_anchors = 3
+myst_all_links_external = False
+suppress_warnings = [
+    "myst.header",
+    # static parse: `_ffi` is private (ADR-013) and left out of the tree, so
+    # every `from apexbot._ffi.x import ...` in driver code warns on
+    # resolution; likewise the one cyclic __init__ re-export chain. Harmless.
+    "autoapi.python_import_resolution",
+    # generated API pages cross-reference short annotation names (`type`,
+    # `Tick`) that exist as several classes; ambiguity is cosmetic.
+    "ref.python",
+    # generated API pages only: live .py docstrings contain tables/indent
+    # shapes that trip rst definition-list rendering in autoapi's output
+    "docutils",               # existing files have h2/h3 skips
+    "misc.highlighting_failure", # pre-tool 'mermaid' fences + pygments lacking a lexer for the 'solidity' snippets in docs/aave
+]
+
+# The Rust core is documented on docs.rs, not here (apexbot_rs is
+# `publish = false`, so it never reaches docs.rs). Cross-link by URL as needed.
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3.12", None),
+}
+
+templates_path = ["_templates"]
+exclude_patterns = [
+    "_build", "Thumbs.db", ".DS_Store",
+    "handoffs/*", "tasks/*", "gate-viz/*", "grafana/provisioning/*",
+    # untitled ergo-task artifacts; releases/ carries the site copy
+    "release-notes/*",
+]
+
+# -- Options for HTML output -------------------------------------------------
+
+html_theme = "furo"
+html_static_path = ["_static"]
+html_title = f"{project} documentation"
+
+# Python API reference is generated from the PyO3 layer's stubs/docstrings;
+# until that lands,see docs/index.md for the autodoc follow-up note.

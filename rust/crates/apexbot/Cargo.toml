@@ -1,0 +1,62 @@
+[package]
+name = "apexbot"
+description = "Umbrella Rust crate: re-exports the pyo3-free apexbot core surface (Bot state, DexIdentity presets, calc math) for standalone Rust consumers."
+keywords = ["mev", "arbitrage", "evm", "uniswap", "bot"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# The umbrella is pure-Rust: it pulls ONLY the pyo3-free core crates and
+# re-exports them. It has NO `pyo3` dependency (verified by
+# `rg 'use pyo3' rust/crates/apexbot` — empty). A standalone Rust consumer
+# `cargo add apexbot` gets `BotState`/`DexIdentity`/presets/calc with zero
+# Python in the build graph (ADR-005 standalone claim, made concrete by
+# `examples/standalone_consumer.rs`). The binding layer (`apexbot_rs` cdylib,
+# built from `crates/apexbot-python/`) is a separate workspace member that
+# DOES pull pyo3; the umbrella never depends on it.
+[dependencies]
+parking_lot = { version = "^0.12" }
+alloy = { version = "^2.4", features = ["full"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }
+apexbot-config.workspace = true
+apexbot-aave.workspace = true
+apexbot-abi.workspace = true
+apexbot-math.workspace = true
+hashbrown.workspace = true
+apexbot-bot.workspace = true
+apexbot-core.workspace = true
+apexbot-ingestion.workspace = true
+apexbot-db.workspace = true
+apexbot-decoders.workspace = true
+apexbot-execution.workspace = true
+apexbot-executor.workspace = true
+apexbot-fork.workspace = true
+# The net-profit order index — re-exported for standalone consumers; the
+# `apexbot-arbitrage` edge below enables its `order-index` feature so
+# `dispatch_profitable` gets the deterministic pre-sim selection in every
+# umbrella build (B5L2XA; ADR-024).
+apexbot-order-index.workspace = true
+apexbot-pathfinding.workspace = true
+apexbot-pool-updater.workspace = true
+apexbot-pools.workspace = true
+apexbot-price.workspace = true
+apexbot-rpc.workspace = true
+apexbot-simulation.workspace = true
+apexbot-arbitrage = { workspace = true, features = ["order-index"] }
+apexbot-solvers.workspace = true
+apexbot-submission.workspace = true
+apexbot-uniswap.workspace = true
+
+[dev-dependencies]
+async-trait = "0.1"
+alloy = { version = "^2.4", features = ["full"] }
+revm = { version = "^43.0", default-features = false }
+tokio = { version = "^1.53", features = ["rt-multi-thread", "macros"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }
