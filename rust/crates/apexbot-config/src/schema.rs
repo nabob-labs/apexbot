@@ -124,6 +124,18 @@ impl KeyDecl {
 
 crate::config_schema! {
 
+    // SMTH6M: the ambient I/O runtime of the two-runtime contract (solve
+    // bins on one side, shared I/O runtime on the other) is sized from the
+    // cgroup CPU budget; this section carries the explicit operator
+    // override for that sizing. Declared once — the typed field, env name,
+    // TOML path, and doc entry all come from this line.
+    runtime RuntimeConfig {
+        io_workers [opt usize] = None, env = "APEXBOT_IO_WORKERS", def = "(unset; derived from the cgroup CPU budget)",
+            doc = "Ambient I/O runtime worker count; when unset it is derived from the cgroup CPU budget after the solve bins take theirs (see solve.solve_cpus / solve.solve_headroom).";
+        fleet_profile [enum FleetProfile Auto Pinned Serial] = FleetProfile::Auto, env = "APEXBOT_FLEET_PROFILE", def = "auto",
+            doc = "Fleet host-binding profile (FLEETFLOOR FF-T2): auto resolves the host tier from the CPU budget (pinned at/above the pinned-role floor, serial on 2-5 cores, refused below 2); pinned/serial force a binding — a forced pinned binding below the floor runs marked oversubscribed, and forced bindings still need 2 or more cores.";
+    }
+
     telemetry TelemetryConfig {
         otel [bool] = true, env = "APEXBOT_OTEL", def = "true",
             doc = "Enable the OTel OTLP span layer and the Prometheus metrics endpoint; `0`/empty opts out.";
@@ -131,6 +143,8 @@ crate::config_schema! {
             doc = "Prometheus scrape endpoint bind address (only active when otel is on).";
         jaeger_endpoint [string] = String::from("http://127.0.0.1:4318"), env = "APEXBOT_JAEGER_ENDPOINT", def = "http://127.0.0.1:4318",
             doc = "OTLP endpoint used by the opt-in Jaeger E2E test.";
+        log_fmt_stderr [bool] = true, env = "APEXBOT_LOG_FMT", def = "true",
+            doc = "Keep the stderr fmt-layer mirror of every record (including the Python logging bridge); 0 routes the fmt layer to the sink so a driver teeing both sinks records each line once.";
         jaeger_e2e [bool] = false, env = "APEXBOT_JAEGER_E2E", def = "false",
             doc = "Gate for the network-accessible Jaeger E2E test (Jaeger must be reachable at jaeger_endpoint).";
     }
@@ -166,6 +180,27 @@ crate::config_schema! {
             doc = "Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep.";
         ws_completeness [bool] = true, env = "APEXBOT_WS_COMPLETENESS", def = "true",
             doc = "WS completeness gating (newHeads + logs double-delivery check); `0` disables.";
+        // BM35LK (epic FIMZES; design in the gitignored logs/ design note
+        // logs/quiesce-design-20260908.md §6): the
+        // adaptive trailing-quiesce estimator. Default flipped to `adaptive`
+        // after the 2026-09-09 live A/B (the untracked `logs/` run artifact
+        // logs/perf-after-20260909.md: settle
+        // p50 25→10ms, publish p95 100→50ms, zero late-admit tripwires);
+        // `fixed` retains the historical `pump_debounce_ms` behavior. W =
+        // clamp(EWMA·quiesce_margin, floor, ceil), the EWMA tracking each
+        // block's max intra-block silence gap.
+        quiesce_mode [enum QuiesceMode Fixed Adaptive] = QuiesceMode::Adaptive, env = "APEXBOT_PUMP_QUIESCE_MODE", def = "adaptive",
+            doc = "Settle-window mode: `fixed` = constant pump.pump_debounce_ms debounce; `adaptive` = EWMA trailing-quiesce estimator (never below quiesce_floor_ms, never above quiesce_ceil_ms; late-admit budget overruns hold at the ceiling).";
+        quiesce_floor_ms [ms] = 2, env = "APEXBOT_PUMP_QUIESCE_FLOOR_MS", def = "2",
+            doc = "Adaptive mode: lower bound (ms) of the trailing settle window (clamped >= 1; a 0/garbage value never collapses the window to zero).";
+        quiesce_ceil_ms [ms] = 20, env = "APEXBOT_PUMP_QUIESCE_CEIL_MS", def = "20",
+            doc = "Adaptive mode: upper bound (ms) of the trailing settle window; the estimator never grows beyond it (inherits the debounce parse contract: unset/zero/invalid falls back, never 0).";
+        quiesce_margin_ms [f64] = 3.0, env = "APEXBOT_PUMP_QUIESCE_MARGIN_MS", def = "3.0",
+            doc = "Adaptive mode: safety multiplier over the silence-gap EWMA (W = EWMA × margin, then floor/ceiling clamp).";
+        quiesce_ewma_alpha [f64] = 0.1, env = "APEXBOT_PUMP_QUIESCE_EWMA_ALPHA", def = "0.1",
+            doc = "Adaptive mode: EWMA smoothing constant over per-block max silence gaps (≈10-block memory); clamped to (0, 1].";
+        quiesce_late_budget [u64] = 120, env = "APEXBOT_PUMP_QUIESCE_LATE_BUDGET", def = "120",
+            doc = "Adaptive-mode runtime backstop (HJ5HWF contract): more than this many benign late-admit events in a sliding hour holds the window at quiesce_ceil_ms until the ledger drains.";
     }
 
     trace TraceConfig {
@@ -198,18 +233,18 @@ crate::config_schema! {
             doc = "Override the detected solve CPU budget (worker bin count).";
         solve_headroom [opt usize] = None, env = "APEXBOT_SOLVE_HEADROOM", def = "(unset)",
             doc = "Override the I/O headroom carved out of the CPU budget before solve bins.";
-        executor [enum SolveExecutor Tokio Rayon] = SolveExecutor::Tokio, env = "APEXBOT_SOLVE_EXECUTOR", def = "tokio",
-            doc = "Solve fan-out executor: tokio (low-priority dedicated runtime, production default) or rayon.";
         solve_inline_sim [bool] = true, env = "APEXBOT_SOLVE_INLINE_SIM", def = "true",
             doc = "Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables.";
         solve_resolve_par [bool] = true, env = "APEXBOT_SOLVE_RESOLVE_PAR", def = "true",
             doc = "Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables.";
-        solve_sim_inflight [opt usize] = None, env = "APEXBOT_SOLVE_SIM_INFLIGHT", def = "(unset; derived from CPU budget)",
-            doc = "Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation.";
         inline_sim_workers [opt usize] = None, env = "APEXBOT_INLINE_SIM_WORKERS", def = "(unset; derived from CPU budget)",
             doc = "Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site).";
-        detached_solves [bool] = true, env = "APEXBOT_DETACHED_SOLVES", def = "true",
-            doc = "Route solve arms through detached (out-of-cycle) workers; `0`/`false` opts back into the in-cycle engine-Mutex hold. Default ON: the solve path takes no engine-level Mutex (epic MROOY7 task 2UVG3E, seam #4).";
+        admission_shed [bool] = true, env = "APEXBOT_SOLVE_ADMISSION", def = "true",
+            doc = "QTZGFL capacity-modulated admission stance: unset/`1`/`true`/`on` (default) replaces the retired in-flight cap degrade with budget = max(0, admission_target_depth - in-flight) and SHEDS zero-budget cycles; `0`/`false`/`off` is the intentional take-all no-shed operator stance (A/B).";
+        admission_target_depth [usize] = 8, env = "APEXBOT_SOLVE_ADMISSION_TARGET_DEPTH", def = "8",
+            doc = "QTZGFL: un-merged-result pipe depth target in KEYS (pools) — the draw budget headroom. Clamped at engine construction to 1..=DETACHED_INFLIGHT_CAP (DETACHED_INFLIGHT_CAP is only the default/clamp for this key now, no longer a runtime cap verdict); default 8 = DETACHED_INFLIGHT_CAP.";
+        admission_retention_blocks [u64] = 50, env = "APEXBOT_SOLVE_ADMISSION_RETENTION", def = "50",
+            doc = "QTZGFL: retained (carried) key retention window W in blocks — on each block advance the ledger prunes buckets older than head - W and counts apexbot.detached.leads_expired. Default 50.";
         min_profit_wei [u128] = 0, env = "APEXBOT_MIN_PROFIT_WEI", def = "0",
             doc = "Minimum path profit floor in wei (decimal text; TOML: quoted string).";
         walk_event_solver_legacy [bool_not] = false, env = "APEXBOT_WALK_EVENT_SOLVER", def = "false",
@@ -228,8 +263,31 @@ crate::config_schema! {
             doc = "Walk-memo recomposition census (`1` enables).";
         cl_projection_cache [bool] = true, env = "APEXBOT_CL_PROJECTION_CACHE", def = "true",
             doc = "CL projection memo cache; `0`/`off`/`false`/`disabled` disables.";
-        lpt_partition [bool] = true, env = "APEXBOT_LPT_PARTITION", def = "true",
-            doc = "K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables.";
+    }
+
+    fleet FleetConfig {
+        quota_cpus [opt f64] = None, env = "APEXBOT_FLEET_QUOTA_CPUS", def = "(unset; detected from the cgroup)",
+            doc = "Terminal override of the fractional cgroup CPU quota (cores) feeding the fleet budget sum check; unset detects from the cgroup (ADR-042 §5).";
+        reserve_cpus [opt usize] = None, env = "APEXBOT_FLEET_RESERVE_CPUS", def = "(unset; default 1)",
+            doc = "Fleet-budget reserve share H (Python bridge, pump, OTel, async GC) in cores; overrides the fixed default 1 (design doc §5).";
+        solver_cpus [opt usize] = None, env = "APEXBOT_FLEET_SOLVER_CPUS", def = "(unset; derived floor(Q)-H-A-R-M)",
+            doc = "Fleet Solver CPU share S in cores; terminal when set and it participates in the same startup sum check (default: floor(quota) − H − A − R − M; S < 2 fails the boot).";
+        sim_slot_cap [opt usize] = None, env = "APEXBOT_FLEET_SIM_SLOT_CAP", def = "(unset; default 4)",
+            doc = "SimDriver slot cap (duty-counted; spendable from the fractional-quota remainder); default 4, today's SimSlots cap.";
+        pool_state_updater_slots [opt usize] = None, env = "APEXBOT_FLEET_POOL_STATE_UPDATER_SLOTS", def = "(unset; default 4)",
+            doc = "PoolStateUpdater slot cap (the registration intake station: duty-counted, spendable from the fractional-quota remainder, Deferrable cordon class); default 4.";
+        cordon_enter_events [usize] = 2, env = "APEXBOT_FLEET_CORDON_ENTER_EVENTS", def = "2",
+            doc = "Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment delivered: runtime-tunable via the operator channel — `apexbot fleet posture set --cordon-enter-events N` on a live process).";
+        cordon_enter_window_ms [ms] = 1000, env = "APEXBOT_FLEET_CORDON_ENTER_WINDOW_MS", def = "1000",
+            doc = "Rolling window (ms) for the throttle-event burst enter trigger.";
+        cordon_duty_percent [f64] = 2.0, env = "APEXBOT_FLEET_CORDON_DUTY_PERCENT", def = "2.0",
+            doc = "Throttled-time duty percent over the duty window that cordons the fleet (enter trigger; 2.0 = >2%).";
+        cordon_duty_window_ms [ms] = 5000, env = "APEXBOT_FLEET_CORDON_DUTY_WINDOW_MS", def = "5000",
+            doc = "Trailing window (ms) over which throttled-time duty is evaluated.";
+        cordon_exit_clean_ms [ms] = 10000, env = "APEXBOT_FLEET_CORDON_EXIT_CLEAN_MS", def = "10000",
+            doc = "Clean-window hysteresis (ms) required before cordon exits (design doc §6: 10 s of clean windows).";
+        cordon_sim_intake_floor [opt usize] = None, env = "APEXBOT_FLEET_CORDON_SIM_INTAKE_FLOOR", def = "(unset; half the slot cap)",
+            doc = "SimDriver new-lease cap while cordoned; in-flight sims are never cancelled (default: half the slot cap).";
     }
 
     capture CaptureConfig {
@@ -350,5 +408,79 @@ mod tests {
                 k.toml_path
             );
         }
+    }
+
+    #[test]
+    fn fleet_section_declares_the_adr_042_keys() {
+        let want = [
+            ("fleet.quota_cpus", "APEXBOT_FLEET_QUOTA_CPUS"),
+            ("fleet.reserve_cpus", "APEXBOT_FLEET_RESERVE_CPUS"),
+            ("fleet.solver_cpus", "APEXBOT_FLEET_SOLVER_CPUS"),
+            ("fleet.sim_slot_cap", "APEXBOT_FLEET_SIM_SLOT_CAP"),
+            (
+                "fleet.cordon_enter_events",
+                "APEXBOT_FLEET_CORDON_ENTER_EVENTS",
+            ),
+            (
+                "fleet.cordon_enter_window_ms",
+                "APEXBOT_FLEET_CORDON_ENTER_WINDOW_MS",
+            ),
+            (
+                "fleet.cordon_duty_percent",
+                "APEXBOT_FLEET_CORDON_DUTY_PERCENT",
+            ),
+            (
+                "fleet.cordon_duty_window_ms",
+                "APEXBOT_FLEET_CORDON_DUTY_WINDOW_MS",
+            ),
+            (
+                "fleet.cordon_exit_clean_ms",
+                "APEXBOT_FLEET_CORDON_EXIT_CLEAN_MS",
+            ),
+            (
+                "fleet.cordon_sim_intake_floor",
+                "APEXBOT_FLEET_CORDON_SIM_INTAKE_FLOOR",
+            ),
+        ];
+        for (toml_path, env) in want {
+            let key = SCHEMA.iter().find(|k| k.toml_path == toml_path);
+            assert!(
+                key.is_some(),
+                "schema key {toml_path} must be declared exactly once"
+            );
+            assert_eq!(key.map(|k| k.env), Some(env), "{toml_path} env drift");
+        }
+        // LW-T9 hard cutover: the stance key is RETIRED — it must not be
+        // declared (mirror of the P6YXA6 solve.executor removal; the env
+        // var + TOML key fail the load loudly at the loader).
+        assert!(
+            !SCHEMA.iter().any(|k| k.toml_path == "fleet.stance"),
+            "fleet.stance must be retired from the schema"
+        );
+        assert!(
+            !SCHEMA.iter().any(|k| k.env == "APEXBOT_FLEET"),
+            "APEXBOT_FLEET must be retired from the schema"
+        );
+    }
+
+    #[test]
+    fn retired_solve_stance_keys_are_not_declared() {
+        // WFF6MM hard cutover: the detached-solve stance key is RETIRED with
+        // the in-cycle fallback arm — detached is the only solve arm now.
+        // The key must not be declared; a surviving TOML key fails the load
+        // with the generic unknown-key error (fail-closed) and a CLI
+        // override naming it is rejected (mirror of the fleet.stance
+        // retirement; the one-release pointed refusals were themselves
+        // removed at d5c450c84 — ADR-012 deletion, not a flag).
+        assert!(
+            !SCHEMA
+                .iter()
+                .any(|k| k.toml_path == "solve.detached_solves"),
+            "solve.detached_solves must be retired from the schema"
+        );
+        assert!(
+            !SCHEMA.iter().any(|k| k.env == "APEXBOT_DETACHED_SOLVES"),
+            "APEXBOT_DETACHED_SOLVES must be retired from the schema"
+        );
     }
 }

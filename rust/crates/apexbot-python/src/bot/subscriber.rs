@@ -128,6 +128,17 @@ pub(crate) fn init_subscriber_drainer() {
         let drainer_state = Arc::clone(&state);
         #[expect(clippy::expect_used)] // thread spawn fails only under resource exhaustion
         {
+            // PE4FPM: self-register the drainer thread.
+            apexbot_core::worker_census::register(
+                apexbot_core::worker_census::WorkerCensusEntry {
+                    resource: "subscriber_drainer",
+                    kind: "std drainer thread (subscriber notifications → Python callbacks)",
+                    count: 1,
+                    thread_name: "subscriber-drainer",
+                    sizing: "exactly one (fixed; started once inside the get_or_init)",
+                    binding: "pinned",
+                },
+            );
             thread::Builder::new()
                 .name("subscriber-drainer".into())
                 .spawn(move || subscriber_drainer_loop(drainer_state))

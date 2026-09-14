@@ -508,6 +508,125 @@ mod tests {
             .unwrap();
     }
 
+    use crate::arb_engine::lifecycle::PathRegistrationError;
+
+    /// PRG-4 / IRUMXD: the engine path registry owns the registered-path
+    /// cap. At the cap, a NEW path registration is refused with the typed
+    /// benign-stop refusal (`RegistryFull`) — no Python counters involve —
+    /// while a DUPLICATE registration still answers with the existing id
+    /// (dedup is by construction; the cap only gates growth).
+    #[test]
+    fn register_path_refuses_new_paths_at_the_cap() {
+        let mut engine = ArbitrageEngine::new();
+        let v2_addr = Address::from([0x11u8; 20]);
+        let v2_fwd =
+            engine.register_v2_pool(v2_addr, usdc(1_500_000), weth(800), GAMMA_03, FEE_DENOM_03);
+        let v2_addr2 = Address::from([0x12u8; 20]);
+        let v2_fwd2 = engine.register_v2_pool(
+            v2_addr2,
+            weth(1000),
+            usdc(2_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let v2_addr3 = Address::from([0x13u8; 20]);
+        let _v2_fwd3 = engine.register_v2_pool(
+            v2_addr3,
+            weth(3000),
+            usdc(3_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+
+        engine.set_path_cap(Some(1));
+
+        // Two-hop path (usdc→weth then weth→usdc), per the dedicated
+        // reversed-direction registration test above.
+        let hops = vec![
+            PoolHop {
+                pool_id: v2_fwd,
+                zero_for_one: true,
+            },
+            PoolHop {
+                pool_id: v2_fwd2,
+                zero_for_one: true,
+            },
+        ];
+        let id1 = engine
+            .register_path(hops.clone())
+            .expect("first registration fits the cap");
+
+        // A duplicate at-cap still answers (dedup precedes the cap check).
+        let dup = engine
+            .register_path(hops.clone())
+            .expect("dedup is not capped");
+        assert_eq!(dup, id1, "duplicate registration returns the existing id");
+
+        // A NEW path at the cap (same pools, reversed direction): the typed
+        // benign-stop refusal.
+        let hops2 = vec![
+            PoolHop {
+                pool_id: v2_fwd2,
+                zero_for_one: true,
+            },
+            PoolHop {
+                pool_id: v2_fwd,
+                zero_for_one: true,
+            },
+        ];
+        let err = engine
+            .register_path(hops2.clone())
+            .expect_err("cap reached");
+        assert_eq!(
+            err,
+            PathRegistrationError::RegistryFull {
+                cap: 1,
+                registered: 1
+            },
+            "the refusal carries cap + registered counts"
+        );
+
+        // Raising the cap admits the queued registration.
+        engine.set_path_cap(Some(2));
+        let id2 = engine
+            .register_path(hops2)
+            .expect("registry grown by the operator");
+        assert_ne!(id1, id2);
+    }
+
+    /// PRG-4: dedup hits are counted engine-side (the `dup` skip telemetry
+    /// no longer has a Python witness — the duplicate never crosses the FFI
+    /// as a skip).
+    #[test]
+    fn register_path_dedup_is_counted_for_the_skip_family() {
+        let mut engine = ArbitrageEngine::new();
+        let v2_addr = Address::from([0x11u8; 20]);
+        let v2_fwd =
+            engine.register_v2_pool(v2_addr, usdc(1_500_000), weth(800), GAMMA_03, FEE_DENOM_03);
+        let v2_addr2 = Address::from([0x12u8; 20]);
+        let v2_fwd2 = engine.register_v2_pool(
+            v2_addr2,
+            weth(1000),
+            usdc(2_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let hops = vec![
+            PoolHop {
+                pool_id: v2_fwd,
+                zero_for_one: true,
+            },
+            PoolHop {
+                pool_id: v2_fwd2,
+                zero_for_one: true,
+            },
+        ];
+        let _ = engine.register_path(hops.clone()).expect("first register");
+        assert_eq!(engine.path_dedups(), 0, "first registration is not a dedup");
+        let _ = engine.register_path(hops).expect("dedup hit");
+        assert_eq!(engine.path_dedups(), 1, "the duplicate was counted");
+    }
+
     /// FPGOYX: registering the same path (same pools + directions) twice
     /// must be idempotent — return the SAME `path_id`, not a new one.
     /// Unbounded registration growth (8.7k -> 107k in 25 min) caused OOM kills
@@ -921,7 +1040,7 @@ mod tests {
         // A real solve has anchored `results_block` (the delivery-policy
         // solve-anchor guard defers candidates while it is still 0 — see
         // `diff_and_send_with_zero_anchor_defers_candidates_and_does_not_commit`).
-        engine.results_block = 100;
+        engine.set_results_block_for_test(100);
 
         // send_result_batch computes the diff, sends it, and advances
         // `delivered` to the above-threshold subset.
@@ -967,7 +1086,8 @@ mod tests {
         // Pump seeds the settled resume boundary (block 500) at resume.
         engine.set_solve_anchor(500);
         assert_eq!(
-            engine.results_block, 500,
+            engine.results_block(),
+            500,
             "cold-start anchor seeded to settled resume block"
         );
 
@@ -1019,11 +1139,42 @@ mod tests {
         assert!(engine.delivery.delivered.contains_key(&path_id));
 
         // Never regress a real solve anchor: a later seed must not lower it.
-        engine.results_block = 900;
+        engine.set_results_block_for_test(900);
         engine.set_solve_anchor(600);
         assert_eq!(
-            engine.results_block, 900,
+            engine.results_block(),
+            900,
             "set_solve_anchor never clobbers a real anchor"
+        );
+    }
+
+    /// 6XB6NJ pin (the review's Q6 strengthening): the solve-stamp path is
+    /// MONOTONE - a late/stale stamp can no longer regress the results
+    /// anchor. Both stamps below go through the REAL solve-stamp path
+    /// (`solve_dirty` -> `rebuild_and_solve_affected`'s anchor re-stamp):
+    /// block 10 anchors first, then a stale block-5 cycle (a lagging drain
+    /// entry, a re-fired boundary, a detached straggler) must NOT pull the
+    /// anchor backwards - delivery would re-emit at a regressed
+    /// `solve_block`. RED before the block cursor: the stamp was an
+    /// unconditional `self.results_block = solve_block` write.
+    #[test]
+    fn late_solve_stamp_cannot_regress_results_anchor() {
+        let mut engine = ArbitrageEngine::new();
+
+        // First solve cycle anchors at block 10.
+        engine.solve_dirty(10, &BlockMetadata::default(), &[]);
+        assert_eq!(
+            engine.results_block(),
+            10,
+            "the solve-stamp path anchors results_block at the cycle's solve block"
+        );
+
+        // A late/stale stamp through the same path must not regress it.
+        engine.solve_dirty(5, &BlockMetadata::default(), &[]);
+        assert_eq!(
+            engine.results_block(),
+            10,
+            "a stale solve stamp must never regress the results anchor"
         );
     }
 
@@ -1061,7 +1212,7 @@ mod tests {
         // Anchor the solve at a real block: candidates are only deliverable
         // once `results_block` is non-zero (solve-anchor delivery guard — a 0
         // anchor would sim at block 0, the 0x841820 code-less panic).
-        engine.results_block = 100;
+        engine.set_results_block_for_test(100);
         engine.compute_diff_and_send(&BlockMetadata::default());
 
         let batch = rx
@@ -1107,7 +1258,7 @@ mod tests {
 
         // Anchor the solve at a real block (solve-anchor delivery guard — see
         // `diff_and_send_with_zero_anchor_defers_candidates_and_does_not_commit`).
-        engine.results_block = 100;
+        engine.set_results_block_for_test(100);
         engine.compute_diff_and_send(&BlockMetadata::default());
 
         let batch = rx
@@ -3297,7 +3448,7 @@ mod tests {
             result.is_err(),
             "register_path must reject a pool_id not present in the BotState"
         );
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains(&bogus_id.to_string()),
             "error must name the missing pool_id={bogus_id}, got: {msg}"
@@ -3562,7 +3713,7 @@ mod tests {
 
     // --- ADR-005 slice 15b-1: Rust parallel solve fan-out -----------------
     //
-    // `solve_dirty`'s affected-path solve loop is parallelized via rayon
+    // `solve_dirty`'s affected-path solve loop is parallelized via executor bins
     // `par_iter`. The tracer bullet below pins the invariant the parallel
     // fan-out must preserve: equivalence with the serial baseline. This test
     // runs green against the current serial `solve_all()`; after the parallel
@@ -3572,7 +3723,7 @@ mod tests {
     // many paths (drives the par_iter loop across non-trivial batch sizes).
 
     /// Pin the parallel-fan-out equivalence invariant: the batch re-solver
-    /// (`solve_all_paths` → `solve_all` → rayon `par_iter` of `solve_path`)
+    /// (`solve_all_paths` → `solve_all` → executor bins of `solve_path`)
     /// must produce results identical to the per-path eager baseline captured
     /// at `register_and_solve_path` time. Any drift between the two means the
     //  fan-out is dropping paths, double-counting, or producing a different
@@ -3623,7 +3774,7 @@ mod tests {
 
         // Full batch re-solve via solve_all_paths — this is the call path
         // whose solve loop gets parallelized. Equivalent eager results must
-        // survive the batch re-solve (today serial; after the refactor, rayon
+        // survive the batch re-solve (today in the resolve fan-out; a batch
         // `par_iter`).
         engine.solve_all_paths(1);
         let (results, block) = engine.latest_results();
@@ -3646,7 +3797,7 @@ mod tests {
 
     /// ADR-006 slice 10 acceptance for the parallel solve fan-out
     /// (ADR-005 slice 15b-1): characterize the engine-then-core lock ordering
-    /// when the engine's `solve_dirty` solve loop runs under rayon `par_iter`.
+    /// when the engine's `solve_dirty` solve loop runs under executor bins.
     /// The `par_iter` workers operate only on owned/Cloned data (`ResolvedMixedPath`
     /// clones + collected `(pid, SolvePathResult)` pairs); they acquire NO
     /// engine `Mutex` and NO core lock — so the engine-then-core lock order
@@ -3655,7 +3806,7 @@ mod tests {
     /// This test drives the contention with N=8 paths registered (so the
     /// `par_iter` batch is non-trivial — at least 8 work items per `solve_dirty`)
     /// under one writer (`solve_dirty`) + four readers (core.read companions).
-    /// Bounded join; a real deadlock (rayon re-entering the engine `Mutex`, or
+    /// Bounded join; a real deadlock (bins re-entering the engine `Mutex`, or
     /// a re-entrant core guard) surfaces as a panic on the writer thread.
     #[test]
     fn solve_dirty_parallel_fanout_survives_concurrent_readers_and_writer() {
@@ -3707,7 +3858,7 @@ mod tests {
         // Writer: `solve_dirty` invokes `solve_all_paths` semantically via
         // `rebuild_and_solve_affected` → `par_iter` of `Self::solve_path`. The
         // writer holds the engine `Mutex` then (inside) `core.read()` (path
-        // resolution) and briefly `core.write()` (V3/V4 buffer expiry). Rayon's
+        // resolution) and briefly `core.write()` (V3/V4 buffer expiry). The bins'
         // internal workers touch no engine/core state.
         let writer_engine = Arc::clone(&engine);
         let writer_done = Arc::clone(&done);
@@ -3742,7 +3893,7 @@ mod tests {
             handle.join().expect("reader panicked");
         }
         writer_result.expect(
-            "writer deadlocked — rayon `par_iter` in `solve_dirty` reintroduced a \
+            "writer deadlocked — engine-lock re-entry in `solve_dirty` bins reintroduced a \
              core/engine lock nesting or re-entrant guard (ADR-006 D2 violated)",
         );
     }
@@ -3754,7 +3905,7 @@ mod tests {
     // delay + only advances on a send). `BlockNotification` + `block_tx` are
     // the dedicated channel, plumbed parallel to `result_tx`.
     // See docs/architecture/rust-owned-bot.md §6.1 (`block_tx.send — Python
-    // reads this`) and .ergo/plans/block-stream-clock.md.
+    // reads this`); the block-stream-clock plan file has since been removed.
 
     #[test]
     fn block_notification_carries_block_and_metadata() {
@@ -5298,7 +5449,7 @@ mod tests {
         let marker_delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         {
             for pid in &pool_ids {
-                marker_delta.record_affected(HopType::V2, *pid);
+                marker_delta.record_affected(HopType::V2, *pid, 0u64);
             }
         }
 
@@ -5318,7 +5469,7 @@ mod tests {
                 // LXDY4C: the marker records into the shared epoch ledger —
                 // the delta IS what the drain takes (no engine-local intake
                 // remains, so the retired probe<->take window cannot exist).
-                marker_delta_thread.record_affected(HopType::V2, pool_ids[rot % 8]);
+                marker_delta_thread.record_affected(HopType::V2, pool_ids[rot % 8], 0u64);
                 rot = rot.wrapping_add(1);
                 // Bounded pace: enough iterations to hit any probe<->take
                 // window the old gate exposed, without spinning hot and
@@ -5380,11 +5531,10 @@ mod tests {
     /// the successor's first-dirt under the dead block's identity (traces
     /// ab13f75f: finalize(83) solved 1,755 paths of 84's dirt; 98f7cf52 and
     /// the fresh census: 2/20 blocks with the degenerate pattern). The
-    /// boundary is now bookkeeping-only: the guard branch advances
-    /// `last_solved_block` / `has_logs_this_block` / `last_processed_block` /
-    /// `results_block` and emits the terminal publish; dirt stays unconsumed
-    /// for the pump's drained-settle gate. RED while `finalize_block` still
-    /// called `solve_dirty`.
+    /// boundary is now bookkeeping-only: the guarded transition advances the
+    /// block cursor (6XB6NJ: `BlockCursor::finalize`) and emits the terminal
+    /// publish; dirt stays unconsumed for the pump's drained-settle gate. RED
+    /// while `finalize_block` still called `solve_dirty`.
     #[test]
     #[expect(clippy::expect_used)]
     fn finalize_block_consumes_no_dirt_and_emits_no_solve() {
@@ -5970,17 +6120,50 @@ mod tests {
     /// RED before the per-path result-queue streaming exists: the batched
     /// barrier merges everything only AFTER the slowest solve, so the drain
     /// probe stays empty past the deadline while the slow path still runs.
+    ///
+    /// Pinned-tier fixture (FF-T2): the streaming-merge premise binds only
+    /// on a host whose auto-resolved fleet binding is pinned (see the
+    /// host-tier gate in the body); the serial tier's ONE solve seat has no
+    /// second LPT bin to stream a fast merge into the probe.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the T1 acceptance carries the whole hook-probe + streaming-ordering story in one deterministic body"
+    )]
     #[test]
     fn tokio_executor_merges_fast_paths_while_slow_path_solves() {
         if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
             eprintln!("skipping: streaming-merge test requires >=2 cores");
             return;
         }
+        // Host-tier gate (FF-T2): the premise needs the PINNED tier's
+        // multi-seat solver fan-out — the slow path isolated in its own LPT
+        // bin while the other bins stream fast merges into the probe. On a
+        // 2-5-core host the auto profile resolves the fleet to the serial
+        // binding by design (ONE cycle lane, ONE solve seat): there is no
+        // second bin to merge anything before the slow path's release
+        // marker, so the ordering assertion cannot bind there. The
+        // serial-tier delivery story is covered by
+        // `streaming_delivery_emits_fast_result_while_slow_path_solves`
+        // (which tolerates the single-seat ordering). Mirror the <2-core
+        // self-skip channel.
+        let tier_quota =
+            apexbot_workers::budget::detected_quota_cpus(&apexbot_config::FleetConfig::default());
+        if apexbot_workers::budget::FleetBudget::derive(
+            tier_quota,
+            &apexbot_workers::budget::BudgetOverrides::default(),
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping: the fleet resolves this host to the serial tier \
+                 ({tier_quota} cores) — one solve seat, no second LPT bin"
+            );
+            return;
+        }
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
 
         // Seven independent mispriced V2->V2 pairs -> seven profitable paths
         // (>=2 cores: LPT puts the slow path FIRST in its bin, so at least
@@ -6098,110 +6281,6 @@ mod tests {
              barrier order puts the marker first (probe = {observed:?})"
         );
     }
-    /// T2 (epic BXZBWY) acceptance: a slowened `solve_dirty` holding the engine
-    /// Mutex must NOT starve other tasks on the shared multi-thread runtime
-    /// (the production pump runtime hosts the block clock + `WS` tasks on the
-    /// same pool). RED before the `block_in_place` seam: the slowened solve
-    /// occupied the ONLY worker and the heartbeat task starved.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn solve_dirty_hold_does_not_starve_runtime_tasks() {
-        // The stage surface provides the solve hooks on the engine
-        // (`EngineStages`; the retired `Engine` trait is gone — SZJUKL).
-        use std::time::Duration;
-
-        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
-
-        let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
-            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut engine = ArbitrageEngine::new();
-
-        // One profitable V2->V2 pair, plus an injected 600ms delay, so the
-        // solve carries real work and holds the Mutex across that window.
-        let fwd = engine.register_v2_pool(
-            Address::from([0x60u8; 20]),
-            usdc(1_500_000),
-            weth(800),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        let back = engine.register_v2_pool(
-            Address::from([0x61u8; 20]),
-            weth(800),
-            usdc(1_600_000),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        engine
-            .register_path(vec![
-                PoolHop {
-                    pool_id: fwd,
-                    zero_for_one: true,
-                },
-                PoolHop {
-                    pool_id: back,
-                    zero_for_one: true,
-                },
-            ])
-            .unwrap();
-        // Prod: the subscriber routes pool events into the dirty set; here we
-        // drive it directly so solve_dirty carries real work.
-        oracle.insert(fwd, HopType::V2);
-        oracle.insert(back, HopType::V2);
-        engine.set_solve_delay_hook(std::sync::Arc::new(|_pid: u64| {
-            std::thread::sleep(Duration::from_millis(600));
-        }));
-        engine.set_merge_probe(probe.clone());
-
-        let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
-        let handle = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
-
-        // Heartbeat task on the same runtime: with the seam, the scheduler
-        // marks the solve-holding worker blocking and spawns a replacement,
-        // so the heartbeat keeps ticking; RED, the only worker runs the
-        // blocking solve inline and the heartbeat starves.
-        let (beat_tx, beat_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let heartbeats = tokio::spawn(async move {
-            let mut beats = 0usize;
-            loop {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                if beat_tx.send(()).is_err() {
-                    break;
-                }
-                beats += 1;
-            }
-            beats
-        });
-
-        let solve_task = tokio::spawn(async move {
-            let t0 = std::time::Instant::now();
-            handle.solve_dirty(&oracle.to_affected_keys(), 100, &BlockMetadata::default());
-            t0.elapsed()
-        });
-
-        // Let the solve complete its injected delay before closing the
-        // heartbeat channel (early close would under-count beats).
-        let solve_elapsed = solve_task.await.unwrap_or_default();
-        drop(beat_rx);
-        let beats = heartbeats.await.unwrap_or(0);
-
-        let guard = engine.lock();
-        let (results, _block) = guard.latest_results();
-        drop(guard);
-
-        assert!(
-            results.iter().any(|(_, r)| !r.profit.is_zero()),
-            "the solve must have produced a profitable result"
-        );
-        assert!(
-            solve_elapsed >= Duration::from_millis(500),
-            "premise: the injected delay actually ran ({solve_elapsed:?})"
-        );
-        assert!(
-            beats >= 5,
-            "runtime tasks must keep progressing while solve_dirty holds the \
-             engine Mutex (T2 seam); heartbeats in 600ms = {beats}"
-        );
-    }
     /// T3 (epic BXUSGL) acceptance: with `APEXBOT_STREAMING_DELIVERY` the drain
     /// emits each clamp-passed above-threshold result as an immediate single
     /// -entry batch — a fast path's batch must arrive on the channel while the
@@ -6217,7 +6296,6 @@ mod tests {
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
         engine.set_streaming_delivery(true);
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
         engine.set_result_channel(result_tx);
@@ -6381,7 +6459,7 @@ mod tests {
         (engine, pool_ids, path_ids)
     }
 
-    /// Structural acceptance (red/green): with `detached_solving=ON` and an
+    /// Structural acceptance (red/green): with the one (detached) arm and an
     /// injected 400ms slow path, `rebuild_and_solve_affected` — driven via
     /// the production `EngineStages` solve seam, which also spawns the
     /// merge sidecar — RETURNS before the merge lands, and the sidecar
@@ -6392,8 +6470,7 @@ mod tests {
             eprintln!("skipping: detached-cycle structural test requires >=2 cores");
             return;
         }
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
+        let (engine, pool_ids, path_ids) = detached_fixture(400);
         let slow_pid = path_ids[0];
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
@@ -6439,59 +6516,121 @@ mod tests {
         let guard = engine.lock();
         assert_eq!(
             guard
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             3
         );
     }
 
-    /// Structural acceptance, flag OFF (default): the results are merged
-    /// SYNCHRONOUSLY inside the call (pre-epic behaviour) — at return every
-    /// path's result is already in the map, after the injected slow solve.
+    /// Q1a stale policy (red/green): a straggler whose resolved-update stamp
+    /// is stale (a pool ticked during the solve → its `update_block` moved)
+    /// is DROPPED, not applied. A fresh-stamp straggler applies
+    /// (apply-if-unchanged) through the same merge seam. LW-T9: the two
+    /// dispositions ride DIFFERENT pids — the QR3NUS exactness fuse (carried
+    /// to the sidecar) owns per-(cycle_seq, pid) delivery uniqueness, so the
+    /// stale→fresh stamp flip on ONE pid is fused by construction now.
     #[test]
-    fn detached_off_merges_synchronously_inside_the_call() {
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        // Default construction stance (APEXBOT_DETACHED_SOLVES unset → OFF);
-        // set explicitly to make the stance under test unmistakable.
-        engine.set_detached_solving(false);
+    fn detached_straggler_with_stale_update_stamp_is_dropped() {
+        // 43E3H3 const hoist: the straggler probes a seq the baseline
+        // in-cycle run did NOT claim (that run consumed seq 1; the ONE
+        // (`solve_seq`, pid) ledger must not false-trip a plain sidecar
+        // Q1a probe).
+        const STRAGGLER_SEQ: u64 = 2;
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
         let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
             .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
             .collect();
-        let _ = &engine;
-        let slow_pid = path_ids[0];
-
-        let t0 = std::time::Instant::now();
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
-        let returned = t0.elapsed();
+        let stale_pid = path_ids[0];
+        let fresh_pid = path_ids[1];
+        assert!(
+            engine.results.contains_key(&stale_pid) && engine.results.contains_key(&fresh_pid),
+            "precondition: fresh results merged by the inline drain"
+        );
+        // WFF6MM: the baseline cycle's own merges counted here — the straggler
+        // assertions below are DELTAS against this snapshot.
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let stale_stamp: Vec<u64> = engine.resolved_update_snapshot[&stale_pid]
+            .clone()
+            .iter()
+            .map(|b| b + 1)
+            .collect();
+        let stale_result = engine.results.get(&stale_pid).unwrap().clone();
+        let fresh_stamp = engine.resolved_update_snapshot[&fresh_pid].clone();
+        let fresh_result = engine.results.get(&fresh_pid).unwrap().clone();
 
-        // The whole cycle — INCLUDING the 400ms slow solve + clamp merge —
-        // ran inside the call.
-        assert!(
-            returned >= std::time::Duration::from_millis(390),
-            "flag OFF must merge synchronously inside the call (slow solve \
-             included); took {returned:?}"
-        );
-        assert!(
-            engine.results.contains_key(&slow_pid),
-            "flag OFF: the slow path's result is merged before return"
-        );
-        assert_eq!(engine.results.len(), 3);
+        let item = |result: SolvePathResult, stamp: Vec<u64>, pid: u64| {
+            crate::arb_engine::executor::LaneOutcome::Solved(
+                crate::arb_engine::executor::SolveOutcome {
+                    payload: None,
+                    worker_clamp_twins: 0,
+                    cycle_seq: STRAGGLER_SEQ,
+                    solve_block: 100,
+                    metadata: BlockMetadata::default(),
+                    pid,
+                    update_stamp: stamp,
+                    result,
+                    solve_span: tracing::Span::none(),
+                },
+            )
+        };
+
+        // A straggler whose pools ALL ticked during the solve.
+        engine.merge_detached_item(item(stale_result, stale_stamp, stale_pid));
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .dropped_stale
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "flag OFF: no detached merges may occur"
+            1,
+            "the stale straggler must be dropped"
+        );
+        assert_eq!(
+            engine
+                .detached_cycle
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            applied_before
+        );
+
+        // The unchanged-intake twin APPLIES (apply-if-unchanged).
+        engine.merge_detached_item(item(fresh_result, fresh_stamp, fresh_pid));
+        assert_eq!(
+            engine
+                .detached_cycle
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            applied_before + 1,
+            "the unchanged straggler must be applied"
+        );
+        assert_eq!(
+            engine
+                .detached_cycle
+                .dropped_stale
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 
-    /// Q1a stale policy (red/green): a straggler whose resolved-update stamp
-    /// is stale (a pool ticked during the solve → its `update_block` moved)
-    /// is DROPPED, not applied. The fresh-stamp twin applies (apply-if-
-    /// unchanged) through the same merge seam.
+    /// LW-T9 note-(a) carry (red): the DETACHED sidecar merge must carry the
+    /// SAME exactness assert as the in-cycle drain (QR3NUS): one path outcome
+    /// exactly once — a duplicate (`cycle_seq`, `pid`) delivery trips the loud
+    /// exactness fuse and is NOT applied a second time. RED before the
+    /// cutover: the sidecar had no duplicate guard, so the twin merge
+    /// counted applied == 2.
     #[test]
-    fn detached_straggler_with_stale_update_stamp_is_dropped() {
+    fn detached_duplicate_straggler_trips_the_exactness_fuse() {
+        // 43E3H3 const hoist: the baseline in-cycle run consumed seq 1 — the
+        // straggler probes the NEXT seq so it cannot shadow a key the
+        // in-cycle arm already claimed under the ONE (`solve_seq`, pid)
+        // ledger (that collision is N2's job; R1 pins a SIDECAR-ONLY
+        // double-delivery).
+        const STRAGGLER_SEQ: u64 = 2;
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
         let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -6499,68 +6638,46 @@ mod tests {
             .collect();
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let pid = path_ids[0];
-        assert!(
-            engine.results.contains_key(&pid),
-            "precondition: a fresh result merged in-cycle"
-        );
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
         let fresh_result = engine.results.get(&pid).unwrap().clone();
 
-        // A straggler whose pools ALL ticked during the solve.
-        let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: stale_stamp,
-                result: fresh_result.clone(),
-                solve_span: tracing::Span::none(),
-            },
-        );
-        assert_eq!(
-            engine
-                .detached_dropped_stale
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "the stale straggler must be dropped"
-        );
-        assert_eq!(
-            engine
-                .detached_applied
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
+        let item = |result: SolvePathResult| {
+            crate::arb_engine::executor::LaneOutcome::Solved(
+                crate::arb_engine::executor::SolveOutcome {
+                    payload: None,
+                    worker_clamp_twins: 0,
+                    cycle_seq: STRAGGLER_SEQ,
+                    solve_block: 100,
+                    metadata: BlockMetadata::default(),
+                    pid,
+                    update_stamp: fresh_stamp.clone(),
+                    result,
+                    solve_span: tracing::Span::none(),
+                },
+            )
+        };
+        engine.merge_detached_item(item(fresh_result.clone()));
+        engine.merge_detached_item(item(fresh_result));
 
-        // The unchanged-intake twin APPLIES (apply-if-unchanged).
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: fresh_stamp,
-                result: fresh_result,
-                solve_span: tracing::Span::none(),
-            },
+        assert_eq!(
+            engine
+                .detached_cycle
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            applied_before + 1,
+            "the duplicate delivery must not apply a second time"
         );
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "the unchanged straggler must be applied"
-        );
-        assert_eq!(
-            engine
-                .detached_dropped_stale
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            "the duplicate delivery must trip the loud exactness fuse once"
         );
     }
 
@@ -6603,8 +6720,8 @@ mod tests {
         assert!(engine.deregister_path(pid), "path must deregister");
         assert!(!engine.results.contains_key(&pid));
 
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+        engine.merge_detached_item(crate::arb_engine::executor::LaneOutcome::Solved(
+            crate::arb_engine::executor::SolveOutcome {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6615,10 +6732,11 @@ mod tests {
                 result: fresh_result,
                 solve_span: tracing::Span::none(),
             },
-        );
+        ));
         assert_eq!(
             engine
-                .detached_dropped_deregistered
+                .detached_cycle
+                .dropped_deregistered
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the deregistered straggler must be dropped"
@@ -6626,21 +6744,25 @@ mod tests {
         assert!(!engine.results.contains_key(&pid));
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            3,
+            "the baseline inline-drain merges, and the dropped straggler adds none"
         );
     }
     /// MQUKB6-T2: the detached-merge sidecar thread has NO ambient span
-    /// context, so every `DetachedMergeItem` carries the enqueue-time
-    /// solve span — the merge-time event (here: the Q1a deregister drop)
-    /// must land on the carried span rather than orphaning into a Jaeger
-    /// root. Uses the deregister drop path (unknown pid): deterministic,
-    /// no registration and no core lock needed. Scoped LOCAL subscriber.
+    /// context, so every `LaneOutcome::Solved` carrier carries the
+    /// enqueue-time solve span — the merge-time event (here: the Q1a
+    /// deregister drop) must land on the carried span rather than
+    /// orphaning into a Jaeger root. Uses the deregister drop path
+    /// (unknown pid): deterministic, no registration and no core lock
+    /// needed. Scoped LOCAL subscriber.
     #[cfg(feature = "otel")]
     #[test]
     fn detached_merge_event_parents_under_the_carried_solve_span() {
-        use crate::arb_engine::solver_dispatch::{detached_merge_sidecar, DetachedMergeItem};
+        use crate::arb_engine::executor::LaneOutcome;
+        use crate::arb_engine::solver_dispatch::detached_merge_sidecar;
         use crate::{arb_engine::ArbitrageEngine, otel};
         use alloy::primitives::U256;
         use apexbot_solvers::mixed::SolvePathResult;
@@ -6653,7 +6775,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-        let (tx, rx) = std::sync::mpsc::channel::<DetachedMergeItem>();
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
 
         // tracing::Span binds to the thread-local subscriber at CREATION, so
         // the whole span lifecycle (create → capture → sidecar merge → drop)
@@ -6662,30 +6784,32 @@ mod tests {
             let solve_span = tracing::info_span!("apexbot.arb.solve", block.number = 42u64);
             {
                 let _guard = solve_span.enter();
-                tx.send(DetachedMergeItem::Solved {
-                    payload: None,
-                    worker_clamp_twins: 0,
-                    cycle_seq: 1,
-                    solve_block: 42,
-                    metadata: BlockMetadata::default(),
-                    pid: 0xDEAD,
-                    update_stamp: Vec::new(),
-                    result: SolvePathResult {
-                        optimal_input: U256::ZERO,
-                        profit: U256::ZERO,
-                        hop_outputs: Vec::new(),
-                        consumed_inputs: Vec::new(),
-                        state_nonces: Vec::new(),
-                        solver_pool_states: Vec::new(),
+                tx.send(LaneOutcome::Solved(
+                    crate::arb_engine::executor::SolveOutcome {
+                        payload: None,
+                        worker_clamp_twins: 0,
+                        cycle_seq: 1,
+                        solve_block: 42,
+                        metadata: BlockMetadata::default(),
+                        pid: 0xDEAD,
+                        update_stamp: Vec::new(),
+                        result: SolvePathResult {
+                            optimal_input: U256::ZERO,
+                            profit: U256::ZERO,
+                            hop_outputs: Vec::new(),
+                            consumed_inputs: Vec::new(),
+                            state_nonces: Vec::new(),
+                            solver_pool_states: Vec::new(),
+                        },
+                        solve_span: tracing::Span::current(),
                     },
-                    solve_span: tracing::Span::current(),
-                })
+                ))
                 .expect("sidecar rx is alive");
             }
             drop(tx);
             // Inline sidecar run (this thread): the merge enters the item's
             // carried span — exactly what the real std-thread would see.
-            detached_merge_sidecar(&engine, rx);
+            detached_merge_sidecar(&engine, rx, None);
             // This outer handle is the LAST reference to the solve span —
             // dropping it closes (exports) the span.
             drop(solve_span);
@@ -6715,6 +6839,46 @@ mod tests {
         );
     }
 
+    /// AQV6EF AC2 (red-first): a panic inside `merge_detached_item` must be
+    /// CAUGHT — it becomes a typed drain-death record that trips the SAME
+    /// sticky cordon as a failed send, and the sidecar must return (not
+    /// vanish silently, stranding every later send with no signal). The
+    /// dropped Receiver then makes every later send a COUNTED loss.
+    #[test]
+    fn a_panicking_merge_becomes_a_typed_record_and_a_sticky_cordon() {
+        use crate::arb_engine::executor::LaneOutcome;
+        use crate::arb_engine::solver_dispatch::detached_merge_sidecar;
+
+        let owner: &'static apexbot_workers::posture::PostureOwner = std::boxed::Box::leak(
+            std::boxed::Box::new(apexbot_workers::posture::PostureOwner::new(
+                apexbot_workers::posture::PosturePolicy::doc_defaults(),
+            )),
+        );
+        let engine = std::sync::Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
+        engine
+            .lock()
+            .set_merge_panic_hook(std::sync::Arc::new(|pid| {
+                assert_ne!(pid, 0x5151_5151, "merge boom");
+            }));
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        tx.send(LaneOutcome::Suppressed { pid: 0x5151_5151 })
+            .expect("rx alive");
+        let tx_after = tx.clone();
+        drop(tx);
+        detached_merge_sidecar(&engine, rx, Some(owner));
+        assert_eq!(
+            owner.current(),
+            apexbot_workers::posture::FleetPosture::Cordoned,
+            "a caught merge panic must trip the sticky drain-death cordon"
+        );
+        assert!(
+            tx_after
+                .send(LaneOutcome::Suppressed { pid: 0x1 })
+                .is_err(),
+            "the panicked sidecar has exited: later sends hit the dead pipe (the send-failure signal)"
+        );
+    }
+
     /// T2 (epic SRQEK5 4QKZE3) cadence acceptance, SZJUKL-port: with detached
     /// cycles ON through the PRODUCTION stage surface (`EngineStages` — the
     /// shipped `solve_dirty` cadence the driver executes INLINE at the machine's
@@ -6727,12 +6891,11 @@ mod tests {
     /// (enqueue-end, not apply-end), and the stragglers must still land.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_stragglers_do_not_block_inline_stage_work() {
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
+        let (engine, pool_ids, path_ids) = detached_fixture(400);
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         for &p in &pool_ids {
-            delta.record_affected(HopType::V2, p);
+            delta.record_affected(HopType::V2, p, 0u64);
         }
         let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
         stages.set_delta(delta);
@@ -6774,11 +6937,1104 @@ mod tests {
         assert!(path_ids.iter().all(|p| guard.results.contains_key(p)));
     }
 
+    // =================================================================
+    // 43E3H3 red-first breaker suite (design logs/lane-unify-design.md §5).
+    // Status at HEAD (commit 1): each test below is RED against current
+    // code — they pin the POST-merge contracts (one carrier, one ledger,
+    // the detached arm's lane witness). They GREEN in commit 2.
+    // =================================================================
+
+    /// N2 (same-seq replay, WFF6MM single-arm): a merged result and a later
+    /// carrier naming the SAME (`cycle_seq`, pid) must collide on the ONE
+    /// ledger — the fuse refuses the second arrival instead of merging
+    /// twice.
+    // 43E3H3 red-first: pins the (solve_seq, pid) key half the merged
+    // ledger owns (design §3.3).
+    #[test]
+    fn merged_ledger_rejects_same_seq_pid_replay() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        // In-cycle solve of the same block: all 3 paths land in `results`.
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let pid = path_ids[0];
+        assert!(
+            engine.results.contains_key(&pid),
+            "baseline: the in-cycle arm must merge pid {pid} first"
+        );
+        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
+        let fresh_result = engine.results.get(&pid).unwrap().clone();
+        let results_before = engine.results.len();
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // The replay claims the cycle_seq the merged cycle consumed: under
+        // the one ledger this is the SAME (solve_seq, pid) key and the fuse
+        // must refuse it.
+        let item = crate::arb_engine::executor::LaneOutcome::Solved(
+            crate::arb_engine::executor::SolveOutcome {
+                payload: None,
+                worker_clamp_twins: 0,
+                cycle_seq: engine.detached_cycle.issued_seq(), // the merged cycle's seq
+                solve_block: 100,
+                metadata: BlockMetadata::default(),
+                pid,
+                update_stamp: fresh_stamp,
+                result: fresh_result,
+                solve_span: tracing::Span::none(),
+            },
+        );
+        engine.merge_detached_item(item);
+
+        assert_eq!(
+            engine
+                .detached_cycle
+                .duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "merged ledger: the same-seq replay must trip the fuse exactly once"
+        );
+        assert_eq!(
+            engine.results.len(),
+            results_before,
+            "merged ledger: the refused duplicate must not add a results entry"
+        );
+        assert_eq!(
+            engine
+                .detached_cycle
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            applied_before,
+            "merged ledger: the refused duplicate must not count as applied"
+        );
+    }
+
+    /// N3 (prune correctness): the merged ledger prunes keyed rows only
+    /// past `LEDGER_AGE`, driven by the DETACHED arm's cycle issuance —
+    /// and an in-cycle-only advance must NOT prune (the anchor is
+    /// detached-issued-seq). Red at HEAD: the in-cycle side has no
+    /// ledger/rows at all; the detach-keyed prune ages on any current
+    /// seq the claim sees.
+    // 43E3H3 red-first: pins LEDGER_AGE=64 exactly and the anchor choice
+    // (design §3.3 + §3.3.1 REV 2).
+    #[test]
+    fn merged_ledger_prunes_only_past_ledger_age() {
+        use std::sync::atomic::Ordering;
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let results_before = engine.results.len();
+
+        // Seed directly into the sidecar ledger (pub(crate) state) with
+        // pids not otherwise involved, at seq boundaries chosen to straddle
+        // the LEDGER_AGE edge driven through the DETACHED key space.
+        let mut seed = |seq: u64, pid: u64| {
+            let fresh_stamp = engine.resolved_update_snapshot[&path_ids[0]].clone();
+            let result = engine.results.get(&path_ids[0]).unwrap().clone();
+            let item = crate::arb_engine::executor::LaneOutcome::Solved(
+                crate::arb_engine::executor::SolveOutcome {
+                    payload: None,
+                    worker_clamp_twins: 0,
+                    cycle_seq: seq,
+                    solve_block: 100,
+                    metadata: BlockMetadata::default(),
+                    pid,
+                    update_stamp: fresh_stamp,
+                    result,
+                    solve_span: tracing::Span::none(),
+                },
+            );
+            engine.merge_detached_item(item);
+        };
+
+        // Drive the anchor forward by ONE detached merge at a high seq; the
+        // seeds at (current-65) and (current-63) straddle the age edge.
+        let current = 100u64;
+        seed(current - 65, 1111); // beyond LEDGER_AGE: must be PRUNED
+        seed(current - 63, 2222); // within LEDGER_AGE: must be RETAINED
+        seed(current, 3333); // the advancing merge itself
+
+        // 43E3H3: the seq-100 merge's PRUNE swept BOTH seeds' rows as a
+        // side effect (the engine-side ledger now prunes on every claim,
+        // not just the sidecar's). Restore the retained-row marker its
+        // (36, 2222) key placed there — the prune must prove (36, 2222)
+        // SURVIVES a later claim, not that it survived the sweep that
+        // built the (100, 3333) row.
+        engine
+            .detached_cycle
+            .outcome_ledger
+            .lock()
+            .claim((current - 63, 2222))
+            .ok();
+
+        let ledger_rows = engine.detached_cycle.outcome_ledger.lock();
+        assert!(
+            !ledger_rows.contains((current - 65, 1111)),
+            "LEDGER_AGE=64: row (seq-65) must be pruned after the seq-{current} claim"
+        );
+        assert!(
+            ledger_rows.contains((current - 63, 2222)),
+            "LEDGER_AGE=64: row (seq-63) must be retained after the seq-{current} claim"
+        );
+        drop(ledger_rows);
+
+        // NEGATIVE half (design §3.3.1 REV 2): in-cycle-only advances of
+        // the shared counter must NOT prune detached-keyed rows. Run two
+        // in-cycle solves (the shared counter ticks), then re-assert the
+        // retained row survived them.
+        engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
+        engine.solve_dirty(102, &BlockMetadata::default(), &affected_keys_v2);
+        let ledger_rows_still = engine.detached_cycle.outcome_ledger.lock();
+        assert!(
+            ledger_rows_still.contains((current - 63, 2222)),
+            "in-cycle-only advances must not prune detached-keyed rows (anchor = detached_issued_seq)"
+        );
+        let _ = results_before;
+        let _ = Ordering::Relaxed;
+    }
+
+    /// N4 (detached undercount): a detached bin that panics mid-walk must
+    /// deliver a typed disposition for EVERY owed pid — no silent
+    /// undercount. Red at HEAD: the detached arm has NO lane witness
+    /// (sD:2350 submits a raw bin body), so a panicked bin simply never
+    /// delivers its undelivered pids.
+    // 43E3H3 red-first: pins the detached arm's witness adoption
+    // (design §5.2). GREEN requires Failed records on the detached pipe.
+    #[test]
+    fn detached_undercount_trips_the_fan_in_assert() {
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+            eprintln!("skipping: detached panic test requires >=2 cores");
+            return;
+        }
+        // Drive a detached cycle with a panicking pid; then REQUIRE that
+        // every submitted pid got exactly one disposition (Solved,
+        // Suppressed, or Failed) — observed through the applied+dropped
+        // counters, which today stay short (the undelivered pids never
+        // arrive at all: SILENT UNDERCOUNT).
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let kill = path_ids[1];
+        engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
+            if pid != kill {
+                return;
+            }
+            panic!("path killed mid-bin (43E3H3 red harness)");
+        }));
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        // Drive through the production stage seam so the sidecar spawns.
+        let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
+        let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
+        for &p in &pool_ids {
+            delta.record_affected(HopType::V2, p, 0u64);
+        }
+        let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
+        stages.set_delta(delta);
+        stages.solve_dirty(&affected_keys_v2, 100, &BlockMetadata::default());
+
+        // Wait for the dispositions to land (the sidecar merges async).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let guard = engine.lock();
+            let applied = guard
+                .detached_cycle
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let stale = guard
+                .detached_cycle
+                .dropped_stale
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dereg = guard
+                .detached_cycle
+                .dropped_deregistered
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dup = guard
+                .detached_cycle
+                .duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            drop(guard);
+            let disposed = applied + stale + dereg + dup;
+            if disposed >= path_ids.len() as u64 || std::time::Instant::now() > deadline {
+                // 43E3H3: THE assert — every submitted path must be
+                // dispositioned EXACTLY once. At HEAD the panicked bin's
+                // undelivered pids NEVER arrive, so disposed < submitted.
+                assert_eq!(
+                    disposed, path_ids.len() as u64,
+                    "[detached] outcome accounting undercount — exactness fuse \\\n                     (QR3NUS/43E3H3): a panicked bin must still disposition \\\n                     every owed pid as a typed Failed record"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// N5 (gauge pairing through a panic): the in-flight gauge must return
+    /// to its EXACT pre-cycle value after a panicking detached cycle AND
+    /// keep the cap gate engaging on true load. Red at HEAD: the panicked
+    /// bin's flushed Solved items bump at send but the panic kills the
+    /// remaining path solves, nothing decrements the orphaned bumps
+    // 43E3H3 red-first: pins constraint (b) THROUGH the panic path AND
+    // the variant-gated bump/decrement pairing (design §4.6.1 REV 2).
+    #[test]
+    fn detached_panic_does_not_leak_inflight_gauge() {
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+            eprintln!("skipping: detached panic test requires >=2 cores");
+            return;
+        }
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let kill = path_ids[2];
+        engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
+            if pid != kill {
+                return;
+            }
+            panic!("path killed mid-bin (43E3H3 red harness)");
+        }));
+        let g0 = engine
+            .detached_cycle
+            .outstanding
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
+        let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
+        for &p in &pool_ids {
+            delta.record_affected(HopType::V2, p, 0u64);
+        }
+        let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
+        stages.set_delta(delta);
+        stages.solve_dirty(&affected_keys_v2, 100, &BlockMetadata::default());
+
+        // After all dispositions land, the gauge must be back at g0 EXACTLY
+        // (a leaked count OR a sagged count both move it off g0 — only the
+        // exact value pins BOTH directions of a broken pairing).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let guard = engine.lock();
+            let applied = guard
+                .detached_cycle
+                .applied
+                .load(std::sync::atomic::Ordering::Relaxed)
+                + guard
+                    .detached_cycle
+                    .dropped_stale
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                + guard
+                    .detached_cycle
+                    .dropped_deregistered
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                + guard
+                    .detached_cycle
+                    .duplicate_outcomes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            let gauge = guard
+                .detached_cycle
+                .outstanding
+                .load(std::sync::atomic::Ordering::Relaxed);
+            drop(guard);
+            if applied >= path_ids.len() as u64 || std::time::Instant::now() > deadline {
+                assert_eq!(
+                    gauge, g0,
+                    "[detached] in-flight gauge must return to its EXACT pre-cycle \\\n                     value g0={g0} through a panicking cycle (variant-gated pairing, \\\n                     design §4.6.1 REV 2) — got {gauge}"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// WFF6MM cutover: the in-flight cap gate is RETIRED — a cycle whose
+    /// un-dispositioned count sits AT the old cap STILL detaches (the
+    /// admission draw, not the cap, owns backpressure now; there is no
+    /// in-cycle fallback left to degrade to).
+    #[test]
+    fn retired_inflight_cap_no_longer_degrades() {
+        let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
+        // Seed the gauge AT the old cap: it must be ignored.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed); // == DETACHED_INFLIGHT_CAP
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "detached",
+            "the retired cap must no longer degrade a cycle to an in-cycle arm"
+        );
+    }
+
+    /// Cold-start trace (degraded-state measurement): the dispatch LATCHES the
+    /// cycle's arm on the engine (the `solve_entry` precedent) — a span field
+    /// alone is unreadable to the caller, and the caller (`EngineStages`) is
+    /// the only place the cycle's duration and Mutex hold are measurable,
+    /// i.e. AFTER `solve_dirty` returns. `unset` is the never-dispatched
+    /// sentinel: deliberately visible rather than folded into
+    /// `skipped_empty`.
+    #[test]
+    fn cycle_arm_label_latches_for_every_dispatch_arm() {
+        let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
+        assert_eq!(
+            engine.cycle_arm(),
+            "unset",
+            "no cycle has been dispatched yet"
+        );
+        // Sub-cap under the detached stance: the detached arm.
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "detached",
+            "a sub-cap cycle under the detached stance must latch the detached arm"
+        );
+        // At the (retired) in-flight cap: STILL detached (WFF6MM — the
+        // cap gate is gone; every dispatched cycle takes the one arm).
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed); // == DETACHED_INFLIGHT_CAP
+        engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "detached",
+            "the retired cap gate must not divert a cycle off the one dispatch arm"
+        );
+        // A dirty key with NO registered paths: the bookkeeping-only pass.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let orphan = engine.register_v2_pool(
+            Address::from([0x77_u8; 20]),
+            usdc(1_000_000),
+            weth(500),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        engine.solve_dirty(
+            102,
+            &BlockMetadata::default(),
+            &[apexbot_solvers::affected_keys::AffectedKey::new(
+                HopType::V2,
+                orphan,
+            )],
+        );
+        assert_eq!(
+            engine.cycle_arm(),
+            "skipped_empty",
+            "a dirty key with no registered paths must latch the bookkeeping-only arm"
+        );
+    }
+
+    #[test]
+    fn detached_solve_returns_at_enqueue_end_when_sync_drain_is_off() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
+        // WFF6MM: direct-call engines merge inline (synchronous harness); turn
+        // that OFF so this pins the PRODUCTION return semantics — enqueue end,
+        // results ABSENT until the sidecar (or a later drain) lands them.
+        engine.set_sync_merge_for_test(false);
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(engine.cycle_arm(), "detached");
+        // With a 400ms slow path the results land AFTER return (T2's read) —
+        // at least the slow pid is absent.
+        assert!(
+            !engine.results.contains_key(&path_ids[0]),
+            "the detached arm must return at enqueue end: the slow pid is absent AT return"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // QTZGFL: capacity-modulated admission draw (experiment; flag OFF by
+    // default so the current degrade stays byte-identical).
+    // -------------------------------------------------------------------
+
+    /// Budget arithmetic: `budget = max(0, target − outstanding)` in KEYS,
+    /// `None` while the stance is OFF, and the target is clamped to the
+    /// design-locked safety valve. `Some(0)` is the shed predicate.
+    #[test]
+    fn admission_budget_arithmetic_and_target_clamp() {
+        let (mut engine, _pool_ids, _path_ids) = detached_fixture(0);
+        // Stance OFF: no budget — the caller take-alls (byte-identical).
+        assert_eq!(
+            engine.admission_budget_keys(),
+            None,
+            "flag OFF must yield no budget (the take_keys path)"
+        );
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(3);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(3),
+            "empty pipe: full headroom"
+        );
+        engine
+            .detached_cycle
+            .outstanding
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(2),
+            "one straggler: target − 1"
+        );
+        engine
+            .detached_cycle
+            .outstanding
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(0),
+            "at target: zero budget = the SHED verdict"
+        );
+        engine
+            .detached_cycle
+            .outstanding
+            .store(99, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(0),
+            "an overshoot saturates at zero (no unsigned wrap)"
+        );
+        // The target is clamped to the design-locked safety valve.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        engine.set_admission_target_depth(usize::MAX);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(
+                usize::try_from(crate::arb_engine::detached_cycle::DETACHED_INFLIGHT_CAP)
+                    .expect("cap fits usize")
+            ),
+            "an over-cap target clamps to DETACHED_INFLIGHT_CAP"
+        );
+        engine.set_admission_target_depth(0);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(1),
+            "a zero target clamps up to 1 (a target of 0 would never submit)"
+        );
+    }
+
+    /// Full-path shed: the gauge preloaded AT the target makes the DRAW
+    /// (the single consumption decision, `on_resolve`) return a zero budget,
+    /// so the cycle submits NOTHING, advances the solved-block cursor exactly
+    /// like the `skipped_empty` bookkeeping pass, latches
+    /// `cycle.arm="shed"`, and counts the shed. Driven through the staged
+    /// path (Resolved -> Solved), because the dispatch no longer re-reads the
+    /// gauge — it consumes the draw-time verdict stashed by `on_resolve`.
+    #[test]
+    fn admission_zero_budget_sheds_the_whole_cycle() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for &p in &pool_ids {
+            delta.record(
+                apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p),
+                10,
+            );
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        let ctx = BlockContext::new(Epoch::at(100), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            drawn.0.is_empty(),
+            "a zero-budget draw consumes nothing; the keys are RETAINED"
+        );
+        let sheds_before = engine
+            .lock()
+            .detached_cycle
+            .shed_cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        let guard = engine.lock();
+        assert_eq!(
+            guard.cycle_arm(),
+            "shed",
+            "a zero-budget cycle must latch the shed arm"
+        );
+        assert!(
+            path_ids.iter().all(|p| !guard.results.contains_key(p)),
+            "a shed cycle SUBMITS NOTHING: no path may be solved or merged"
+        );
+        assert_eq!(
+            guard
+                .detached_cycle
+                .shed_cycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            sheds_before + 1,
+            "the shed counter must fire exactly once"
+        );
+        assert_eq!(
+            guard.results_block(),
+            100,
+            "a shed cycle advances the solved-block cursor like skipped_empty"
+        );
+    }
+
+    /// F2: a draw-zero shed responds BEFORE the `pending_new_paths` merge, so
+    /// it never consumes the eager-registration protection — the eagerly
+    /// solved path is still merged on the NEXT normal cycle (a post-merge
+    /// shed would clear the pipe and let the next cycle's results replacement
+    /// drop the eager result).
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn admission_draw_zero_shed_preserves_pending_new_paths() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let mut engine = ArbitrageEngine::new();
+        let a = engine.register_v2_pool(
+            Address::from([0x11u8; 20]),
+            usdc(1_500_000),
+            weth(800),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let b = engine.register_v2_pool(
+            Address::from([0x12u8; 20]),
+            weth(1000),
+            usdc(2_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let pid = engine
+            .register_and_solve_path(vec![
+                PoolHop {
+                    pool_id: a,
+                    zero_for_one: true,
+                },
+                PoolHop {
+                    pool_id: b,
+                    zero_for_one: true,
+                },
+            ])
+            .expect("eager path registration succeeds");
+        assert!(
+            engine.pending_new_paths.contains(&pid),
+            "the eager path starts in the merge pipe"
+        );
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        delta.record(
+            apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, a),
+            10,
+        );
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        // Cycle 1 (draw-zero): the shed responds before the merge.
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(drawn.0.is_empty(), "zero budget draws nothing");
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        {
+            let guard = engine.lock();
+            assert_eq!(guard.cycle_arm(), "shed");
+            assert!(
+                guard.pending_new_paths.contains(&pid),
+                "a draw-zero shed must NOT consume the eager merge protection"
+            );
+            assert!(
+                guard.results.contains_key(&pid),
+                "the eagerly-solved result survives the shed"
+            );
+        }
+        // Cycle 2 (headroom back): the eager path merges and the pipe clears.
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let ctx = BlockContext::new(Epoch::at(11), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        // WFF6MM: the cycle enqueues and returns; wait for the sidecar merge.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let merged = {
+                let guard = engine.lock();
+                guard.pending_new_paths.is_empty() && guard.results.contains_key(&pid)
+            };
+            if merged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the next normal cycle must merge + clear the eager-registration pipe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let guard = engine.lock();
+        assert!(
+            guard.pending_new_paths.is_empty(),
+            "the next normal cycle merges + clears the eager-registration pipe"
+        );
+        assert!(
+            guard.results.contains_key(&pid),
+            "the eager result survives the merge cycle"
+        );
+    }
+
+    /// RACE REGRESSION (F1/F3, red-first): the admission budget is decided
+    /// ONCE, at the DRAW. A cycle that drew a POSITIVE budget owns those keys
+    /// (they are already removed from the ledger); an earlier cycle's bin
+    /// thread bumping in-flight to/over the target between the draw and the
+    /// dispatch must NOT turn that cycle into a shed — the drawn keys would
+    /// be discarded (never submitted, never re-recorded). WFF6MM: the drawn
+    /// keys submit down the one (detached) arm regardless of the gauge.
+    ///
+    /// The test drives both stages explicitly, so it can interleave the
+    /// in-flight bump exactly in the race window (between `on_resolve` and
+    /// `on_solve`) — the shape the stage machine's Resolved -> Solved
+    /// sequencing makes deterministic here. RED on the pre-remediation code
+    /// (the dispatch re-read the gauge fresh and shed, discarding the drawn
+    /// keys); GREEN after the draw-time verdict travels with the cycle.
+    #[test]
+    fn admission_race_positive_draw_never_sheds() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        // An eager-registration path in the merge pipe: a post-merge race
+        // shed would be the F2 data-loss class.
+        engine.pending_new_paths.insert(path_ids[1]);
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for &p in &pool_ids {
+            delta.record(
+                apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p),
+                10,
+            );
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        // DRAW with an EMPTY pipe: budget = 8 -> positive; every key drawn.
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            !drawn.0.is_empty(),
+            "an empty pipe must draw a positive budget"
+        );
+        assert!(
+            delta.is_empty(),
+            "the draw consumed the ledger keys (a shed would lose them)"
+        );
+        // RACE: the bin thread bumps in-flight to the cap between the draw
+        // and the dispatch.
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let sheds_before = engine
+            .lock()
+            .detached_cycle
+            .shed_cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        // WFF6MM: the dispatch enqueues and returns; the sidecar merges. Wait
+        // for the merge before reading the results/pending pipe.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let merged = {
+                let guard = engine.lock();
+                path_ids.iter().all(|p| guard.results.contains_key(p))
+                    && guard.pending_new_paths.is_empty()
+            };
+            if merged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sidecar must merge the drawn keys after the detached enqueue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let guard = engine.lock();
+        assert_eq!(
+            guard.cycle_arm(),
+            "detached",
+            "a positive-budget draw always detaches — there is no in-cycle response left"
+        );
+        assert_eq!(
+            guard
+                .detached_cycle
+                .shed_cycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            sheds_before,
+            "a cycle that drew a POSITIVE budget must NEVER shed at the dispatch"
+        );
+        assert!(
+            path_ids.iter().all(|p| guard.results.contains_key(p)),
+            "the drawn keys must be SUBMITTED, never discarded"
+        );
+        assert!(
+            guard.pending_new_paths.is_empty(),
+            "the race cycle must still merge + clear the eager-registration pipe (F2)"
+        );
+    }
+
+    /// Carry: a shed cycle RETAINS its keys in the ledger; a later cycle with
+    /// headroom draws them again (a fresh solve against current state, not a
+    /// replay). This is the acceptance the whole design turns on.
+    #[test]
+    fn admission_carries_retained_keys_to_a_later_cycle() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let engine = ArbitrageEngine::new();
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        engine.lock().set_solve_admission(true);
+        engine.lock().set_admission_target_depth(2);
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+
+        let keys: Vec<_> = (1..=3u64)
+            .map(|id| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, id))
+            .collect();
+        for key in &keys {
+            delta.record(*key, 10);
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        // Gauge AT the target: zero budget ⇒ shed — nothing drawn, all retained.
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            drawn.0.is_empty(),
+            "zero-budget draw takes nothing; the keys are RETAINED"
+        );
+        assert_eq!(
+            delta.snapshot_keys(),
+            keys,
+            "carry: the ledger keeps every key"
+        );
+        // Depth falls: the NEXT cycle draws the carried keys (budget = 2).
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let ctx = BlockContext::new(Epoch::at(11), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(
+            drawn.0,
+            vec![keys[0], keys[1]],
+            "the carried keys are drawn freshest-first in insertion order"
+        );
+        assert_eq!(
+            delta.snapshot_keys(),
+            vec![keys[2]],
+            "the overflow stays retained for the next cycle"
+        );
+        // And the final carry drains on the next empty pipe.
+        let ctx = BlockContext::new(Epoch::at(12), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(drawn.0, vec![keys[2]], "the last carried key drains");
+        assert!(delta.is_empty());
+    }
+
+    /// Retention: on a block advance the ledger prunes carried keys older than
+    /// `head − W` and counts the expiry, so a lead that stays starved
+    /// eventually expires VISIBLY instead of pinning the ledger forever.
+    #[test]
+    fn admission_retention_window_expires_carried_leads() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let engine = ArbitrageEngine::new();
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        engine.lock().set_solve_admission(true);
+        engine.lock().set_admission_target_depth(4);
+        engine.lock().set_admission_retention_blocks(5);
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+
+        let stale = apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, 1);
+        let fresh = apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, 2);
+        delta.record(stale, 10);
+        delta.record(fresh, 100);
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        // head 100, W 5 ⇒ cutoff 95: the block-10 lead expires; the block-100
+        // lead is drawn.
+        let ctx = BlockContext::new(Epoch::at(100), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(drawn.0, vec![fresh], "only the in-window lead is drawn");
+        assert_eq!(
+            engine
+                .lock()
+                .detached_cycle
+                .leads_expired
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the retention prune must count exactly one expired lead"
+        );
+        assert!(delta.is_empty());
+    }
+
+    /// Flag OFF: `on_resolve` take-alls (even with the gauge saturated) and
+    /// the engine DETACHES every cycle — never a shed, and (WFF6MM) never any
+    /// in-cycle degrade either.
+    #[test]
+    fn admission_off_keeps_take_all_and_never_sheds() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
+        // Stance left OFF; the gauge at the cap must NOT shed.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "detached",
+            "flag OFF: the cycle still takes the one dispatch arm (WFF6MM)"
+        );
+        assert_eq!(
+            engine
+                .detached_cycle
+                .shed_cycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "flag OFF must never shed"
+        );
+        // And the draw path take-alls regardless of the gauge.
+        let engine_arc = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine_arc));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for id in 1..=5u64 {
+            delta.record(
+                apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, id),
+                10,
+            );
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(
+            drawn.0.len(),
+            5,
+            "flag OFF: take_keys consumes the whole ledger"
+        );
+        assert!(delta.is_empty());
+    }
+
+    /// N1 (in-cycle duplicate policy, tightened): a duplicate
+    /// (`solve_seq`, pid) arrival at the in-cycle drain must be REFUSED —
+    /// counted and logged, never merged twice. Red at HEAD against the
+    /// NEW policy (today the in-cycle drain logs-and-merges anyway —
+    /// sD:2550 — because its local set is dropped with the cycle).
+    // 43E3H3 red-first: pins the tightened refuse-the-merge policy
+    // (design §4.4 REV 2 decision, Risk 5 option 1).
+    #[test]
+    fn duplicate_lane_outcome_does_not_double_apply() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<apexbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let pid = path_ids[0];
+        let results_before = engine.results.len();
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // WFF6MM: the machine issues the seq (no in-cycle counter) — read
+        // back the tick the cycle actually claimed so the replay collides.
+        let cycle_seq = engine.detached_cycle.issued_seq();
+
+        // A second Solved arrival for the SAME (seq, pid) through the merge
+        // disposition must be refused: no second results write, no applied
+        // count for the duplicate.
+        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
+        let fresh_result = engine.results.get(&pid).unwrap().clone();
+        let item = crate::arb_engine::executor::LaneOutcome::Solved(
+            crate::arb_engine::executor::SolveOutcome {
+                payload: None,
+                worker_clamp_twins: 0,
+                cycle_seq,
+                solve_block: 100,
+                metadata: BlockMetadata::default(),
+                pid,
+                update_stamp: fresh_stamp,
+                result: fresh_result,
+                solve_span: tracing::Span::none(),
+            },
+        );
+        engine.merge_detached_item(item);
+
+        assert_eq!(
+            engine
+                .detached_cycle
+                .duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "in-cycle dup policy (tightened): the fuse must trip exactly once"
+        );
+        assert_eq!(
+            engine.results.len(),
+            results_before,
+            "in-cycle dup policy (tightened): the refused duplicate must not re-merge"
+        );
+        let _ = applied_before;
+    }
+
     #[test]
     #[expect(clippy::too_many_lines)] // A/B harness: two full engines, worth the length
     fn resolve_chunk_parity_parallel_matches_serial_and_reuses_cache_walks() {
-        use std::sync::atomic::Ordering;
-
         const N: usize = 600; // >= RESOLVE_PAR_MIN (512) so the parallel arm engages
 
         let build = || {
@@ -6837,8 +8093,9 @@ mod tests {
 
         let run = |parallel: bool| {
             let (mut engine, path_ids, hub_a, hub_b) = build();
-            crate::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
-                .store(parallel, Ordering::Relaxed);
+            // YI5NGB: the A/B arm drives the INSTANCE stance now (no
+            // process-global flip; no parallel-order dependence).
+            engine.set_resolve_parallel_for_test(parallel);
 
             // Cycle 1: dirty BOTH hubs -> all N paths re-resolve in one cycle.
             engine.process_updates(
@@ -6892,8 +8149,7 @@ mod tests {
         let (serial_results, serial_same_state, serial_proj_delta, path_ids) = run(false);
         let (par_results, par_same_state, par_proj_delta, _path_ids) = run(true);
 
-        // Restore the production stance after the A/B.
-        crate::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE.store(true, Ordering::Relaxed);
+        // YI5NGB: the instance-stance cutover -> nothing process-global remains to restore.
 
         assert_eq!(path_ids.len(), N);
         for (path_id, _unique, _a, _b) in &path_ids {
@@ -6924,6 +8180,368 @@ mod tests {
         assert_eq!(
             serial_proj_delta, 1,
             "cycle-2 must walk only the dirty pool, got {serial_proj_delta}"
+        );
+    }
+    // KJWIK5: the deferred-path carry — the ledger re-record at the deferral
+    // site. The future-price tripwire is unreachable after the solve-anchor
+    // head floor (only a mid-solve state advance can trip it), so these tests
+    // install the `test_force_deferred` seam to exercise the carry
+    // deterministically. The re-record hook itself is the production seam
+    // `EngineStages::set_delta` installs (`set_deferred_re_record`); with
+    // the hook unset (direct engine drives) the deferral keeps today's drop.
+    // -------------------------------------------------------------------
+
+    fn kjwik5_key(pool_id: u64) -> apexbot_solvers::affected_keys::AffectedKey {
+        apexbot_solvers::affected_keys::AffectedKey::new(HopType::V2, pool_id)
+    }
+
+    fn kjwik5_affected_keys(pool_ids: &[u64]) -> Vec<apexbot_solvers::affected_keys::AffectedKey> {
+        pool_ids.iter().copied().map(kjwik5_key).collect()
+    }
+
+    fn kjwik5_path_keys(
+        engine: &ArbitrageEngine,
+        path_id: u64,
+    ) -> Vec<apexbot_solvers::affected_keys::AffectedKey> {
+        engine
+            .path_pools()
+            .get(&path_id)
+            .expect("registered path")
+            .pools
+            .iter()
+            .map(|r| apexbot_solvers::affected_keys::AffectedKey::new(r.hop_type, r.pool_key))
+            .collect()
+    }
+
+    /// Guard 1: capture the `[solve-phase]` events' `paths.deferred_future_price`
+    /// field. Both reporting sites (the resolve funnel and the detached
+    /// enqueue) carry the same value; the test asserts every captured value.
+    type Kjwik5EventFields = std::sync::Arc<parking_lot::Mutex<Vec<Vec<(String, String)>>>>;
+
+    type Kjwik5ReRecords = std::sync::Arc<
+        parking_lot::Mutex<Vec<(Vec<apexbot_solvers::affected_keys::AffectedKey>, u64)>>,
+    >;
+
+    fn kjwik5_capture_deferred_counter(run: impl FnOnce()) -> Vec<u64> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct EventCapture(Kjwik5EventFields);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Saver(Vec<(String, String)>);
+                impl tracing::field::Visit for Saver {
+                    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                        self.0.push((f.name().to_string(), v.to_string()));
+                    }
+                    fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                        self.0.push((f.name().to_string(), v.to_string()));
+                    }
+                    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                        self.0.push((f.name().to_string(), format!("{v:?}")));
+                    }
+                }
+                let mut saver = Saver(Vec::new());
+                event.record(&mut saver);
+                self.0.lock().push(saver.0);
+            }
+        }
+
+        let capture = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(EventCapture(std::sync::Arc::clone(&capture)));
+        tracing::subscriber::with_default(subscriber, run);
+        let events = capture.lock().clone();
+        events
+            .into_iter()
+            .filter_map(|fields| {
+                fields
+                    .iter()
+                    .find(|(name, _)| name == "paths.deferred_future_price")
+                    .and_then(|(_, value)| {
+                        value
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>()
+                            .parse::<u64>()
+                            .ok()
+                    })
+            })
+            .collect()
+    }
+
+    /// Red-first (a): a deferred path re-records ALL its hop pools through the
+    /// engine's installed hook, with the cycle's solve block — the ledger
+    /// carry that lets the next draw re-include the path through the same
+    /// freshness ordering.
+    #[test]
+    fn deferred_path_re_records_all_hop_pools_via_the_hook() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let deferred = path_ids[0];
+        let expected = kjwik5_path_keys(&engine, deferred);
+        assert_eq!(expected.len(), 2, "fixture path has two hops");
+        engine.set_force_deferred_for_test(HashSet::from([deferred]));
+        let seen: Kjwik5ReRecords = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen_hook = std::sync::Arc::clone(&seen);
+        engine.set_deferred_re_record(std::sync::Arc::new(move |keys, block| {
+            seen_hook.lock().push((keys.to_vec(), block));
+        }));
+
+        engine.solve_dirty(
+            100,
+            &BlockMetadata::default(),
+            &kjwik5_affected_keys(&pool_ids),
+        );
+
+        let calls = seen.lock().clone();
+        assert_eq!(calls.len(), 1, "one re-record call per deferred cycle");
+        assert_eq!(
+            calls[0].1, 100,
+            "the re-record targets the cycle's solve block"
+        );
+        assert_eq!(
+            calls[0].0.as_slice(),
+            expected.as_slice(),
+            "EVERY hop pool of the deferred path, in path order"
+        );
+        assert!(
+            !engine.results.contains_key(&deferred),
+            "the deferred path is not submitted this cycle (no double-submit)"
+        );
+        for &sibling in &path_ids[1..] {
+            assert!(
+                engine.results.contains_key(&sibling),
+                "non-deferred siblings still solve"
+            );
+        }
+    }
+
+    /// Red-first (d): with the hook unset (direct engine drive, no driver),
+    /// the deferral keeps today's dropped behavior and counts unchanged.
+    #[test]
+    fn deferred_path_without_hook_keeps_today_drop_behavior() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let deferred = path_ids[1];
+        engine.set_force_deferred_for_test(HashSet::from([deferred]));
+        engine.solve_dirty(
+            100,
+            &BlockMetadata::default(),
+            &kjwik5_affected_keys(&pool_ids),
+        );
+        assert!(
+            !engine.results.contains_key(&deferred),
+            "with the hook unset the deferred path keeps today's dropped behavior"
+        );
+        assert!(engine.results.contains_key(&path_ids[0]));
+        assert!(engine.results.contains_key(&path_ids[2]));
+    }
+
+    /// Red-first (c): `paths.deferred_future_price` semantics are unchanged —
+    /// same site, same triggers, same counts (0 with no future hop, N with N).
+    #[test]
+    fn future_price_counter_semantics_are_unchanged() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected = kjwik5_affected_keys(&pool_ids);
+        let baseline = kjwik5_capture_deferred_counter(|| {
+            engine.solve_dirty(100, &BlockMetadata::default(), &affected);
+        });
+        assert!(
+            !baseline.is_empty(),
+            "the counter is reported at its [solve-phase] sites"
+        );
+        assert!(
+            baseline.iter().all(|&count| count == 0),
+            "no future-priced hop → the counter reads 0; got {baseline:?}"
+        );
+        engine.set_force_deferred_for_test(HashSet::from([path_ids[0], path_ids[2]]));
+        let forced = kjwik5_capture_deferred_counter(|| {
+            engine.solve_dirty(101, &BlockMetadata::default(), &affected);
+        });
+        assert!(
+            forced.iter().all(|&count| count == 2),
+            "two deferred paths count at the same site; got {forced:?}"
+        );
+    }
+
+    /// Red-first (b): the staged carry. Cycle 1 defers the future-priced path
+    /// and re-records its pools into the ledger; cycle 2 (the anchor caught
+    /// up) draws it back and solves it against the retry cycle's block.
+    #[test]
+    fn staged_deferred_path_carries_via_the_ledger_and_solves_on_the_retry() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let deferred = path_ids[0];
+        let deferred_keys = kjwik5_path_keys(&engine, deferred);
+        engine.set_force_deferred_for_test(HashSet::from([deferred]));
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for &p in &pool_ids {
+            delta.record(kjwik5_key(p), 10);
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+
+        // Cycle 1: draw, defer, re-record into the ledger at block 100.
+        let ctx = BlockContext::new(Epoch::at(100), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(
+            drawn.0.len(),
+            pool_ids.len(),
+            "cycle 1 draws every seed key"
+        );
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        assert!(
+            !engine.lock().results.contains_key(&deferred),
+            "cycle 1 defers the path (it is never submitted)"
+        );
+        let pending = delta.snapshot_keys();
+        for key in &deferred_keys {
+            assert!(
+                pending.contains(key),
+                "the deferred path's key {key:?} is re-recorded for the next draw"
+            );
+        }
+
+        // The anchor catches up: the path is no longer future-priced. Cycle 2
+        // draws it back from the ledger.
+        engine.lock().set_force_deferred_for_test(HashSet::new());
+        let ctx = BlockContext::new(Epoch::at(101), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        let drawn_keys: HashSet<_> = drawn.0.iter().copied().collect();
+        for key in &deferred_keys {
+            assert!(
+                drawn_keys.contains(key),
+                "the retry draw re-includes {key:?}"
+            );
+        }
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+
+        // Q1a: the retried path's solve block is the RETRY cycle's block.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !engine.lock().results.contains_key(&deferred) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retried path must solve and merge via the sidecar"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            engine.lock().results_block(),
+            101,
+            "the retried path solves at the retry cycle's block"
+        );
+    }
+
+    /// Guard 4: the retention window now bounds the deferred-retry lifetime —
+    /// a deferred lead never redrawn within `admission_retention_blocks` is
+    /// pruned and counted in `apexbot.detached.leads_expired`.
+    #[test]
+    fn staged_deferred_retry_expires_after_the_retention_window() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let deferred = path_ids[0];
+        let deferred_keys = kjwik5_path_keys(&engine, deferred);
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        // Cycle 1's window is wide (nothing seeded may expire before the
+        // deferral); it is narrowed before cycle 2 to bound the retry.
+        engine.set_admission_retention_blocks(200);
+        engine.set_force_deferred_for_test(HashSet::from([deferred]));
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for &p in &pool_ids {
+            delta.record(kjwik5_key(p), 10);
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+
+        // Cycle 1 defers + re-records the deferred path at block 100.
+        let ctx = BlockContext::new(Epoch::at(100), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        let expired_before = engine
+            .lock()
+            .detached_cycle
+            .leads_expired
+            .load(Ordering::Relaxed);
+        // The re-record targeted cycle 1's solve block.
+        let defer_block = engine.lock().results_block();
+
+        // Cycle 2: narrow the window to zero and advance one block — the
+        // cutoff prunes the deferred lead's bucket before the draw, so it is
+        // never redrawn.
+        engine.lock().set_force_deferred_for_test(HashSet::new());
+        engine.lock().set_admission_retention_blocks(0);
+        let ctx = BlockContext::new(Epoch::at(defer_block + 1), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            !drawn.0.iter().any(|key| deferred_keys.contains(key)),
+            "the deferred retry lead expired at the retention window boundary"
+        );
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        let expired_after = engine
+            .lock()
+            .detached_cycle
+            .leads_expired
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            expired_after - expired_before,
+            u64::try_from(deferred_keys.len()).expect("small key count"),
+            "the expired deferred lead is counted (apexbot_detached_leads_expired_total)"
         );
     }
 }
@@ -6996,4 +8614,63 @@ pub(crate) mod test_keys {
             Self::new()
         }
     }
+
+    // Cold-start trace (detached-cycle arm attribution): the cycle span must
+    // carry `cycle.arm`, derivable WITHOUT log archaeology. The helper below
+    // is the ONE wiring site (solver_dispatch, at the machine's begin_cycle
+    // verdict). WFF6MM: one arm remains, so one stamp.
+    #[cfg(feature = "otel")]
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn cycle_arm_span_field_stamps_the_arm() {
+        use crate::arb_engine::solver_dispatch::record_cycle_arm_telemetry;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = crate::otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(crate::otel::layer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let detached =
+                tracing::info_span!("apexbot.arb.solve", cycle.arm = tracing::field::Empty,);
+            let guard = detached.enter();
+            assert_eq!(
+                record_cycle_arm_telemetry(&detached, "detached"),
+                "detached",
+                "the helper returns the label the caller latches on the engine"
+            );
+            drop(guard);
+        });
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let solve_spans: Vec<_> = spans
+            .iter()
+            .filter(|sp| sp.name.as_ref() == "apexbot.arb.solve")
+            .collect();
+        assert_eq!(
+            solve_spans.len(),
+            1,
+            "expected exactly the one stamped cycle span; got {spans:?}"
+        );
+        let arm_values: Vec<String> = solve_spans
+            .iter()
+            .filter_map(|sp| {
+                sp.attributes
+                    .iter()
+                    .find(|kv| kv.key == opentelemetry::Key::from_static_str("cycle.arm"))
+                    .and_then(|kv| match &kv.value {
+                        opentelemetry::Value::String(v) => Some(v.to_string()),
+                        _ => None,
+                    })
+            })
+            .collect();
+        assert!(
+            arm_values == vec!["detached".to_string()],
+            "the one dispatch arm must stamp cycle.arm exactly once; got {arm_values:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
 }

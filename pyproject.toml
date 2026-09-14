@@ -11,14 +11,14 @@ name = "apexbot"
 # normalizes the semver form to PEP 440 (e.g. 0.6.0-alpha.3 -> 0.6.0a3).
 dynamic = ["version"]
 authors = [
-    { name="nabob-labs" },
+    { name="Nabob Labs" },
 ]
 description = "Python + Rust building blocks for Uniswap (V2, V3, V4), Curve V1, Solidly V2, Balancer V2 & Aave V3 arbitrage and liquidation bots on EVM-compatible blockchains"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "alembic ~= 1.19",
-    "click ~= 8.4",
+    "click ~= 8.5",
     "pydantic ~= 2.13",
     "pydantic-settings ~= 2.15",
     "sqlalchemy ~= 2.0",
@@ -26,12 +26,12 @@ dependencies = [
     "tomlkit ~= 0.15",
     "tqdm ~= 4.70",
 ]
-license = { text = "Apache-2.0" }
+license = {text = "Apache-2.0"}
 license-files = ["LICENSE"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache-2.0",
+    "License :: OSI Approved :: Apache-2.0 license",
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Natural Language :: English",
@@ -39,7 +39,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://www.apexbot.com"
+Homepage = "https://www.apexcode.com"
 Repository = "https://github.com/nabob-labs/apexbot.git"
 Tracker = "https://github.com/nabob-labs/apexbot/issues"
 
@@ -169,6 +169,13 @@ allow-star-arg-any = true
 "src/apexbot/registry/deployment_loader.py" = [
     "import-outside-top-level",  # lazy imports avoid circular dependency (pool classes → uniswap → this module)
 ]
+"src/apexbot/operator/operator_channel.py" = [
+    "import-outside-top-level",  # the fleet mirror home is lazy: the transport module stays independent of the compiled extension and the home mints on the first fleet-posture op
+]
+"src/apexbot/build_info/__init__.py" = [
+    "import-outside-top-level",  # the _ffi import is lazy so the receipt helpers work (and the module imports) even where the extension is stale/broken
+    "print",     # python -m apexbot.build_info prints its summary to stdout/stderr by design
+]
 "src/apexbot/uniswap/deployments.py" = [
     "import-outside-top-level",  # lazy import avoids circular dependency (deployment_loader → pool classes → this module)
 ]
@@ -274,6 +281,9 @@ link-mode = "copy"
 cache-keys = [
     {file = "rust/**/Cargo.toml"},
     {file = "rust/crates/*/src/**/*.rs"},
+    # build.rs bakes the stale-.so counter (APEXBOT_BUILD_NUMBER); a change
+    # to it must invalidate the wheel cache like any other Rust source.
+    {file = "rust/crates/apexbot-python/build.rs"},
 ]
 
 [tool.maturin]
@@ -288,15 +298,17 @@ bindings = "pyo3"
 # `maturin develop`); the published wheel is built by the PyO3/maturin-action
 # in .github/workflows/release.yml, which passes `--release`
 # explicitly and OVERRIDES the features list — so the shipped artifact is
-# unaffected by this setting and stays fully optimized. See
-# rust/PERF_RESULTS.md "dev-vs-release profile" lever.
+# unaffected by this setting and stays fully optimized. (The detailed lever
+# analysis lived in rust/PERF_RESULTS.md, dropped in `f082db7a7`)
 profile = "dev"
 # Dev builds compile hotpath in (toggle at runtime via APEXBOT_HOTPATH=1 —
-# see rust/crates/apexbot-bot/src/profiling.rs). Release wheels override this
+# see rust/crates/apexbot-bot/src/profiling.rs), plus its Prometheus exporter
+# (guard-enabled runs serve profiler /metrics on :6772, see
+# docs/grafana/ALERTS.md). Release wheels override this
 # list with `--features pyo3/extension-module` (see
 # .github/workflows/release.yml) so the shipped artifact excludes
 # hotpath — macros are no-op `lib_off`, zero runtime penalty.
-features = ["pyo3/extension-module", "apexbot-bot/hotpath", "apexbot-solvers/hotpath", "apexbot-bot/allocator-ctrl", "otel", "mimalloc"]
+features = ["pyo3/extension-module", "apexbot-bot/hotpath", "apexbot-bot/hotpath-prometheus", "apexbot-solvers/hotpath", "apexbot-bot/allocator-ctrl", "otel", "mimalloc"]
 python-packages = ["apexbot"]
 
 [tool.alembic]

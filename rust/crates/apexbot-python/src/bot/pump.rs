@@ -363,8 +363,9 @@ impl PumpState {
     //
     // The whole-batch liquidity-map verifier (`verify_liquidity_maps` and its
     // V3/V4 twins) was REMOVED as redundant + racy (the per-pool two-step
-    // registration lifecycle below is the verify authority; see
-    // dev-run-solver-state-findings.md Addendum 3). What remains here is only
+    // registration lifecycle below is the verify authority; the
+    // dev-run-solver-state-findings.md Addendum 3 evidence lived only under
+    // logs/ and was removed in the stale-docs cleanup `71ec78b2`). What remains here is only
     // the verify CONFIG the per-pool lifecycle consumes.
 
     /// Set the HTTP RPC URL used for verification (ADR-006 D4 T4).
@@ -529,6 +530,128 @@ impl PumpState {
                 }
             })
         })
+    }
+
+    /// Blocking (GIL-detached) V3 verify-lifecycle — the seat-thread twin of
+    /// [`Self::run_v3_registration_lifecycle`] (PRG-5 / IRUMXD): the crawl units
+    /// run on fleet `PoolStateUpdater` seats, which own no asyncio loop, so the
+    /// choreography parks on the shared tokio runtime via `block_on` INSIDE
+    /// `py.detach` (the build-adapter GIL cadence — incident 2026-08-20 #2's
+    /// inversion class is preserved against: the detach spans the whole park).
+    /// Telemetry + typed-error mapping are IDENTICAL to the async twin.
+    pub(crate) fn run_v3_registration_lifecycle_blocking(
+        &self,
+        py: Python<'_>,
+        address: String,
+        snapshot_block: Option<u64>,
+    ) -> PyResult<()> {
+        let pool_addr: alloy::primitives::Address = address.parse().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid V3 address: {e}"))
+        })?;
+        let core = {
+            let engine = self.engine.lock();
+            Arc::clone(engine.core())
+        };
+        let provider = self.verify_provider.lock().clone();
+        let result = py.detach(move || {
+        use tracing::Instrument as _;
+
+        use apexbot_bot::bot_core::registration_lifecycle::RegistrationLifecycleError;
+        // Telemetry: the same Jaeger span shape as the async twin — the seat
+        // thread plants the root span (no ambient pump context).
+        let lifecycle_span = tracing::info_span!(
+            "apexbot.pool.verify_lifecycle",
+            pool.version = "v3",
+            pool.address = %address,
+        );
+        let result = apexbot_core::runtime::get_runtime().block_on(
+            apexbot_bot::bot_core::run_v3_registration_lifecycle(
+                &core,
+                provider.as_ref(),
+                pool_addr,
+                snapshot_block,
+            )
+            .instrument(lifecycle_span),
+        );
+        if result.is_ok() {
+            tracing::info!(target: "apexbot::state", version = "v3", address = %address, "[pool] registration verify-lifecycle complete");
+        } else {
+            tracing::warn!(target: "apexbot::state", version = "v3", address = %address, "[pool] registration verify-lifecycle FAILED");
+        }
+        result.map_err(|err| match err {
+            RegistrationLifecycleError::Verify(v) => map_liquidity_verify_error(v),
+            RegistrationLifecycleError::MissingProvider => {
+                crate::bot::engine::VerificationRpcError::new_err(err.to_string())
+            }
+            RegistrationLifecycleError::MissingStateView => {
+                pyo3::exceptions::PyValueError::new_err(err.to_string())
+            }
+        })
+    });
+        result
+    }
+
+    /// Blocking (GIL-detached) V4 verify-lifecycle — the seat-thread twin of
+    /// [`Self::run_v4_registration_lifecycle`] (see the V3 twin for the GIL
+    /// cadence and telemetry parity contract).
+    pub(crate) fn run_v4_registration_lifecycle_blocking(
+        &self,
+        py: Python<'_>,
+        pool_manager_address: String,
+        pool_id_hex: String,
+        snapshot_block: Option<u64>,
+    ) -> PyResult<()> {
+        let pool_manager: alloy::primitives::Address =
+            pool_manager_address.parse().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Invalid pool_manager: {e}"))
+            })?;
+        let pool_id = crate::bot::engine::hex_string_to_pool_id(&pool_id_hex).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid pool_id: {e}"))
+        })?;
+        let state_view = *self.verify_state_view.lock();
+        let core = {
+            let engine = self.engine.lock();
+            Arc::clone(engine.core())
+        };
+        let provider = self.verify_provider.lock().clone();
+        let result = py.detach(move || {
+        use tracing::Instrument as _;
+
+        use apexbot_bot::bot_core::registration_lifecycle::RegistrationLifecycleError;
+        // Telemetry: V4 twin of the V3 verify-lifecycle span.
+        let lifecycle_span = tracing::info_span!(
+            "apexbot.pool.verify_lifecycle",
+            pool.version = "v4",
+            pool.manager = %pool_manager_address,
+            pool.id = %pool_id_hex,
+        );
+        let result = apexbot_core::runtime::get_runtime().block_on(
+            apexbot_bot::bot_core::run_v4_registration_lifecycle(
+                &core,
+                provider.as_ref(),
+                pool_manager,
+                pool_id,
+                state_view,
+                snapshot_block,
+            )
+            .instrument(lifecycle_span),
+        );
+        if result.is_ok() {
+            tracing::info!(target: "apexbot::state", version = "v4", pool_id = %pool_id_hex, "[pool] registration verify-lifecycle complete");
+        } else {
+            tracing::warn!(target: "apexbot::state", version = "v4", pool_id = %pool_id_hex, "[pool] registration verify-lifecycle FAILED");
+        }
+        result.map_err(|err| match err {
+            RegistrationLifecycleError::Verify(v) => map_liquidity_verify_error(v),
+            RegistrationLifecycleError::MissingProvider => {
+                crate::bot::engine::VerificationRpcError::new_err(err.to_string())
+            }
+            RegistrationLifecycleError::MissingStateView => {
+                pyo3::exceptions::PyValueError::new_err(err.to_string())
+            }
+        })
+    });
+        result
     }
 }
 

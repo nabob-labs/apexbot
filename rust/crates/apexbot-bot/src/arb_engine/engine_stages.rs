@@ -84,8 +84,27 @@ impl EngineStages {
 
     /// Hand the stage surface the shared epoch ledger (the wiring layer
     /// passes `Bot::active_delta`).
+    ///
+    /// KJWIK5: this is also the installer for the engine's deferred-path
+    /// re-record hook — the ledger carry for `paths.deferred_future_price`
+    /// deferrals. The engine's dispatch maps a deferred path's pid to its
+    /// hop-pool keys and calls the hook with the cycle's solve block; the
+    /// closure re-records them into THIS shared ledger, so the next draw
+    /// re-includes the path through the same freshness ordering, admission
+    /// budget, and retention window (one deferral concept). This is the ONE
+    /// engine access to the ledger (engine-side ownership was deliberately
+    /// avoided — LXDY4C); lock order stays engine mutex outer, ledger mutex
+    /// inner, matching `on_resolve`.
     pub fn set_delta(&self, delta: Arc<EpochDelta>) {
-        *self.delta.write() = delta;
+        *self.delta.write() = Arc::clone(&delta);
+        let ledger = delta;
+        self.engine
+            .lock()
+            .set_deferred_re_record(Arc::new(move |keys, block| {
+                for &key in keys {
+                    ledger.record(key, block);
+                }
+            }));
     }
 
     /// Attach the block-clock channel sender (the wiring layer creates the
@@ -162,6 +181,13 @@ impl EngineStages {
         // ~2µs empty pass, gate + work under ONE mutex acquisition.
         let mut engine =
             hotpath::measure_block!("EngineStages::solve.probe_lock", self.engine.lock());
+        // WFF6MM: this path spawns the merge sidecar AFTER `solve_dirty`
+        // returns (below), and the machine's merge Receiver is take-once —
+        // a direct-call inline drain (the synchronous unit-test harness)
+        // would steal it. Disable the inline drain for every EngineStages-
+        // driven engine; the sidecar owns the pipe here.
+        #[cfg(test)]
+        engine.set_sync_merge_for_test(false);
         if affected.is_empty() {
             // Kept for inner bookkeeping parity (last_processed_block et al);
             // provably cannot consume dirt under this continuous hold.
@@ -176,6 +202,10 @@ impl EngineStages {
             "apexbot.arb.solve",
             block.number = block,
             cycle.solve_block = tracing::field::Empty,
+            // Cold-start trace: the dispatch arm ("detached" |
+            // "skipped_empty" | "shed"), recorded at the machine's begin_cycle
+            // verdict (or the admission shed) in solver_dispatch.
+            cycle.arm = tracing::field::Empty,
         );
         // ZZS6CG: exact-match reparent onto this block's published pump
         // span. The work now runs INLINE in the driver (no drainer task), so
@@ -189,6 +219,9 @@ impl EngineStages {
             if let Some(p) = crate::instruments::pipeline() {
                 p.set_registered_paths(u64::try_from(engine.path_count()).unwrap_or(u64::MAX));
             }
+            hotpath::gauge!("engine_registered_paths").set(f64::from(
+                u32::try_from(engine.path_count()).unwrap_or(u32::MAX),
+            ));
             // T3 (epic BXZBWY): the solve cycle must not pin a shared
             // pump-runtime worker while it runs. 2UVG3E seam #4: under the
             // detached stance the engine Mutex hold collapses to enqueue end
@@ -201,56 +234,42 @@ impl EngineStages {
             }
             // KNEUQX: surface the cycle's anchored block on the span.
             span.record("cycle.solve_block", engine.results_block());
+            // Cold-start trace: the arm the dispatch latched THIS cycle on
+            // (the span field is unreadable here) attributes the hold sample.
+            let cycle_arm = engine.cycle_arm();
             if let Some(p) = crate::instruments::pipeline() {
-                p.observe_mutex_hold_duration(hold_start.elapsed().as_secs_f64());
+                p.observe_mutex_hold_duration(hold_start.elapsed().as_secs_f64(), cycle_arm);
             }
             // SRQEK5 (WV62TX): spawn the detached merge sidecar at the FIRST
             // detached enqueue (rx take + spawn atomic under the held guard).
-            if let Some(merge_rx) = engine.take_detached_merge_rx() {
-                let engine_arc = Arc::clone(&self.engine);
-                if let Err(err) = std::thread::Builder::new()
-                    .name("arb-detached-merge".to_string())
-                    .spawn(move || {
-                        super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
-                    })
-                {
-                    // LOUD abort: a stranded merge pipe would silently orphan
-                    // every detached result.
-                    tracing::error!(
-                        error = %err,
-                        "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
-                    );
-                    std::process::abort();
-                }
+            // P37YJG: THE ONE spawn — the machine owns the census register +
+            // named thread + loud abort; this site only takes the parked rx.
+            if let Some(merge_rx) = engine.detached_cycle.take_merge_rx() {
+                super::detached_cycle::spawn_merge_sidecar(&self.engine, merge_rx);
             }
         }
         if let Some(p) = crate::instruments::pipeline() {
-            p.observe_solve_duration(solve_start.elapsed().as_secs_f64());
+            p.observe_solve_duration(solve_start.elapsed().as_secs_f64(), engine.cycle_arm());
             p.count_solves_executed();
         }
     }
 
     /// SRQEK5 (WV62TX): if the empty-affected solve path took the parked
     /// Receiver tradeoff, the sidecar spawn happens here instead.
+    /// P37YJG: THE ONE spawn — the machine owns it (the take-once rides the
+    /// machine; the census/thread/abort body is `spawn_merge_sidecar`).
     fn spawn_detached_sidecar_if_pending(&self) {
-        let Some(merge_rx) = self.engine.lock().take_detached_merge_rx() else {
+        let Some(merge_rx) = self.engine.lock().detached_cycle.take_merge_rx() else {
             return;
         };
-        let engine_arc = Arc::clone(&self.engine);
-        if let Err(err) = std::thread::Builder::new()
-            .name("arb-detached-merge".to_string())
-            .spawn(move || {
-                super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
-            })
-        {
-            tracing::error!(
-                error = %err,
-                "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
-            );
-            std::process::abort();
-        }
+        super::detached_cycle::spawn_merge_sidecar(&self.engine, merge_rx);
     }
 }
+
+// P37YJG: the sidecar's thread name + census row + the ONE spawn moved
+// into the machine — `detached_cycle::{merge_sidecar_thread_name,
+// merge_sidecar_census_entry, spawn_merge_sidecar}` (byte-identical
+// naming and census row).
 
 /// Is the caller inside an ambient multi-thread tokio runtime? `block_in_place`
 /// is only valid there; a current-thread runtime or no runtime runs inline.
@@ -275,8 +294,41 @@ impl StageHandlers for EngineStages {
     /// Resolved row: consume the epoch ledger's touched keys ONCE (the
     /// LXDY4C take preserves the retired `DirtySets::take_all` semantics;
     /// keys recorded while this drain runs land in the NEXT cycle).
+    ///
+    /// QTZGFL: under the construction-stamped admission stance this is a
+    /// capacity-modulated DRAW — `budget = max(0, target − in-flight)` KEYS,
+    /// freshest-first, the overflow RETAINED for a later cycle (carry). A zero
+    /// budget draws nothing; the engine's solve cycle then sheds. The same
+    /// site prunes carried keys older than `head − W` (the retention window)
+    /// and counts the expiry. Lock order: the engine mutex is taken first and
+    /// the ledger mutex inside `expire_older_than`/`draw_freshest` is the
+    /// inner lock — never the reverse.
+    ///
+    /// QTZGFL: THIS is the SINGLE consumption decision (F3). The zero-budget
+    /// verdict is stashed on the engine for the same cycle's dispatch — the
+    /// dispatch consumes and clears it under the engine mutex and never
+    /// re-reads the live gauge. The stage machine drives Resolved -> Solved
+    /// sequentially on the driver thread, so no other draw can interleave
+    /// between the stash and the read.
     fn on_resolve(&self, work: &Resolve<'_>) -> Result<AffectedPaths, StageError> {
-        let affected = work.delta.take_keys();
+        let mut engine = self.engine.lock();
+        let admission = engine
+            .admission_budget_keys()
+            .map(|budget| (budget, engine.admission_retention_blocks));
+        let affected = if let Some((budget, retention)) = admission {
+            let cutoff = work.ctx.block().saturating_sub(retention);
+            let expired = work.delta.expire_older_than(cutoff);
+            engine.detached_cycle.note_leads_expired(expired);
+            // Stash the draw-time verdict BEFORE drawing: the drawn keys
+            // leave the ledger, so the dispatch must honor THIS cycle's
+            // decision, not a fresh gauge read.
+            engine.admission_draw_zero = budget == 0;
+            work.delta.draw_freshest(budget)
+        } else {
+            engine.admission_draw_zero = false;
+            work.delta.take_keys()
+        };
+        drop(engine);
         Ok(AffectedPaths(affected))
     }
 
@@ -368,5 +420,51 @@ impl StageHandlers for EngineStages {
         );
         self.block_clock.lock().close();
         self.engine.lock().on_pump_ended();
+    }
+}
+
+#[cfg(test)]
+mod fleet_stance_tests {
+    //! BCA77G: the merge sidecar hosted as the fleet `Merge` role. LW-T9:
+    //! the fleet.stance flip matrix is retired — ONE posture survives.
+
+    // P37YJG: the naming/census fns moved into the machine; the pins
+    // (byte-identical naming + census row) stay right here.
+    use crate::arb_engine::detached_cycle::{
+        merge_sidecar_census_entry, merge_sidecar_thread_name,
+    };
+
+    /// Under `fleet.stance=fleet` the sidecar runs as the pinned `Merge`
+    /// role: the role's greppable thread-name pattern and the fleet merge
+    /// census row (exactly one seat).
+    #[test]
+    fn fleet_stance_hosts_the_sidecar_as_the_merge_role() {
+        let name = merge_sidecar_thread_name();
+        assert_eq!(
+            name, "work-fleet-merge-1",
+            "role.thread_name() with the seat index"
+        );
+        let row = merge_sidecar_census_entry();
+        assert_eq!(row.resource, "fleet_merge_slots");
+        assert_eq!(row.thread_name, "work-fleet-merge-{n}");
+        assert_eq!(row.count, 1);
+    }
+
+    /// LW-T9: there IS no legacy posture — every construction hosts the
+    /// sidecar as the fleet `Merge` role, byte-identical to the fleet arm
+    /// (RED before the cutover: the false-stance branch kept the
+    /// historical "arb-detached-merge" identity).
+    #[test]
+    fn every_construction_hosts_the_sidecar_as_the_merge_role() {
+        let name = merge_sidecar_thread_name();
+        assert_eq!(
+            name, "work-fleet-merge-1",
+            "the historical legacy identity is retired: every sidecar is \
+             the pinned Merge seat"
+        );
+        let row = merge_sidecar_census_entry();
+        assert_eq!(row.resource, "fleet_merge_slots");
+        assert_eq!(row.thread_name, "work-fleet-merge-{n}");
+        assert_eq!(row.count, 1);
     }
 }

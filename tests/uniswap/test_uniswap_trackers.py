@@ -44,11 +44,11 @@ MAINNET_UNISWAPV3_WETH_WBTC_ADDRESS = get_checksum_address(
 BASE_UNISWAP_V2_FACTORY_ADDRESS = get_checksum_address("0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6")
 BASE_UNISWAP_V3_FACTORY_ADDRESS = get_checksum_address("0x33128a8fC17869897dcE68Ed026d694621f6FDfD")
 BASE_WETH_ADDRESS = get_checksum_address("0x4200000000000000000000000000000000000006")
-BASE_DEGEN_ADDRESS = get_checksum_address("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed")
-BASE_UNISWAP_V2_WETH_DEGEN_ADDRESS = get_checksum_address(
+BASE_APEX_ADDRESS = get_checksum_address("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed")
+BASE_UNISWAP_V2_WETH_APEX_ADDRESS = get_checksum_address(
     "0x7C327d692B72f60b28AecEDbcC1BA784712fE7b2",
 )
-BASE_UNISWAP_V3_WETH_DEGEN_ADDRESS = get_checksum_address(
+BASE_UNISWAP_V3_WETH_APEX_ADDRESS = get_checksum_address(
     "0xc9034c3E7F58003E6ae0C8438e7c8f4598d5ACAA",
 )
 BASE_PANCAKESWAP_V3_FACTORY_ADDRESS = get_checksum_address(
@@ -89,15 +89,15 @@ def test_create_base_chain_trackers(fork_base_full: AnvilFork):
 
     # Get known pairs
     uniswap_v2_lp = uniswap_v2_pool_tracker.get_pool_from_tokens(
-        token_addresses=(BASE_WETH_ADDRESS, BASE_DEGEN_ADDRESS),
+        token_addresses=(BASE_WETH_ADDRESS, BASE_APEX_ADDRESS),
     )
     uniswap_v3_lp = uniswap_v3_pool_tracker.get_pool_from_tokens_and_fee(
-        token_addresses=(BASE_WETH_ADDRESS, BASE_DEGEN_ADDRESS),
+        token_addresses=(BASE_WETH_ADDRESS, BASE_APEX_ADDRESS),
         pool_fee=3000,
     )
 
-    assert uniswap_v2_lp.address == BASE_UNISWAP_V2_WETH_DEGEN_ADDRESS
-    assert uniswap_v3_lp.address == BASE_UNISWAP_V3_WETH_DEGEN_ADDRESS
+    assert uniswap_v2_lp.address == BASE_UNISWAP_V2_WETH_APEX_ADDRESS
+    assert uniswap_v3_lp.address == BASE_UNISWAP_V3_WETH_APEX_ADDRESS
 
     with pytest.raises(TrackerAlreadyInitialized):
         UniswapV2PoolTracker(factory_address=BASE_UNISWAP_V2_FACTORY_ADDRESS, bot=bot)

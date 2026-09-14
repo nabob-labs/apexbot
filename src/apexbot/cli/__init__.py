@@ -3,7 +3,13 @@
 import click
 
 from apexbot.bot import Bot
-from apexbot.exceptions import DatabaseSchemaStale
+from apexbot.exceptions import BootRefused, DatabaseSchemaStale
+
+# FF-T1 (BPHR6F): the apexbot binary maps the typed fleet boot refusal
+# (the library never aborts the host process on that arm) to its loud
+# named fail-fast exit. 78 is sysexits EX_CONFIG: the host cannot host
+# the fleet configuration.
+EXIT_FLEET_BOOT_REFUSED = 78
 
 
 class ApexbotCLI(click.Group):
@@ -13,6 +19,11 @@ class ApexbotCLI(click.Group):
     when the DB is stamped at a prior Alembic revision) and prints a friendly
     one-line remediation hint instead of a Python traceback. End users see
     "run `apexbot database upgrade`", not a wall of stack frames.
+
+    Also maps the typed fleet boot refusal (:class:`BootRefused`, FF-T1) to
+    a single named line and exit code 78 (sysexits EX_CONFIG): the library
+    never aborts the host process on the boot-refusal arm; the binary owns
+    the loud fail-fast exit.
 
     The ``database upgrade`` command itself is unaffected: its
     :func:`upgrade_existing_sqlite_database` shell catches
@@ -34,6 +45,9 @@ class ApexbotCLI(click.Group):
         except DatabaseSchemaStale as exc:
             click.echo(str(exc), err=True)
             ctx.exit(1)
+        except BootRefused as exc:
+            click.echo(f"[fleet-boot] REFUSED — {exc}", err=True)
+            ctx.exit(EXIT_FLEET_BOOT_REFUSED)
 
 
 @click.group(cls=ApexbotCLI)
@@ -48,6 +62,7 @@ from . import (  # ruff:ignore[unused-import, module-import-not-at-top-of-file]
     aave,
     database,
     exchange,
+    fleet,
     path,
     pool,
 )

@@ -42,6 +42,7 @@ apexbot-pathfinding = { path = "../apexbot-pathfinding", optional = true }
 apexbot-price = { path = "../apexbot-price", optional = true, features = ["pyo3"] }
 apexbot-submission = { path = "../apexbot-submission", optional = true, features = ["pyo3"] }
 apexbot-simulation = { path = "../apexbot-simulation", optional = true }
+apexbot-workers = { path = "../apexbot-workers", optional = true }
 revm = { version = "^43.0", default-features = false }
 apexbot-arbitrage = { path = "../apexbot-arbitrage", optional = true, features = ["order-index"] }
 apexbot-executor = { path = "../apexbot-executor", optional = true }
@@ -69,7 +70,7 @@ serde = { version = "^1.0", features = ["derive"] }
 serde_json = { version = "^1.0" }
 thiserror = { version = "^2.0" }
 tokio = { version = "^1.53", features = ["rt-multi-thread", "time", "macros", "sync"] }
-toml = "1.1.5"
+toml = "1.1.6"
 
 [features]
 # Per-domain binding-layer features (ergo UG6FKN task UKDOUR). Each gates its optional
@@ -86,10 +87,14 @@ toml = "1.1.5"
 default = ["auto-initialize", "bot", "rpc", "price", "submission", "simulation", "abi", "concentrated-liquidity-math", "balancer-math", "curve-math", "solidly-math", "v2-math", "uniswap", "pathfinding", "async", "db", "executor", "execution", "pool", "aave-updater", "fork"]
 extension-module = ["pyo3/extension-module"]
 auto-initialize = ["pyo3/auto-initialize"]
-bot = ["dep:apexbot-bot", "dep:apexbot-ingestion", "dep:apexbot-solvers", "rpc", "decoders", "uniswap"]
+# FF-T1 (BPHR6F): `bot` also names apexbot-workers — the intake seam maps
+# the workers' typed BootError family onto the BootRefused exception at
+# the pyo3 leaf (the simulation feature already pulled the dep; bot-only
+# builds now name the type too).
+bot = ["dep:apexbot-bot", "dep:apexbot-ingestion", "dep:apexbot-solvers", "dep:apexbot-workers", "rpc", "decoders", "uniswap"]
 price = ["dep:apexbot-price", "rpc"]
 submission = ["dep:apexbot-submission", "rpc"]
-simulation = ["dep:apexbot-simulation", "dep:apexbot-arbitrage", "rpc", "executor", "submission"]
+simulation = ["dep:apexbot-simulation", "dep:apexbot-arbitrage", "dep:apexbot-workers", "rpc", "executor", "submission"]
 executor = ["dep:apexbot-executor"]
 execution = ["dep:apexbot-execution", "executor"]
 fork = ["dep:apexbot-fork"]

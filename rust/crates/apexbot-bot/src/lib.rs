@@ -15,7 +15,7 @@
 //! This fusion is **tracked debt** (ADR-018): the solve surface is not
 //! reachable standalone (a `cargo add apexbot` consumer wanting only the
 //! V2/V3/V4 solve math must take this crate + `apexbot-rpc` +
-//! `apexbot-db` + `tokio` + `rayon` + `dashmap`). The extraction trigger
+//! `apexbot-db` + `tokio` + `dashmap`). The extraction trigger
 //! is a **second engine family** joining (e.g. an `AaveLiquidationEngine`
 //! or a split `SolidlyEngine`); until then, the cross-references are the
 //! cost of one engine family and one state owner co-evolving.
@@ -56,16 +56,18 @@ pub mod instruments {
     pub struct PipelineInstruments;
 
     impl PipelineInstruments {
-        /// no-op
-        pub fn observe_header_to_solved(&self, _secs: f64) {}
+        /// no-op (ADR-041 epoch race)
+        pub fn observe_header_to_publish(&self, _secs: f64) {}
+        /// no-op (ADR-041 streaming stage wait)
+        pub fn observe_streaming_age(&self, _secs: f64) {}
+        /// no-op (ADR-041 I3 stale drops)
+        pub fn count_stale_drop(&self) {}
         /// no-op
         pub fn observe_header_to_first_log(&self, _secs: f64) {}
         /// no-op
         pub fn observe_log_burst(&self, _secs: f64) {}
         /// no-op
         pub fn observe_settle_wait(&self, _secs: f64) {}
-        /// no-op
-
         /// no-op
         pub fn observe_log_decode(&self, _secs: f64) {}
         /// no-op
@@ -86,6 +88,10 @@ pub mod instruments {
         pub fn observe_reorg_depth(&self, _blocks: u64) {}
         /// no-op (WAJEQP T-R1)
         pub fn count_reorg_recovery_dropped(&self) {}
+        /// no-op (HJ5HWF benign late-admit family)
+        pub fn count_late_log_admitted(&self) {}
+        /// no-op (BM35LK adaptive quiesce window)
+        pub fn observe_quiesce_window(&self, _ms: u64) {}
         /// no-op
         pub fn count_ws_log_seen(&self) {}
         /// no-op
@@ -108,6 +114,16 @@ pub mod instruments {
         pub fn count_sim_error_reason(&self, _reason: &str) {}
         /// no-op (FRKBGP)
         pub fn set_process_rss_bytes(&self, _bytes: u64) {}
+        /// no-op (NO4DIW per-block log funnel)
+        pub fn observe_epoch_logs(
+            &self,
+            _seen: u64,
+            _received: u64,
+            _applied: u64,
+            _ignored: u64,
+            _closing_block: u64,
+        ) {
+        }
         /// no-op (MROOY7 BF43PM)
         pub fn observe_publish_cycle(&self, _secs: f64) {}
         /// no-op (MROOY7 BF43PM)
@@ -115,17 +131,15 @@ pub mod instruments {
         /// no-op (MROOY7 BF43PM)
         pub fn observe_rewind_duration(&self, _secs: f64) {}
         /// no-op
-
-        /// no-op
         pub fn set_state_head_lag(&self, _head_minus_clock: i64) {}
         /// no-op
         pub fn set_seconds_since_header(&self, _secs: f64) {}
         /// no-op
         pub fn set_seconds_since_apply(&self, _secs: f64) {}
         /// no-op
-        pub fn observe_mutex_hold_duration(&self, _secs: f64) {}
+        pub fn observe_mutex_hold_duration(&self, _secs: f64, _arm: &'static str) {}
         /// no-op
-        pub fn observe_solve_duration(&self, _secs: f64) {}
+        pub fn observe_solve_duration(&self, _secs: f64, _arm: &'static str) {}
         /// no-op
         pub fn observe_per_path_solve_duration(&self, _secs: f64) {}
         /// no-op
@@ -146,6 +160,8 @@ pub mod instruments {
         pub fn observe_dispatch_gas(&self, _gas: u64) {}
         /// no-op
         pub fn count_submit_outcome(&self, _outcome: &str) {}
+        /// no-op (PRG-2 / IRUMXD registration-skip family)
+        pub fn count_registration_skip(&self, _reason: &str) {}
         /// no-op
         pub fn observe_submit_latency(&self, _secs: f64) {}
         /// no-op
@@ -166,6 +182,16 @@ pub mod instruments {
         pub fn count_detached_stale_dropped(&self) {}
         /// no-op
         pub fn count_detached_applied(&self) {}
+        /// no-op (cold-start trace: degraded-cycle counter)
+        pub fn count_detached_degraded_cycle(&self) {}
+        /// no-op (AQV6EF: detached outcomes lost to a dead merge drain)
+        pub fn count_detached_send_failed(&self) {}
+        /// no-op (AQV6EF: merge-seat panics caught by the sidecar guard)
+        pub fn count_detached_merge_panic(&self) {}
+        /// no-op (QTZGFL: admission-shed cycles)
+        pub fn count_detached_shed(&self) {}
+        /// no-op (QTZGFL: retained admission keys expired by the retention window)
+        pub fn count_detached_leads_expired(&self, _n: u64) {}
     }
 
     /// Epic FRKBGP close-out: resident set bytes (drift-watch). Default
@@ -175,6 +201,9 @@ pub mod instruments {
         None
     }
 
+    /// no-op (FF-T5 fleet profile metric)
+    pub fn note_fleet_profile(_summary: &crate::arb_engine::fleet_status::FleetProfileSummary) {}
+
     /// Always `None` — metrics are compiled out of this build.
     #[must_use]
     pub fn pipeline() -> Option<&'static PipelineInstruments> {
@@ -183,6 +212,9 @@ pub mod instruments {
 }
 pub mod allocator_ctrl;
 pub mod arb_engine;
+/// The PRG-3 intake surface (LNQDOA): the documented single re-export the
+/// pyo3 leaf depends on — no other `arb_engine` module is public surface.
+pub use arb_engine::fleet_intake;
 pub mod failure_policy;
 #[cfg(feature = "otel")]
 pub mod instruments;
@@ -193,35 +225,10 @@ pub mod otel;
 pub mod profiling;
 pub mod telemetry;
 
-/// Configure the process-global rayon pool used by the engine's
-/// `par_iter` solve fan-out ([`crate::arb_engine`]).
-///
-/// GOQWCL (incident 2026-08-21): the pool was previously implicit — rayon
-/// spawns its global pool lazily on first `par_iter` with **unnamed**
-/// threads, which masquerade as unrelated workers in thread dumps (during
-/// the incident forensics they showed up as anonymous futex waiters and
-/// were nearly misattributed to tokio). Naming them makes any future
-/// dump immediately attributable.
-///
-/// Idempotent-ish: if a global pool already exists (another component or
-/// test built it first), the request is ignored with a debug log — rayon's
-/// global pool can only be configured once per process.
-/// Two-runtime contract (ADR: the tokio CPU/I-O split): the ambient I/O
-/// runtime (pump, websocket, dispatch, delivery) keeps the headroom cores
-/// (`DEFAULT_SOLVE_HEADROOM`), so the CPU-side pools — this rayon global
-/// pool, the solve-executor bins, and the sim drivers behind the
-/// `sim_slots` cap — are all sized from `solve_worker_count()` and its
-/// leftover, never from raw `available_parallelism`.
-pub fn configure_rayon_solver_pool() {
-    let workers = crate::bot_core::cpu_budget::solve_worker_count();
-    let result = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .thread_name(|i| format!("apexbot-solve-{i}"))
-        .build_global();
-    if let Err(err) = result {
-        tracing::debug!(
-            %err,
-            "[rayon] global pool already configured - keeping existing pool"
-        );
-    }
-}
+// P6YXA6 hard cutover: the process-global rayon pool (`configure_rayon_
+// solver_pool`) is retired with the rayon dispatch arms it served — every
+// solve bin rides the fleet-hosted executor or the dedicated private tokio
+// runtime, and the resolve fan-out runs on scoped std threads. The
+// two-runtime contract stands: the ambient I/O runtime keeps the headroom
+// cores; the solve-executor bins are sized from `solve_worker_count()` and
+// its leftover, never from raw `available_parallelism`.

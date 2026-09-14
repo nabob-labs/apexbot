@@ -36,6 +36,24 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "concentrated-liquidity-math")]
     crate::concentrated_liquidity_math::add_concentrated_liquidity_math_module(m)?;
 
+    // Build identity (stale-.so detector, AGENTS.md): the monotonic build
+    // counter `build.rs` bakes into every compile of this cdylib.
+    // Unconditional — the freshness check must work in every configuration.
+    m.add_function(wrap_pyfunction!(crate::build_info::build_number, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::build_info::build_fingerprint, m)?)?;
+
+    // FF-T5 (NT7HJC): the runtime fleet status — budget, plan,
+    // census ("apexbot.runtime_status()").
+    m.add_function(wrap_pyfunction!(crate::runtime_status::runtime_status, m)?)?;
+
+    // Ambient-runtime driver seam (VJGZJ2): lets a Python driver satisfy the
+    // ambient-runtime-only policy on the verify seams. Unconditional —
+    // apexbot-core (the runtime singleton) is.
+    m.add_function(wrap_pyfunction!(
+        crate::ambient_runtime::call_on_ambient_runtime,
+        m
+    )?)?;
+
     // Keccak256 + event topic (always a dependency; ergo 5JKNQH)
     m.add_function(wrap_pyfunction!(crate::crypto::keccak256, m)?)?;
     m.add_function(wrap_pyfunction!(crate::crypto::event_topic, m)?)?;
@@ -171,6 +189,16 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
             .get_type::<crate::bot::engine::VerificationRpcError>(),
     )?;
 
+    // FF-T1 (BPHR6F): the fleet boot refusal surfaces as the typed
+    // BootRefused exception — the library never aborts the host process
+    // on the boot-refusal arm; the apexbot binary maps it to its loud
+    // named fail-fast exit.
+    #[cfg(feature = "bot")]
+    m.add(
+        "BootRefused",
+        m.py().get_type::<crate::bot::engine::BootRefused>(),
+    )?;
+
     // Typed pool-admission exceptions (Plan 102, F2EVV6): a unified
     // `PoolRegistrationError` hierarchy so `build_paths` can classify
     // V2/V3/V4 admission refusals by type instead of fragile string
@@ -219,10 +247,19 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "SpecViolationError",
         m.py().get_type::<crate::bot::engine::SpecViolationError>(),
     )?;
+    // PRG-4 / IRUMXD: the registered-path cap refusal — a BENIGN stop signal
+    // the crawl catches instead of a Python counter unwind.
+    #[cfg(feature = "bot")]
+    m.add(
+        "PathRegistryFullError",
+        m.py()
+            .get_type::<crate::bot::engine::PathRegistryFullError>(),
+    )?;
 
     // Bot — Rust-owned state (feature = "bot")
     #[cfg(feature = "bot")]
     m.add_class::<crate::bot::PyBot>()?;
+    m.add_class::<crate::bot::intake::PyIntakeReceipt>()?;
     #[cfg(feature = "bot")]
     m.add_class::<crate::bot::pool::PyLiquidityPool>()?;
     #[cfg(feature = "bot")]
@@ -268,6 +305,13 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // driven over the `apexbot-simulation` engine's `BlockSimHandle`).
     #[cfg(feature = "simulation")]
     crate::simulation::add_simulation_module(m)?;
+
+    // Fleet operator seam (feature = "simulation") — the JCI2FW Part B
+    // runtime re-tune channel over the process posture owner. Registered on
+    // a real Python submodule `apexbot._ffi.fleet` (the mirror home is
+    // `apexbot.fleet`; the operator op is `set_fleet_posture`).
+    #[cfg(feature = "simulation")]
+    crate::fleet::add_fleet_module(m)?;
 
     // Pub/sub seam: register a Python callback as a `PoolStateSubscriber`
     // against the Rust `LogDispatcher` fan-out (ZBD4MS) (feature = "bot")

@@ -18,14 +18,19 @@
 //!   formula without the percentile clamp. The soak compares LATENCY
 //!   primarily; the formula (target/decay) dominates the clamp on mainnet.
 //!
-//! Runtime caveat (the T4 body note): `WrapDatabaseAsync::new` captures
-//! `Handle::try_current()` at build time, and its DB calls escalate to
-//! `block_in_place` on a multi-threaded worker. The solve workers are
-//! rayon/`std` threads — NO ambient runtime — so the sim body spawns onto
-//! this hook's DEDICATED multi-thread runtime (task-spawn, not
+//! Runtime caveat (the T4 body note, updated by LW-T9):
+//! `WrapDatabaseAsync::new` captures `Handle::try_current()` at build time,
+//! and its DB calls escalate to `block_in_place` on a multi-threaded
+//! worker. The fleet worker seats are `std` threads — NO ambient runtime
+//! (the LW-T2 wedge test pins this structurally; the old
+//! sync-inside-async BY DESIGN comment was that invariant's only
+//! enforcement before the cutover) — so the sim body spawns onto this
+//! hook's DEDICATED multi-thread runtime (task-spawn, never
 //! `block_in_place`): the spawned task runs on a runtime worker (where
 //! `block_in_place` is legal AND the handle capture succeeds), and the
-//! worker blocks on the `JoinHandle` from the plain thread.
+//! worker blocks on the join from the plain thread. Out-of-band work
+//! (affect-cache misses, escalations) rides the injected `EscalationPort`
+//! — never an ambient `Handle`.
 
 use std::sync::Arc;
 
@@ -84,6 +89,18 @@ pub(crate) struct InlineSimHook {
     spotcheck_n: std::sync::atomic::AtomicU64,
 }
 
+impl InlineSimHook {
+    /// The escalation port bound to the hook's sim runtime (LW-T3 Seam C):
+    /// handed to `install_default_escalation_port` at hook install — the
+    /// default impl's capability lane IS the inline-sim runtime; the
+    /// cold-miss budget ceiling is the runtime's drive capacity.
+    pub(crate) fn escalation_port(
+        &self,
+    ) -> std::sync::Arc<dyn apexbot_workers::lane::EscalationPort> {
+        std::sync::Arc::new(SimRuntimeEscalationPort::new(Arc::clone(&self.sim_runtime)))
+    }
+}
+
 fn outputs_vec(req: &InlineSimRequest) -> Vec<u128> {
     req.hop_outputs
         .iter()
@@ -130,25 +147,7 @@ impl InlineSimHook {
             )),
             reverify_armed: std::sync::Mutex::new(std::collections::HashSet::new()),
             spotcheck_n: std::sync::atomic::AtomicU64::new(0),
-            sim_runtime: {
-                #[expect(clippy::expect_used)]
-                // unreachable in production: multi-thread Builder only fails on allocator OOM or invalid config (worker count is clamped 1..=32)
-                Arc::new(
-                    tokio::runtime::Builder::new_multi_thread()
-                        // M2 soak sizing (2026-09-05): with the hard-coded 2
-                        // workers the per-cycle wall was 72ms + 4.74ms/path
-                        // (R^2 0.89, 228 steady cycles) - the payload sims queued
-                        // on the 2-thread runtime while ~50 bins/cycle arrived
-                        // concurrently (sims p50 12ms). Sizing to the core count
-                        // lets the bins' sims actually overlap. Env-tunable for
-                        // constrained hosts; the sim bodies still block on the
-                        // DB wrap's block_on, so workers also cover that wait.
-                        .worker_threads(inline_sim_worker_count())
-                        .enable_all()
-                        .build()
-                        .expect("inline-sim runtime build"),
-                )
-            },
+            sim_runtime: Arc::new(build_inline_sim_runtime()),
         }
     }
 
@@ -254,29 +253,128 @@ where
     .await
 }
 
-/// Join a sim-task future from ANY thread context (the soak's runtime
-/// caveat: `block_in_place` is only legal on runtime workers, so an ambient
-/// multi-thread runtime blocks in place; otherwise the dedicated sim runtime
-/// is driven directly): the solve arms' workers may be plain threads (rayon/`std`), OR
-/// tokio tasks on the solve-executor runtime (`APEXBOT_SOLVE_EXECUTOR=tokio`
-/// spawns the per-bin jobs as tasks). `Runtime::block_on` from inside a
-/// runtime context panics ("Cannot start a runtime from within a runtime" —
-/// the 2026-09-05 soak freeze #2), so:
-/// - inside a multi-thread runtime: `block_in_place` + join on THAT runtime's
-///   handle (legal on a worker; the handle drive keeps the task-local context
-///   the DB wrap needs);
-/// - otherwise (plain threads): block on the dedicated sim runtime.
+/// LW-T3 (Seam C): the DEFAULT escalation port impl — the inline-sim
+/// runtime IS the port's own capability lane (pyo3 is fine here; the trait
+/// lives pyo3-free in apexbot-workers, ADR-042 §8) and escalated work
+/// NEVER occupies the submitting seat (CPU cannot starve I/O). The
+/// cold-miss budget ceiling is the runtime's drive capacity (worker count)
+/// and is visible at [`EscalationPort::counters`].
+///
+/// RED scaffold: the budget is NOT enforced and the caller's span context
+/// is NOT propagated (the SGDXWU orphan-root pattern) — the red tests
+/// fail exactly there.
+pub(crate) struct SimRuntimeEscalationPort {
+    runtime: Arc<tokio::runtime::Runtime>,
+    gate: Arc<apexbot_workers::lane::EscalationGate>,
+}
+
+impl SimRuntimeEscalationPort {
+    /// Build the port over the sim runtime; the cold-miss budget is the
+    /// runtime's worker count (its drive capacity).
+    /// RED: the cap is WORKER-PARITY BY DESIGN (each escalation busies a
+    /// runtime worker, as blocking sims do) — should escalations become
+    /// io-await-heavy enough to sit purely on I/O resources, re-derive this
+    /// cap and document the NEW model here; do not let the number drift by
+    /// accident.
+    pub(crate) fn new(runtime: Arc<tokio::runtime::Runtime>) -> Self {
+        let budget = runtime.metrics().num_workers();
+        Self {
+            runtime,
+            gate: apexbot_workers::lane::EscalationGate::new(budget.max(1)),
+        }
+    }
+}
+
+impl apexbot_workers::lane::EscalationPort for SimRuntimeEscalationPort {
+    fn escalate(
+        &self,
+        work: apexbot_workers::lane::EscalationWork,
+    ) -> Result<(), apexbot_workers::lane::EscalationError> {
+        // Fail-fast: the cold-miss budget is the escalation capacity
+        // ceiling — a refusal is typed and synchronous, never a hang.
+        let permit = self.gate.begin()?;
+        // SGDXWU (LW-T3): the escalation RE-ENTERS the caller's span —
+        // Jaeger continuity survives the port (no orphan roots).
+        let parent = tracing::Span::current();
+        // FinishOnDrop moves INTO the task: completion, panic and cancel
+        // all reclaim the in-flight slot identically (no budget leak), and
+        // only work that RUNS TO COMPLETION tallies into `completed`.
+        self.runtime.spawn(async move {
+            let _guard = parent.enter();
+            work.await;
+            permit.retire();
+        });
+        Ok(())
+    }
+
+    fn counters(&self) -> apexbot_workers::lane::EscalationCountersSnapshot {
+        self.gate.counters()
+    }
+}
+
+/// Join a sim-task future from a worker seat: the dedicated sim runtime is
+/// driven directly. The ambient-runtime arm the old treatment carried
+/// (`block_in_place` + ambient-handle drive) is DELETED with the tokio
+/// solve stance (LW-T9): every caller is a fleet worker seat — plain OS
+/// thread, NO ambient runtime, pinned structurally by the LW-T2 wedge test
+/// in `apexbot_bot::arb_engine::fleet_solve_executor` — and sim
+/// escalations drive on the injected `EscalationPort`, never an ambient
+/// `Handle`. A future caller that DOES hold an ambient runtime now fails
+/// loudly (`block_on` inside a runtime panics — the 2026-09-05 soak freeze
+/// #2 anti-pattern the old arm re-purchased) instead of silently
+/// `block_in_place`-driving on a CPU seat.
 fn join_sim_task<F>(sim_runtime: &tokio::runtime::Runtime, fut: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread => {
-            tokio::task::block_in_place(|| handle.block_on(fut))
-        }
-        _ => sim_runtime.block_on(fut),
-    }
+    sim_runtime.block_on(fut)
+}
+
+/// GOQWCL: the inline-sim runtime previously kept the default thread name
+/// (`tokio-runtime-worker`) — indistinguishable in thread dumps from every
+/// other defaulting pool. The census (PE4FPM) declares the distinct
+/// `apexbot-inline-sim-{n}` pattern; the seq closure mirrors tokio 1.53's
+/// per-thread `thread_name_fn` invocation (same mechanism as
+/// `apexbot_core::runtime`).
+static INLINE_SIM_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn inline_sim_thread_name() -> String {
+    format!(
+        "apexbot-inline-sim-{}",
+        INLINE_SIM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// The private multi-thread runtime hosting the payload sims (7LV6VN T5).
+/// Sized by [`inline_sim_worker_count`], named distinctly, census-registered
+/// (PE4FPM).
+fn build_inline_sim_runtime() -> tokio::runtime::Runtime {
+    let workers = inline_sim_worker_count();
+    apexbot_core::worker_census::register(apexbot_core::worker_census::WorkerCensusEntry {
+        resource: "inline_sim_runtime_workers",
+        kind: "tokio multi-thread runtime (inline-sim hook — payload sims; fleet-hosted SimDriver target, ADR-042)",
+        count: workers,
+        thread_name: "apexbot-inline-sim-{n}",
+        sizing: "leftover_worker_budget (7LV6VN T5); override `solve.inline_sim_workers` (env APEXBOT_INLINE_SIM_WORKERS), clamp 1..=32",
+        binding: "shared",
+    });
+    #[expect(clippy::expect_used)]
+    // unreachable in production: multi-thread Builder only fails on allocator OOM or invalid config (worker count is clamped 1..=32)
+    tokio::runtime::Builder::new_multi_thread()
+        // M2 soak sizing (2026-09-05): with the hard-coded 2
+        // workers the per-cycle wall was 72ms + 4.74ms/path
+        // (R^2 0.89, 228 steady cycles) - the payload sims queued
+        // on the 2-thread runtime while ~50 bins/cycle arrived
+        // concurrently (sims p50 12ms). Sizing to the core count
+        // lets the bins' sims actually overlap. Env-tunable for
+        // constrained hosts; the sim bodies still block on the
+        // DB wrap's block_on, so workers also cover that wait.
+        .worker_threads(workers)
+        .thread_name_fn(inline_sim_thread_name)
+        .enable_all()
+        .build()
+        .expect("inline-sim runtime build")
 }
 
 /// The inline-sim runtime's worker count (M2 soak sizing): core-count by
@@ -290,7 +388,7 @@ fn inline_sim_worker_count() -> usize {
     // of the CPU budget after the solve bins (not raw available
     // parallelism), so sim runtime workers + solve bins never exceed
     // the quota.
-    let default = apexbot_bot::bot_core::cpu_budget::leftover_worker_budget();
+    let default = apexbot_core::cpu_budget::leftover_worker_budget();
     // KAHU5W: typed schema key `solve.inline_sim_workers`
     // (`APEXBOT_INLINE_SIM_WORKERS`); the loader owns the env read.
     match ::apexbot_config::holder::config().solve.inline_sim_workers {
@@ -592,15 +690,129 @@ impl InlineSimulator for InlineSimHook {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)] // census/name assertions follow the repo's loud-assert test style
 mod tests {
+    use std::sync::Arc;
+
+    // The trait resolves the port methods (escalate/counters) in tests.
+    use apexbot_workers::lane::EscalationPort as _;
+
     // The override parsing matrix moved to apexbot-config's precedence
     // tests (KAHU5W: the loader owns the env read). This pins the production
     // default only: with no override, the count follows the leftover CPU
     // budget (7LV6VN T5), NOT raw available_parallelism.
     #[test]
     fn inline_sim_worker_count_defaults_to_leftover_budget() {
-        let default = apexbot_bot::bot_core::cpu_budget::leftover_worker_budget();
+        let default = apexbot_core::cpu_budget::leftover_worker_budget();
         assert_eq!(super::inline_sim_worker_count(), default);
+    }
+
+    /// LW-T3 (Seam C): the DEFAULT escalation port enforces the cold-miss
+    /// budget fail-fast (typed `ColdMissBudgetExceeded`, visible on the
+    /// gauge surface) and retired escalations re-free capacity.
+    #[test]
+    fn inline_sim_escalation_port_enforces_the_cold_miss_budget_fail_fast() {
+        let port =
+            super::SimRuntimeEscalationPort::new(Arc::new(super::build_inline_sim_runtime()));
+        // Park `budget` escalations on the lane; they hold the whole
+        // capacity (the worker count).
+        let (release1, parked1) = tokio::sync::oneshot::channel::<()>();
+        let (release2, parked2) = tokio::sync::oneshot::channel::<()>();
+        port.escalate(Box::pin(async move {
+            let _ = parked1.await;
+        }))
+        .expect("first escalation within budget");
+        port.escalate(Box::pin(async move {
+            let _ = parked2.await;
+        }))
+        .expect("second escalation within budget");
+        let refused = port
+            .escalate(Box::pin(std::future::ready(())))
+            .expect_err("the cold-miss budget must refuse SYNCHRONOUSLY, not hang");
+        assert_eq!(
+            refused,
+            apexbot_workers::lane::EscalationError::ColdMissBudgetExceeded
+        );
+        assert_eq!(
+            port.counters().budget_exceeded,
+            1,
+            "the refusal must be visible on the gauge surface"
+        );
+        drop((release1, release2)); // retire the parked escalations
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while port.counters().completed < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parked escalations did not retire in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        port.escalate(Box::pin(std::future::ready(())))
+            .expect("completed escalations re-free capacity");
+    }
+
+    /// LW-T3 (Seam C, reth `IncCounterOnDrop`): an escalated future that
+    /// PANICS must NOT leak its admission slot — finish-on-drop covers
+    /// completion, panic and cancel identically; a leaked slot is a budget
+    /// leak into permanent hard-refusal (the raddest fail-fast failure
+    /// mode). Cancel-before-completion is pinned at the same invariant (a
+    /// dropped permit reclaims; a cancelled escalation is never counted
+    /// completed).
+    #[test]
+    fn a_panicking_escalation_does_not_leak_the_in_flight_slot() {
+        let port =
+            super::SimRuntimeEscalationPort::new(Arc::new(super::build_inline_sim_runtime()));
+        port.escalate(Box::pin(async {
+            // The panic IS the fixture's signal (the slot must reclaim on
+            // panic exactly as on completion).
+            #[expect(
+                clippy::panic,
+                reason = "panicking escalated work is the reclaimed-slot contract under test"
+            )]
+            {
+                panic!("cold-miss escalation panics mid-work (LW-T3)");
+            }
+        }))
+        .expect("escalation admitted");
+        // The admission must be RECLAIMED whether the work panicked,
+        // completed or was cancelled: in_flight returns to 0 with no other
+        // signal, and a subsequent escalation succeeds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while port.counters().in_flight != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the panicking escalation leaked the in-flight slot"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        port.escalate(Box::pin(std::future::ready(())))
+            .expect("a leaked slot must NOT hard-refuse subsequent escalations");
+    }
+
+    /// PE4FPM (GOQWCL): the inline-sim runtime's workers must carry the
+    /// DISTINCT census thread name — never the shared
+    /// `tokio-runtime-worker` default that made thread dumps
+    /// unattributable when both runtimes overlapped.
+    #[test]
+    fn inline_sim_runtime_workers_carry_the_census_thread_name() {
+        let rt = super::build_inline_sim_runtime();
+        let name = rt.block_on(async {
+            tokio::spawn(async move { std::thread::current().name().map(str::to_owned) })
+                .await
+                .expect("worker spawn")
+        });
+        let name = name.expect("worker thread name");
+        assert!(
+            name.starts_with("apexbot-inline-sim-"),
+            "inline-sim worker must be census-named, got {name}"
+        );
+        // And the self-registration agrees with the built runtime.
+        let row = apexbot_core::worker_census::snapshot()
+            .into_iter()
+            .find(|e| e.resource == "inline_sim_runtime_workers")
+            .expect("inline-sim runtime must self-register in the census");
+        assert_eq!(row.count, rt.metrics().num_workers());
+        assert_eq!(row.thread_name, "apexbot-inline-sim-{n}");
     }
 }
 
@@ -612,7 +824,10 @@ mod tests {
 #[cfg(all(test, feature = "otel", not(target_arch = "wasm32")))]
 #[expect(clippy::expect_used)] // otel tests assert loudly per telemetry.rs otel_tests
 mod spawn_span_parent_tests {
+    use std::sync::Arc;
+
     use apexbot_bot::otel;
+    use apexbot_workers::lane::EscalationPort as _;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -670,6 +885,69 @@ mod spawn_span_parent_tests {
             inline.parent_span_id,
             solve.span_context.span_id(),
             "sim span must parent under the calling span"
+        );
+    }
+
+    /// LW-T3 (Seam C): escalations RE-ENTER the caller's span through the
+    /// port — Jaeger continuity survives the port (SGDXWU: no orphan roots).
+    /// RED scaffold: the port does not propagate the span yet.
+    #[test]
+    fn escalations_reenter_the_caller_span_through_the_port() {
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+        let port = super::SimRuntimeEscalationPort::new(Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test escalation runtime"),
+        ));
+        let done: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("global default already set by another test");
+
+        {
+            let solve = tracing::info_span!("apexbot.arb.solve", block.number = 3u64);
+            let _guard = solve.enter();
+            let done = Arc::clone(&done);
+            port.escalate(Box::pin(async move {
+                let child = tracing::info_span!("apexbot.simulate.escalation", path_id = 7u64);
+                let _enter = child.enter();
+                done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }))
+            .expect("escalation within budget");
+        } // solve span ends before the flush
+
+        // Wait for the escalated work to run (its span closed) then flush.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while done.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "escalated work never ran in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let solve = spans
+            .iter()
+            .find(|sp| sp.name.as_ref() == "apexbot.arb.solve")
+            .expect("caller span must be exported");
+        let child = spans
+            .iter()
+            .find(|sp| sp.name.as_ref() == "apexbot.simulate.escalation")
+            .expect("escalated span must be exported");
+        assert_eq!(
+            child.span_context.trace_id(),
+            solve.span_context.trace_id(),
+            "the escalated span must JOIN the caller's trace (no orphan root)"
+        );
+        assert_eq!(
+            child.parent_span_id,
+            solve.span_context.span_id(),
+            "the escalated span must parent under the calling span"
         );
     }
 }

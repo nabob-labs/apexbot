@@ -1,19 +1,23 @@
-"""Pipeline-side wiring of SkipGate: counter replay for memoized V4 rejects (2CBDPR).
+"""Pipeline-side skip recording for path registration (INN6TK + PRG-2).
 
-The memo short-circuit in `PathRegistrationPipeline._consume` must keep the
-summary counters byte-compatible with the first-attempt branches, so the
-`[build_paths] Progress` breakdown looks identical whether a rejection is
-seen live or replayed from the memo.
+The reason-tagged skip breakdown ([build_paths] Progress lines) records every
+candidate skip; PRG-2 additionally lands each skip in the Rust
+`apexbot.registration.skips` meter family through the FFI. The former
+SkipGate fatal memo retired: immutable V4 admission verdicts are refused
+pre-RPC by the core registration gate (bot_core/registration_gate.rs), and
+raced duplicate builds self-heal in the engine single-flight path (PRG-1).
 """
+
+from __future__ import annotations
 
 from types import SimpleNamespace
 
 from apexbot.runner.build_paths import PathRegistrationPipeline
 
 
-def make_pipeline() -> PathRegistrationPipeline:
+def make_pipeline(py_bot: object | None = None) -> PathRegistrationPipeline:
     ctx = SimpleNamespace(
-        bot=None,
+        bot=SimpleNamespace(_py_bot=py_bot, registration_fleet_hosted=lambda: True),
         chain_id=1,
         db=None,
         uniswap_v3_tracker=None,
@@ -24,25 +28,43 @@ def make_pipeline() -> PathRegistrationPipeline:
     return PathRegistrationPipeline(context=ctx, engine_registry=None)
 
 
-def test_memo_replay_hook_rejection_counts_admission() -> None:
+class _RecordingPyBot:
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+
+    def record_registration_skip(self, reason: str) -> None:
+        self.reasons.append(reason)
+
+
+def test_record_skip_counts_the_reason() -> None:
     p = make_pipeline()
-    assert p._reject_v4_from_memo("v4-hook-rejected") is True
-    assert p.v4_hook_rejected == 1
-    assert p.v4_dynamic_fee_rejected == 0
-    assert p._skip_reasons["v4-hook-rejected"] == 1
+    p._record_skip("build-v3:ConnectionError")
+    p._record_skip("build-v3:ConnectionError")
+    p._record_skip("dup")
+    assert p._skip_reasons["build-v3:ConnectionError"] == 2
+    assert p._skip_reasons["dup"] == 1
 
 
-def test_memo_replay_dynamic_fee_counts_admission() -> None:
-    p = make_pipeline()
-    assert p._reject_v4_from_memo("v4-dynamic-fee-rejected") is True
-    assert p.v4_dynamic_fee_rejected == 1
-    assert p.v4_hook_rejected == 0
-    assert p._skip_reasons["v4-dynamic-fee-rejected"] == 1
+def test_record_skip_forwards_to_the_rust_meter() -> None:
+    meter = _RecordingPyBot()
+    p = make_pipeline(py_bot=meter)
+    p._record_skip("v4-dynamic-fee-rejected")
+    p._record_skip("path-cap")
+    assert meter.reasons == ["v4-dynamic-fee-rejected", "path-cap"]
 
 
-def test_memo_replay_plain_failure_is_not_admission() -> None:
-    p = make_pipeline()
-    assert p._reject_v4_from_memo("build-v4:HighFeePoolRejectedError") is False
-    assert p.v4_hook_rejected == 0
-    assert p.v4_dynamic_fee_rejected == 0
-    assert p._skip_reasons["build-v4:HighFeePoolRejectedError"] == 1
+def test_record_skip_without_a_bot_only_counts() -> None:
+    # Construction contexts without a live core (pipeline tests) must not
+    # attempt the meter record.
+    ctx = SimpleNamespace(
+        bot=SimpleNamespace(_py_bot=None, registration_fleet_hosted=lambda: True),
+        chain_id=1,
+        db=None,
+        uniswap_v3_tracker=None,
+        sushiswap_v3_tracker=None,
+        pancakeswap_v3_tracker=None,
+        weth=None,
+    )
+    p = PathRegistrationPipeline(context=ctx, engine_registry=None)
+    p._record_skip("v4-no-hash")
+    assert p._skip_reasons["v4-no-hash"] == 1

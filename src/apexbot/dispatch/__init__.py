@@ -35,12 +35,20 @@ Symbol map (FFI name → stable companion name):
 - ``SimulateContext``   → :class:`SimulateContext`
 - ``TxSigner``          → :class:`TxSigner`
 - ``dispatch_profitable_py`` → :func:`dispatch_profitable`
+- ``merge_payload_results_py`` → :func:`merge_payload_results`
 - ``dispatch_and_submit_py`` → :func:`dispatch_and_submit`
 - ``fetch_fee_history_py``   → :func:`fetch_fee_history`
 """
 
-from apexbot._ffi.simulation import DispatchCandidate, DispatchOutcome, SimulateContext
+from apexbot._ffi.simulation import (
+    DispatchCandidate,
+    DispatchOutcome,
+    PayloadOutcome,
+    PayloadVerdict,
+    SimulateContext,
+)
 from apexbot._ffi.simulation import dispatch_profitable_py as dispatch_profitable
+from apexbot._ffi.simulation import merge_payload_results_py as merge_payload_results
 from apexbot._ffi.submission import Dispatcher, SubmitCandidate, TxSigner
 from apexbot._ffi.submission import dispatch_and_submit_py as dispatch_and_submit
 from apexbot._ffi.submission import fetch_fee_history_py as fetch_fee_history
@@ -49,10 +57,13 @@ __all__ = [
     "DispatchCandidate",
     "DispatchOutcome",
     "Dispatcher",
+    "PayloadOutcome",
+    "PayloadVerdict",
     "SimulateContext",
     "SubmitCandidate",
     "TxSigner",
     "dispatch_and_submit",
     "dispatch_profitable",
     "fetch_fee_history",
+    "merge_payload_results",
 ]

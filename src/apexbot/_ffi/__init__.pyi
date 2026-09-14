@@ -45,6 +45,12 @@ from . import diagnostics as diagnostics
 from . import eip_1559 as eip_1559
 from . import execution as execution
 from . import executor as executor
+
+# ------------------------------------------------------------------
+# ── Fleet operator seam (feature = "simulation", JCI2FW Part B). ──
+# The runtime re-tune channel over the process posture owner; see
+# `fleet.pyi` for the two pyfunctions + the typed refusal exception.
+from . import fleet as fleet
 from . import fork as fork
 from . import pool as pool
 from . import price as price
@@ -109,6 +115,40 @@ from .submission import (
 # optional `0x` prefix), `bytes`, `bytearray`, or `str` (hex); return `bytes`.
 # Truncated/invalid back-references surface as `ValueError`. The Python
 # companion `apexbot.utils.solady.libzip` delegates here (sub-step C routing).
+def call_on_ambient_runtime(fn: object) -> object:
+    """Call ``fn()`` on the calling thread, sharing the core runtime.
+
+    The verify seams read the caller's ambient tokio runtime and refuse to
+    build a per-call runtime; Rust consumers run on it natively, so a
+    Python driver wraps its verify-seam call in this helper to supply the
+    ambient runtime. The shared runtime singleton is created on first use
+    and the enter guard is held for the duration of the call.
+
+    Args:
+        fn: A zero-argument callable; its return value (or exception) is
+            passed through unchanged.
+
+    Returns:
+        Whatever ``fn`` returns.
+
+    """
+
+def build_fingerprint() -> str: ...
+def build_number() -> int: ...
+def runtime_status() -> dict[str, Any]:
+    """FF-T5 (NT7HJC): the runtime fleet status.
+
+    Returns a dict with the resolved plan (``fleet_booted``, ``profile``,
+    ``quota_cpus``, ``binding`` (pinned/serial), ``oversubscribed``,
+    ``tier_refused``: the typed refusal the plan fell from, rendered
+    ``NAME: message`` — an auto/serial host carries the
+    ``QuotaTooSmallForPinnedRoles`` that placed it there, a forced-pinned
+    oversubscribed host carries the pinned-floor refusal it overrode;
+    ``None`` when nothing was refused), the projected budget (``budget``:
+    the seat/share table), and the worker census rows (``census``: one
+    dict per resource, with the lane-to-thread ``binding`` per row).
+    """
+
 def build_path_graph(
     database_path: str,
     chain_id: int,
@@ -626,6 +666,19 @@ class Bot:
         coordinator-owned, so this lives on Bot (the pump-lifecycle handle),
         not on ArbitrageEngine. Once-only; a second call raises RuntimeError.
         """
+    def registration_fleet_hosted(self) -> bool:
+        """Whether the fleet hosts the registration intake (PRG-3).
+
+        Reads the fleet-stance boot gate installed at engine construction.
+        The driver reads this ONCE at pipeline construction.
+        """
+
+    def submit_registration_unit(self, fn: object) -> IntakeReceipt:
+        """Submit one pool-build callable to the fleet intake (PRG-3).
+
+        The callable runs on a pooled `work-fleet-poolupd-{n}` seat; the
+        receipt joins it. Refuses under the legacy stance.
+        """
     def load_snapshot_from_db(self, db_path: str, chain_id: int) -> None:
         """Load `S` from the DB into the core `BotState` at construction time.
 
@@ -909,6 +962,17 @@ class Bot:
         pool_id_hex: str,
         snapshot_block: int | None,
     ) -> Coroutine[Any, Any, None]: ...
+    def run_v3_registration_lifecycle_sync(
+        self,
+        address: str,
+        snapshot_block: int | None,
+    ) -> None: ...
+    def run_v4_registration_lifecycle_sync(
+        self,
+        pool_manager_address: str,
+        pool_id_hex: str,
+        snapshot_block: int | None,
+    ) -> None: ...
     def register_curve_pool(
         self,
         address: str,
@@ -1068,6 +1132,9 @@ class ArbitrageEngine:
     def v3_pool_count(self) -> int: ...
     def v4_pool_count(self) -> int: ...
     def path_count(self) -> int: ...
+    def set_path_cap(self, cap: int | None = None) -> None: ...
+    @property
+    def path_dedups(self) -> int: ...
     def sync_v3_pool_states(
         self,
         v3_sync_updates: list[tuple[str, int, int, int, dict[int, tuple[int, int]]]],
@@ -1123,6 +1190,17 @@ class ArbitrageEngine:
     def __anext__(self) -> Coroutine[Any, Any, dict[str, Any]]: ...
 
     # ── Verify config (consumer-safe: nothing emits before resume). ──
+    def run_v3_registration_lifecycle_sync(
+        self,
+        address: str,
+        snapshot_block: int | None,
+    ) -> None: ...
+    def run_v4_registration_lifecycle_sync(
+        self,
+        pool_manager_address: str,
+        pool_id_hex: str,
+        snapshot_block: int | None,
+    ) -> None: ...
     def set_verify_rpc_url(self, rpc_url: str) -> None: ...
     def set_verify_state_view(self, state_view_address: str) -> None: ...
     def verify_v3_pool(
@@ -1151,8 +1229,8 @@ class ArbitrageEngine:
     ) -> Coroutine[Any, Any, None]: ...
 
     # ── Pool + path registration ──
-    def register_path(self, pool_refs: list[tuple[int, bool]]) -> int: ...
-    def register_and_solve_path(self, pool_refs: list[tuple[int, bool]]) -> int: ...
+    def register_path(self, pool_refs: list[tuple[int, bool]]) -> tuple[int, bool]: ...
+    def register_and_solve_path(self, pool_refs: list[tuple[int, bool]]) -> tuple[int, bool]: ...
 
     # ── Inline-sim hook (SIMPIPE2 T3/T4) ──
     # Install this session's sim config as the engine's InlineSimulator
@@ -1178,6 +1256,19 @@ class BlockStream:
     def __aiter__(self) -> BlockStream: ...
     def __anext__(self) -> Coroutine[Any, Any, dict[str, Any]]: ...
 
+class IntakeReceipt:
+    """Join handle for one fleet-intake registration unit (PRG-3).
+
+    Returned by :meth:`Bot.submit_registration_unit`; `done()` polls for
+    completion, `result()` delivers the callable's return value or raises
+    its exception, and `wait()` is the blocking (GIL-detached) join.
+    """
+
+    def done(self) -> bool: ...
+    def result(self) -> object: ...
+    def wait(self, timeout: float | None = None) -> object: ...
+    def wait_async(self) -> Coroutine[Any, Any, None]: ...
+
 class VerificationMismatchError(RuntimeError):
     """On-chain verification mismatch: engine tick data != on-chain state.
 
@@ -1196,6 +1287,30 @@ class VerificationRpcError(RuntimeError):
     also not safe to silently skip (an unverifiable pool is no safer than a
     mismatched one), but a distinct type so the caller can choose
     retry/backoff vs abort. Subclasses ``RuntimeError``.
+    """
+
+class BootRefused(RuntimeError):
+    """The fleet host refused to boot (FF-T1, BPHR6F).
+
+    Raised when the detected CPU budget is below the pinned-role floor
+    or a fleet boot invariant failed: the message carries the detected
+    budget, the floor, and one operator hint. The library NEVER aborts
+    the host process on this arm — the refusal is typed and sticky
+    (every submit re-surfaces it); the ``apexbot`` binary maps it to
+    its loud named fail-fast exit (exit code 78, EX_CONFIG). Subclasses
+    ``RuntimeError`` so broad handlers keep working; classify by
+    ``isinstance`` for the fail-fast path.
+    """
+
+class PathRegistryFullError(ValueError):
+    """The engine path registry is at its configured registered-path cap.
+
+    PRG-4: the cap lives in the Rust path registry; this refusal is a BENIGN
+    stop signal - the crawl catches it and stops discovery (it replaces the
+    Python ``DiscoveryCrawlComplete`` pre-count unwind raised from the Python
+    ``MAX_REGISTERED_PATHS`` counter). Deliberately NOT under
+    :class:`PoolRegistrationError` - a full registry is a state, not a
+    pool-admission refusal.
     """
 
 class PoolRegistrationError(ValueError):
@@ -1390,6 +1505,7 @@ __all__ = [
     "ArbitrageEngine",
     "BalanceVectorView",
     "BlockStream",
+    "BootRefused",
     "Bot",
     "BotIo",
     "ConcentratedLiquidityView",
@@ -1411,6 +1527,8 @@ __all__ = [
     "aave",
     "abi",
     "balancer_math",
+    "build_fingerprint",
+    "build_number",
     "build_path_graph",
     "cancel",
     "compute_aerodrome_v2_pool_address",
@@ -1426,10 +1544,12 @@ __all__ = [
     "execution",
     "executor",
     "find_paths_rust",
+    "fleet",
     "fork",
     "pool",
     "price",
     "provider",
+    "runtime_status",
     "shutdown_log_drainer",
     "shutdown_subscriber_drainer",
     "simulation",

@@ -2078,7 +2078,7 @@ impl MergeFallbackReason {
 /// order, so legacy's stable-sort tie machinery sees identical relative
 /// order for every pair that exists).
 ///
-/// Safety: DEGENERATE-FREE pair selection is impossible to prove for tie /
+/// Safety: APEXERATE-FREE pair selection is impossible to prove for tie /
 /// ceil-collision inputs, so this routine falls back to the frozen legacy
 /// chain whenever selection is ambiguous:
 ///   - any flat line (b == 0) or negative-slope line on either side (the

@@ -16,7 +16,6 @@
 //! remaining records. The Python driver should call this before interpreter
 //! finalization (e.g. in `__aexit__` or via Python `atexit`).
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -81,6 +80,15 @@ impl PythonLogLayer {
             shutdown: AtomicBool::new(false),
         });
         let drainer_state = Arc::clone(&state);
+        // PE4FPM: self-register the drainer thread.
+        apexbot_core::worker_census::register(apexbot_core::worker_census::WorkerCensusEntry {
+            resource: "rust_log_drainer",
+            kind: "std drainer thread (tracing → Python logging bridge)",
+            count: 1,
+            thread_name: "rust-log-drainer",
+            sizing: "exactly one (fixed; built with the layer at logging init)",
+            binding: "pinned",
+        });
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _drainer = thread::Builder::new()
             .name("rust-log-drainer".into())
@@ -177,18 +185,13 @@ where
 /// has `target = "log"` and the original log target is stored in the
 /// `log.target` field. This function visits the event fields and returns
 /// the original target if found.
-/// The user config file (`~/.config/apexbot/config.toml`). Separate helper
-/// so tests can point it at a fixture.
-pub(crate) fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| Path::new(&home).join(".config/apexbot/config.toml"))
-}
-
 /// Resolve the OTLP endpoint for span export. Precedence (first wins):
 ///
 /// 1. `OTEL_EXPORTER_OTLP_ENDPOINT` env var (standard `OTel` signal env —
 ///    explicit, always wins),
-/// 2. `otel.endpoint` in the user config file
-///    (`~/.config/apexbot/config.toml`),
+/// 2. `telemetry.jaeger_endpoint` in the user config file (the modern
+///    OTLP-key home; the pre-0.6 `[otel]` table is retired and any file
+///    still carrying it is refused at boot — JLFE2F),
 /// 3. `None` — the exporter falls back to its built-in default
 ///    (`http://localhost:4318`).
 ///
@@ -198,7 +201,7 @@ pub(crate) fn user_config_path() -> Option<PathBuf> {
 #[must_use]
 pub(crate) fn resolve_otlp_endpoint(
     env_raw: Option<&str>,
-    config_file: Option<&Path>,
+    config_file: Option<&std::path::Path>,
 ) -> Option<String> {
     if let Some(url) = env_raw.filter(|s| !s.is_empty()) {
         return Some(url.to_owned());
@@ -209,8 +212,8 @@ pub(crate) fn resolve_otlp_endpoint(
     };
     match text.parse::<toml::Table>() {
         Ok(table) => table
-            .get("otel")
-            .and_then(|otel| otel.get("endpoint"))
+            .get("telemetry")
+            .and_then(|telemetry| telemetry.get("jaeger_endpoint"))
             .and_then(|v| v.as_str())
             .map(str::to_owned),
         Err(e) => {
@@ -577,12 +580,50 @@ where
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(tracing_subscriber::fmt::writer::BoxMakeWriter::new(
-                    std::io::stderr,
-                ))
+                .with_writer(fmt_writer())
                 .with_ansi(true),
         )
         .with(python_layer)
+}
+
+/// `APEXBOT_LOG_FMT`: the stderr `fmt` layer copy of every record.
+///
+/// Default ON (the stderr mirror is handy for hand-runs that only capture
+/// stderr). Set `APEXBOT_LOG_FMT=0` to route the fmt layer to `io::sink()`:
+/// a driver that tees BOTH stdout (Python logging) and stderr (fmt layer)
+/// into one file then records every apexbot line exactly once, halving the
+/// run-log volume and dropping the ANSI-escaped blocker lines from the file.
+/// The writer (not the layer) is swapped so the builder types — and every
+/// caller/test against them — stay unchanged; the layer keeps formatting
+/// (costs are CPU-trivial at INFO levels).
+#[cfg(feature = "otel")]
+pub(crate) fn fmt_enabled() -> bool {
+    !matches!(
+        std::env::var("APEXBOT_LOG_FMT")
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no" | "")
+    )
+}
+
+#[cfg(not(feature = "otel"))]
+fn fmt_enabled() -> bool {
+    !matches!(
+        std::env::var("APEXBOT_LOG_FMT")
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no" | "")
+    )
+}
+
+/// The writer for the stderr `fmt` layer: stderr, or a sink when
+/// `APEXBOT_LOG_FMT` is falsey (see [`fmt_enabled`]).
+fn fmt_writer() -> tracing_subscriber::fmt::writer::BoxMakeWriter {
+    if fmt_enabled() {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink)
+    }
 }
 
 #[cfg(feature = "otel")]
@@ -638,9 +679,7 @@ where
         .with(otel_layer.with_filter(record_filter))
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(tracing_subscriber::fmt::writer::BoxMakeWriter::new(
-                    std::io::stderr,
-                ))
+                .with_writer(fmt_writer())
                 .with_ansi(true)
                 .with_filter(console_filter.clone()),
         )
@@ -693,11 +732,12 @@ pub fn init_logging_subscriber() {
             // T5/RMH23E dev default: ON whenever the `otel` feature is
             // compiled (dev builds only — release wheels carry zero OTel
             // code). Opt out with APEXBOT_OTEL=0. Endpoint precedence:
-            // OTEL_EXPORTER_OTLP_ENDPOINT env > otel.endpoint in
-            // ~/.config/apexbot/config.toml > exporter default.
+            // OTEL_EXPORTER_OTLP_ENDPOINT env > telemetry.jaeger_endpoint
+            // in ~/.config/apexbot/config.toml (JLFE2F: the pre-0.6
+            // [otel] table is retired) > exporter default.
             let endpoint = resolve_otlp_endpoint(
                 std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
-                user_config_path().as_deref(),
+                ::apexbot_config::standard_file_path().as_deref(),
             );
             let build_provider = || match &endpoint {
                 Some(url) => apexbot_bot::otel::provider_from_endpoint(url),
@@ -987,7 +1027,10 @@ mod tests {
         let cfg = dir.join("config.toml");
 
         // 1. env wins over an existing config file
-        let contents = concat!("[otel]\n", "endpoint = \"http://from-config:4318\"\n");
+        let contents = concat!(
+            "[telemetry]\n",
+            "jaeger_endpoint = \"http://from-config:4318\"\n"
+        );
         std::fs::write(&cfg, contents).unwrap();
         assert_eq!(
             resolve_otlp_endpoint(Some("http://from-env:4318"), Some(&cfg)).as_deref(),

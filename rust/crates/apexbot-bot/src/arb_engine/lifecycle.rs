@@ -7,6 +7,39 @@ use ::apexbot_solvers::mixed::{
     HopType, MixedPath, MixedPoolRef, PoolHop, ResolvedMixedPath, SolvePathResult,
 };
 
+/// Typed refusal from [`ArbitrageEngine::register_path`] (PRG-4 / IRUMXD —
+/// was a bare `String`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathRegistrationError {
+    /// Structural caller bug or stale view: fewer than two hops, a
+    /// `pool_id` not registered in the associated `BotState`, or a
+    /// structurally unroutable hop. Message text is unchanged from the
+    /// legacy `String` form (the `PyO3` mapping surfaces it verbatim as a
+    /// `ValueError`).
+    Invalid(String),
+    /// PRG-4: the registered-path cap is reached. A BENIGN stop signal, not
+    /// an error condition — the crawl catches it and stops discovery (it
+    /// replaces the Python `DiscoveryCrawlComplete` pre-count unwind).
+    RegistryFull {
+        /// The configured capacity.
+        cap: usize,
+        /// The registered-path count at refusal (== `cap`).
+        registered: usize,
+    },
+}
+
+impl std::fmt::Display for PathRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(msg) => f.write_str(msg),
+            Self::RegistryFull { cap, registered } => write!(
+                f,
+                "registered-path cap reached ({registered}/{cap}) — the crawl must stop discovery"
+            ),
+        }
+    }
+}
+
 impl ArbitrageEngine {
     /// Derive a hop's family from the `BotState`'s `PoolEntry` variant.
     ///
@@ -65,14 +98,15 @@ impl ArbitrageEngine {
     ///
     /// Returns `Err` if any `pool_id` is not registered in the associated
     /// `BotState`.
-    pub fn register_path(&mut self, hops: Vec<PoolHop>) -> Result<u64, String> {
+    #[expect(clippy::too_many_lines)] // one path registration: dedup + cap gate + resolve + store in one contract
+    pub fn register_path(&mut self, hops: Vec<PoolHop>) -> Result<u64, PathRegistrationError> {
         // R522XA: fewer than two hops is a structural caller bug, not a state —
         // reject loudly at construction.
         if hops.len() < 2 {
-            return Err(format!(
+            return Err(PathRegistrationError::Invalid(format!(
                 "register_path: path has {} hops (need >= 2) — structurally unroutable",
                 hops.len()
-            ));
+            )));
         }
 
         // Telemetry: one Jaeger node per path registration (a root span on the
@@ -91,7 +125,26 @@ impl ArbitrageEngine {
                 hops.count = hops.len(),
                 "[path] duplicate registration skipped (dedup)"
             );
+            // PRG-4: the duplicate never crosses the FFI as a skip — the
+            // engine counts it for the registration skip telemetry itself.
+            self.path_dedups += 1;
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_registration_skip("dup");
+            }
             return Ok(existing_id);
+        }
+
+        // PRG-4 / IRUMXD: the registered-path cap lives HERE, in the engine
+        // path registry (was the Python `MAX_REGISTERED_PATHS` counter +
+        // the `DiscoveryCrawlComplete` unwind). A new registration past the
+        // cap is refused with the typed benign-stop refusal — the crawl
+        // catches it and stops discovery; dedup hits above never reach this
+        // check (an existing path is not growth).
+        if let Some(cap) = self.path_cap {
+            let registered = self.path_pools.len();
+            if registered >= cap {
+                return Err(PathRegistrationError::RegistryFull { cap, registered });
+            }
         }
 
         let reg_span = tracing::info_span!("apexbot.path.register", hops.count = hops.len());
@@ -105,10 +158,10 @@ impl ArbitrageEngine {
             let core = self.core.read();
             for hop in hops {
                 let Some(hop_type) = Self::derive_hop_type(&core, hop.pool_id) else {
-                    return Err(format!(
+                    return Err(PathRegistrationError::Invalid(format!(
                         "register_path: pool_id {} is not registered in the associated BotState",
                         hop.pool_id
-                    ));
+                    )));
                 };
                 hop_descs.push(super::path_info::describe_hop(
                     &core,
@@ -142,12 +195,12 @@ impl ArbitrageEngine {
             .iter()
             .find(|d| d.reason.is_structurally_unroutable())
         {
-            return Err(format!(
+            return Err(PathRegistrationError::Invalid(format!(
                 "register_path: hop ({hop_type:?} pool {pool_key}) is structurally unroutable ({reason}) — rejecting path at construction",
                 hop_type = format!("{:?}", unroutable.hop_type),
                 pool_key = unroutable.pool_key,
                 reason = unroutable.reason,
-            ));
+            )));
         }
 
         // Only now allocate the path id (no gaps from rejected registrations)
@@ -174,7 +227,13 @@ impl ArbitrageEngine {
             .set_resolved(&deficits);
         self.path_signatures.insert(sig, path_id);
 
-        tracing::info!(
+        // DEBUG-gated (log-volume cut OPBD7L): one line per path registration
+        // was ~48% of a 10G run log (new pools/hop-combos register constantly
+        // on a live run). The registration itself stays fully observable via
+        // the `apexbot.path.register` OTel span (record filter uncapped) and
+        // the `path_pools` count metric; re-enable with
+        // `RUST_LOG=apexbot_bot=debug` for desync investigations.
+        tracing::debug!(
             target: "apexbot::path",
             path_id = path_id,
             hops.count = hop_descs.len(),
@@ -197,7 +256,10 @@ impl ArbitrageEngine {
     ///
     /// Returns `Err` if any `pool_id` is not registered in the associated
     /// `BotState` (see [`register_path`](Self::register_path)).
-    pub fn register_and_solve_path(&mut self, hops: Vec<PoolHop>) -> Result<u64, String> {
+    pub fn register_and_solve_path(
+        &mut self,
+        hops: Vec<PoolHop>,
+    ) -> Result<u64, PathRegistrationError> {
         let path_id = self.register_path(hops)?;
 
         // Eagerly solve the newly registered path
@@ -252,7 +314,7 @@ impl ArbitrageEngine {
                 .iter()
                 .map(|r| (*r.key(), r.value().clone()))
                 .collect(),
-            self.results_block,
+            self.cursor.results_block(),
         )
     }
 
@@ -260,7 +322,7 @@ impl ArbitrageEngine {
     /// Returns `None` if no block has been processed yet.
     #[must_use]
     pub const fn last_processed_block(&self) -> Option<u64> {
-        self.last_processed_block
+        self.cursor.last_processed_block()
     }
 
     /// Set the last processed block manually.
@@ -270,8 +332,11 @@ impl ArbitrageEngine {
     /// the pump would restart from `first_observed_block` and buffer
     /// events that the Python pools already reflect, causing
     /// double-application when pools are later registered.
-    pub const fn set_last_processed_block(&mut self, block: u64) {
-        self.last_processed_block = Some(block);
+    ///
+    /// 6XB6NJ: a monotone advance on the block cursor — a lower value
+    /// cannot pull the processed boundary backwards.
+    pub fn set_last_processed_block(&mut self, block: u64) {
+        self.cursor.advance_processed(block);
     }
 
     /// The last block this engine's `finalize_block` guard advanced past.
@@ -281,15 +346,20 @@ impl ArbitrageEngine {
     /// tombstone `finalize_block(block > 0)` fires).
     #[must_use]
     pub const fn last_solved_block(&self) -> u64 {
-        self.last_solved_block
+        self.cursor.last_solved_block()
     }
 
     /// Seed the engine's `last_solved_block` (e.g. on mid-flight join: a late
     /// engine inherits the pump's current solved block). Test helper too — the
     /// `finalize_block_threads_metadata_into_send` test pre-seeds 0 to fire the
     /// guard. Production pump path lets `finalize_block` advance it.
+    ///
+    /// 6XB6NJ: a monotone advance on the block cursor. Behavior-preserving
+    /// on every existing call path (the ADR-006 D4 inherit + tests): the
+    /// engine starts at 0 and the production stamps are non-decreasing, so
+    /// the max is the same value the old unconditional write landed.
     pub fn set_last_solved_block(&mut self, block: u64) {
-        self.last_solved_block = block;
+        self.cursor.advance_solved_boundary(block);
     }
 
     /// Seed the cold-start `results_block` anchor to a **settled** block (the
@@ -304,12 +374,21 @@ impl ArbitrageEngine {
     /// cold-start candidates deliver immediately at a valid, verification-safe
     /// solve block.
     ///
-    /// Only fills when `results_block` is still `0`: once a real solve has
-    /// established a (possibly higher) anchor, we never regress it.
+    /// 6XB6NJ: a plain monotone advance on the block cursor — the old
+    /// only-if-zero guard is subsumed ("never regress" holds by
+    /// construction; see `BlockCursor::advance_solved`).
     pub fn set_solve_anchor(&mut self, block: u64) {
-        if self.results_block == 0 {
-            self.results_block = block;
-        }
+        self.cursor.advance_solved(block);
+    }
+
+    /// KJWIK5: install the deferred-path re-record hook (the ledger carry).
+    /// `EngineStages::set_delta` is the production installer — it captures
+    /// the shared `EpochDelta` and re-records a deferred path's hop-pool
+    /// keys at the cycle's solve block. Direct engine drives (unit tests, the
+    /// cold-start `solve_all`) leave it unset, and the deferral falls back
+    /// to today's dropped behavior.
+    pub(crate) fn set_deferred_re_record(&mut self, hook: super::DeferredReRecordHook) {
+        self.deferred_re_record = Some(hook);
     }
 
     /// Whether any forward log applied since the last `finalize_block` (the
@@ -318,14 +397,14 @@ impl ArbitrageEngine {
     /// since LEZJAS; returns `false` until the first `record_logs_this_block`.
     #[must_use]
     pub const fn has_logs_this_block(&self) -> bool {
-        self.has_logs_this_block
+        self.cursor.has_logs_this_block()
     }
 
     /// Record that at least one forward log applied this block (clears on the
     /// next `finalize_block`). Replaces the pump's `has_logs_this_block = true;`
     /// out-param write (ergo task LEZJAS).
     pub fn record_logs_this_block(&mut self) {
-        self.has_logs_this_block = true;
+        self.cursor.record_logs();
     }
 
     /// Resolve and solve all registered paths. **Solve-only — does NOT dispatch
@@ -375,7 +454,9 @@ impl ArbitrageEngine {
         for (pid, r) in results {
             self.results.insert(pid, r);
         }
-        self.results_block = block_number;
+        // 6XB6NJ: monotone advance on the block cursor (the cold-start
+        // sweep can no longer drag a seeded resume anchor backwards).
+        self.cursor.advance_solved(block_number);
 
         // Intentionally no compute_diff_and_send here: dispatching would
         // advance `delivered` (claiming "Python has seen these") before any
@@ -405,6 +486,21 @@ impl ArbitrageEngine {
     #[must_use]
     pub fn path_count(&self) -> usize {
         self.path_pools.len()
+    }
+
+    /// PRG-4 / IRUMXD: the engine path registry owns the registered-path cap
+    /// (was the Python `MAX_REGISTERED_PATHS` counter). `None` = unlimited.
+    /// The `PyO3` driver sets it once at boot from the typed config value.
+    pub fn set_path_cap(&mut self, cap: Option<usize>) {
+        self.path_cap = cap;
+    }
+
+    /// PRG-4: dedup hits counted engine-side — a duplicate registration
+    /// returns the existing id and never surfaces to the driver as a skip,
+    /// so the `dup` telemetry needs this witness.
+    #[must_use]
+    pub fn path_dedups(&self) -> u64 {
+        self.path_dedups
     }
 
     /// Total actual hop projections performed (cache misses) since engine

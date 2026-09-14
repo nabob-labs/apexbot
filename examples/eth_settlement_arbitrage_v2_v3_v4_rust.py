@@ -29,6 +29,7 @@ import time
 import dotenv
 
 from apexbot._ffi.diagnostics import mark_progress, start_gil_probe
+from apexbot.exceptions import BootRefused
 from apexbot.logging import logger as bot_logger
 from apexbot.runner import BotRunner
 from apexbot.runner.cli import build_arbitrage_arg_parser
@@ -193,6 +194,7 @@ async def main() -> None:
             if args.operator_socket:
                 from apexbot.operator.operator_channel import (
                     OperatorServer,
+                    handle_fleet_posture_op,
                     step_from_wire,
                 )
 
@@ -206,6 +208,11 @@ async def main() -> None:
                         bound = payload.get("bound")
                         n = await session.trigger_discovery(bound=bound)
                         return {"detail": f"discovery processed {n} paths"}
+                    if op in ("set_fleet_posture", "get_fleet_posture"):
+                        # JCI2FW Part B: the live cordon-threshold re-tune
+                        # + read, routed through the shared helper (the
+                        # apexbot.fleet mirror home mints on first use).
+                        return handle_fleet_posture_op(op, payload)
                     return {"error": f"unknown op {op!r}"}
 
                 operator = OperatorServer(operator_handler, socket_path=args.operator_socket)
@@ -219,6 +226,14 @@ async def main() -> None:
                     with contextlib.suppress(asyncio.CancelledError):
                         await operator_task
                     await operator.close()
+    except BootRefused as exc:
+        # FF-T1 (BPHR6F): the library surfaced the TYPED fleet boot
+        # refusal (it never aborts the host process); the BINARY owns the
+        # loud fail-fast exit — one named line, non-zero status, the same
+        # message discipline the process abort used to carry. 78 is
+        # sysexits EX_CONFIG: the host cannot host the fleet configuration.
+        bot_logger.error(f"[fleet-boot] REFUSED — {exc}")
+        sys.exit(78)
     except (KeyboardInterrupt, asyncio.CancelledError):
         bot_logger.info("[shutdown] interrupted — Rust pump stopped, exiting.")
 

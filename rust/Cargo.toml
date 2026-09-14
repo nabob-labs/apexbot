@@ -18,12 +18,12 @@
 # (`crates/apexbot-python/`) inherits it, and maturin reads that crate's
 # version to set the published wheel's — so one edit moves both halves.
 [workspace.package]
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 edition = "2021"
-license = "Apache-2.0"
+license = "Apache-2.0 license"
 rust-version = "1.97"
 repository = "https://github.com/nabob-labs/apexbot.git"
-authors = ["nabob-labs"]
+authors = ["Nabob Labs"]
 
 # Single source of truth for lint policy across all workspace members
 # (ADR: centralize per-crate [lints] duplication). Every member inherits these
@@ -69,34 +69,42 @@ exit = "deny"
 # Internal path deps carry explicit version requirements here so the 26
 # publishable crates pass cargo publish manifest validation. Keep these
 # version literals in sync with [workspace.package].version (lockstep, ADR-009).
-apexbot-aave = { version = "0.6.0-alpha.9", path = "crates/apexbot-aave" }
-apexbot-abi = { version = "0.6.0-alpha.9", path = "crates/apexbot-abi" }
-apexbot-arbitrage = { version = "0.6.0-alpha.9", path = "crates/apexbot-arbitrage" }
-apexbot-bot = { version = "0.6.0-alpha.9", path = "crates/apexbot-bot" }
-apexbot-core = { version = "0.6.0-alpha.9", path = "crates/apexbot-core" }
-apexbot-config = { version = "0.6.0-alpha.9", path = "crates/apexbot-config" }
-apexbot-db = { version = "0.6.0-alpha.9", path = "crates/apexbot-db" }
-apexbot-decoders = { version = "0.6.0-alpha.9", path = "crates/apexbot-decoders" }
-apexbot-execution = { version = "0.6.0-alpha.9", path = "crates/apexbot-execution" }
-apexbot-executor = { version = "0.6.0-alpha.9", path = "crates/apexbot-executor" }
-apexbot-fork = { version = "0.6.0-alpha.9", path = "crates/apexbot-fork" }
-apexbot-ingestion = { version = "0.6.0-alpha.9", path = "crates/apexbot-ingestion" }
-apexbot-math = { version = "0.6.0-alpha.9", path = "crates/apexbot-math" }
-apexbot-order-index = { version = "0.6.0-alpha.9", path = "crates/apexbot-order-index" }
-apexbot-pathfinding = { version = "0.6.0-alpha.9", path = "crates/apexbot-pathfinding" }
-apexbot-pool-updater = { version = "0.6.0-alpha.9", path = "crates/apexbot-pool-updater" }
-apexbot-pools = { version = "0.6.0-alpha.9", path = "crates/apexbot-pools" }
-apexbot-price = { version = "0.6.0-alpha.9", path = "crates/apexbot-price" }
-apexbot-rpc = { version = "0.6.0-alpha.9", path = "crates/apexbot-rpc" }
-apexbot-simulation = { version = "0.6.0-alpha.9", path = "crates/apexbot-simulation" }
-apexbot-solvers = { version = "0.6.0-alpha.9", path = "crates/apexbot-solvers" }
-apexbot-submission = { version = "0.6.0-alpha.9", path = "crates/apexbot-submission" }
-apexbot-uniswap = { version = "0.6.0-alpha.9", path = "crates/apexbot-uniswap" }
+apexbot-aave = { version = "0.6.0-alpha.10", path = "crates/apexbot-aave" }
+apexbot-abi = { version = "0.6.0-alpha.10", path = "crates/apexbot-abi" }
+apexbot-arbitrage = { version = "0.6.0-alpha.10", path = "crates/apexbot-arbitrage" }
+apexbot-bot = { version = "0.6.0-alpha.10", path = "crates/apexbot-bot" }
+apexbot-core = { version = "0.6.0-alpha.10", path = "crates/apexbot-core" }
+apexbot-config = { version = "0.6.0-alpha.10", path = "crates/apexbot-config" }
+apexbot-db = { version = "0.6.0-alpha.10", path = "crates/apexbot-db" }
+apexbot-decoders = { version = "0.6.0-alpha.10", path = "crates/apexbot-decoders" }
+apexbot-execution = { version = "0.6.0-alpha.10", path = "crates/apexbot-execution" }
+apexbot-executor = { version = "0.6.0-alpha.10", path = "crates/apexbot-executor" }
+apexbot-fork = { version = "0.6.0-alpha.10", path = "crates/apexbot-fork" }
+apexbot-ingestion = { version = "0.6.0-alpha.10", path = "crates/apexbot-ingestion" }
+apexbot-math = { version = "0.6.0-alpha.10", path = "crates/apexbot-math" }
+apexbot-order-index = { version = "0.6.0-alpha.10", path = "crates/apexbot-order-index" }
+apexbot-pathfinding = { version = "0.6.0-alpha.10", path = "crates/apexbot-pathfinding" }
+apexbot-pool-updater = { version = "0.6.0-alpha.10", path = "crates/apexbot-pool-updater" }
+apexbot-pools = { version = "0.6.0-alpha.10", path = "crates/apexbot-pools" }
+apexbot-price = { version = "0.6.0-alpha.10", path = "crates/apexbot-price" }
+apexbot-rpc = { version = "0.6.0-alpha.10", path = "crates/apexbot-rpc" }
+apexbot-simulation = { version = "0.6.0-alpha.10", path = "crates/apexbot-simulation" }
+apexbot-solvers = { version = "0.6.0-alpha.10", path = "crates/apexbot-solvers" }
+apexbot-submission = { version = "0.6.0-alpha.10", path = "crates/apexbot-submission" }
+apexbot-uniswap = { version = "0.6.0-alpha.10", path = "crates/apexbot-uniswap" }
+apexbot-workers = { version = "0.6.0-alpha.10", path = "crates/apexbot-workers" }
 # hashbrown: foldhash-based HashMap/HashSet for the hot maps (small int/string
 # keys generated in-process — no DoS surface). 0.17.1 + foldhash 0.2.0 already
 # resolve transitively (indexmap 2.14 / lru 0.18), so this direct dependency
 # unifies the graph instead of growing it. default-hasher = foldhash.
 hashbrown = { version = "0.17", features = ["default-hasher"] }
+# indexmap: insertion-ordered set/map. `IndexSet` is the recency ledger's bucket
+# set (epic MROOY7 task 7S4QAG) — hashbrown offers no ordered variant, and the
+# ledger needs order-preserving mutation: `shift_remove` on promotion, a
+# `split_off` head/tail split on a partial drain, and `mem::take` for a
+# whole-bucket drain. 2.14.2 already resolves transitively (alloy et al.), so
+# this direct dep unifies the graph rather than growing it.
+indexmap = "2"
 # zstd: decode-only use for the committed .jsonl.zst capture fixtures
 # (apexbot-solvers/src/capture_fixture.rs). arrays avoids building the
 # legacy/mt C code paths we never touch.
@@ -131,6 +139,7 @@ members = [
     "crates/apexbot-submission",
     "crates/apexbot-uniswap",
     "crates/apexbot-order-index",
+    "crates/apexbot-workers",
 ]
 
 # Release profile.

@@ -78,6 +78,12 @@ pub use apexbot_fork as fork;
 /// Standalone-Rust core mirroring the Aave updater shape.
 pub use apexbot_pool_updater as pool_updater;
 
+/// The role-switching worker fleet (ADR-042): the `WorkerRole` FSM, the
+/// `FleetBudget` quota authority, bounded priority dispatch, and the
+/// `Nominal ⇄ Cordoned` posture — one bounded host for every execution
+/// resource, usable by a pure-Rust consumer with zero Python.
+pub use apexbot_workers as workers;
+
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 

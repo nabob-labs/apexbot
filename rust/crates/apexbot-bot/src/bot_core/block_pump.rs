@@ -55,6 +55,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// LW-T5 (Seam E): the pump feeds the cgroup throttle sample straight
+// through the Executor seam (block_pump no longer reaches into the
+// engine's internal solve-executor module).
+use crate::bot_core::stage_machine::QuiesceParams;
 use crate::bot_core::stance;
 use crate::bot_core::{CompletenessDecision, StageDecision, StageMachine};
 
@@ -66,6 +70,7 @@ use apexbot_ingestion::{
     IngestEvent as WsEvent, Watchdog, WsIngestor, BACKFILL_TIMEOUT_SECS,
     DEFAULT_BACKFILL_CHUNK_SIZE, RELEVANT_TOPICS,
 };
+use apexbot_workers::posture::ThrottleSample;
 use futures_util::{stream, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -88,9 +93,49 @@ fn us_to_secs(us: u64) -> f64 {
     f64::from(u32::try_from(us).unwrap_or(u32::MAX)) / 1_000_000.0
 }
 
+/// LW-T5 (Seam E): wall-clock anchor for the header throttle-sample
+/// cadence — the pump owns the sample interval. The FSM needs each
+/// sample's poll interval (elapsed), and the pump poller samples on
+/// header cadence, so the delta accounting lives here with the sampler.
+static LAST_HEADER_SAMPLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Feed ONE per-header cgroup throttle sample to the ONE process-level
+/// fleet posture owner (JCI2FW Part A — the Executor seam's
+/// `observe_throttle` channel is dissolved; the pump feeds
+/// `apexbot_workers::posture::process()` directly and every fleet host
+/// consults that same owner). The pump owns the header sample cadence:
+/// `elapsed_usec` is the time since the previous sample (0 for the first
+/// sample, the `last_ms == 0` sentinel). Always fed.
+fn feed_executor_throttle_sample(now_ms: u64, events: u64, throttled_usec: u64) {
+    let last_ms = LAST_HEADER_SAMPLE_MS.swap(now_ms, Ordering::Relaxed);
+    let elapsed_usec = if last_ms == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(last_ms).saturating_mul(1_000)
+    };
+    apexbot_workers::posture::process().observe_throttle(
+        now_ms,
+        ThrottleSample {
+            events,
+            throttled_usec,
+            elapsed_usec,
+        },
+    );
+}
+
+/// Wall-clock milliseconds since the Unix epoch. The epoch-race anchor
+/// clock: header accept (`header_ms`) and Published dispatch
+/// (`drive_publish`) are both stamped here so the race can be diffed in a
+/// method that does not own the run loop's `tick_epoch` local.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Milliseconds -> seconds with a 32-bit guard (the `event_dispatch`
-/// `ms_to_secs` helper, kept for the header→solved latency histogram the
-/// dissolved `DispatchOwner` drainer stamped).
+/// `ms_to_secs` helper, kept for the header→publish epoch-race histogram
+/// the dissolved `DispatchOwner` header→solved stamp became).
 fn ms_to_secs(ms: u64) -> f64 {
     f64::from(u32::try_from(ms).unwrap_or(u32::MAX)) / 1_000.0
 }
@@ -143,8 +188,9 @@ pub struct BlockPump {
     /// driver's select (the FSM decides, the driver executes — ADR-008).
     watchdog: Watchdog,
     /// Wall-clock ms of the last accepted header — the anchor the driver
-    /// measures `header_to_solved` latency against (the T2 metric the
-    /// dissolved `DispatchOwner` owned; single-writer: the pump task).
+    /// measures `header_to_publish` (the ADR-041 epoch race) against
+    /// (succeeds the dissolved `DispatchOwner`'s T2 header→solved anchor;
+    /// single-writer: the pump task).
     header_ms: std::sync::atomic::AtomicU64,
     /// Whether the per-block WS-delivery completeness cross-check runs
     /// (`assert_ws_block_complete` — aborts on any relevant-topic log that
@@ -155,12 +201,6 @@ pub struct BlockPump {
     /// `ws_delivered` index-tracking map is not populated
     /// (no work on the hot loop).
     ws_completeness_enabled: bool,
-    /// Publish-debounce window (ms): after a dirty log, wait this long for a
-    /// straggler before settling the block (solve + dispatch). Default is the
-    /// historical 50 ms; operator-tunable via `APEXBOT_PUMP_DEBOUNCE_MS`
-    /// (f701ccd3 lead-2: the window fired full-length on ~every block while
-    /// log bursts spaned 1.3-27.5 ms, making it a fixed per-block settle-tax).
-    debounce_ms: u64,
     /// Early-slice window (ms) for the drained-settle gate (PWPPAZ T2): when
     /// nonzero and unsolved dirt has been observed this long in the current
     /// block window, the gate dispatches ONE bounded early Drain mid-burst
@@ -170,6 +210,15 @@ pub struct BlockPump {
     /// accepted header and at each settle dispatch) keeps MBNASQ's unbounded
     /// per-gap serial solves from returning.
     early_slice_ms: u64,
+    /// BM35LK: the quiesce-estimator parameters the FSM's adaptive
+    /// trailing window arms from (a snapshot of the `pump.quiesce_*`
+    /// schema keys; `fixed` + `pump_debounce_ms` is today's behavior).
+    /// Held on the pump (not read from the ambient stance inside the loop)
+    /// so tests stay immune to the global environment — the same per-pump
+    /// pattern `early_slice_ms` established. The FSM's fixed-mode window
+    /// now carries the live debounce value (`fixed_ms`; the retired
+    /// `debounce_ms` field was its last read side).
+    quiesce_params: QuiesceParams,
 }
 
 /// State held between `subscribe()` and `resume()` calls.
@@ -223,8 +272,11 @@ impl BlockPump {
             stage_max_age: Duration::from_secs(super::stage_telemetry::STAGE_MAX_AGE_SECS),
             ws_completeness_enabled: stance::config().pump.ws_completeness,
             header_ms: std::sync::atomic::AtomicU64::new(0),
-            debounce_ms: stance::config().pump.pump_debounce_ms,
             early_slice_ms: stance::config().pump.early_slice_ms,
+            quiesce_params: QuiesceParams::from_schema(
+                stance::config(),
+                stance::config().pump.pump_debounce_ms,
+            ),
         };
         // KAHU5W: the dispatcher-side strict decode-miss fault follows the
         // pump's completeness stance (respecting any per-pump opt-out).
@@ -391,6 +443,31 @@ impl BlockPump {
             .await
     }
 
+    // L3B6AE (epic VHCRD2, DECIDED 2026-09-10) — phasing-trigger POLICY: phase
+    // this method only when a single change must touch MORE THAN TWO of its five
+    // interleaved concerns in one PR (below the threshold the interleaving in a
+    // single-writer loop is measured-and-accepted, not a hazard). Line anchors are
+    // HEAD-of-this-commit (0bd2b8909 + this comment block):
+    //   (1) hotpath guards + timed-exit pruning (hotpath_guard / timed_exit_tick);
+    //   (2) allocator purge control (allocator_ctrl::on_header_observed, header
+    //       branch @1136; init_from_env_at_pump_start @527);
+    //   (3) WS-completeness cross-check (CompletenessDecision Verify @1591 /
+    //       BackfillOwned @1603, behind ws_completeness_enabled);
+    //   (4) posture telemetry on the executor seam (feed_executor_throttle_sample
+    //       header-cadence feed @1159);
+    //   (5) backfill/rewind re-anchoring (fsm.record_backfill @619 + the header
+    //       epoch anchors).
+    // Re-baseline: production body ~1400 lines (492..1891, up to
+    // boundary_drain_dispatch's docs); the original review's "1391+" came from a
+    // drifted revision — churn since is additive test mass, so the
+    // trailing-average shrink claim stays qualitative.
+    // PRESERVE under phasing: Arc<dyn StageHandlers> (the test surface) and the
+    // for_test knobs (set_quiesce_for_test / bot_arc_for_test / header-staleness /
+    // early-slice / log-silence, ~2400-2485), plus the FSM instance and its
+    // mutation points (fsm.set_quiesce_params @611, fsm.record_backfill @619).
+    // The future phaser must document the phase-state carrier decision (shared
+    // struct vs heavy parameter passing) with its change. Decision record:
+    // CONTEXT.md "Block-pump dispatch seam" -> pump-driver phasing (DECIDED).
     /// Processes logs eagerly: each WS log is applied to engine state
     /// immediately and affected paths are solved right away, without
     /// waiting for a block header. Block headers provide metadata
@@ -439,6 +516,13 @@ impl BlockPump {
         // build_with_shutdown thread, whose process::exit aborted tokio
         // workers mid-TLS-teardown).
         let _hotpath_guard = crate::profiling::hotpath_guard("block_pump");
+        // hotpath tokio-runtime monitor (hotpath_tokio_* families): must run
+        // inside the ambient I/O runtime, which this is. The interesting
+        // getters need --cfg tokio_unstable (root .cargo/config.toml); without
+        // it the monitor emits only the unstable-free subset. No-op when the
+        // hotpath feature is off.
+        #[cfg(feature = "hotpath")]
+        hotpath::tokio_runtime!(&tokio::runtime::Handle::current());
         // AZZDBI/XXJR3A: apply any fixed APEXBOT_MIMALLOC_PURGE_DELAY_MS and
         // arm the block-cadence discovery for the purge-delay control.
         crate::allocator_ctrl::init_from_env_at_pump_start();
@@ -522,6 +606,10 @@ impl BlockPump {
         // Epic A1: the pump's decision state now lives in the StageMachine; the
         // driver routes the decision arms through it. `current_block` seeds the FSM.
         let mut fsm = StageMachine::new(current_block, 0);
+        // BM35LK: the FSM owns the adaptive quiesce estimator (pure) — the
+        // pump hands it the operator-tuned parameter snapshot once and then
+        // only feeds settle-point observations and reads the armed window.
+        fsm.set_quiesce_params(self.quiesce_params);
         // DFQYM5 single-writer, now FSM-owned (epic O3HW7E/T3): on a resume
         // where the snapshot→WS gap was backfilled (S < W), the backfill owns
         // [S+1, W] inclusive and the live WS owns [W+1, ∞). Seed the FSM's
@@ -567,11 +655,13 @@ impl BlockPump {
         // precedent), the live WS NO LONGER owns any block ≤ `recovery_anchor`:
         // when a stalled WS recovers and flushes buffered forward logs for
         // those blocks, they are duplicates of state we already applied and are
-        // dropped (they never reach the `PanicLateForward` hard fault). Reorg
-        // logs (`removed: true`) are NEVER dropped — they always reach the
-        // reorg classifier. A forward ABOVE `recovery_anchor` that is stale
-        // still faults (ADR-008 D3): only blocks the pump itself backfilled are
-        // benign duplicates by construction.
+        // dropped (they never reach the `LateForward` benign late-admit
+        // drop). Reorg logs (`removed: true`) are NEVER dropped — they always
+        // reach the reorg classifier. A forward ABOVE `recovery_anchor` that
+        // is stale takes the same benign `LateForward` drop as any other
+        // post-tombstone survivor (HJ5HWF: lateness is counted noise, never
+        // a fatal signal — only blocks the pump itself backfilled are silent
+        // duplicates by construction).
 
         // ADR-008 per-block state machine. The clock is the authority for
         // block completeness (the tombstone) and the cursor; the pump loop is
@@ -651,6 +741,13 @@ impl BlockPump {
             logs: 0,
         };
 
+        // BM35LK — per-block intra-block silence-gap tracker: the max gap
+        // between consecutive relevant logs feeds the FSM's adaptive
+        // trailing-quiesce EWMA at each settle point (timings arrive as
+        // data; the FSM owns no clock). Reset at each accepted header.
+        let mut last_relevant_log_at: Option<std::time::Instant> = None;
+        let mut block_max_gap_us: u64 = 0;
+
         // PWPPAZ T2 early-slice state: `Some` from the first gate iteration
         // that observed unsolved dirt in the current block window; the slice
         // fires once when the age crosses `early_slice_ms`. `slice_done`
@@ -720,7 +817,10 @@ impl BlockPump {
             // inactivity backfill window. A new event arriving before the
             // window elapses cancels the flush (the burst is still in flight).
             let wait_timeout = if fsm.publish_pending() {
-                Duration::from_millis(self.debounce_ms)
+                // BM35LK: the settle timers arm the FSM's window (fixed mode
+                // = the debounce history; adaptive = the estimator's current
+                // W) instead of the raw debounce field.
+                Duration::from_millis(fsm.settle_window_ms())
             } else {
                 Duration::from_secs(BACKFILL_TIMEOUT_SECS)
             };
@@ -809,7 +909,23 @@ impl BlockPump {
                     // — the quiesce-before-publish gate + solver-release gate
                     // (ADR-008 D2) vs the inactivity backfill. The driver only
                     // executes the emitted decisions.
-                    for decision in fsm.on_settle() {
+                    //
+                    // BM35LK: feed the settled block's observed max silence
+                    // gap (when any relevant log arrived) so the estimator
+                    // re-arms W for the NEXT settle, publish the current W on
+                    // the quiesce-window gauge, and measure the
+                    // on_settle-entry-to-decision latency in the hotpath
+                    // profiler (VD62GX open item #1 — the 8.4%-of-blocks
+                    // settle-overshoot suspects become visible as a bucket).
+                    if pregap.logs > 0 {
+                        fsm.observe_settle_gap(block_max_gap_us / 1000, now_ms());
+                    }
+                    if let Some(p) = crate::instruments::pipeline() {
+                        p.observe_quiesce_window(fsm.settle_window_ms());
+                    }
+                    let settle_decisions =
+                        hotpath::measure_block!("pump.settle_decision", fsm.on_settle());
+                    for decision in settle_decisions {
                         match decision {
                             StageDecision::Publish { open, metadata } => {
                                 // Option-A solver-state accuracy gate (AV42C7):
@@ -983,6 +1099,10 @@ impl BlockPump {
                         last_log: None,
                         logs: 0,
                     };
+                    // BM35LK: restart the silence-gap tracker for the new
+                    // block window.
+                    last_relevant_log_at = None;
+                    block_max_gap_us = 0;
                     // PWPPAZ T2: new block window — re-arm the early slice.
                     slice_first_dirty = None;
                     slice_done = false;
@@ -990,6 +1110,18 @@ impl BlockPump {
                     // from the prior epoch (an all-quiet prior block never
                     // reached a settle) so nothing dangles into the new one.
                     stage_tel.new_epoch();
+                    // NO4DIW: the epoch that just closed is fully accounted —
+                    // sample its log ledger into the per-block funnel gauges.
+                    let ledger = self.bot.dispatcher().snapshot_epoch_logs_and_reset();
+                    if let Some(p) = crate::instruments::pipeline() {
+                        p.observe_epoch_logs(
+                            ledger.seen,
+                            ledger.received,
+                            ledger.applied,
+                            ledger.undecoded + ledger.apply_missed,
+                            number,
+                        );
+                    }
                     // Sync-only header-processing scope (TQ7PD6): this enter
                     // guard dies before the first await below, so it can never
                     // leak across a task migration. The backfill future below
@@ -1009,19 +1141,33 @@ impl BlockPump {
                             // VPD5ZH follow-up: the kernel throttle counters
                             // that identified the >10s solve p95 belong on the
                             // dashboard, one sample per block cadence.
-                            if let Some(stats) =
-                                crate::bot_core::cpu_budget::cgroup_throttle_delta()
+                            if let Some(stats) = apexbot_core::cpu_budget::cgroup_throttle_delta()
                             {
                                 p.observe_cgroup_throttled(
                                     stats.nr_throttled,
                                     stats.throttled_usec,
                                 );
+                                // LW-T5 (Seam E), re-routed by JCI2FW
+                                // Part A: the SAME per-block sample feeds
+                                // the ONE process fleet posture owner
+                                // (`apexbot_workers::posture::process()`
+                                // — the Executor seam channel is
+                                // dissolved). The pump owns the
+                                // header-cadence delta
+                                // (LAST_HEADER_SAMPLE_MS). Always fed.
+                                feed_executor_throttle_sample(
+                                    wall_ms(),
+                                    stats.nr_throttled,
+                                    stats.throttled_usec,
+                                );
                             }
                         }
-                        // T2: the header→solved latency anchor (the dissolved
-                        // DispatchOwner's note; single-writer pump task).
+                        // ADR-041: the header→publish epoch-race anchor
+                        // (the dissolved DispatchOwner drainer's header→solved
+                        // anchor, re-stamped at the Published edge; single-writer
+                        // pump task). Wall clock — see `wall_ms`.
                         self.header_ms
-                            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                            .store(wall_ms(), std::sync::atomic::Ordering::Relaxed);
                     }
                     // ADR-028: THE header decision lives in the FSM. Feeding
                     // the header (metadata + a wall-clock `now_ms` for the
@@ -1097,6 +1243,9 @@ impl BlockPump {
                     if let Some(p) = crate::instruments::pipeline() {
                         p.count_ws_log_seen();
                     }
+                    // NO4DIW: the funnel's `seen` leg — tallied at the event
+                    // source (pre topic-filter) exactly like the instrument.
+                    self.bot.dispatcher().inc_seen();
                     // Logs-subscription liveness: ANY log (even one the topic
                     // pre-filter drops below) proves the `eth_subscribe
                     // "logs"` arm is delivering. Refresh before the pre-filter
@@ -1131,6 +1280,16 @@ impl BlockPump {
                         }
                         pregap.last_log = Some(now);
                         pregap.logs += 1;
+                        // BM35LK: consecutive-relevant-log silence deltas —
+                        // the exact r.v. the adaptive trailing quiesce must
+                        // cover (design §2.1 intra-block gaps).
+                        if let Some(prev) = last_relevant_log_at {
+                            let gap_us = now.saturating_duration_since(prev).as_micros() as u64;
+                            if gap_us > block_max_gap_us {
+                                block_max_gap_us = gap_us;
+                            }
+                        }
+                        last_relevant_log_at = Some(now);
                     }
                     // BF43PM: the Streaming stage interval opens at the first
                     // relevant log of the epoch (idempotent within the epoch —
@@ -1149,7 +1308,7 @@ impl BlockPump {
                     // stalled WS that recovers flushes buffered forward logs for
                     // blocks ≤ the anchor — those are duplicates of state the
                     // backfill already applied and are DROPPED (they never reach
-                    // `observe_log`/`PanicLateForward`). This mirrors the DFQYM5
+                    // `observe_log`'s `LateForward` class). This mirrors the DFQYM5
                     // resume-boundary rule, generalized to mid-run recovery.
                     // Reorg logs (`removed: true`) are NEVER dropped — they must
                     // reach the reorg classifier to unwind the backfilled range.
@@ -1230,7 +1389,7 @@ impl BlockPump {
                             LogDecision::CloseReorg { .. } => "CloseReorg",
                             LogDecision::TombstonePrevious(_) => "TombstonePrevious",
                             LogDecision::DispatchForward => "DispatchForward",
-                            LogDecision::PanicLateForward(_) => "PanicLateForward",
+                            LogDecision::LateForward(_) => "LateForward",
                         },
                     );
                     match log_decision {
@@ -1461,22 +1620,57 @@ impl BlockPump {
                             );
                         }
                         LogDecision::DispatchForward => {}
-                        LogDecision::PanicLateForward(b) => {
-                            // A removed:false log on a tombstoned block, NOT in a
-                            // reorg → unreliable WS (out-of-order / duplicated
-                            // forward events). Blocks ≤ the authoritative
-                            // `fsm.recovery_anchor` are already dropped by the
-                            // single-writer recovery discard (BQ7ZBC) before they
-                            // reach this classifier — so firing HERE means b is a
-                            // genuine late forward ABOVE the recovery anchor that
-                            // the pump did NOT itself backfill → unrecoverable
-                            // for correctness → shut down (ADR-008 D3).
-                            tracing::error!(
+                        LogDecision::LateForward(b) => {
+                            // HJ5HWF no-landmine ruling: a removed:false log on
+                            // a tombstoned block (NOT a reorg) is delivery-
+                            // jitter LATENESS, not a structural fault. Blocks ≤
+                            // the authoritative `fsm.recovery_anchor` are
+                            // already dropped by the single-writer recovery
+                            // discard (BQ7ZBC) before they reach this
+                            // classifier — so what lands here is a
+                            // post-tombstone survivor ABOVE the anchor. It is
+                            // dropped UN-applied: I4 forbids pool-state writes
+                            // outside the block's Streaming window, and the
+                            // tombstone already fixed the delivery cutoff (I7 —
+                            // no move, either way). Count it in the benign
+                            // late-admit metric family and emit ONE deduped
+                            // `late_log` policy event whose message names the
+                            // benign path explicitly, so a spate of tight-
+                            // settle-window drops can never masquerade as a
+                            // structural bug. The completeness verify at the
+                            // tombstone/Published edge stays the loud safety
+                            // net for genuinely dropped WS logs.
+                            if let Some(p) = crate::instruments::pipeline() {
+                                p.count_late_log_admitted();
+                            }
+                            // BM35LK: feed the estimator's sliding-hour
+                            // ledger — sustained budget overruns hold the
+                            // adaptive window at the ceiling (HJ5HWF
+                            // backstop contract).
+                            fsm.record_late_admit(now_ms());
+                            // The bool (first sighting vs cooldown-suppressed)
+                            // is informational; the counted home is the
+                            // late_log.admitted counter above.
+                            let _ = crate::telemetry::record_exception_keyed(
+                                crate::telemetry::error_kind::LATE_LOG,
+                                "ws",
                                 b,
-                                "BlockPump: ADR-008 D3 late forward log on tombstoned block — unreliable WS, shutting down"
+                                format_args!(
+                                    "late forward log for tombstoned block {b}; dropped un-applied via the benign late-admit path (delivery jitter past the D1 tombstone edge); not a structural fault"
+                                ),
                             );
-                            self.shutdown.store(true, Ordering::Relaxed);
-                            return;
+                            crate::bot_core::trace_ws_log_dispatch(
+                                log.address(),
+                                log.topics(),
+                                log_block,
+                                log.log_index,
+                                log.transaction_index,
+                                log.removed,
+                                "LateAdmitDropped",
+                            );
+                            // Skip the apply below: the late log never writes
+                            // state (I4) — back to the top of the loop.
+                            continue;
                         }
                     }
 
@@ -1619,14 +1813,14 @@ impl BlockPump {
                         // Deadline passed: the slice dispatch decision is
                         // purely a function of the age below; the timed peek
                         // resolves immediately (zero wait).
-                        Duration::ZERO.min(Duration::from_millis(self.debounce_ms))
+                        Duration::ZERO.min(Duration::from_millis(fsm.settle_window_ms()))
                     } else {
                         target
                             .saturating_sub(age)
-                            .min(Duration::from_millis(self.debounce_ms))
+                            .min(Duration::from_millis(fsm.settle_window_ms()))
                     }
                 }
-                _ => Duration::from_millis(self.debounce_ms),
+                _ => Duration::from_millis(fsm.settle_window_ms()),
             };
             let has_buffered = if dirty_now {
                 // Only await when there's work to solve — otherwise skip
@@ -1698,7 +1892,7 @@ impl BlockPump {
         &self,
         fsm: &StageMachine,
         block_span: Option<&tracing::Span>,
-        now_ms: u64,
+        _now_ms: u64, // the retired header→solved stamp consumed it; the epoch race is stamped in drive_publish
     ) {
         let _solve_ctx = block_span.map(tracing::Span::enter);
         let state_head = self.bot.state_arc().read().pool_state_head();
@@ -1706,14 +1900,6 @@ impl BlockPump {
             unreachable!("drain_decision always drains when called");
         };
         self.drive_solve(fsm, fsm.context_for(block, metadata));
-        // T2: header→solved latency for solve-carrying work items (the
-        // dissolved `DispatchOwner` drainer stamp; single-writer inline now).
-        let header_ms = self.header_ms.load(std::sync::atomic::Ordering::Relaxed);
-        if header_ms != 0 {
-            if let Some(p) = crate::instruments::pipeline() {
-                p.observe_header_to_solved(ms_to_secs(now_ms.saturating_sub(header_ms)));
-            }
-        }
     }
 
     /// The I3 stale-epoch drop (7NFYQW, T6IYKY review Q2 edge) — the
@@ -1738,7 +1924,7 @@ impl BlockPump {
                 "reorg-flying stage work: stale epoch dropped instead of consuming epoch.block() (I3)"
             );
             if let Some(p) = crate::instruments::pipeline() {
-                p.count_reorg_recovery_dropped();
+                p.count_stale_drop();
             }
             return true;
         }
@@ -1800,6 +1986,16 @@ impl BlockPump {
     ) {
         if self.reorg_flying_stale(fsm, &ctx) {
             return;
+        }
+        // ADR-041 epoch race: header accept → Published dispatch (succeeds
+        // the dissolved `DispatchOwner` drainer's header→solved stamp; the
+        // money race ends at this edge — submission/delivery subscribe here).
+        // Single-writer: the pump task alone stores `header_ms`.
+        let header_ms = self.header_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if header_ms != 0 {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.observe_header_to_publish(ms_to_secs(wall_ms().saturating_sub(header_ms)));
+            }
         }
         if let Err(error) = self.engine.on_publish(&Publish {
             ctx,
@@ -1925,7 +2121,7 @@ impl BlockPump {
                     LogDecision::EnterReorg(_)
                     | LogDecision::ContinueReorg
                     | LogDecision::CloseReorg { .. }
-                    | LogDecision::PanicLateForward(_) => {
+                    | LogDecision::LateForward(_) => {
                         tracing::warn!(
                             block,
                             "BlockPump: backfill saw unexpected decision; skipping log"
@@ -1983,6 +2179,10 @@ impl BlockPump {
     /// Panics if `eth_getLogs` reveals a relevant-topic log for `block` that
     /// the live websocket did not deliver — a catastrophic WS delivery drop
     /// that must fail loudly rather than silently stale the engine state.
+    // future=true: poll-level attribution for the per-block getLogs
+    // completeness call (WS-gap verification) — poll time here is network
+    // wait, useful against the header->published latency race.
+    #[hotpath::measure(future = true)]
     pub async fn assert_ws_block_complete(
         &self,
         block: u64,
@@ -2223,15 +2423,23 @@ impl BlockPump {
             // synthetic log streams (which use relevant-topic logs as pure block
             // tombstones) never trip a spurious eth_getLogs comparison/abort.
             ws_completeness_enabled: false,
-            // Historical default: tests exercise the shared window (a per-
-            // pump override seam exists via the field, not env, so tests stay
-            // immune to the global environment).
-            debounce_ms: 50,
+            // Fixed-debounce posture exactly as the historical tests pin it
+            // (no ambient-env reads); adaptive-mode tests override via
+            // `set_quiesce_for_test`. The fixed 50 mirrors the retired
+            // `debounce_ms` field this constructor used to set.
+            quiesce_params: QuiesceParams::fixed(50),
             // Production default (PWPPAZ T2) — finite test streams end before
             // the slice deadline, so existing quiesce tests are unaffected;
             // the gap-stream tests below set the field explicitly.
             early_slice_ms: 25,
         }
+    }
+
+    /// Test-only override of the quiesce-estimator parameters (BM35LK) —
+    /// per-pump field override (not env) so tests stay immune to the
+    /// environment. Applied to the FSM when the run loop starts.
+    pub fn set_quiesce_for_test(&mut self, params: QuiesceParams) {
+        self.quiesce_params = params;
     }
 
     /// Test-only access to the shared `Bot` arc (FD7NFG tests inject
@@ -2294,6 +2502,8 @@ impl BlockPump {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot_core::stage_machine::QuiesceParams;
+    use apexbot_config::QuiesceMode;
     use apexbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
     use apexbot_decoders::v3_mint_burn_decoder::{V3_BURN_TOPIC, V3_MINT_TOPIC};
     use apexbot_decoders::v3_swap_decoder::V3_SWAP_TOPIC;
@@ -3342,6 +3552,64 @@ mod tests {
             rel >= Duration::from_millis(120),
             "slice disabled: the solve must wait out the full debounce/quiesce, got {rel:?}"
         );
+    }
+
+    /// BM35LK — adaptive quiesce: with `quiesce_mode = adaptive` (pre-seed
+    /// window = the 20 ms ceiling) the drained-settle gate arms the
+    /// ESTIMATOR window, not the fixed 50 ms debounce: the same 40 ms-gapped
+    /// burst that settles at ≥ 120 ms under the fixed debounce (see
+    /// `early_slice_disabled_restores_gate_parity`) dispatches at its
+    /// window deadline — because each 40 ms inter-log gap exceeds the
+    /// 20 ms window, exactly one dispatch fires per gap, all at block 101.
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_quiesce_arms_the_estimator_window() {
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let (mut pump, sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        pump.set_early_slice_ms_for_test(0);
+        pump.set_quiesce_for_test(QuiesceParams {
+            mode: QuiesceMode::Adaptive,
+            ..QuiesceParams::default()
+        });
+        // The fake engine's dirty flag is a static test toggle, so raise it
+        // at 35 ms VIRTUAL time — after the header, just before the first
+        // log lands at 40 ms — so every drain dispatch is attributable to
+        // the settle window alone (a pre-header dirty would dispatch at the
+        // window deadline with no logs at all).
+        {
+            let sink_flag = Arc::clone(&sink);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                sink_flag.set_dirty(true);
+            });
+        }
+
+        let combined = gap_burst_stream(3, 40);
+        let t0 = tokio::time::Instant::now();
+        pump.run_test_loop(combined, 100).await;
+        drainer_settle(|| !sink.drained_blocks().is_empty()).await;
+
+        let stamps = sink.drained_at();
+        assert!(
+            !stamps.is_empty(),
+            "adaptive mode must still settle (the gate never starves)"
+        );
+        let rel_first = stamps[0] - t0;
+        // The estimator window (pre-seed = ceil 20 ms) must beat the fixed
+        // debounce's earliest possible dispatch under this stream shape
+        // (3 gaps × 40 ms + anything ≥ the 20 ms window): the fixed-50 ms
+        // posture dispatches at ≥ 120 ms.
+        assert!(
+            rel_first < Duration::from_millis(120),
+            "adaptive settle dispatched at {rel_first:?}; expected inside the estimator window (< 120 ms fixed-debounce floor)"
+        );
+        assert!(
+            rel_first >= Duration::from_millis(40),
+            "adaptive settle must still wait its window; dispatched at {rel_first:?}"
+        );
+        for (i, b) in sink.drained_blocks().iter().enumerate() {
+            assert_eq!(*b, 101, "all dispatches settle the open block (drain #{i})");
+        }
     }
 
     /// Drive a reorg scenario under the [`ReorgSpanCapture`] layer on a local
@@ -4523,6 +4791,258 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // HJ5HWF — late-log admission safety (the no-landmine rule).
+    //
+    // A tightened settle/debounce window (50ms → 16ms, task VD62GX) may
+    // admit logs whose delivery jitter carries them PAST their block's
+    // quiesce/tombstone edge (the first successor log — ADR-008 D1). Every
+    // such late log must land in a counted, benign, documented state-
+    // machine path: dropped un-applied (I4: writers are Streaming-confined),
+    // counted (apexbot.late_log.admitted + the deduped `late_log` bucket),
+    // NEVER a shutdown/abort that would masquerade as a structural bug.
+    //
+    // The completeness verify at the tombstone/Published edge stays the loud
+    // safety net for genuinely dropped WS logs — these paths cover only
+    // POST-tombstone delivery jitter, which the verify cannot see.
+    // -----------------------------------------------------------------
+
+    /// A forward log for a block that is ALREADY tombstoned (delivery jitter
+    /// past the tombstone edge) must NOT shut the pump down (the retired
+    /// ADR-008 D3 hard-fault behavior). Target contract, task HJ5HWF:
+    /// - the pump keeps running and later blocks still process normally;
+    /// - the late log is dropped WITHOUT applying it (no pool-state mutation
+    ///   outside the Streaming window — I4);
+    /// - the delivery cutoff stays monotone at the last tombstone (I7);
+    /// - every tombstone finalize still fires exactly once (I5).
+    #[tokio::test]
+    async fn late_forward_after_tombstone_is_benign_late_admit() {
+        let pool_addr = Address::from([0x33u8; 20]);
+        let (bot, pool_id, _sub) = bot_with_registered_v2(pool_addr, 5);
+        let (mut pump, sink, shutdown) = pump_for_test_with_bot(Arc::clone(&bot), Some(5));
+
+        // Stream: Sync@7 (opens block 7), Sync@8 (tombstones 7, cutoff → 7),
+        // then a jittered TAIL for block 7 arriving AFTER the tombstone edge
+        // (the late admission), then Sync@9 (tombstones 8, cutoff → 8). End.
+        let events = vec![
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
+                pool_addr,
+                U256::from(3_000),
+                U256::from(4_000),
+                7,
+                false,
+            ))),
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
+                pool_addr,
+                U256::from(5_000),
+                U256::from(6_000),
+                8,
+                false,
+            ))),
+            // LATE: block 7's tail log, delivered after 7 was tombstoned.
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
+                pool_addr,
+                U256::from(9_999),
+                U256::from(8_888),
+                7,
+                false,
+            ))),
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
+                pool_addr,
+                U256::from(7_000),
+                U256::from(8_000),
+                9,
+                false,
+            ))),
+        ];
+        pump.run_test_loop(stream::iter(events).boxed(), 5).await;
+        drainer_settle(|| sink.finalized.lock().unwrap().len() >= 2).await;
+
+        // THE no-landmine assertion: lateness must never look structural.
+        assert!(
+            !shutdown.load(Ordering::Relaxed),
+            "a late forward after the tombstone edge must NOT shut the pump down"
+        );
+        // Both tombstone finalizes fired exactly once (I5 at the Finalize row).
+        let finalized: Vec<u64> = sink
+            .finalized
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(b, _)| *b)
+            .collect();
+        assert_eq!(
+            finalized.len(),
+            2,
+            "both tombstones (7 and 8) must finalize exactly once (got {finalized:?})"
+        );
+        assert!(
+            finalized.contains(&7) && finalized.contains(&8),
+            "tombstone finalizes for 7 and 8 must both fire (got {finalized:?})"
+        );
+        // Delivery cutoff monotone: advanced to the LAST tombstoned block;
+        // the late log for 7 must not regress it (I7).
+        assert_eq!(
+            bot.state_arc().read().pump_complete_cutoff(),
+            8,
+            "cutoff must rest at the last tombstone (8), untouched by the late log"
+        );
+        // Streaming-only writes: exactly the 3 in-window logs were applied
+        // (blocks 7, 8, 9) — the dropped late log never dispatches (I4).
+        assert_eq!(
+            sink.logs_recorded(),
+            3,
+            "only the in-Streaming-window logs apply; the late log is dropped"
+        );
+        // Pool state holds the LAST legitimately applied sync (9's), never
+        // the late log's reserves — either applying the late log after 9's
+        // or counting it into the applies would trip this.
+        assert_eq!(
+            bot.state_arc().read().v2_snapshot(pool_id),
+            Some((U256::from(7_000), U256::from(8_000), 9)),
+            "pool state reflects only Streaming-window applies; late reserves dropped"
+        );
+    }
+
+    // HJ5HWF property: synthetic lateness across a whole capture. The tail
+    // of EVERY block's log set (a randomized subset) is jitted past its
+    // quiesce/tombstone edge (delivered behind the successor's first log).
+    // Invariants asserted per run:
+    // - no tripwire/fatal path fires from lateness (pump never shuts down);
+    // - the delivery cutoff stays monotone at the last tombstone (I7);
+    // - no pool-state mutation outside Streaming: apply accounting counts
+    //   exactly the in-window deliveries — late tails are benign drops (I4);
+    // - one tombstone finalize per block, no superfluous publishes (I5);
+    // - the reorg recovery-drop class is NOT a bucket for lateness: no
+    //   recovery anchor is ever established by a jitter stream, so no
+    //   late log may be mis-filed there (it takes the late-admit path).
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
+        #[test]
+        fn synthetic_lateness_jitter_never_trips_fatal_paths(
+            plan in proptest::collection::vec((1u8..=3, 0u8..=2), 2usize..=6),
+        ) {
+            use stream::StreamExt;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            // The async case reports its first invariant breach as an Err
+            // message; the `return Err` below targets the proptest run
+            // closure (a property failure must surface as a TestCaseError,
+            // and a `return` inside an async block cannot reach it).
+            let check = async {
+                let pool_addr = Address::from([0x34u8; 20]);
+                let (bot, pool_id, _sub) = bot_with_registered_v2(pool_addr, 5);
+                let (mut pump, sink, shutdown) = pump_for_test_with_bot(Arc::clone(&bot), Some(5));
+
+                let base = 100u64;
+                // Distinct reserves per (block, log-index) so any mis-applied
+                // (late) log is observable in the final state.
+                let reserves = |block: u64, j: usize| {
+                    let k = 1_000u64 + block * 10 + j as u64;
+                    (U256::from(k), U256::from(2_000 + k))
+                };
+                let log_event = |block: u64, j: usize| {
+                    let (r0, r1) = reserves(block, j);
+                    WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
+                        pool_addr, r0, r1, block, false,
+                    )))
+                };
+
+                // Weave the stream: per block, deliver pre-tail logs; every
+                // NON-LAST block's tail is deferred until just after the next
+                // block's FIRST log (the tombstone/quiesce edge) — the
+                // synthetic-jitter shape for a tightened settle window. The
+                // last block's tail is still inside its open Streaming window
+                // and applies normally.
+                let mut events: Vec<WsEvent> = Vec::new();
+                let mut deferred_tail: Vec<WsEvent> = Vec::new();
+                let mut expected_applied = 0usize;
+                let mut expected_finalized: Vec<u64> = Vec::new();
+                let (mut last_reserves, mut last_block) = ((U256::ZERO, U256::ZERO), 0u64);
+                for (i, (pre, tail)) in plan.iter().enumerate() {
+                    let block = base + i as u64;
+                    // First log of the block = the tombstone edge; the
+                    // previous block's jittered tail lands right behind it.
+                    events.push(log_event(block, 0));
+                    events.append(&mut deferred_tail);
+                    for j in 1..*pre as usize {
+                        events.push(log_event(block, j));
+                    }
+                    expected_applied += *pre as usize;
+                    if i + 1 < plan.len() {
+                        // This block's tail jitters past its tombstone edge.
+                        deferred_tail = (0..*tail as usize)
+                            .map(|j| log_event(block, *pre as usize + j))
+                            .collect();
+                        expected_finalized.push(block);
+                    } else {
+                        // Last block: tail inside the open window.
+                        for j in 0..*tail as usize {
+                            events.push(log_event(block, *pre as usize + j));
+                        }
+                        expected_applied += *tail as usize;
+                        let jj = if *tail > 0 {
+                            *pre as usize + *tail as usize - 1
+                        } else {
+                            *pre as usize - 1
+                        };
+                        last_reserves = reserves(block, jj);
+                        last_block = block;
+                    }
+                }
+
+                pump.run_test_loop(stream::iter(events).boxed(), 5).await;
+                drainer_settle(|| sink.finalized.lock().unwrap().len() >= expected_finalized.len())
+                    .await;
+
+                // No-landmine: lateness never trips a fatal path.
+                if shutdown.load(Ordering::Relaxed) {
+                    return Err("synthetic lateness must never shut the pump down".to_owned());
+                }
+                // I5: exactly one finalize per tombstoned block, none else.
+                let finalized: Vec<u64> = sink
+                    .finalized
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(b, _)| *b)
+                    .collect();
+                if finalized != expected_finalized {
+                    return Err(format!(
+                        "one finalize per block, in order: got {finalized:?}, want {expected_finalized:?}"
+                    ));
+                }
+                // I7: cutoff monotone at the last tombstone.
+                let cutoff = bot.state_arc().read().pump_complete_cutoff();
+                if cutoff != base + plan.len() as u64 - 2 {
+                    return Err(format!(
+                        "delivery cutoff must rest at the last tombstone: got {cutoff}"
+                    ));
+                }
+                // I4: applies == in-window deliveries exactly.
+                let recorded = sink.logs_recorded();
+                if recorded != expected_applied {
+                    return Err(format!(
+                        "only in-window logs may apply (I4): got {recorded}, want {expected_applied}"
+                    ));
+                }
+                // The last LEGITIMATELY applied log owns pool state.
+                let snap = bot.state_arc().read().v2_snapshot(pool_id);
+                if snap != Some((last_reserves.0, last_reserves.1, last_block)) {
+                    return Err(format!(
+                        "pool state holds the last in-window apply, not a late tail: got {snap:?}"
+                    ));
+                }
+                Ok(())
+            };
+            if let Err(msg) = rt.block_on(check) {
+                return Err(proptest::test_runner::TestCaseError::fail(msg));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn reorg_log_restores_pool_via_coordinator_and_pump_continues() {
         let pool_addr = Address::from([0x11u8; 20]);
@@ -4662,20 +5182,24 @@ mod tests {
         );
     }
 
-    /// ADR-008 D3 pump-level: a `removed: false` log on a tombstoned block
-    /// (NOT a reorg) means the WS delivered a forward event out-of-order /
-    /// duplicated — unreliable. The pump must shut down rather than silently
-    /// re-apply. Cursor never silently regresses.
+    /// HJ5HWF pump-level (supersedes the retired ADR-008 D3 hard-fault
+    /// behavior, the no-landmine ruling): a `removed: false` log on a
+    /// tombstoned block (NOT a reorg) is delivery-jitter LATENESS. The pump
+    /// takes the benign late-admit path: the late log is dropped UN-applied,
+    /// counted (`apexbot.late_log.admitted` + the deduped `late_log`
+    /// bucket, mapped in the trace as `LateAdmitDropped`), and the pump
+    /// KEEPS RUNNING. No silent re-apply: the cutoff never regresses and the
+    /// pool's state pins are untouched by the late survivor.
     #[tokio::test]
-    async fn late_forward_log_on_tombstoned_block_shuts_down_pump() {
+    async fn late_forward_log_on_tombstoned_block_is_benign_late_admit() {
         let pool_addr = Address::from([0x44u8; 20]);
-        let (bot, _pool_id, _sub) = bot_with_registered_v2(pool_addr, 5);
+        let (bot, pool_id, _sub) = bot_with_registered_v2(pool_addr, 5);
 
         // Single pump session: forward sync(7) opens block 7; forward sync(8)
         // tombstones 7 (open block becomes 8); THEN a forward (removed:false)
         // sync at block 7 arrives late — block 7 is tombstoned and the open
-        // block is 8 -> late forward -> unreliable WS -> shutdown.
-        let (mut pump, _sink, shutdown) = pump_for_test_with_bot(Arc::clone(&bot), Some(5));
+        // block is 8 -> late forward -> benign late-admit drop.
+        let (mut pump, sink, shutdown) = pump_for_test_with_bot(Arc::clone(&bot), Some(5));
         let s7 = make_v2_sync_log(pool_addr, U256::from(1_500), U256::from(2_500), 7, false);
         let s8 = make_v2_sync_log(pool_addr, U256::from(1_600), U256::from(2_600), 8, false);
         let late = make_v2_sync_log(pool_addr, U256::from(9_999), U256::from(9_999), 7, false);
@@ -4686,10 +5210,29 @@ mod tests {
         ])
         .boxed();
         pump.run_test_loop(combined, 5).await;
+        drainer_settle(|| sink.logs_recorded() >= 2).await;
 
         assert!(
-            shutdown.load(Ordering::Relaxed),
-            "late removed:false on a tombstoned block must shut the pump down (ADR-008 D3)"
+            !shutdown.load(Ordering::Relaxed),
+            "late removed:false on a tombstoned block is counted lateness — the pump must keep running (HJ5HWF)"
+        );
+        // Exactly the two in-window logs applied; the late survivor dropped.
+        assert_eq!(
+            sink.logs_recorded(),
+            2,
+            "the late forward must never dispatch (I4: Streaming-only writes)"
+        );
+        // Cutoff rests at the last tombstone — the late log for 7 moved
+        // neither the cutoff nor the pool state (I7).
+        assert_eq!(
+            bot.state_arc().read().pump_complete_cutoff(),
+            7,
+            "cutoff rests at the tombstoned block 7"
+        );
+        assert_eq!(
+            bot.state_arc().read().v2_snapshot(pool_id),
+            Some((U256::from(1_600), U256::from(2_600), 8)),
+            "pool state holds the last in-window apply, never the late survivor"
         );
     }
 
@@ -4753,14 +5296,16 @@ mod tests {
         );
     }
 
-    /// BQ7ZBC — FSM guard: the single-writer discard is scoped to blocks the
-    /// pump itself backfilled (≤ `recovery_anchor`). The header-staleness
-    /// watchdog catch-up anchors at 102, then a `removed:false` forward at
-    /// block 103 arrives late (103 tombstoned by 104, 103 > 102) — a GENUINE
-    /// steady-state anomaly above the recovery anchor → MUST still shut the
-    /// pump down (ADR-008 D3 preserved).
+    /// BQ7ZBC × HJ5HWF — FSM guard: the single-writer discard is scoped to
+    /// blocks the pump itself backfilled (≤ `recovery_anchor`). The
+    /// header-staleness watchdog catch-up anchors at 102, then a
+    /// `removed:false` forward at block 103 arrives late (103 tombstoned by
+    /// 104, 103 > 102) — OUTSIDE the silent single-writer duplicate class, so
+    /// it lands in the BENIGN late-admit drop: dropped un-applied, counted in
+    /// `apexbot.late_log.admitted`, pump keeps running (the no-landmine
+    /// ruling supersedes the retired ADR-008 D3 hard fault).
     #[tokio::test]
-    async fn recovery_anchor_still_faults_stale_forward_above_anchor() {
+    async fn recovery_anchor_stale_forward_above_anchor_is_benign_late_admit() {
         let pool_addr = Address::from([0x44u8; 20]);
         let (_bot, _pool_id, _sub) = bot_with_registered_v2(pool_addr, 5);
 
@@ -4807,8 +5352,8 @@ mod tests {
         pump.run_test_loop(combined, 100).await;
 
         assert!(
-            shutdown.load(Ordering::Relaxed),
-            "a stale forward ABOVE recovery_anchor must still shut down (ADR-008 D3)"
+            !shutdown.load(Ordering::Relaxed),
+            "a stale forward ABOVE recovery_anchor is counted lateness — the pump keeps running (HJ5HWF no-landmine)"
         );
     }
 
@@ -5540,7 +6085,8 @@ mod tests {
     /// (which has `update_block = N`). This PROVES the race cannot produce
     /// the observed symptom: a pin at `update_block = N` requires the
     /// tombstone to have fired (cutoff = N), and the tombstone can only fire
-    /// AFTER all of N's logs were dispatched (else `PanicLateForward`). So all
+    /// AFTER all of N's logs were dispatched (else `LateForward` — the benign
+    /// late-admit drop, HJ5HWF). So all
     /// delivered Mints@N are drained together. The missing Mint must have
     /// been never delivered (scenario B).
     #[tokio::test]

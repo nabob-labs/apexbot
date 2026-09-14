@@ -89,6 +89,9 @@ shared instruments.
 
 - Import `docs/grafana/apexbot-overview.json` for the companion dashboard;
   point it at the Prometheus data source scraping the bot endpoint.
+- Function-level profiler metrics (hotpath) are a separate scrape job + the
+  `docs/grafana/hotpath-profiling.json` dashboard — the enablement and scrape
+  recipe is [`HOTPATH.md`](HOTPATH.md).
 - Traces: Jaeger UI, service `apexbot-bot`. Per-block traces root at
   `apexbot.epoch` (attrs `epoch.block` / `epoch.seq` plus the pre-solve gap
   fields); the ADR-041 stage spans (`apexbot.stage.streaming` / `quiesced` /
@@ -147,6 +150,18 @@ Rule inventory (10 rules, 2 groups, 60s evaluation):
   15m), **ApexbotProfitEfficiencyDrop** (>80% left on table),
   **ApexbotSimulateErrorRate** (>10% error outcomes 10m) - severity
   semantics unchanged from the Prometheus file.
+- **ApexbotEpochRaceSlow** - epoch race (ADR-041) degraded:
+  `apexbot_epoch_header_to_publish_seconds` 5m p95 > 2s for 5m. The money
+  race ends at the Published edge (submission/delivery subscribe there), not
+  at solve; the retired drain-era header→solved endpoint no longer owns this
+  signal. Triage with the dashboard stage-cycle waterfall (delivery / burst /
+  settle / streaming-age legs) plus a `apexbot.epoch` Jaeger trace.
+- **ApexbotEpochStaleDrops** - `apexbot_epoch_stale_drops_total` > 0 for
+  10m: the I3 rewind-generation fail-fast is dropping stage work as stale
+  epochs (the loud warn in `BlockPump::reorg_flying_stale`). Early warning
+  that the stage cycle chronically spills past the next header (also visible
+  as the dashboard stale-drop-share stat); precedes detached-straggler
+  backpressure.
 
 ### Removed
 

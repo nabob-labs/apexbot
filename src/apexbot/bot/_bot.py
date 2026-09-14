@@ -62,7 +62,7 @@ from apexbot.version import __version__
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from apexbot._ffi import BlockStream
+    from apexbot._ffi import BlockStream, IntakeReceipt
     from apexbot.builders.protocol import PoolBuilder
     from apexbot.erc20.erc20 import Erc20Token
     from apexbot.types.abstract.liquidity_pool import AbstractLiquidityPool
@@ -318,6 +318,42 @@ class Bot:
 
         # Check database migration version
         self._check_database_version()
+
+    def registration_fleet_hosted(self) -> bool:
+        """Return the construction-time registration-intake stance (PRG-3/5).
+
+        Thin pass-through to the core: True once the engine has installed the
+        fleet intake boot (the module-init stance holder is read at FFI init,
+        the boot descriptor installs at engine construction). The crawl
+        driver requires this hard-True from pipeline construction on (PRG-5:
+        the legacy crawl shell is retired — no getattr-default fallback).
+
+        Returns:
+            True once the fleet intake boot is installed (stance = fleet).
+
+        """
+        return self._py_bot.registration_fleet_hosted()
+
+    def submit_registration_unit(self, fn: object) -> IntakeReceipt:
+        """Submit ONE registration-intake unit for fleet-seat execution.
+
+        The receipt exposes ``done()`` / ``result()`` / ``wait()`` /
+        ``wait_async()``. The crawl's per-path units (build + verify
+        lifecycles + path registration) ride the fleet's duty-counted
+        ``PoolStateUpdater`` seats through this seam (PRG-5).
+
+        FF-T1 (BPHR6F): on a host whose fleet boot was refused (detected
+        CPU budget below the pinned-role floor, or a boot invariant), this
+        submit — and every submit after it — raises the typed, sticky
+        ``BootRefused`` from the FFI seam: the library never aborts the host
+        process on the boot-refusal arm, and nothing is enqueued into a
+        pipe that will not be drained.
+
+        Returns:
+            The unit's receipt (``IntakeReceipt``).
+
+        """
+        return self._py_bot.submit_registration_unit(fn)
 
     @staticmethod
     def _enforce_provider_chain(provider: AlloyProvider, expected: ChainId) -> None:

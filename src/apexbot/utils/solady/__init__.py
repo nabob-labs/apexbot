@@ -3,9 +3,10 @@
 Thin delegation shim over the Rust ``apexbot-core`` core, exposed via the
 ``apexbot._ffi.solady`` extension module (Rust cdylib crate
 ``apexbot_rs``). The pure-Python implementation has been retired
-(per ADR-005 sub-step C — ``docs/migration-guides/three-layer-transition.md``
-§3.3); the Rust core (``rust/crates/apexbot-core/src/libzip.rs``) is the
-single implementation, ``#[cfg(test)]`` corpus the regression set.
+(per ADR-005 sub-step C, the §3.3 transition rubric in the
+three-layer-transition guide, removed in the stale-docs cleanup `71ec78b2`);
+the Rust core (``rust/crates/apexbot-core/src/libzip.rs``) is the single
+implementation, ``#[cfg(test)]`` corpus the regression set.
 """
 
 from apexbot._ffi.solady import flz_compress as _flz_compress_rust

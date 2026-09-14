@@ -16,6 +16,12 @@ Highest wins (12-factor parity; recorded here by the schema and asserted by the 
 
 The loader is fail-closed: unparsable values and unknown file keys are reported, never silently ignored.
 
+## `runtime`
+
+| Env var | TOML key | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `APEXBOT_IO_WORKERS` | `runtime.io_workers` | `Option<usize>` | `(unset; derived from the cgroup CPU budget)` | Ambient I/O runtime worker count; when unset it is derived from the cgroup CPU budget after the solve bins take theirs (see solve.solve_cpus / solve.solve_headroom). |
+| `APEXBOT_FLEET_PROFILE` | `runtime.fleet_profile` | `FleetProfile(Auto|Pinned|Serial)` | `auto` | Fleet host-binding profile (FLEETFLOOR FF-T2): auto resolves the host tier from the CPU budget (pinned at/above the pinned-role floor, serial on 2-5 cores, refused below 2); pinned/serial force a binding — a forced pinned binding below the floor runs marked oversubscribed, and forced bindings still need 2 or more cores. |
 ## `telemetry`
 
 | Env var | TOML key | Type | Default | Description |
@@ -23,6 +29,7 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `APEXBOT_OTEL` | `telemetry.otel` | `bool` | `true` | Enable the OTel OTLP span layer and the Prometheus metrics endpoint; `0`/empty opts out. |
 | `APEXBOT_METRICS_ADDR` | `telemetry.metrics_addr` | `string` | `127.0.0.1:9464` | Prometheus scrape endpoint bind address (only active when otel is on). |
 | `APEXBOT_JAEGER_ENDPOINT` | `telemetry.jaeger_endpoint` | `string` | `http://127.0.0.1:4318` | OTLP endpoint used by the opt-in Jaeger E2E test. |
+| `APEXBOT_LOG_FMT` | `telemetry.log_fmt_stderr` | `bool` | `true` | Keep the stderr fmt-layer mirror of every record (including the Python logging bridge); 0 routes the fmt layer to the sink so a driver teeing both sinks records each line once. |
 | `APEXBOT_JAEGER_E2E` | `telemetry.jaeger_e2e` | `bool` | `false` | Gate for the network-accessible Jaeger E2E test (Jaeger must be reachable at jaeger_endpoint). |
 ## `allocator`
 
@@ -48,6 +55,12 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `APEXBOT_EARLY_SLICE_MS` | `pump.early_slice_ms` | `duration-ms (u64)` | `25` | Early-slice window in ms; `0` valid and disables the slice (settle-only parity). |
 | `APEXBOT_STREAMING_DELIVERY` | `pump.streaming_delivery` | `bool` | `true` | Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep. |
 | `APEXBOT_WS_COMPLETENESS` | `pump.ws_completeness` | `bool` | `true` | WS completeness gating (newHeads + logs double-delivery check); `0` disables. |
+| `APEXBOT_PUMP_QUIESCE_MODE` | `pump.quiesce_mode` | `QuiesceMode(Fixed|Adaptive)` | `adaptive` | Settle-window mode: `fixed` = constant pump.pump_debounce_ms debounce; `adaptive` = EWMA trailing-quiesce estimator (never below quiesce_floor_ms, never above quiesce_ceil_ms; late-admit budget overruns hold at the ceiling). |
+| `APEXBOT_PUMP_QUIESCE_FLOOR_MS` | `pump.quiesce_floor_ms` | `duration-ms (u64)` | `2` | Adaptive mode: lower bound (ms) of the trailing settle window (clamped >= 1; a 0/garbage value never collapses the window to zero). |
+| `APEXBOT_PUMP_QUIESCE_CEIL_MS` | `pump.quiesce_ceil_ms` | `duration-ms (u64)` | `20` | Adaptive mode: upper bound (ms) of the trailing settle window; the estimator never grows beyond it (inherits the debounce parse contract: unset/zero/invalid falls back, never 0). |
+| `APEXBOT_PUMP_QUIESCE_MARGIN_MS` | `pump.quiesce_margin_ms` | `f64` | `3.0` | Adaptive mode: safety multiplier over the silence-gap EWMA (W = EWMA × margin, then floor/ceiling clamp). |
+| `APEXBOT_PUMP_QUIESCE_EWMA_ALPHA` | `pump.quiesce_ewma_alpha` | `f64` | `0.1` | Adaptive mode: EWMA smoothing constant over per-block max silence gaps (≈10-block memory); clamped to (0, 1]. |
+| `APEXBOT_PUMP_QUIESCE_LATE_BUDGET` | `pump.quiesce_late_budget` | `u64` | `120` | Adaptive-mode runtime backstop (HJ5HWF contract): more than this many benign late-admit events in a sliding hour holds the window at quiesce_ceil_ms until the ledger drains. |
 ## `trace`
 
 | Env var | TOML key | Type | Default | Description |
@@ -69,12 +82,12 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | --- | --- | --- | --- | --- |
 | `APEXBOT_SOLVE_CPUS` | `solve.solve_cpus` | `Option<usize>` | `(unset)` | Override the detected solve CPU budget (worker bin count). |
 | `APEXBOT_SOLVE_HEADROOM` | `solve.solve_headroom` | `Option<usize>` | `(unset)` | Override the I/O headroom carved out of the CPU budget before solve bins. |
-| `APEXBOT_SOLVE_EXECUTOR` | `solve.executor` | `SolveExecutor(Tokio|Rayon)` | `tokio` | Solve fan-out executor: tokio (low-priority dedicated runtime, production default) or rayon. |
 | `APEXBOT_SOLVE_INLINE_SIM` | `solve.solve_inline_sim` | `bool` | `true` | Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables. |
 | `APEXBOT_SOLVE_RESOLVE_PAR` | `solve.solve_resolve_par` | `bool` | `true` | Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables. |
-| `APEXBOT_SOLVE_SIM_INFLIGHT` | `solve.solve_sim_inflight` | `Option<usize>` | `(unset; derived from CPU budget)` | Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation. |
 | `APEXBOT_INLINE_SIM_WORKERS` | `solve.inline_sim_workers` | `Option<usize>` | `(unset; derived from CPU budget)` | Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site). |
-| `APEXBOT_DETACHED_SOLVES` | `solve.detached_solves` | `bool` | `true` | Route solve arms through detached (out-of-cycle) workers; `0`/`false` opts back into the in-cycle engine-Mutex hold. Default ON: the solve path takes no engine-level Mutex (epic MROOY7 task 2UVG3E, seam #4). |
+| `APEXBOT_SOLVE_ADMISSION` | `solve.admission_shed` | `bool` | `true` | QTZGFL capacity-modulated admission stance: unset/`1`/`true`/`on` (default) replaces the retired in-flight cap degrade with budget = max(0, admission_target_depth - in-flight) and SHEDS zero-budget cycles; `0`/`false`/`off` is the intentional take-all no-shed operator stance (A/B). |
+| `APEXBOT_SOLVE_ADMISSION_TARGET_DEPTH` | `solve.admission_target_depth` | `usize` | `8` | QTZGFL: un-merged-result pipe depth target in KEYS (pools) — the draw budget headroom. Clamped at engine construction to 1..=DETACHED_INFLIGHT_CAP (DETACHED_INFLIGHT_CAP is only the default/clamp for this key now, no longer a runtime cap verdict); default 8 = DETACHED_INFLIGHT_CAP. |
+| `APEXBOT_SOLVE_ADMISSION_RETENTION` | `solve.admission_retention_blocks` | `u64` | `50` | QTZGFL: retained (carried) key retention window W in blocks — on each block advance the ledger prunes buckets older than head - W and counts apexbot.detached.leads_expired. Default 50. |
 | `APEXBOT_MIN_PROFIT_WEI` | `solve.min_profit_wei` | `u128 (decimal text)` | `0` | Minimum path profit floor in wei (decimal text; TOML: quoted string). |
 | `APEXBOT_WALK_EVENT_SOLVER` | `solve.walk_event_solver_legacy` | `bool (inverted: `0` enables)` | `false` | Legacy event-solver path is enabled by `APEXBOT_WALK_EVENT_SOLVER=0` (inverted flag). |
 | `APEXBOT_WALK_EVENT_CENSUS` | `solve.walk_event_census` | `bool` | `false` | Loop-15 nested event census counters in the CL walker (`1` enables). |
@@ -84,7 +97,21 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `APEXBOT_SOLVER_WALK_MEMO` | `solve.solver_walk_memo` | `bool` | `false` | CL-solver walk memo (result caching) (`1` enables). |
 | `APEXBOT_SOLVER_WALK_MEMO_STATS` | `solve.solver_walk_memo_stats` | `bool` | `false` | Walk-memo recomposition census (`1` enables). |
 | `APEXBOT_CL_PROJECTION_CACHE` | `solve.cl_projection_cache` | `bool` | `true` | CL projection memo cache; `0`/`off`/`false`/`disabled` disables. |
-| `APEXBOT_LPT_PARTITION` | `solve.lpt_partition` | `bool` | `true` | K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables. |
+## `fleet`
+
+| Env var | TOML key | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `APEXBOT_FLEET_QUOTA_CPUS` | `fleet.quota_cpus` | `Option<f64>` | `(unset; detected from the cgroup)` | Terminal override of the fractional cgroup CPU quota (cores) feeding the fleet budget sum check; unset detects from the cgroup (ADR-042 §5). |
+| `APEXBOT_FLEET_RESERVE_CPUS` | `fleet.reserve_cpus` | `Option<usize>` | `(unset; default 1)` | Fleet-budget reserve share H (Python bridge, pump, OTel, async GC) in cores; overrides the fixed default 1 (design doc §5). |
+| `APEXBOT_FLEET_SOLVER_CPUS` | `fleet.solver_cpus` | `Option<usize>` | `(unset; derived floor(Q)-H-A-R-M)` | Fleet Solver CPU share S in cores; terminal when set and it participates in the same startup sum check (default: floor(quota) − H − A − R − M; S < 2 fails the boot). |
+| `APEXBOT_FLEET_SIM_SLOT_CAP` | `fleet.sim_slot_cap` | `Option<usize>` | `(unset; default 4)` | SimDriver slot cap (duty-counted; spendable from the fractional-quota remainder); default 4, today's SimSlots cap. |
+| `APEXBOT_FLEET_POOL_STATE_UPDATER_SLOTS` | `fleet.pool_state_updater_slots` | `Option<usize>` | `(unset; default 4)` | PoolStateUpdater slot cap (the registration intake station: duty-counted, spendable from the fractional-quota remainder, Deferrable cordon class); default 4. |
+| `APEXBOT_FLEET_CORDON_ENTER_EVENTS` | `fleet.cordon_enter_events` | `usize` | `2` | Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment delivered: runtime-tunable via the operator channel — `apexbot fleet posture set --cordon-enter-events N` on a live process). |
+| `APEXBOT_FLEET_CORDON_ENTER_WINDOW_MS` | `fleet.cordon_enter_window_ms` | `duration-ms (u64)` | `1000` | Rolling window (ms) for the throttle-event burst enter trigger. |
+| `APEXBOT_FLEET_CORDON_DUTY_PERCENT` | `fleet.cordon_duty_percent` | `f64` | `2.0` | Throttled-time duty percent over the duty window that cordons the fleet (enter trigger; 2.0 = >2%). |
+| `APEXBOT_FLEET_CORDON_DUTY_WINDOW_MS` | `fleet.cordon_duty_window_ms` | `duration-ms (u64)` | `5000` | Trailing window (ms) over which throttled-time duty is evaluated. |
+| `APEXBOT_FLEET_CORDON_EXIT_CLEAN_MS` | `fleet.cordon_exit_clean_ms` | `duration-ms (u64)` | `10000` | Clean-window hysteresis (ms) required before cordon exits (design doc §6: 10 s of clean windows). |
+| `APEXBOT_FLEET_CORDON_SIM_INTAKE_FLOOR` | `fleet.cordon_sim_intake_floor` | `Option<usize>` | `(unset; half the slot cap)` | SimDriver new-lease cap while cordoned; in-flight sims are never cancelled (default: half the slot cap). |
 ## `capture`
 
 | Env var | TOML key | Type | Default | Description |

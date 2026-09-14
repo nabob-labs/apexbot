@@ -35,6 +35,8 @@
 //! | [`solver_dispatch`] | Path resolution, solver dispatch, rebuild logic |
 //! | [`delivery_lifecycle`] | Delivery lifecycle: channel open/send/close + the end-of-stream contract (incident 2026-08-20 #2) |
 //! | [`delivery_policy`] | Delivery policy: diff computation, thresholds, delivered-bookkeeping (BI7UZV) |
+//! | [`block_cursor`] | The engine block cursor — one owner of the engine-side block-coordinate residue (6XB6NJ) |
+//! | [`detached_cycle`] | THE one detached/in-cycle solve-arm machine: per-cycle states, the merge pipe, the gauge pair, the seq counters, the ledger door, the disposition counters, the fan-in tripwire, and the ONE sidecar spawn (P37YJG) |
 //! | [`lifecycle`] | Path registration, buffer management, engine accessors |
 //! | [`py_binding`] | PyO3 wrapper (`PyArbitrageEngine`) |
 //! | [`tests`] | Unit tests |
@@ -48,14 +50,29 @@ use ::apexbot_solvers::mixed::{HopType, MixedPath, ResolvedMixedPath, SolvePathR
 use alloy::primitives::aliases::U112;
 use alloy::primitives::Address;
 
+use self::block_cursor::BlockCursor;
+use self::boot_stamp::BootStamp;
 use self::delivery_policy::DeliveryPolicy;
 use crate::bot_core::resolve::HopProjectionCache;
 use crate::bot_core::state_lock::StateLock;
 use crate::bot_core::BotState;
 
+// THE construction-stamped fleet boot carrier (YI5NGB): the engine's own
+// FleetBoot value + the ride ledger the per-role fleet statics consult.
+mod boot_stamp;
+// 6XB6NJ: the ONE engine block cursor — the consolidated owner of the
+// engine-side block-coordinate residue (completes ADR-041 §3.5's
+// engine-side anchor fold; see the module's own doc header).
+pub(crate) mod block_cursor;
 // Sub-modules — each contains `impl ArbitrageEngine` or `impl PyArbitrageEngine` blocks.
 mod delivery_lifecycle;
 mod delivery_policy;
+// THE one detached/in-cycle solve-arm machine (P37YJG): the per-cycle
+// states, the merge pipe, the gauge pair, the seq counters, the ledger
+// door, the disposition counters, the fan-in tripwire, and the ONE
+// sidecar spawn — see the module's own doc header.
+pub(crate) mod detached_cycle;
+
 mod diagnostic;
 // SZJUKL seam retirement: the arb engine's StageHandlers implementation —
 // the ONE surface left between the machine driver and the engine. The
@@ -65,13 +82,22 @@ mod diagnostic;
 // hard cutover, Q6.
 pub mod engine_stages;
 mod event_routing;
+pub(crate) mod executor;
+pub mod fleet_intake;
+mod fleet_registration_executor;
+mod fleet_sim_executor;
+pub(crate) mod fleet_solve_executor;
+pub mod fleet_status;
 pub mod inline_sim;
-mod lifecycle;
+pub mod lifecycle;
 pub mod path_info;
 mod path_lifecycle;
-pub mod sim_slots;
+// RZEWTX: the ONE pooled-seat host for the WorkQueue fleet roles (sim +
+// registration) — the executors are thin role descriptors over it; the
+// solve executor's exclusion (per-seat channel model + posture-invariant
+// typed-submit admission) is documented in the module doc.
+mod seat_host;
 mod snapshot_verify;
-mod solve_executor;
 mod solver_dispatch;
 #[cfg(test)]
 mod tests;
@@ -299,6 +325,17 @@ pub struct ResultBatch {
     pub payloads: HashMap<u64, inline_sim::SimulatedPathResult>,
 }
 
+/// KJWIK5: the deferred-path re-record hook (the ledger carry). The
+/// dispatch calls it with the deferred paths' hop-pool keys and the cycle's
+/// solve block; `EngineStages::set_delta` installs the
+/// `EpochDelta::record` closure so a deferred path re-enters through the
+/// next draw (same freshness ordering, admission budget, retention window —
+/// one deferral concept). `None` on direct engine drives (unit tests, the
+/// cold-start `solve_all`): the deferral then keeps its pre-fold dropped
+/// behavior.
+pub(crate) type DeferredReRecordHook =
+    std::sync::Arc<dyn Fn(&[apexbot_solvers::affected_keys::AffectedKey], u64) + Send + Sync>;
+
 /// The unified Uniswap engine — owns V2, V3, and V4 pool state and solves
 /// mixed arbitrage paths.
 ///
@@ -308,19 +345,7 @@ pub struct ResultBatch {
 /// [`ArbitrageEngine::with_core`]; `new()` standalone sugar allocates its own)
 /// and reads/writes pool state through it. Lock ordering when nested is
 /// **engine-then-core** — no code path ever nests core-then-engine.
-/// Which dispatch mechanism drives the solve fan-out (epic BXUSGL T1).
-/// `Rayon` is today's `rayon::scope` LPT path, byte-for-byte; `Tokio` routes
-/// the same LPT bins through a private, lower-priority tokio runtime whose
-/// workers stream each path's result into the result queue as it completes.
-/// The stance is resolved ONCE at engine construction from the environment —
-/// never read at call time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SolveExecutorKind {
-    Rayon,
-    Tokio,
-}
-
-#[expect(clippy::struct_excessive_bools)] // 4th bool (detached_solving) added by epic SRQEK5 — each bool is a distinct construction-time stance, not flag soup
+#[expect(clippy::struct_excessive_bools)] // construction-time stances (streaming, admission, resolve-par, event expiry) — each a distinct stance, not flag soup
 pub struct ArbitrageEngine {
     /// KAHU5W: the owner-loaded typed bot config (one loader process-wide;
     /// never re-read from the environment). Construction stances + capture
@@ -376,29 +401,30 @@ pub struct ArbitrageEngine {
     /// `Mutex`. Writes happen during the sequential `clamp_merge` phase;
     /// reads snapshot the shards into a `HashMap` for the delivery policy.
     results: DashMap<u64, SolvePathResult>,
-    /// Block number for the last solved results
-    results_block: u64,
-    /// Last block number processed by `process_block`.
-    /// `None` means no block has been processed yet.
-    /// Used by the pump to determine the backfill boundary on startup.
-    last_processed_block: Option<u64>,
-    /// The last block this engine's `finalize_block` guard advanced past
-    /// (i.e. the last block whose dirty-path solve + diff send completed).
-    /// Owned by the engine since ergo task LEZJAS (the pump's `&mut` out-
-    /// params retired). Initialize to `0` so the first header/tombstone
-    /// `finalize_block(block > 0)` fires; survives a mid-flight engine
-    /// joining the pump (ADR-006 D4).
-    last_solved_block: u64,
-    /// Whether any forward log applied since the last `finalize_block`.
-    /// `true` after `record_logs_this_block()` (the pump's forward-log path),
-    /// cleared by `finalize_block`. Owned by the engine since LEZJAS.
-    has_logs_this_block: bool,
+    /// 6XB6NJ: the ONE engine block cursor — the consolidated owner of the
+    /// block-coordinate residue (the `results_block` solve-anchor stamp
+    /// [KNEUQX], the `last_processed_block` backfill boundary hint, the
+    /// `last_solved_block` finalize boundary, and the
+    /// `has_logs_this_block` forward-log flag). Every advance rule lives
+    /// on the cursor (monotone-max; see the `block_cursor` module docs —
+    /// one intentional strengthening: a late/stale stamp can no longer
+    /// regress the anchor).
+    cursor: BlockCursor,
     /// REMED1 T2: which entry drove the CURRENT solve cycle - `drain`
     /// (`EngineStages::solve_dirty`, per-log streaming) vs `finalize` (the
     /// boundary catch in `finalize_block`). Emitted on the cycle-complete
     /// line so a block's two real cycles (65/1853 overnight) are attributable
     /// instead of looking like duplicate logging.
     solve_entry: &'static str,
+    /// Cold-start trace: the CURRENT solve cycle's dispatch arm — `detached`
+    /// | `skipped_empty` | `shed` (the cycle-span vocabulary; WFF6MM retired
+    /// the `in_cycle` arm), latched by the dispatch at the machine's begin
+    /// verdict (the `solve_entry` precedent). Read AFTER `solve_dirty`
+    /// returns, where the cycle's duration and Mutex hold are measurable, so
+    /// those histograms can be attributed by arm. `unset` = no cycle
+    /// dispatched yet (a bug signal, deliberately visible rather than folded
+    /// into `skipped_empty`).
+    cycle_arm: &'static str,
     /// Paths registered via `register_and_solve_path` that have been eagerly
     /// solved and appended to `results`. Tracked so `rebuild_and_solve_affected`
     /// can merge them instead of discarding them when it replaces `self.results`.
@@ -435,9 +461,6 @@ pub struct ArbitrageEngine {
     /// (dense-CL envelope compose, sims≈0) were invisible to the LPT cost —
     /// bin-packed as cheap while dominating wall time.
     last_gate_us: std::sync::Arc<parking_lot::Mutex<HashMap<u64, u64>>>,
-    /// Which dispatch drives the solve fan-out (epic BXUSGL T1); see
-    /// [`SolveExecutorKind`].
-    solve_executor: SolveExecutorKind,
     /// T3 (epic BXUSGL): emit each clamp-passed above-threshold result as
     /// an IMMEDIATE single-entry [`ResultBatch`] during the drain instead of
     /// waiting for the pump debounce. Construction-time stance; **streaming
@@ -446,14 +469,62 @@ pub struct ArbitrageEngine {
     /// debounce sweep (A/B opt-out), which still owns expired/removed + the
     /// end-of-cycle metadata batch either way.
     streaming_delivery: bool,
+    /// THE construction-stamped fleet boot (YI5NGB): the engine's OWN
+    /// `FleetBoot`, derived from the CALLER's cfg at construction and
+    /// stamped with the engine id + a deterministic cfg hash. Packed in
+    /// `with_core_cfg` right beside `streaming_delivery` (the KAHU5W
+    /// construction-stance pattern); the per-role fleet statics courier it
+    /// to the ONE process fleet materialization per role, and any
+    /// divergent-cfg rider is ledgered (`boot_stamp::record_ride`). The
+    /// non-test build carries it write-only (the stamp's consumers are the
+    /// install-time ledger + the per-role statics); test builds read it
+    /// through the white-box probe accessor.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fleet_boot_stamp: BootStamp,
+    /// KAHU5W: the chunked-parallel resolve stance as an instance value
+    /// (YI5NGB) — packed at construction from `cfg.solve.solve_resolve_par`;
+    /// the `RESOLVE_PAR_STANCE` process-static is deleted and the one test
+    /// A/B flip site mutates this field through the test-only seam.
+    resolve_par_stance: bool,
     /// Test-only: hook invoked at the start of each path solve — lets the
     /// streaming test slowen one path deterministically.
     #[cfg(test)]
     test_solve_delay: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// 43E3H3 red-first: test-only per-path PANIC hook (the breaker suite
+    /// needs a bin body that dies mid-walk to pin the detached arm's
+    /// witness/gauge behavior through the panic path).
+    #[cfg(test)]
+    test_solve_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// KJWIK5 test seam: force the future-price deferral for these path ids.
+    /// The real tripwire is unreachable after the solve-anchor head floor
+    /// (only a mid-solve state advance can trip it), so this seam exists to
+    /// exercise the carry deterministically in tests.
+    #[cfg(test)]
+    test_force_deferred: Option<HashSet<u64>>,
     /// Test-only: the drain appends each merged path id here (with the tokio
     /// executor this happens per-path, before the slowest path completes).
     #[cfg(test)]
     merge_probe: Option<std::sync::Arc<parking_lot::Mutex<Vec<u64>>>>,
+    /// AQV6EF red-first: test-only per-path PANIC hook for the MERGE seat
+    /// (the sidecar guard suite needs `merge_detached_item` to die mid-item
+    /// so the caught-panic disposition + sticky cordon are pinned).
+    #[cfg(test)]
+    test_merge_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// WFF6MM test harness: when ON (default), a DIRECT
+    /// `rebuild_and_solve_affected` / `solve_dirty` call merges its own
+    /// just-enqueued detached pipe INLINE (`drain_merge_inline`) so the
+    /// synchronous unit tests keep reading results. `EngineStages::solve_dirty`
+    /// turns this OFF before driving the engine — there the sidecar owns the
+    /// pipe (the spawn happens AFTER the engine call returns, so an inline
+    /// drain would steal the Receiver from it).
+    #[cfg(test)]
+    test_sync_merge: bool,
+    /// WFF6MM test harness: the inline drain's cached handle on the merge
+    /// pipe. Taken once on the first direct-call drain (the production
+    /// sidecar is never spawned for direct-call tests) and kept so repeated
+    /// drains reuse it — the machine's `take_merge_rx` is take-ONCE.
+    #[cfg(test)]
+    test_merge_rx: Option<std::sync::mpsc::Receiver<crate::arb_engine::executor::LaneOutcome>>,
     /// Reuse-eligibility counter for the current solve cycle (probe only;
     /// reset each `solve_dirty` and surfaced on the resolve event).
     paths_same_state_this_cycle: u64,
@@ -464,6 +535,14 @@ pub struct ArbitrageEngine {
     /// rebuilds) accumulated duplicate paths indefinitely — 8.7k → 107k in
     /// 25 min, causing OOM kills and multi-second CPU-bound solves (FPGOYX).
     path_signatures: HashMap<Vec<(u64, bool)>, u64>,
+    /// PRG-4 / IRUMXD: the registered-path capacity owned by the engine
+    /// path registry (was the Python `MAX_REGISTERED_PATHS` counter). `None`
+    /// = unlimited. Set via [`Self::set_path_cap`].
+    path_cap: Option<usize>,
+    /// PRG-4: dedup hits counted engine-side — the duplicate registration
+    /// never crosses the FFI, so the `dup` skip telemetry needs this
+    /// witness (feeds `apexbot.registration.skips{reason="dup"}`).
+    path_dedups: u64,
     /// Engine lifecycle phase (ZU7RAF — core-OWNED). Enforces ordering
     /// `Created → Subscribed → SnapshotLoaded → Backfilled → Resumed`.
     /// Previously the `AtomicU8` lived on the pyo3 `PumpState` wrapper;
@@ -473,44 +552,58 @@ pub struct ArbitrageEngine {
     /// `Arc<Mutex<..>>` so the atomic read is lock-free across the pyo3
     /// wrappers and the pump task.
     phase: std::sync::atomic::AtomicU8,
-    // --- Detached solve cycle (epic SRQEK5, task WV62TX) ------------------
-    /// Construction-time stance: `APEXBOT_DETACHED_SOLVES` (default ON since
-    /// task 2UVG3E — the solve path takes no engine-level Mutex; `0` opts out).
-    /// When ON, `rebuild_and_solve_affected`
-    /// RETURNS at ENQUEUE end and the solves merge on the sidecar thread.
-    detached_solving: bool,
-    /// Monotonic counter bumped per issued detached cycle (the sidecar's
-    /// straggler-age telemetry reads `detached_issued_seq` against it).
-    detached_seq_ctr: u64,
-    /// The seq of the most recently issued detached cycle.
-    detached_issued_seq: u64,
+    // --- Detached solve cycle (epic SRQEK5 WV62TX; P37YJG machine) --------
+    /// QTZGFL: construction-time admission stance (`APEXBOT_SOLVE_ADMISSION`,
+    /// default OFF for the experiment). OFF keeps the in-flight cap degrade
+    /// byte-identical; ON replaces it with a capacity-modulated draw
+    /// (`budget = max(0, admission_target_depth − in-flight)`) that SHEDS a
+    /// zero-budget cycle at the draw/cycle level (nothing submitted, arm
+    /// latched `"shed"`, cursor advanced, keys retained for carry).
+    solve_admission: bool,
+    /// QTZGFL: the un-merged-result pipe depth target in KEYS, clamped at
+    /// construction to `1..=detached_cycle::DETACHED_INFLIGHT_CAP` (a target
+    /// above the design-locked safety valve is meaningless; a target of 0
+    /// would never submit).
+    admission_target_depth: u64,
+    /// QTZGFL: the retained (carried) key retention window W in blocks — the
+    /// ledger prunes carried keys older than `head − W` on each block advance
+    /// so a starved lead expires visibly instead of pinning the ledger.
+    admission_retention_blocks: u64,
+    /// QTZGFL: the DRAW's consumption verdict for the cycle currently between
+    /// `on_resolve` and the dispatch — `true` when the admission draw's budget
+    /// was zero (the cycle SHEDS). The DRAW is the SINGLE consumption
+    /// decision; the dispatch consumes AND clears this verdict under the
+    /// engine mutex instead of re-reading the in-flight gauge. Two reads can
+    /// disagree, and every disagreement loses work: the draw already REMOVED
+    /// its keys from the ledger, so a later zero read would discard them
+    /// (never submitted, never re-recorded). Set in
+    /// [`EngineStages::on_resolve`](super::engine_stages::EngineStages::on_resolve)
+    /// under the engine lock, consumed + cleared by
+    /// `rebuild_and_solve_affected` in the same engine-lock scope. The stage
+    /// machine drives Resolved -> Solved sequentially on the driver thread,
+    /// so this stash cannot interleave with another cycle's draw.
+    admission_draw_zero: bool,
+    /// KJWIK5: the deferred-path re-record hook (the ledger carry for
+    /// `paths.deferred_future_price` deferrals). Installed by
+    /// `EngineStages::set_delta` alongside the shared ledger — the engine
+    /// holds no ledger of its own (LXDY4C deliberately avoided engine-side
+    /// ownership); the dispatch maps a deferred pid to its hop-pool keys and
+    /// fires this with the cycle's solve block. `None` on a direct engine
+    /// drive (unit tests, `solve_all`), where the deferral falls back to the
+    /// log-driven retry.
+    deferred_re_record: Option<DeferredReRecordHook>,
+    /// THE one solve-arm machine (P37YJG; WFF6MM reduced it to the two
+    /// detached states): the per-cycle states (`Unopened → Open`), the merge
+    /// pipe open/take, the outstanding-gauge pair, the seq counters, the
+    /// outcome-ledger door, and the disposition counters. See the module doc
+    /// ([`detached_cycle`]) — it owns the lifecycle end to end.
+    detached_cycle: detached_cycle::DetachedCycle,
     /// LPEOBI: does the core hold a configured `max_age` for the V3/V4
     /// buffered-event expiry? With the cockpit default (`max_age=None`)
     /// `expire` is a provable no-op, so `solve_dirty` must not take a core
     /// write for it — each one bought a ~2.9s writer-queue slot under the
     /// block-apply stream. Flipped by [`Self::set_event_buffer_max_age`].
     event_buffer_expiry_enabled: bool,
-    /// Sender half of the UNBOUNDED mpsc merge pipe; `Some` from the first
-    /// detached enqueue until teardown. Each enqueue clones it into the
-    /// per-bin `std::thread`s.
-    detached_merge_tx: Option<std::sync::mpsc::Sender<solver_dispatch::DetachedMergeItem>>,
-    /// Receiver parked until `EngineStages::solve_dirty` spawns the merge
-    /// sidecar (taken once via `take_detached_merge_rx`). `Mutex`-wrapped so
-    /// the engine stays `Sync` (the parked Receiver behind the worker-only
-    /// guard is touched exactly once, by the spawner thread).
-    detached_merge_rx:
-        parking_lot::Mutex<Option<std::sync::mpsc::Receiver<solver_dispatch::DetachedMergeItem>>>,
-    /// In-flight gauge: detached results SENT but not yet dispositioned.
-    /// `Arc` because the enqueue half's bin threads bump it at send time and
-    /// the sidecar decrements it per terminal disposition. At cycle start a
-    /// count ≥ `DETACHED_INFLIGHT_CAP` degrades that cycle to the in-cycle
-    /// path (backpressure via fallback).
-    detached_outstanding: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Detached straggler outcome counters (applied / stale-dropped /
-    /// deregistered-dropped); T2 wires the `detached.*` metrics from these.
-    detached_applied: std::sync::atomic::AtomicU64,
-    detached_dropped_stale: std::sync::atomic::AtomicU64,
-    detached_dropped_deregistered: std::sync::atomic::AtomicU64,
     /// The inline-sim hook (SIMPIPE2 T1): `apexbot-python` installs the
     /// implementation at engine construction via
     /// [`ArbitrageEngine::set_inline_simulator`]; `None` = stance-relevant
@@ -555,22 +648,16 @@ impl ArbitrageEngine {
         self.streaming_delivery
     }
 
-    /// Probe the packed solve-dispatch executor kind (smoke-boot
-    /// observability; no environment read).
-    #[must_use]
-    pub fn solve_executor_probe(&self) -> &'static str {
-        match self.solve_executor {
-            SolveExecutorKind::Tokio => "tokio",
-            SolveExecutorKind::Rayon => "rayon",
-        }
-    }
-
     #[must_use]
     pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
-        Self::with_core_cfg(
-            core,
-            &std::sync::Arc::new(::apexbot_config::BotConfig::default()),
-        )
+        // KAHU5W/P6YXA6 production-boot fix: pack from the INSTALLED loader
+        // config (the _ffi module init installs the env/file-loaded BotConfig
+        // before any engine construction). A fresh `BotConfig::default()`
+        // here meant the python-driven pump's engine never observed
+        // construction stances like fleet.stance — schema defaults only
+        // apply when no owner installed one (tests / standalone clean-env
+        // constructions, byte-compatible per the holder docs).
+        Self::with_core_cfg(core, ::apexbot_config::holder::config_arc())
     }
 
     /// KAHU5W: config-threaded construction. `cfg` is the typed `BotConfig`
@@ -582,7 +669,35 @@ impl ArbitrageEngine {
         core: Arc<StateLock<BotState>>,
         cfg: &std::sync::Arc<::apexbot_config::BotConfig>,
     ) -> Self {
-        solver_dispatch::install_engine_stances(cfg);
+        // J4HN66 (epic 64ZQLA): construction stances come from the CALLER's
+        // own cfg — never from an install-then-read process static. A
+        // parallel construction flips such a static between our install and
+        // a global read (TOCTOU). The install call remains for its process
+        // projections — the construction-STAMPED fleet boots (YI5NGB); the
+        // stance statics other consumers observe). LW-T9: there is no
+        // stance — the fleet installs unconditionally, it is the only
+        // behavior.
+        let streaming_delivery = cfg.pump.streaming_delivery;
+        let resolve_par_stance = cfg.solve.solve_resolve_par;
+        // QTZGFL: the admission stance + its two typed knobs (KAHU5W
+        // construction-stance pattern — packed ONCE here, never re-read).
+        // `APEXBOT_SOLVE_ADMISSION` parse matrix (supervisor-confirmed
+        // conservative default): unset/0/false ⇒ OFF (current degrade,
+        // byte-identical); 1/true/on ⇒ the capacity-modulated draw; any other
+        // word fails config load loudly (the loader owns the words). The
+        // target is clamped to the design-locked safety valve: it is the SAME
+        // number as the in-flight cap, just made explicit/tunable.
+        let solve_admission = !cfg!(test) && cfg.solve.admission_shed;
+        let admission_target_depth = u64::try_from(cfg.solve.admission_target_depth)
+            .unwrap_or(detached_cycle::DETACHED_INFLIGHT_CAP)
+            .clamp(1, detached_cycle::DETACHED_INFLIGHT_CAP);
+        let admission_retention_blocks = cfg.solve.admission_retention_blocks;
+        // YI5NGB: the engine OWNS its fleet boot (KAHU5W) — the stamp is
+        // constructed from THIS cfg BEFORE the installer runs, so the
+        // construction hand-off carries the caller's value, identified.
+        let fleet_boot_stamp =
+            BootStamp::of(apexbot_workers::dispatcher::FleetBoot::from_config(cfg));
+        solver_dispatch::install_engine_stances(cfg, &fleet_boot_stamp);
         Self {
             cfg: std::sync::Arc::clone(cfg),
             runtime_cfg: solver_dispatch::solve_runtime_config_from_cfg(cfg),
@@ -595,31 +710,35 @@ impl ArbitrageEngine {
             cl_projection_memo: crate::bot_core::resolve::projection_memo_enabled(),
             pool_to_paths: HashMap::new(),
             results: DashMap::new(),
-            results_block: 0,
-            last_processed_block: None,
-            last_solved_block: 0,
-            has_logs_this_block: false,
+            cursor: BlockCursor::default(), // (0, None, 0, false) — the pre-cursor init, unchanged
             solve_entry: "drain",
+            cycle_arm: "unset",
             pending_new_paths: HashSet::new(),
             next_path_id: 1, // path IDs start at 1
             path_signatures: HashMap::new(),
+            path_cap: None,
+            path_dedups: 0,
             path_description_cache: parking_lot::Mutex::new(HashMap::new()),
             resolved_update_snapshot: HashMap::new(),
             last_walk_sims: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             last_gate_us: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            solve_executor: if solver_dispatch::SOLVE_EXECUTOR_TOKIO
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                SolveExecutorKind::Tokio
-            } else {
-                SolveExecutorKind::Rayon
-            },
-            streaming_delivery: solver_dispatch::STREAMING_DELIVERY_ENABLED
-                .load(std::sync::atomic::Ordering::Relaxed),
+            streaming_delivery,
+            fleet_boot_stamp,
+            resolve_par_stance,
             #[cfg(test)]
             test_solve_delay: None,
             #[cfg(test)]
+            test_solve_panic: None,
+            #[cfg(test)]
+            test_force_deferred: None,
+            #[cfg(test)]
             merge_probe: None,
+            #[cfg(test)]
+            test_merge_panic: None,
+            #[cfg(test)]
+            test_sync_merge: true,
+            #[cfg(test)]
+            test_merge_rx: None,
             walk_memo: std::sync::Arc::new(::apexbot_solvers::mobius_v3_int::WalkMemo::new(
                 cfg.solve.solver_walk_memo,
                 cfg.solve.solver_walk_memo_stats,
@@ -627,17 +746,15 @@ impl ArbitrageEngine {
             paths_same_state_this_cycle: 0,
             delivery: DeliveryPolicy::default(),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
-            detached_solving: solver_dispatch::DETACHED_SOLVES_ENABLED
-                .load(std::sync::atomic::Ordering::Relaxed),
-            detached_seq_ctr: 0,
-            detached_issued_seq: 0,
+            solve_admission,
+            admission_target_depth,
+            admission_retention_blocks,
+            admission_draw_zero: false,
+            deferred_re_record: None,
+            // P37YJG: the machine's pre-cycle init lives on the machine
+            // (dormant Unopened, pipe closed, counters at 0).
+            detached_cycle: detached_cycle::DetachedCycle::new(),
             event_buffer_expiry_enabled: false,
-            detached_merge_tx: None,
-            detached_merge_rx: parking_lot::Mutex::new(None),
-            detached_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            detached_applied: std::sync::atomic::AtomicU64::new(0),
-            detached_dropped_stale: std::sync::atomic::AtomicU64::new(0),
-            detached_dropped_deregistered: std::sync::atomic::AtomicU64::new(0),
             inline_sim: None,
             inline_payloads: DashMap::new(),
         }
@@ -798,28 +915,102 @@ impl ArbitrageEngine {
 
 // ---------------------------------------------------------------------------
 // Epic BXUSGL T1: test-only knobs. Never compiled outside `cargo test` — the
-// streaming-orchestration test needs per-test control of the executor stance,
-// a deterministic per-path delay, and an observation point on the drain.
+// streaming-orchestration test needs a deterministic per-path delay and an
+// observation point on the drain.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 impl ArbitrageEngine {
-    pub(crate) fn set_solve_executor(&mut self, kind: SolveExecutorKind) {
-        self.solve_executor = kind;
-    }
-
     pub(crate) fn set_solve_delay_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
         self.test_solve_delay = Some(hook);
+    }
+
+    pub(crate) fn set_solve_panic_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.test_solve_panic = Some(hook);
+    }
+
+    /// KJWIK5 test seam: force the future-price deferral for `pids` (empty
+    /// clears it). The real tripwire is unreachable after the solve-anchor
+    /// head floor, so the carry is exercised through this seam.
+    pub(crate) fn set_force_deferred_for_test(&mut self, pids: HashSet<u64>) {
+        self.test_force_deferred = if pids.is_empty() { None } else { Some(pids) };
     }
 
     pub(crate) fn set_merge_probe(&mut self, probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>>) {
         self.merge_probe = Some(probe);
     }
 
+    pub(crate) fn set_merge_panic_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.test_merge_panic = Some(hook);
+    }
+
+    /// WFF6MM test harness: toggle the inline merge drain. `EngineStages`
+    /// turns it OFF before driving the engine (the sidecar owns the pipe
+    /// there — see the field doc).
+    pub(crate) fn set_sync_merge_for_test(&mut self, on: bool) {
+        self.test_sync_merge = on;
+    }
+
+    /// WFF6MM test harness: drain up to `expected` items from the merge pipe
+    /// INLINE through the sidecar's own per-item merge path
+    /// (`merge_detached_item`), so a direct `solve_dirty` /
+    /// `rebuild_and_solve_affected` caller reads its results synchronously.
+    /// The Receiver is taken once and cached on the engine; the machine's
+    /// `take_merge_rx` is take-ONCE, so the sidecar is never spawned for
+    /// these engines.
+    pub(crate) fn drain_merge_inline(&mut self, expected: usize) {
+        if self.test_merge_rx.is_none() {
+            self.test_merge_rx = self.detached_cycle.take_merge_rx();
+        }
+        let Some(rx) = self.test_merge_rx.take() else {
+            return;
+        };
+        for _ in 0..expected {
+            let Ok(item) = rx.recv() else { break };
+            self.merge_detached_item(item);
+        }
+        self.test_merge_rx = Some(rx);
+    }
+
     pub(crate) fn set_streaming_delivery(&mut self, on: bool) {
         self.streaming_delivery = on;
     }
 
-    pub(crate) fn set_detached_solving(&mut self, on: bool) {
-        self.detached_solving = on;
+    /// YI5NGB (test-only F-suite probe): the engine's construction-stamped
+    /// boot — lets the white-box tests verify twin constructions share a
+    /// byte-identical boot value WITHOUT reaching into the fleet statics.
+    #[cfg(test)]
+    pub(crate) fn fleet_boot_stamp(&self) -> &BootStamp {
+        &self.fleet_boot_stamp
+    }
+
+    /// QTZGFL: test seam for the admission stance. Production packs it from
+    /// `cfg.solve.admission_shed` at construction (never re-read).
+    #[cfg(test)]
+    pub(crate) fn set_solve_admission(&mut self, on: bool) {
+        self.solve_admission = on;
+    }
+
+    /// QTZGFL: test seam for the target depth — the clamp mirrors the
+    /// construction clamp exactly.
+    #[cfg(test)]
+    pub(crate) fn set_admission_target_depth(&mut self, depth: usize) {
+        self.admission_target_depth = u64::try_from(depth)
+            .unwrap_or(detached_cycle::DETACHED_INFLIGHT_CAP)
+            .clamp(1, detached_cycle::DETACHED_INFLIGHT_CAP);
+    }
+
+    /// QTZGFL: test seam for the retention window (blocks).
+    #[cfg(test)]
+    pub(crate) fn set_admission_retention_blocks(&mut self, window: u64) {
+        self.admission_retention_blocks = window;
+    }
+
+    /// YI5NGB: A/B seam (TEST ONLY). The production stance is
+    /// construction-frozen from `cfg.solve.solve_resolve_par` (KAHU5W);
+    /// the parity test drives both arms through this mutator instead of
+    /// flipping a process-global.
+    #[cfg(test)]
+    pub(crate) fn set_resolve_parallel_for_test(&mut self, on: bool) {
+        self.resolve_par_stance = on;
     }
 }

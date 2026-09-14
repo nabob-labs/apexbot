@@ -52,6 +52,10 @@ apexbot-arbitrage = { workspace = true, features = ["order-index"] }
 apexbot-solvers.workspace = true
 apexbot-submission.workspace = true
 apexbot-uniswap.workspace = true
+# The role-switching worker fleet (ADR-042): FSM, budget authority,
+# bounded priority dispatch, cordon posture — pyo3-free core for the
+# standalone Rust consumer.
+apexbot-workers.workspace = true
 
 [dev-dependencies]
 async-trait = "0.1"

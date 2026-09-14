@@ -20,7 +20,6 @@ pub mod bot;
 pub mod cl_orchestration;
 pub mod cl_route;
 pub mod construction_io;
-pub mod cpu_budget;
 pub mod curve_data_provider_impl;
 pub mod curve_state;
 pub mod divergence_probe;
@@ -30,6 +29,9 @@ pub mod liquidity_verifier;
 pub mod log_dispatcher;
 pub mod pool_builder;
 pub mod pump_telemetry;
+/// PRG-2 / IRUMXD: the keyed registration-gate table for immutable V4
+/// admission verdicts (see [registration_gate] docs).
+pub mod registration_gate;
 pub mod registration_lifecycle;
 pub mod reorg_coordinator;
 pub mod reserve_pair_orchestration;
@@ -131,7 +133,8 @@ pub use stage_machine::{
 // ---------------------------------------------------------------------------
 
 pub use ::apexbot_pools::registry::{
-    ConcentratedLiquidityPool, ConcentratedLiquidityPoolMut, PoolEntry, TokenEntry,
+    ConcentratedLiquidityPool, ConcentratedLiquidityPoolMut, PoolEntry, RegisteredPoolFamily,
+    TokenEntry,
 };
 pub use ::apexbot_pools::simulate_swap::simulate_swap;
 pub use ::apexbot_pools::v2_state::{
@@ -190,6 +193,11 @@ pub struct BotState {
     /// `pool_managers` DB row); the solver-state verifier reads it via
     /// [`BotState::state_view_for`].
     v4_state_views: HashMap<Address, Address>,
+    /// PRG-2 / IRUMXD: the keyed registration-gate — immutable V4
+    /// admission verdicts (dynamic fee / fee-exceeds-encoder-limit) recorded
+    /// by [`Self::register_v4_pool`] refusals and consulted pre-RPC by the
+    /// `PyO3` build path. Bounded by refused pools, not candidates.
+    registration_gate: registration_gate::RegistrationGate,
     /// The snapshot seed block `S = min(fetch_newest_update_block(V3), V4)`.
     /// Set by `Bot::load_snapshot_from_db` (or `load_snapshot_from_py`) when a
     /// snapshot is loaded; consumed by the auto-backfill (B1/J3FMDO) that
@@ -735,6 +743,7 @@ impl BotState {
             v4_buffer: ::apexbot_pools::liquidity_event_buffer::LiquidityEventBuffer::new(),
             v4_pool_ids: HashMap::new(),
             v4_state_views: HashMap::new(),
+            registration_gate: registration_gate::RegistrationGate::default(),
             snapshot_seed_block: None,
             pump_complete_cutoff: 0,
             v3_event_horizons: HashMap::new(),
@@ -834,6 +843,37 @@ impl BotState {
     #[must_use]
     pub fn pool_id_by_address(&self, address: &Address) -> Option<u64> {
         self.pool_addresses.get(address).copied()
+    }
+
+    /// The address-keyed registration of record, family-tagged (PRG-1 /
+    /// IRUMXD registry unification). `BotState` is the sole pool registry,
+    /// so the `PyO3` build adapters (`build_v2_pool` / `build_v3_pool` /
+    /// `build_aerodrome_v2_pool` / `build_balancer_*_pool`) consult this
+    /// pre-check INSTEAD of a Python-mirror registry: an address this core
+    /// already registered is answered by this reader — identity straight off
+    /// the registered entry — with no duplicate-handed builder replay and no
+    /// terminal `AlreadyRegistered` refusal.
+    ///
+    /// V4 pools are NOT address-keyed (one `PoolManager` hosts many pool ids,
+    /// keying is `(pool_manager, pool_id)`) and return `None` here; their
+    /// fast path is the existing `try_registered_v4`.
+    #[must_use]
+    pub fn registered_pool_by_address(
+        &self,
+        address: &Address,
+    ) -> Option<(u64, RegisteredPoolFamily)> {
+        let pool_id = self.pool_id_by_address(address)?;
+        let family = match self.pools.get(&pool_id)? {
+            PoolEntry::V2(..) => RegisteredPoolFamily::V2,
+            PoolEntry::V3(..) => RegisteredPoolFamily::V3,
+            PoolEntry::Curve(..) => RegisteredPoolFamily::Curve,
+            PoolEntry::BalancerWeighted(..) => RegisteredPoolFamily::BalancerWeighted,
+            PoolEntry::BalancerStable(..) => RegisteredPoolFamily::BalancerStable,
+            PoolEntry::AerodromeV2(..) => RegisteredPoolFamily::AerodromeV2,
+            // V4 is (PoolManager, pool_id)-keyed, never address-keyed.
+            PoolEntry::V4(..) => return None,
+        };
+        Some((pool_id, family))
     }
 
     /// Unregister a pool. ADR-007 U3.
@@ -1296,8 +1336,9 @@ impl BotState {
             {
                 // PancakeSwap V3 swaps carry a non-canonical topic0 (the fork
                 // added two trailing data fields to the Swap event) — decode
-                // them via the dedicated decoder so these pools stay live. See
-                // docs/exploration-no-profit-crash.md (stale-state root cause).
+                // them via the dedicated decoder so these pools stay live. See the
+                // exploration-no-profit-crash writeup (stale-state root cause;
+                // removed in the stale-docs cleanup `71ec78b2`).
                 if let Some(event) = decode_v3_pancakeswap_swap_log(log) {
                     self.route_v3_event(
                         crate::bot_core::cl_route::Phase::Backfill,
@@ -4466,6 +4507,124 @@ mod tests {
             "re-register must allocate a fresh id (retired, not reused)",
         );
         assert_eq!(core.pool_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRG-1 / IRUMXD registry unification: BotState is the registry of record.
+    // `registered_pool_by_address` answers the PyO3 build adapters' pre-check
+    // with the family-tagged entry, so a duplicate build resolves to the
+    // registered handle instead of replaying the builder into an
+    // `AlreadyRegistered` refusal.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn admission_refusal_records_a_consultable_gate_verdict() {
+        use crate::arb_engine::PoolTickCoverage;
+        use crate::bot_core::{
+            registration_gate::AdmissionVerdict, RegisterV4PoolError, RegisterV4PoolParams,
+            V4PoolKey,
+        };
+        use hashbrown::HashMap;
+
+        let pm = Address::from([0x44u8; 20]);
+        let pid: apexbot_decoders::v4_swap_decoder::V4PoolId = [0xeeu8; 32];
+        let mut core = BotState::new();
+        let base = |fee: u32| RegisterV4PoolParams {
+            pool_manager: pm,
+            pool_id: pid,
+            pool_key: V4PoolKey {
+                currency0: Address::ZERO,
+                currency1: Address::from([1u8; 20]),
+                fee,
+                tick_spacing: 10,
+                hooks: Address::ZERO,
+            },
+            hook_flags: 0,
+            protocol_fee: 0,
+            sqrt_price_x96: U256::from(1u128) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            tick_data: HashMap::new(),
+            update_block: 0,
+            tick_data_block: None,
+            coverage: PoolTickCoverage::Sparse,
+            fetcher: None,
+        };
+
+        // Dynamic-fee refusal records a consultable verdict.
+        assert!(matches! {
+            core.register_v4_pool(&base(0x100_000)),
+            Err(RegisterV4PoolError::DynamicFee { .. }),
+        });
+        assert_eq!(
+            core.admission_verdict(pm, &pid),
+            Some(AdmissionVerdict::DynamicFee { fee: 0x100_000 })
+        );
+
+        // Fee-encoder-limit refusal records its verdict on a fresh pool.
+        let pid2: apexbot_decoders::v4_swap_decoder::V4PoolId = [0x33u8; 32];
+        let mut p2 = base(320_000);
+        p2.pool_id = pid2;
+        assert!(matches! {
+            core.register_v4_pool(&p2),
+            Err(RegisterV4PoolError::FeeExceedsEncoderLimit { fee: 320_000 }),
+        });
+        assert_eq!(
+            core.admission_verdict(pm, &pid2),
+            Some(AdmissionVerdict::FeeExceedsEncoderLimit { fee: 320_000 })
+        );
+        assert_eq!(core.registration_gate_len(), 2);
+
+        // An admitted pool registers normally and answers via the registry
+        // of record — the REGISTRATION refusals gate-record, admissions do
+        // not, and the two readers never mix.
+        let pid3: apexbot_decoders::v4_swap_decoder::V4PoolId = [0x77u8; 32];
+        let mut ok = base(500);
+        ok.pool_id = pid3;
+        let admitted = core.register_v4_pool(&ok).expect("in-spec registration");
+        assert!(
+            core.admission_verdict(pm, &pid3).is_none(),
+            "admitted pools gate-record nothing"
+        );
+        assert!(core.try_registered_v4(pm, &pid3).is_some());
+        let _: u64 = admitted;
+    }
+
+    #[test]
+    fn registered_pool_by_address_answers_registered_families() {
+        let mut core = BotState::new();
+        let params = make_params(U112::from(1000), U112::from(2000));
+        let id = core
+            .register_v2_pool(&params)
+            .expect("test setup: V2 registration");
+
+        let (found_id, family) = core
+            .registered_pool_by_address(&make_pool_addr())
+            .expect("the registered V2 address answers");
+        assert_eq!(found_id, id);
+        assert_eq!(family, RegisteredPoolFamily::V2);
+    }
+
+    #[test]
+    fn registered_pool_by_address_is_none_for_unknown_and_v4() {
+        let mut core = BotState::new();
+        assert_eq!(
+            core.registered_pool_by_address(&Address::from([0x11u8; 20])),
+            None,
+            "an unregistered address answers None"
+        );
+
+        // V4 is (pool_manager, pool_id)-keyed — not address-keyed — so even a
+        // registered V4 pool must NOT answer here (its fast path is the
+        // `try_registered_v4` reader).
+        let v4_params = make_v4_params_in_spec();
+        core.register_v4_pool(&v4_params)
+            .expect("test setup: V4 registration");
+        assert_eq!(
+            core.registered_pool_by_address(&Address::from([0x22u8; 20])),
+            None,
+            "V4 pools do not answer the address-keyed reader"
+        );
     }
 
     #[test]

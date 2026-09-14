@@ -34,10 +34,10 @@ groups:
             (ApexbotHeaderStall deliberately ignores down targets).
         data:
           - refId: A
-            relativeTimeRange: { from: 5m, to: 0s }
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'count(up{job="apexbot"} == 1) == 0 or absent(apexbot_blocks_observed_total)'
+              expr: 'count(up{job="apexbot"} == 1) == 0 or absent(apexbot_blocks_observed_total)'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -59,10 +59,10 @@ groups:
             feed or the pump is dead while the chain advances.
         data:
           - refId: A
-            relativeTimeRange: { from: 5m, to: 0s }
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'rate(apexbot_blocks_observed_total{init!="true"}[1m]) == 0 and on() up{job="apexbot"} == 1'
+              expr: 'rate(apexbot_blocks_observed_total{init!="true"}[1m]) == 0 and on() up{job="apexbot"} == 1'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -86,10 +86,10 @@ groups:
             not landing. Healthy runs sit at 0 and drop stragglers stale.
         data:
           - refId: A
-            relativeTimeRange: { from: 5m, to: 0s }
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'apexbot_detached_in_flight >= 8'
+              expr: 'apexbot_detached_in_flight >= 8'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -108,10 +108,10 @@ groups:
           summary: apexbot state head divergence (freeze signature)
         data:
           - refId: A
-            relativeTimeRange: { from: 5m, to: 0s }
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'abs(apexbot_state_head_lag_blocks{init!="true"}) >= 3'
+              expr: 'abs(apexbot_state_head_lag_blocks{init!="true"}) >= 3'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -142,10 +142,10 @@ groups:
             ApexbotDesyncQuarantine (apexbot_engine_quarantined_pools).
         data:
           - refId: A
-            relativeTimeRange: { from: 15m, to: 0s }
+            relativeTimeRange: { from: 900, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'sum(rate(apexbot_errors_total[5m])) > 0'
+              expr: 'sum(rate(apexbot_errors_total[5m])) > 0'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -173,10 +173,10 @@ groups:
             divergence dump. The bot keeps trading its other paths.
         data:
           - refId: A
-            relativeTimeRange: { from: 15m, to: 0s }
+            relativeTimeRange: { from: 900, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'max_over_time(apexbot_engine_quarantined_pools[30m]) > 0'
+              expr: 'max_over_time(apexbot_engine_quarantined_pools[30m]) > 0'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -195,10 +195,10 @@ groups:
           summary: apexbot submit failures
         data:
           - refId: A
-            relativeTimeRange: { from: 30m, to: 0s }
+            relativeTimeRange: { from: 1800, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'sum(rate(apexbot_submit_outcomes_total{outcome="skipped_broadcast_failed"}[10m])) > 0'
+              expr: 'sum(rate(apexbot_submit_outcomes_total{outcome="skipped_broadcast_failed"}[10m])) > 0'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -217,10 +217,10 @@ groups:
           summary: apexbot monitor expiry spike
         data:
           - refId: A
-            relativeTimeRange: { from: 45m, to: 0s }
+            relativeTimeRange: { from: 2700, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: >-
+              expr: >-
                 sum(rate(apexbot_monitor_outcomes_total{outcome="expired"}[15m]))
                 / clamp_min(sum(rate(apexbot_monitor_outcomes_total[15m])), 0.001) > 0.5
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
@@ -241,10 +241,10 @@ groups:
           summary: apexbot profit efficiency drop
         data:
           - refId: A
-            relativeTimeRange: { from: 30m, to: 0s }
+            relativeTimeRange: { from: 1800, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: >-
+              expr: >-
                 apexbot_profit_missed_total
                 / clamp_min(apexbot_profit_realized_total + apexbot_profit_missed_total, 1) > 0.8
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
@@ -257,6 +257,67 @@ groups:
               expression: A
               conditions:
                 - evaluator: { type: gt, params: [1.0005] }
+      - uid: apexbot-epoch-race-slow
+        title: ApexbotEpochRaceSlow
+        condition: C
+        for: 5m
+        annotations:
+          summary: apexbot epoch race slow - header to publish p95 over 2s
+          description: >-
+            The epoch race (ADR-041): header accept to Published-stage
+            dispatch (apexbot_epoch_header_to_publish_seconds) - the edge
+            where submission/delivery subscribe - has its 5m p95 above 2s.
+            Warning level: money is landing but late. Investigated with the
+            dashboard stage-cycle waterfall (delivery / burst / settle /
+            streaming-age legs) and a apexbot.epoch trace from Jaeger.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expr: >-
+                histogram_quantile(0.95, sum(rate(apexbot_epoch_header_to_publish_seconds_bucket[5m])) by (le)) > 2
+                or vector(0)
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-epoch-stale-drops
+        title: ApexbotEpochStaleDrops
+        condition: C
+        for: 10m
+        annotations:
+          summary: apexbot stale-epoch drops sustained - stage cycle spilling past the next header
+          description: >-
+            Stale-epoch work items are being dropped loudly by the I3
+            rewind-generation fail-fast (apexbot_epoch_stale_drops) for 10m.
+            The stage cycle (Streaming..Publish) is chronically spilling into
+            the next epoch - early warning before the race p95 tail moves and
+            before detached-in-flight backs up (ApexbotDrainerStall).
+        data:
+          - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expr: >-
+                sum(rate(apexbot_epoch_stale_drops_total[5m])) > 0
+                or vector(0)
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
       - uid: apexbot-simulate-error-rate
         title: ApexbotSimulateErrorRate
         condition: C
@@ -265,10 +326,10 @@ groups:
           summary: apexbot simulate error rate high
         data:
           - refId: A
-            relativeTimeRange: { from: 30m, to: 0s }
+            relativeTimeRange: { from: 1800, to: 0 }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: >-
+              expr: >-
                 sum(rate(apexbot_simulate_verdicts_total{outcome="error"}[10m]))
                 / clamp_min(sum(rate(apexbot_simulate_verdicts_total[10m])), 0.001) > 0.1
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }

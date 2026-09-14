@@ -11,9 +11,14 @@ exact same class object. The identity contract is pinned by
 """
 
 from apexbot._ffi import (
+    # FF-T1 (BPHR6F): the typed fleet boot refusal — the library never
+    # aborts the host process on the boot-refusal arm; the binary maps
+    # this exception to its loud named fail-fast exit.
+    BootRefused,
     DynamicFeePoolRejectedError,
     HighFeePoolRejectedError,
     HookedPoolRejectedError,
+    PathRegistryFullError,
     PoolAlreadyRegisteredError,
     PoolRegistrationError,
     SpecViolationError,
@@ -94,6 +99,7 @@ __all__ = (
     "ArbitrageError",
     "BackupExists",
     "BlockFetchingTimeout",
+    "BootRefused",
     "BrokenPool",
     "ConnectionTimeout",
     "ContractLogicError",
@@ -132,6 +138,7 @@ __all__ = (
     "NoPriceOracle",
     "NoSolverSolution",
     "OptimizationError",
+    "PathRegistryFullError",
     "PathRejectedError",
     "PoolAlreadyRegisteredError",
     "PoolCreationFailed",

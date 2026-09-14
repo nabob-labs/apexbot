@@ -37,12 +37,12 @@ naming the shared defaults every member crate inherits:
 
 ```toml
 [workspace.package]
-version = "0.6.0-alpha.3"
+version = "0.6.0-alpha.10"
 edition = "2021"
-license = "MIT"
-publish = false
-repository = "https://github.com/nabob-labs/apexbot"
-authors = ["nabob-labs"]
+license = "Apache-2.0 license"
+rust-version = "1.97"
+repository = "https://github.com/nabob-labs/apexbot.git"
+authors = ["Nabob Labs"]
 ```
 
 Every member crate's `[package]` table then writes the inherited fields as
@@ -172,7 +172,7 @@ for verification at any point in a release.
   versioning half of the same Polars model (Polars itself uses
   `[workspace.package]` + `version.workspace = true` across `polars-core`/
   `-plan`/`-python`/etc., with `dynamic = ["version"]` in `pyproject.toml`).
-- **`rust/AGENTS.md`** — the workspace member list and virtual-manifest
+- **the former `rust/AGENTS.md`** (dropped in `affebc8de`) — the workspace member list and virtual-manifest
   convention; `[workspace.package]` defaults apply to exactly those members.
 - **`pyproject.toml` `[tool.maturin]`** — `manifest-path` points at the
   binding crate whose (inherited) version maturin reads. Unchanged by this

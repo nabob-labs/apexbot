@@ -33,7 +33,7 @@ span start
   ├─[solve-phase] resolved hop snapshots         {paths.resolved, invalid.reasons}
   │  (resolve→LPT staging sits in its own child span — MQUKB6-T2 follow)
   ├─ apexbot.arb.stage                          {paths.staged}
-  ├─[solve-phase] rayon solve complete           {paths.solved, paths.invalid,
+  ├─[solve-phase] streaming solve complete       {paths.solved, paths.invalid,
   │                                               solve.cpu_us, profitable,
   │                                               slowest.paths}
   ├─[solve-phase] cycle complete (clamp done)    {clamp.twins, clamp.phase_us,
@@ -98,7 +98,8 @@ The concurrent-sim pipeline is `APEXBOT_SIM_PIPELINE_CONCURRENCY` (default
 8; 1 = serial A/B arm). Contract: sims overlap across batches; submissions
 stay FIFO in batch-arrival order with the nonce fetched at submit time.
 If the tail/sum ratio rises above ~0.5, the pipeline regressed. Lab + soak
-evidence: `logs/simpipe_lab.md`, `logs/simpipe_soak.md` (K=8 vs K=1: 4.2x
+evidence: the gitignored logs/ artifacts `logs/simpipe_lab.md` and
+`logs/simpipe_soak.md` (since removed; K=8 vs K=1: 4.2x
 tail compression, 0 leaf failures).
 
 Derived quantities (compute these on every investigation):
@@ -107,8 +108,8 @@ Derived quantities (compute these on every investigation):
 |---|---|---|
 | Activation-scan wall | `fanout.phase_us` | < 100ms; scales with affected set |
 | Resolve wall | next-event − fanout timestamp | ~10µs/path |
-| Rayon wall | rayon-event − resolve-event | ≈ `solve.cpu_us / 7.8` (8 cores) |
-| **Achieved parallelism** | **`solve.cpu_us / rayon_wall`** | **≈ 7.8 (8 cores)** |
+| Solve wall | solve-event − resolve-event | ≈ `solve.cpu_us / 7.8` (8 cores) |
+| **Achieved parallelism** | **`solve.cpu_us / solve_wall`** | **≈ 7.8 (8 cores)** |
 | Per-path solve CPU | `solve.cpu_us / paths.solved` | ~1.4–2.6ms |
 | Invalidity rate | `paths.invalid / paths.resolved` | trending down |
 
@@ -128,7 +129,7 @@ Diagnose by reading the phase split before touching code:
    depth/tick counts. Flat ⇒ volume problem; look at activation fan-out width.
 2. **Rayon wall dominates + parallelism well under 7** → contention or pool
    starvation. Hypotheses: (a) worker threads blocked on a mutex inside
-   `solve_path` (none known today — workers touch no engine state), (b) rayon
+   `solve_path` (none known today — workers touch no engine state), (b) bins
    pool shared with another subsystem, (c) CPU steal from co-located processes.
 3. **Activation scan dominates** (fanout.phase_us > several hundred ms at
    modest affected counts) → registry walk regressed; suspect `pool_to_paths`
@@ -142,7 +143,7 @@ the closure (`t0`/`micros`, feeds `slowest.paths`).
 
 ### S2. Achieved parallelism low (< 6×)
 
-`solve.cpu_us` high relative to rayon wall means workers idle or blocked.
+`solve.cpu_us` high relative to solve wall means workers idle or blocked.
 Hypotheses ranked:
 
 1. Affected set too small to saturate 8 workers — benign; ignore unless cycles
@@ -194,7 +195,7 @@ Cross-
 check the matching metric histogram percentiles in Prometheus before adding
 new spans.
 
-### S7. header_to_solved dominated by a flat settle wait
+### S7. header_to_publish dominated by a flat settle wait
 
 Decompose the pre-solve gap first — `apexbot.epoch` root fields (recorded at the settle point):
 `header_to_first_log_us` (header → first relevant log), `log_burst_us`
@@ -206,7 +207,9 @@ same-block log bursts at the price of that fixed tail.
 2026-09-04 baseline (block-25906841 session): `settle_wait_us` pinned at
 ~51 ms on 24 of 28 blocks while `log_burst_us` spanned 1.3–27.5 ms — the 50 ms
 debounce fired long after each burst was fully applied, making it a fixed
-~50 ms per-block tax on header_to_solved. The window is operator-tunable via
+~50 ms per-block tax on header_to_publish (the ADR-041 epoch race; the
+retired drain-era `apexbot_header_to_solved` endpoint measured the solve
+edge). The window is operator-tunable via
 `APEXBOT_PUMP_DEBOUNCE_MS` (parse contract `BlockPump::debounce_ms_cfg`:
 unset/zero/invalid falls back to 50 ms, so a bad value can never collapse the
 window to zero). Live A/B at 15 ms settled the same bursts at ~16 ms with no
@@ -229,8 +232,10 @@ Known incident class, not a bot bug:
 2. **Stale binary**: `uv sync` does NOT reinstall an editable package whose
    version metadata is unchanged — use
    `uv sync --reinstall-package apexbot` after Rust edits, then restart.
-   Verify which build a trace came from via `code.line.number` tags vs current
-   source lines.
+   Verify the installed build first with `just verify-build-fresh` (it exits 1
+   on a stale `.so`; see AGENTS.md "Verifying freshness with the build
+   receipt"). The `code.line.number` tag comparison in traces remains only as
+   a forensic fallback, not the primary check.
 3. Batch-exporter lag: last spans of a killed process are lost. Don't trust a
    trace count drop right after a restart as a regression.
 
@@ -253,7 +258,10 @@ full sweep). Span events carry `code.line.number` — use it to confirm binary
 freshness against current source.
 
 Key Prometheus families (`instruments.rs`): `apexbot_solve_duration_seconds`,
-`apexbot_header_to_solved_seconds`, `apexbot_stage_publish_cycle_seconds` /
+`apexbot_epoch_header_to_publish_seconds` (the epoch race — header accept →
+Published dispatch; the drain-era `apexbot_header_to_solved` family is
+RETIRED with the stage machine), `apexbot_stage_streaming_age_seconds`,
+`apexbot_epoch_stale_drops_total`, `apexbot_stage_publish_cycle_seconds` /
 `apexbot_stage_rewind_total` / `_duration_seconds` (the DispatchOwner
 `apexbot_drain_queue_wait_seconds` / `_depth` families are RETIRED, SZJUKL),
 `apexbot_log_decode_seconds`, `apexbot_state_apply_seconds`,

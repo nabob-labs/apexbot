@@ -324,7 +324,7 @@ fn pipeline_instruments_render_expected_families() {
     let meter = provider.meter("apexbot.test");
     let p = PipelineInstruments::new(&meter);
 
-    p.observe_header_to_solved(0.25);
+    p.observe_header_to_publish(0.25);
     p.count_block();
     p.count_log_received();
     p.count_log_applied();
@@ -333,7 +333,7 @@ fn pipeline_instruments_render_expected_families() {
 
     let text = metrics::render(&registry);
     for family in [
-        "apexbot_block_header_to_solved",
+        "apexbot_epoch_header_to_publish_seconds_bucket",
         "apexbot_blocks_observed_total",
         "apexbot_logs_received_total",
         "apexbot_logs_applied_total",
@@ -364,7 +364,7 @@ fn solver_instruments_render_with_verdict_labels() {
     let meter = provider.meter("apexbot.test");
     let p = PipelineInstruments::new(&meter);
 
-    p.observe_solve_duration(0.012);
+    p.observe_solve_duration(0.012, "detached");
     p.count_solves_executed();
     p.set_registered_paths(42);
     p.count_candidates_found(7);

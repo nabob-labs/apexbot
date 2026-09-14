@@ -13,7 +13,11 @@
 //! Tokio runtime enables true parallelism for these I/O-bound operations,
 //! while a current-thread runtime would serialize them into a bottleneck.
 //!
-//! Thread count is tunable via the `TOKIO_WORKER_THREADS` environment variable.
+//! Two-runtime sizing: the worker count comes from the cgroup-aware CPU
+//! budget (`crate::cpu_budget`) — the leftover after the solve bins take
+//! theirs — and NOT from `available_parallelism`, which reads 24 host cores
+//! inside an 8-core cgroup quota in this devcontainer. Operators pin it
+//! with the typed `runtime.io_workers` key (env `APEXBOT_IO_WORKERS`).
 //!
 //! # Lazy Initialization
 //!
@@ -33,34 +37,46 @@
 //! });
 //! ```
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
 
-const ENV_VAR: &str = "TOKIO_WORKER_THREADS";
-
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+/// Worker-thread sequence for the distinct thread names below. tokio 1.53
+/// spawns every worker through the blocking pool's `spawn_thread`, calling
+/// the `thread_name_fn` closure once per spawned thread — so an internal
+/// counter yields the distinct `apexbot-io-rt-N` names the census declares
+/// (GOQWCL: two defaulting `tokio-runtime-worker` pools made thread dumps
+/// unattributable).
+static IO_RT_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn io_runtime_thread_name() -> String {
+    format!(
+        "apexbot-io-rt-{}",
+        IO_RT_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn build_runtime() -> Result<Runtime, std::io::Error> {
-    let env_raw = std::env::var(ENV_VAR).ok();
-    let env_worker_count = env_raw.as_deref().and_then(|v| v.parse::<usize>().ok());
-
-    if env_worker_count.is_none() && env_raw.is_some() {
-        tracing::warn!(
-            ENV_VAR,
-            "env var set but could not be parsed as a usize; ignoring"
-        );
-        // Remove the invalid env var so Tokio's internal machinery
-        // doesn't panic when it tries to parse it.
-        std::env::remove_var(ENV_VAR);
-    }
-
-    let mut builder = Builder::new_multi_thread();
-
-    if let Some(n) = env_worker_count {
-        builder.worker_threads(n);
-    }
-
-    builder.enable_all().build()
+    // SMTH6M: the cgroup-aware budget is the single sizing authority for the
+    // ambient runtime (see `crate::cpu_budget::ambient_io_worker_count`).
+    let workers = crate::cpu_budget::ambient_io_worker_count();
+    // PE4FPM: self-register in the worker census; fail-destructive-free (the
+    // registry never rejects — see worker_census module docs).
+    crate::worker_census::register(crate::worker_census::WorkerCensusEntry {
+        resource: "io_runtime_workers",
+        kind: "tokio multi-thread runtime (ambient I/O — pump, dispatch, delivery, pyo3-async)",
+        count: workers,
+        thread_name: "apexbot-io-rt-{n}",
+        sizing: "cpu_budget::ambient_io_worker_count — cgroup budget minus the solve bins, floored at 1 (SMTH6M); override `runtime.io_workers` (env APEXBOT_IO_WORKERS)",
+        binding: "shared",
+    });
+    Builder::new_multi_thread()
+        .worker_threads(workers)
+        .thread_name_fn(io_runtime_thread_name)
+        .enable_all()
+        .build()
 }
 
 /// Get the shared Tokio runtime instance.
@@ -68,8 +84,9 @@ fn build_runtime() -> Result<Runtime, std::io::Error> {
 /// This function lazily initializes a multi-threaded Tokio runtime
 /// on first call. Subsequent calls return the same runtime instance.
 ///
-/// Worker thread count defaults to the number of CPU cores, and can be
-/// overridden with the `TOKIO_WORKER_THREADS` environment variable.
+/// Worker thread count is sized by the cgroup-aware CPU budget
+/// ([`crate::cpu_budget`]) and can be pinned explicitly with the typed
+/// `runtime.io_workers` key (env `APEXBOT_IO_WORKERS`).
 ///
 /// # Panics
 ///
@@ -89,11 +106,57 @@ pub fn get_runtime() -> &'static Runtime {
 #[expect(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serialize tests that mutate the `TOKIO_WORKER_THREADS` environment
-    /// variable to prevent race conditions when running tests concurrently.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    #[test]
+    fn test_build_runtime_sizes_from_cgroup_budget_policy() {
+        // SMTH6M: the ambient runtime is sized by the relocated cpu_budget
+        // policy (cgroup+affinity budget, minus the solve bins, floored at
+        // 1) — never from tokio's available_parallelism default, which reads
+        // 24 host cores inside an 8-core cgroup quota here.
+        let expected = crate::cpu_budget::ambient_io_worker_count_from(
+            ::apexbot_config::holder::config().runtime.io_workers,
+            crate::cpu_budget::solve_worker_count(),
+            crate::cpu_budget::effective_cpu_budget(),
+        );
+        let rt = build_runtime().unwrap();
+        assert_eq!(
+            rt.metrics().num_workers(),
+            expected,
+            "ambient runtime workers must follow the CPU-budget policy"
+        );
+    }
+
+    /// PE4FPM (GOQWCL): ambient runtime workers must carry the DISTINCT
+    /// census thread name (no `tokio-runtime-worker` collisions with the
+    /// inline-sim runtime or the solve fleet).
+    #[test]
+    fn ambient_runtime_workers_carry_the_census_thread_name() {
+        let rt = build_runtime().unwrap();
+        let name = rt.block_on(async {
+            tokio::spawn(async move { std::thread::current().name().map(str::to_owned) })
+                .await
+                .expect("worker spawn")
+        });
+        let name = name.expect("worker thread name");
+        assert!(
+            name.starts_with("apexbot-io-rt-"),
+            "ambient worker must be census-named, got {name}"
+        );
+    }
+
+    /// PE4FPM: the runtime self-registers; the census row must agree with
+    /// the built runtime (count == worker count, thread-name pattern).
+    #[test]
+    fn ambient_runtime_registers_a_census_row_matching_its_worker_count() {
+        let rt = build_runtime().unwrap();
+        let row = crate::worker_census::snapshot()
+            .into_iter()
+            .find(|e| e.resource == "io_runtime_workers")
+            .expect("ambient runtime must self-register in the census");
+        assert_eq!(row.count, rt.metrics().num_workers());
+        assert_eq!(row.thread_name, "apexbot-io-rt-{n}");
+        assert_eq!(row.sizing, row.sizing); // sizing text is documentation; presence is the contract
+    }
 
     #[test]
     fn test_runtime_singleton() {
@@ -115,49 +178,5 @@ mod tests {
         });
 
         assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn test_build_runtime_respects_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        std::env::set_var(ENV_VAR, "2");
-        let rt = build_runtime().unwrap();
-        std::env::remove_var(ENV_VAR);
-
-        let result = rt.block_on(async {
-            let handle = tokio::spawn(async { 99 });
-            handle.await.unwrap()
-        });
-        assert_eq!(result, 99);
-    }
-
-    #[test]
-    fn test_build_runtime_ignores_invalid_env() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // Use a fresh runtime with the invalid env var unset so Tokio's
-        // internal machinery doesn't panic during startup.
-        std::env::remove_var(ENV_VAR);
-        let rt = build_runtime().unwrap();
-
-        let result = rt.block_on(async {
-            let handle = tokio::spawn(async { 77 });
-            handle.await.unwrap()
-        });
-        assert_eq!(result, 77);
-    }
-
-    #[test]
-    fn test_build_runtime_handles_invalid_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // Verify that an invalid TOKIO_WORKER_THREADS value is silently
-        // ignored by build_runtime(). The function removes the invalid
-        // var internally so Tokio's internal machinery doesn't panic.
-        std::env::set_var(ENV_VAR, "not_a_number");
-        let result = build_runtime();
-        std::env::remove_var(ENV_VAR);
-        assert!(
-            result.is_ok(),
-            "build_runtime should ignore invalid env var"
-        );
     }
 }

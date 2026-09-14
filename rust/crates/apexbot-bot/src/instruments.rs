@@ -35,8 +35,24 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[
 
 /// Every drain-path instrument, built from one meter.
 pub struct PipelineInstruments {
-    /// Header accepted → solve completed (the race number).
-    header_to_solved: Histogram<f64>,
+    /// Header accepted → Published-stage dispatch (the epoch race; ADR-041
+    /// §3.1 — submission/delivery subscribe at the Published edge, so the
+    /// race ends there, not at solve). Succeeds the drain-era
+    /// `block.header_to_solved` stamp retired with the stage machine.
+    ///
+    /// PROMETHEUS NAME COUPLING: renders as
+    /// `apexbot_epoch_header_to_publish_seconds`; the Grafana headline stat
+    /// and the `ApexbotEpochRaceSlow` alert query that string verbatim —
+    /// rename here and the consumers together.
+    header_to_publish: Histogram<f64>,
+    /// ADR-041 I3: stale-epoch work items dropped loudly by the
+    /// rewind-generation fail-fast (`reorg_flying_stale`). Sustained
+    /// non-zero = the stage cycle chronically spills into the next epoch.
+    epoch_stale_drops: Counter<u64>,
+    /// ADR-041 Streaming-stage wait: first relevant log → quiesce/tombstone.
+    /// The span-only `queue.age_us` attr projected to a series so the
+    /// stage-cycle waterfall owns the leg without Jaeger.
+    stage_streaming_age: Histogram<f64>,
     /// Header accepted → first RELEVANT log delivered (WS-feed latency —
     /// the delivery side of the pre-solve gap).
     header_to_first_log: Histogram<f64>,
@@ -77,6 +93,17 @@ pub struct PipelineInstruments {
     /// WAJEQP T-R1: log events discarded by the recovery-anchor rule
     /// (`DroppedRecovery`); spikes during reorg episodes.
     reorg_recovery_dropped: Counter<u64>,
+    /// HJ5HWF: forward logs admitted LATE — arrived after their block's D1
+    /// tombstone and dropped un-applied via the benign late-admit path (the
+    /// no-landmine ruling: counted delivery noise, never a fatal signal).
+    /// Distinct from `reorg_recovery_dropped`, which counts only single-
+    /// writer duplicates inside an authoritative catch-up's owned range.
+    late_log_admitted: Counter<u64>,
+    /// BM35LK: the currently-armed settle (quiesce) window in ms — fixed
+    /// mode the debounce, adaptive mode the estimator's clamped EWMA
+    /// projection. The §6.2 design instrument pair with
+    /// `late_log.admitted`.
+    quiesce_window_ms: Gauge<f64>,
     /// Header-gap / settle backfills executed.
     backfills_executed: Counter<u64>,
     /// `pool_state_head - engine clock` divergence.
@@ -103,6 +130,16 @@ pub struct PipelineInstruments {
     solves_executed: Counter<u64>,
     /// Registered solver paths (engine gauge).
     registered_paths: Gauge<f64>,
+    /// PE4FPM worker census: one row per registered execution resource
+    /// (`resource` = the `apexbot_core::worker_census` registry id, a
+    /// small closed set). Rendered as `apexbot_worker_census{resource=...}`.
+    worker_census: Gauge<f64>,
+    /// FF-T5 (NT7HJC): the resolved fleet profile — one series,
+    /// low-cardinality labels (profile / binding / oversubscribed),
+    /// value 1. Rendered as
+    /// `apexbot_fleet_profile{profile=...,binding=...}`; the ops
+    /// alerting reads `binding="serial"` (the production alert).
+    fleet_profile: Gauge<f64>,
     /// Candidates entering the simulate fan-out (per-batch sizes summed).
     candidates_found: Counter<u64>,
     /// Solver CL-hop self-corrections (input/forward clamp + output align).
@@ -130,6 +167,11 @@ pub struct PipelineInstruments {
     submit_latency: Histogram<f64>,
     /// Cumulative confirmed net profit (wei).
     profit_realized: Counter<f64>,
+    /// PRG-2 / IRUMXD: registration skips by reason (closed set; the
+    /// Python-side per-pool `SkipGate` memo retired in favor of the Rust
+    /// registration gate + this family). Error-class detail stays in log
+    /// spans and the `[build_paths] Progress` breakdown.
+    registration_skips: Counter<u64>,
     /// Cumulative un-submitted profitable-candidate net profit (wei).
     profit_missed: Counter<f64>,
     /// Monitor outcomes, labeled (`confirmed`, `expired`).
@@ -139,6 +181,25 @@ pub struct PipelineInstruments {
     detached_stale_dropped: Counter<u64>,
     /// Epic SRQEK5 T2: detached stragglers applied to the results map.
     detached_applied: Counter<u64>,
+    /// Cold-start trace: cycles the machine DEGRADED to the in-cycle arm.
+    /// WFF6MM retired that arm (and its producer): the series is retained so
+    /// dashboards keep a stable zero rather than a missing metric.
+    detached_degraded_cycles: Counter<u64>,
+    /// AQV6EF: detached outcomes LOST to a DEAD MERGE DRAIN — a
+    /// `LaneOutcome` send failed (the sidecar Receiver is gone) or an
+    /// outcome was drained/counted as the panicked sidecar shut down. This
+    /// is the only silent loss in the shipped posture; the counter makes it
+    /// measurable and (with the sticky posture cordon) impossible to miss.
+    detached_send_failed: Counter<u64>,
+    /// AQV6EF: merge-seat panics caught by the sidecar's `catch_unwind`
+    /// guard (the typed failure record for a dead merge seat).
+    detached_merge_panic: Counter<u64>,
+    /// QTZGFL: solve cycles SHED by capacity-modulated admission (zero draw
+    /// budget: nothing submitted, cursor advanced, keys retained for carry).
+    detached_shed: Counter<u64>,
+    /// QTZGFL: retained (carried) admission keys pruned by the retention
+    /// window (`head − W`) — a starved lead's visible expiry.
+    detached_leads_expired: Counter<u64>,
     /// Epic K4ETHF T2: time an acquisition waited for the core `BotState`
     /// lock, labeled by `site` (closed set from
     /// `bot_core::state_lock::site_class_for`) + `mode` (read|write).
@@ -161,6 +222,17 @@ pub struct PipelineInstruments {
     /// ADR-040: per-error-reason tally for error-outcome simulations. The
     /// `reason` label is the closed `telemetry::error_reason` set.
     sim_error_reasons: Counter<u64>,
+    /// NO4DIW: per-block log funnel (the pump samples at each header).
+    /// PROMETHEUS NAME COUPLING: renders as `apexbot_epoch_logs_{seen,
+    /// received,applied,ignored,block}` — the dashboard stacked-funnel
+    /// panel + the block-number xychart query those verbatim; rename here
+    /// and the panels together. `block` = the header number at which the
+    /// ledger closed (the xychart uses it as the block-number axis).
+    epoch_logs_seen: Gauge<f64>,
+    epoch_logs_received: Gauge<f64>,
+    epoch_logs_applied: Gauge<f64>,
+    epoch_logs_ignored: Gauge<f64>,
+    epoch_logs_block: Gauge<f64>,
     /// Epic MROOY7 (BF43PM): first relevant log → publish per quiesce cycle
     /// (the publish-cycle duration for the Final-integration A/B).
     publish_cycle: Histogram<f64>,
@@ -185,12 +257,26 @@ impl PipelineInstruments {
     #[must_use]
     #[expect(clippy::too_many_lines)] // one instrument per block; splitting hides the inventory
     pub fn new(meter: &Meter) -> Self {
-        Self {
-            header_to_solved: meter
-                .f64_histogram("apexbot.block.header_to_solved")
+        let instruments = Self {
+            header_to_publish: meter
+                .f64_histogram("apexbot.epoch.header_to_publish")
                 .with_unit("s")
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
-                .with_description("Header accepted to solve completed")
+                .with_description(
+                    "Header accepted to Published-stage dispatch (the epoch race; ADR-041)",
+                )
+                .build(),
+            epoch_stale_drops: meter
+                .u64_counter("apexbot.epoch.stale_drops")
+                .with_description(
+                    "Stale-epoch work items dropped by the I3 rewind-generation fail-fast",
+                )
+                .build(),
+            stage_streaming_age: meter
+                .f64_histogram("apexbot.stage.streaming_age")
+                .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
+                .with_description("First relevant log to epoch quiesce (Streaming stage wait)")
                 .build(),
             header_to_first_log: meter
                 .f64_histogram("apexbot.block.header_to_first_log")
@@ -250,6 +336,18 @@ impl PipelineInstruments {
                 .u64_counter("apexbot.reorg.recovery_dropped")
                 .with_description(
                     "Log events discarded by the recovery-anchor rule (DroppedRecovery)",
+                )
+                .build(),
+            quiesce_window_ms: meter
+                .f64_gauge("apexbot.quiesce.window_ms")
+                .with_description(
+                    "Currently-armed settle (quiesce) window in ms (fixed debounce or the adaptive EWMA estimator's W)",
+                )
+                .build(),
+            late_log_admitted: meter
+                .u64_counter("apexbot.late_log.admitted")
+                .with_description(
+                    "Forward logs dropped via the benign late-admit path (arrived after their block's D1 tombstone; HJ5HWF)",
                 )
                 .build(),
             logs_received: meter
@@ -330,6 +428,18 @@ impl PipelineInstruments {
                 .f64_gauge("apexbot.engine.registered_paths")
                 .with_description("Registered solver paths")
                 .build(),
+            worker_census: meter
+                .f64_gauge("apexbot.worker.census")
+                .with_description(
+                    "Worker census (PE4FPM): declared worker/slot count per execution resource; the resource label is the census registry id",
+                )
+                .build(),
+            fleet_profile: meter
+                .f64_gauge("apexbot.fleet.profile")
+                .with_description(
+                    "The resolved fleet host-binding profile (FF-T5): profile / binding / oversubscribed; alert on binding=\"serial\" (the small-host tier)",
+                )
+                .build(),
             candidates_found: meter
                 .u64_counter("apexbot.candidates.found")
                 .with_description("Candidates entering the simulate fan-out")
@@ -399,6 +509,10 @@ impl PipelineInstruments {
                 .u64_counter("apexbot.monitor.outcomes")
                 .with_description("Monitor outcomes (confirmed/expired)")
                 .build(),
+            registration_skips: meter
+                .u64_counter("apexbot.registration.skips")
+                .with_description("Registration-candidate skips by closed-set reason (PRG-2)")
+                .build(),
             detached_in_flight: meter
                 .f64_gauge("apexbot.detached.in_flight")
                 .with_description(
@@ -412,6 +526,26 @@ impl PipelineInstruments {
             detached_applied: meter
                 .u64_counter("apexbot.detached.applied")
                 .with_description("Detached stragglers applied to the results map")
+                .build(),
+            detached_degraded_cycles: meter
+                .u64_counter("apexbot.detached.degraded_cycles")
+                .with_description("Solve cycles DEGRADED to the in-cycle arm (in-flight cap verdict at begin)")
+                .build(),
+            detached_send_failed: meter
+                .u64_counter("apexbot.detached.send_failed")
+                .with_description("Detached outcomes lost to a dead merge drain (failed send / post-panic drain)")
+                .build(),
+            detached_merge_panic: meter
+                .u64_counter("apexbot.detached.merge_panic")
+                .with_description("Merge-seat panics caught by the sidecar guard (dead merge drain)")
+                .build(),
+            detached_shed: meter
+                .u64_counter("apexbot.detached.shed")
+                .with_description("Solve cycles SHED by capacity-modulated admission (zero draw budget)")
+                .build(),
+            detached_leads_expired: meter
+                .u64_counter("apexbot.detached.leads_expired")
+                .with_description("Retained admission keys expired by the retention window (head - W)")
                 .build(),
             state_lock_wait: meter
                 .f64_histogram("apexbot.state_lock.wait")
@@ -427,6 +561,11 @@ impl PipelineInstruments {
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .with_description("Time a guard was held after acquisition (per site, mode)")
                 .build(),
+            epoch_logs_seen: meter.f64_gauge("apexbot.epoch.logs_seen").build(),
+            epoch_logs_received: meter.f64_gauge("apexbot.epoch.logs_received").build(),
+            epoch_logs_applied: meter.f64_gauge("apexbot.epoch.logs_applied").build(),
+            epoch_logs_ignored: meter.f64_gauge("apexbot.epoch.logs_ignored").build(),
+            epoch_logs_block: meter.f64_gauge("apexbot.epoch.logs_block").build(),
             publish_cycle: meter
                 .f64_histogram("apexbot.stage.publish_cycle")
                 .with_unit("s")
@@ -464,12 +603,42 @@ impl PipelineInstruments {
                     "Resident set bytes of the bot process (drift-watch, FRKBGP close-out)",
                 )
                 .build(),
-        }
+        };
+        // Cold-start trace: zero-initialize the degraded-cycle counter. The
+        // OTel Prometheus exporter omits an instrument that never recorded a
+        // measurement, so an ABSENT series was previously indistinguishable
+        // from "never degraded" (the 2026-09-11 cold soak hit exactly that:
+        // `_applied_total` and `_in_flight` rendered, `degraded_cycles` did
+        // not). This explicit 0 keeps the series always present, making a
+        // scraped `0` mean what it says.
+        instruments.detached_degraded_cycles.add(0, &[]);
+        // AQV6EF: same zero-init for the dead-drain instruments — a missing
+        // `send_failed_total` series must never read as "no lost outcomes".
+        instruments.detached_send_failed.add(0, &[]);
+        instruments.detached_merge_panic.add(0, &[]);
+        // QTZGFL: same zero-init contract for the admission counters — a
+        // missing `shed_total`/`leads_expired_total` series must never read
+        // as "nothing shed / nothing expired" (the 9395c481b lesson).
+        instruments.detached_shed.add(0, &[]);
+        instruments.detached_leads_expired.add(0, &[]);
+        instruments
     }
 
-    /// Header accepted → solve completed.
-    pub fn observe_header_to_solved(&self, secs: f64) {
-        self.header_to_solved.record(secs, &[]);
+    /// Header accepted → Published-stage dispatch (the epoch race).
+    /// PROMETHEUS NAME COUPLING: renders as
+    /// `apexbot_epoch_header_to_publish_seconds` — see the field note.
+    pub fn observe_header_to_publish(&self, secs: f64) {
+        self.header_to_publish.record(secs, &[]);
+    }
+
+    /// Streaming-stage wait: first relevant log → quiesce/tombstone.
+    pub fn observe_streaming_age(&self, secs: f64) {
+        self.stage_streaming_age.record(secs, &[]);
+    }
+
+    /// One stale-epoch work item dropped (I3 reorg-flying fail-fast).
+    pub fn count_stale_drop(&self) {
+        self.epoch_stale_drops.add(1, &[]);
     }
 
     /// Header accepted → first relevant log delivered (pre-solve gap phase 1).
@@ -538,6 +707,22 @@ impl PipelineInstruments {
         self.reorg_recovery_dropped.add(1, &[]);
     }
 
+    /// One forward log admitted LATE (past its block's D1 tombstone) and
+    /// dropped un-applied via the benign late-admit path — HJ5HWF. The
+    /// counted home for settle-window delivery jitter; a sustained rate
+    /// says the WS feed reordered, not that the state machine misbehaved.
+    pub fn count_late_log_admitted(&self) {
+        self.late_log_admitted.add(1, &[]);
+    }
+
+    /// BM35LK: the window the settle timers are currently armed with (ms).
+    /// Observed once per settle point so the Grafana funnel gains the
+    /// estimator's live posture without new scrape paths.
+    #[expect(clippy::cast_precision_loss)]
+    pub fn observe_quiesce_window(&self, ms: u64) {
+        self.quiesce_window_ms.record(ms as f64, &[]);
+    }
+
     /// One WS log event received by the pump (pre topic-filter).
     pub fn count_ws_log_seen(&self) {
         self.ws_logs_seen.add(1, &[]);
@@ -592,13 +777,21 @@ impl PipelineInstruments {
     }
 
     /// Engine-`Mutex` hold duration for a dirty solve cycle (T2 instrument).
-    pub fn observe_mutex_hold_duration(&self, secs: f64) {
-        self.mutex_hold_duration.record(secs, &[]);
+    /// `arm` is the cycle-span vocabulary (`detached` | `in_cycle` |
+    /// `skipped_empty` | `shed`); under the detached stance `in_cycle` IS the DEGRADED
+    /// population (the cap verdict the `apexbot.detached.degraded_cycles`
+    /// counter tallies), so its tail is separable from the detached arm's.
+    pub fn observe_mutex_hold_duration(&self, secs: f64, arm: &'static str) {
+        self.mutex_hold_duration
+            .record(secs, &[KeyValue::new("arm", arm)]);
     }
 
-    /// One dirty-carrying solve cycle's duration.
-    pub fn observe_solve_duration(&self, secs: f64) {
-        self.solve_duration.record(secs, &[]);
+    /// One dirty-carrying solve cycle's duration (same `arm` attribution as
+    /// the hold above — the pairing is what answers "what does degradation
+    /// cost" per cycle).
+    pub fn observe_solve_duration(&self, secs: f64, arm: &'static str) {
+        self.solve_duration
+            .record(secs, &[KeyValue::new("arm", arm)]);
     }
 
     /// One per-path solve closure's duration (gate + decomposed solver).
@@ -620,6 +813,36 @@ impl PipelineInstruments {
     pub fn set_registered_paths(&self, count: u64) {
         self.registered_paths
             .record(f64::from(u32::try_from(count).unwrap_or(u32::MAX)), &[]);
+    }
+
+    /// PE4FPM: one census row — declared workers/slots of `resource`.
+    /// `resource` is a small closed set: the census registry ids.
+    pub fn set_worker_census(&self, resource: &str, workers: f64) {
+        self.worker_census
+            .record(workers, &[KeyValue::new("resource", resource.to_owned())]);
+    }
+
+    /// FF-T5 (NT7HJC): the resolved fleet profile — one series,
+    /// value 1, the labels carry the tier.
+    pub fn set_fleet_profile(
+        &self,
+        summary: &crate::arb_engine::fleet_status::FleetProfileSummary,
+    ) {
+        self.fleet_profile.record(
+            1.0,
+            &[
+                KeyValue::new("profile", summary.profile),
+                KeyValue::new("binding", summary.binding),
+                KeyValue::new(
+                    "oversubscribed",
+                    if summary.oversubscribed {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
     }
 
     /// A batch of `n` candidates entered the simulate fan-out.
@@ -669,6 +892,17 @@ impl PipelineInstruments {
             .add(1, &[KeyValue::new("outcome", outcome.to_owned())]);
     }
 
+    /// PRG-2 / IRUMXD: one registration-candidate skip; `reason` is a small
+    /// closed set (`v4-admission`, `path-cap`, `dup`, `pool-build-error`,
+    /// `engine-reject`, `register-fail`, ...). The live registration-gate
+    /// table refuses immutable V4 admission facts pre-RPC, so this family
+    /// carries the residual (transient/config) skips. Per-error-class
+    /// detail belongs in log spans, not label cardinality.
+    pub fn count_registration_skip(&self, reason: &str) {
+        self.registration_skips
+            .add(1, &[KeyValue::new("reason", reason.to_owned())]);
+    }
+
     /// Candidate loop start → broadcast latency.
     pub fn observe_submit_latency(&self, secs: f64) {
         self.submit_latency.record(secs, &[]);
@@ -702,9 +936,37 @@ impl PipelineInstruments {
         self.detached_stale_dropped.add(1, &[]);
     }
 
+    /// One detached outcome LOST to a dead merge drain (AQV6EF): a failed
+    /// pipe send or an outcome drained as the panicked sidecar shut down.
+    pub fn count_detached_send_failed(&self) {
+        self.detached_send_failed.add(1, &[]);
+    }
+
+    /// One merge-seat panic caught by the sidecar guard (AQV6EF).
+    pub fn count_detached_merge_panic(&self) {
+        self.detached_merge_panic.add(1, &[]);
+    }
+
+    /// QTZGFL: one solve cycle SHED by capacity-modulated admission.
+    pub fn count_detached_shed(&self) {
+        self.detached_shed.add(1, &[]);
+    }
+
+    /// QTZGFL: `n` retained admission keys expired by the retention window.
+    pub fn count_detached_leads_expired(&self, n: u64) {
+        self.detached_leads_expired.add(n, &[]);
+    }
+
     /// One detached straggler applied to the results map.
     pub fn count_detached_applied(&self) {
         self.detached_applied.add(1, &[]);
+    }
+
+    /// One solve cycle DEGRADED to the in-cycle arm (the cap verdict at begin).
+    /// WFF6MM: no producer remains (the in-cycle arm is deleted); kept so the
+    /// zero-init + broken-pipe it exercises stay tested.
+    pub fn count_detached_degraded_cycle(&self) {
+        self.detached_degraded_cycles.add(1, &[]);
     }
 
     /// Epic K4ETHF T2: one state-lock acquisition wait. `site` is a small
@@ -729,6 +991,25 @@ impl PipelineInstruments {
                 KeyValue::new("mode", mode.to_owned()),
             ],
         );
+    }
+
+    /// NO4DIW: per-block log funnel — the pump's header-epilogue snapshot
+    /// (apexbot.epoch.logs_*; see the field note for the coupling).
+    /// `closing_block` = the header number at which the ledger closed.
+    #[expect(clippy::cast_precision_loss)]
+    pub fn observe_epoch_logs(
+        &self,
+        seen: u64,
+        received: u64,
+        applied: u64,
+        ignored: u64,
+        closing_block: u64,
+    ) {
+        self.epoch_logs_seen.record(seen as f64, &[]);
+        self.epoch_logs_received.record(received as f64, &[]);
+        self.epoch_logs_applied.record(applied as f64, &[]);
+        self.epoch_logs_ignored.record(ignored as f64, &[]);
+        self.epoch_logs_block.record(closing_block as f64, &[]);
     }
 
     /// Epic MROOY7 (BF43PM): one publish-cycle duration (first relevant log
@@ -823,9 +1104,58 @@ pub fn pipeline() -> Option<&'static PipelineInstruments> {
             // against forever (observed live 2026-08-22: ApexbotHeaderStall
             // stuck FIRING while the real series advanced). Empty-vs-absent
             // scrapes are already distinguishable via target_info.
-            crate::metrics::try_global_meter().map(|meter| PipelineInstruments::new(&meter))
+            crate::metrics::try_global_meter().map(|meter| {
+                // PE4FPM: the census registry re-fires this hook on every
+                // registration, so the scrape always reflects the table —
+                // including lazily-booted resources registered after the
+                // boot dump.
+                apexbot_core::worker_census::set_export_hook(export_worker_census);
+                let instruments = PipelineInstruments::new(&meter);
+                // FF-T5 (NT7HJC): if the stamp installed BEFORE the
+                // pipeline, record the fleet profile now (the install
+                // path re-fires through note_fleet_profile when the
+                // pipeline came first).
+                if let Some(summary) = crate::arb_engine::fleet_status::fleet_profile_summary() {
+                    instruments.set_fleet_profile(&summary);
+                }
+                instruments
+            })
         })
         .as_ref()
+}
+
+/// PE4FPM production census exporter — installed as the
+/// [`apexbot_core::worker_census`] export hook at instruments init.
+/// No-op while the pipeline is un-built (non-otel builds / gate off).
+fn export_worker_census(entries: &[apexbot_core::worker_census::WorkerCensusEntry]) {
+    if let Some(p) = pipeline() {
+        export_worker_census_with(p, entries);
+    }
+}
+
+/// FF-T5 (NT7HJC): record the resolved fleet profile (the stamp-install
+/// site calls this; the pipeline may not exist yet — the build path
+/// below re-reads the summary so both orders land one series). No-op
+/// while the pipeline is un-built (non-otel builds / gate off).
+pub fn note_fleet_profile(summary: &crate::arb_engine::fleet_status::FleetProfileSummary) {
+    if let Some(p) = pipeline() {
+        p.set_fleet_profile(summary);
+    }
+}
+
+/// Exporter body (test seam): one gauge row per census entry.
+fn export_worker_census_with(
+    p: &PipelineInstruments,
+    entries: &[apexbot_core::worker_census::WorkerCensusEntry],
+) {
+    for e in entries {
+        p.set_worker_census(e.resource, census_count_f64(e.count));
+    }
+}
+
+#[expect(clippy::cast_precision_loss)]
+fn census_count_f64(n: usize) -> f64 {
+    n as f64
 }
 
 #[cfg(test)]
@@ -833,9 +1163,19 @@ pub fn pipeline() -> Option<&'static PipelineInstruments> {
 mod kind_tests {
     use opentelemetry::metrics::MeterProvider as _;
 
-    use crate::instruments::PipelineInstruments;
+    use crate::instruments::{export_worker_census_with, PipelineInstruments};
     use crate::telemetry::error_kind;
     use std::collections::HashSet;
+
+    /// True when `line` is the Prometheus sample line for exactly `name` —
+    /// the name followed by a label brace or the value whitespace, never a
+    /// longer family such as `<name>_total` (the doubled-suffix bug this
+    /// predicate was tightened to catch: the old `starts_with` matched
+    /// `name + "_total"` and masked it).
+    fn series_line_matches(line: &str, name: &str) -> bool {
+        line.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+    }
 
     /// The taxonomy is a compile-time closed set: the consts are unique and
     /// are the only values the `kind` label may take.
@@ -849,9 +1189,87 @@ mod kind_tests {
             error_kind::VERIFY_MISMATCH,
             error_kind::DRAIN_STALL,
             error_kind::DRAIN_DEAD,
+            error_kind::LATE_LOG,
         ];
         let unique: HashSet<&str> = kinds.iter().copied().collect();
         assert_eq!(unique.len(), kinds.len(), "duplicate failure kind");
+    }
+
+    /// The epoch race (ADR-041): `apexbot.epoch.header_to_publish` renders
+    /// via the Prometheus exposition, the I3 stale-drop counter and the
+    /// Streaming-age projection are scrapeable, and the retired drain-era
+    /// `apexbot.block.header_to_solved` family is GONE (hard cutover — a
+    /// lingering family would keep dashboards pointed at the solve endpoint
+    /// instead of the Published edge).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn epoch_race_renders_and_retired_family_gone() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_race"));
+        instruments.observe_header_to_publish(0.62);
+        instruments.count_stale_drop();
+        instruments.observe_streaming_age(0.35);
+        let text = crate::metrics::render(&registry);
+        for family in [
+            "apexbot_epoch_header_to_publish_seconds_bucket",
+            "apexbot_epoch_stale_drops_total",
+            "apexbot_stage_streaming_age_seconds_bucket",
+        ] {
+            assert!(
+                text.contains(family),
+                "epoch-race family missing from exposition: {family}"
+            );
+        }
+        assert!(
+            !text.contains("header_to_solved"),
+            "retired drain-era race family still present in exposition"
+        );
+        drop(provider);
+    }
+
+    /// HJ5HWF: the benign late-admit counter renders through the Prometheus
+    /// exposition — every late forward dropped past its block's D1 tombstone
+    /// is counted here (never surfaced as a structural failure).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn late_log_admitted_counter_renders() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_late"));
+        instruments.count_late_log_admitted();
+        instruments.count_late_log_admitted();
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("apexbot_late_log_admitted_total"))
+            .expect("late_log.admitted family missing from exposition");
+        assert!(line.ends_with('2'), "{line} != 2");
+        drop(provider);
+    }
+
+    /// NO4DIW: per-block log funnel gauges (apexbot.epoch.logs_*) render
+    /// the EXACT per-epoch values the pump snapshots at each header; the
+    /// dashboard stacks them as the per-block funnel bars.
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn epoch_log_funnel_gauges_are_scrapeable() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_funnel"));
+        instruments.observe_epoch_logs(120, 40, 30, 2, 25_934_048);
+        let text = crate::metrics::render(&registry);
+        for (family, value) in [
+            ("apexbot_epoch_logs_seen", 120),
+            ("apexbot_epoch_logs_received", 40),
+            ("apexbot_epoch_logs_applied", 30),
+            ("apexbot_epoch_logs_ignored", 2),
+            ("apexbot_epoch_logs_block", 25_934_048),
+        ] {
+            let line = text.lines().find(|l| l.starts_with(family)).expect(family);
+            assert!(line.ends_with(&value.to_string()), "{line} != {value}");
+        }
+        drop(provider);
     }
 
     /// Fix 3 (VPD5ZH follow-up): the 10.0s top bucket collapsed every
@@ -865,7 +1283,7 @@ mod kind_tests {
         let instruments = PipelineInstruments::new(&provider.meter("test"));
         // A 45s sample must land BETWEEN the new tail bounds, not fuse into
         // the old +inf-only tail: le=30 must separate it from le=60.
-        instruments.observe_solve_duration(45.0);
+        instruments.observe_solve_duration(45.0, "in_cycle");
         let text = crate::metrics::render(&registry);
         for bound in ["10", "30", "60"] {
             assert!(
@@ -894,6 +1312,53 @@ mod kind_tests {
             text.contains("apexbot_cgroup_throttle_time_seconds_total"),
             "throttled-cpu-time counter missing"
         );
+    }
+
+    /// PE4FPM: the worker-census gauge renders as `apexbot_worker_census`
+    /// with the stable `resource` label (one row per resource).
+    #[test]
+    fn worker_census_gauge_is_scrapeable_by_resource() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test"));
+        instruments.set_worker_census("io_runtime_workers", 2.0);
+        instruments.set_worker_census("fleet_solver_slots", 6.0);
+        let text = crate::metrics::render(&registry);
+        assert!(
+            text.contains("apexbot_worker_census"),
+            "worker-census family missing from exposition: {text}"
+        );
+        assert!(text.contains("resource=\"io_runtime_workers\""));
+        assert!(text.contains("resource=\"fleet_solver_slots\""));
+        drop(provider);
+    }
+
+    /// PE4FPM: the REGISTER→EXPORT round trip through the production helper:
+    /// a registered census entry lands on the scrape with its count.
+    #[test]
+    fn worker_census_register_export_round_trip_reaches_the_scrape() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test"));
+        apexbot_core::worker_census::register(apexbot_core::worker_census::WorkerCensusEntry {
+            resource: "census-roundtrip",
+            kind: "test probe",
+            count: 3,
+            thread_name: "census-roundtrip-{n}",
+            sizing: "test sizing rule",
+            binding: "logical",
+        });
+        export_worker_census_with(&instruments, &apexbot_core::worker_census::snapshot());
+        let text = crate::metrics::render(&registry);
+        assert!(
+            text.contains("apexbot_worker_census"),
+            "missing family: {text}"
+        );
+        assert!(
+            text.contains("resource=\"census-roundtrip\""),
+            "missing row: {text}"
+        );
+        drop(provider);
     }
 
     /// ADR-040: the quarantine depth gauge renders under its coupled
@@ -975,7 +1440,7 @@ mod kind_tests {
             crate::metrics::build_prometheus_provider().expect("prometheus provider build");
         let instruments = PipelineInstruments::new(&provider.meter("test_lat"));
         // A realistic solve: ~0.67 s. Must land BETWEEN 0.5 and 1.0 buckets.
-        instruments.observe_solve_duration(0.67);
+        instruments.observe_solve_duration(0.67, "detached");
         let text = crate::metrics::render(&registry);
         // Assert ms-scale le values are present (explicit boundaries replaced
         // the 5s-first default bucket set).
@@ -987,6 +1452,137 @@ mod kind_tests {
         }
         // Sanity: solve_duration family is scrapeable.
         assert!(text.contains("apexbot_solve_duration_seconds_bucket"));
+        drop(provider);
+    }
+
+    /// Cold-start trace (degraded-state measurement): the degraded-cycle
+    /// counter must render BEFORE it ever fires. The 2026-09-11 cold soak
+    /// scraped `/metrics` for 24 min and never saw
+    /// `apexbot_detached_degraded_cycles_total` while its siblings
+    /// (`_applied_total`, `_in_flight`) rendered — a never-measured `OTel`
+    /// instrument is omitted from the exposition, so "never degraded" and
+    /// "not exported" were indistinguishable. Zero-initializing the counter
+    /// makes a missing series impossible and a `0` scrape meaningful.
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn degraded_cycle_counter_renders_before_any_degradation() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_degraded_zero"));
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("apexbot_detached_degraded_cycles_total"))
+            .expect("the degraded counter must be exported at 0 (a missing series reads as 'never degraded')");
+        assert!(line.ends_with(" 0"), "{line} != 0");
+        instruments.count_detached_degraded_cycle();
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("apexbot_detached_degraded_cycles_total"))
+            .expect("the counter stays exported after firing");
+        assert!(line.ends_with(" 1"), "{line} != 1");
+        drop(provider);
+    }
+
+    /// AQV6EF: the dead-merge-drain counter must render BEFORE it ever
+    /// fires — a missing series would read as "no lost outcomes" while a
+    /// dead pipe silently drops every later result. Mirrors the
+    /// degraded-cycle zero-init contract (9395c481b).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn detached_send_failed_counter_renders_before_any_loss() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_send_failed_zero"));
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("apexbot_detached_send_failed_total"))
+            .expect("the send-failed counter must be exported at 0 (a missing series reads as 'no lost outcomes')");
+        assert!(line.ends_with(" 0"), "{line} != 0");
+        instruments.count_detached_send_failed();
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("apexbot_detached_send_failed_total"))
+            .expect("the counter stays exported after firing");
+        assert!(line.ends_with(" 1"), "{line} != 1");
+        drop(provider);
+    }
+
+    /// QTZGFL: the admission counters must render BEFORE they ever fire — a
+    /// missing `shed_total`/`leads_expired_total` series would read as
+    /// "nothing shed / nothing expired" (the 9395c481b zero-init lesson).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn detached_admission_counters_render_before_any_event() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_admission_zero"));
+        let text = crate::metrics::render(&registry);
+        for name in [
+            "apexbot_detached_shed_total",
+            "apexbot_detached_leads_expired_total",
+        ] {
+            let line = text
+                .lines()
+                .find(|l| series_line_matches(l, name))
+                .expect("the admission counter must be exported at 0");
+            assert!(line.ends_with(" 0"), "{line} != 0");
+        }
+        instruments.count_detached_shed();
+        instruments.count_detached_leads_expired(3);
+        let text = crate::metrics::render(&registry);
+        let shed = text
+            .lines()
+            .find(|l| series_line_matches(l, "apexbot_detached_shed_total"))
+            .expect("the shed series stays exported after firing");
+        assert!(shed.ends_with(" 1"), "{shed} != 1");
+        let expired = text
+            .lines()
+            .find(|l| series_line_matches(l, "apexbot_detached_leads_expired_total"))
+            .expect("the leads-expired series stays exported after firing");
+        assert!(expired.ends_with(" 3"), "{expired} != 3");
+        drop(provider);
+    }
+
+    /// Cold-start trace (degraded-state measurement, impact half): the solve
+    /// latency histograms carry the dispatch arm, so the DEGRADED population's
+    /// tail — `in_cycle` under the detached stance, the cap verdict the
+    /// `apexbot.detached.degraded_cycles` counter tallies — is separable from
+    /// the detached arm's in Prometheus. Values are the cycle-span vocabulary
+    /// (`detached` | `in_cycle` | `skipped_empty` | `shed`).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn solve_latency_histograms_carry_the_arm_label() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_arm_label"));
+        instruments.observe_solve_duration(0.67, "in_cycle");
+        instruments.observe_mutex_hold_duration(0.9, "detached");
+        let text = crate::metrics::render(&registry);
+        // The exposition carries scope labels too (otel_scope_name), so
+        // match family + arm + value instead of a literal whole-label string.
+        let mut attributed = 0;
+        for line in text.lines() {
+            let want_arm = if line.starts_with("apexbot_solve_duration_seconds_count") {
+                Some("in_cycle")
+            } else if line.starts_with("apexbot_solve_mutex_hold_seconds_count") {
+                Some("detached")
+            } else {
+                None
+            };
+            if let Some(arm) = want_arm {
+                if line.contains(&format!("arm=\"{arm}\"")) && line.ends_with(" 1") {
+                    attributed += 1;
+                }
+            }
+        }
+        assert_eq!(
+            attributed, 2,
+            "both solve-latency histograms must attribute their sample to the cycle's arm ({text})"
+        );
         drop(provider);
     }
 }

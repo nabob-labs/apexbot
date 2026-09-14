@@ -16,6 +16,12 @@ PIDFILE="$LOGDIR/bot_run.pid"
 mkdir -p "$LOGDIR"
 
 # --------------------------------------------------------------------------
+# POST-LW-T9 CUTOVER (epic XR62VX, commit f3750093d): the fleet executor is
+# the ONLY stance now — the APEXBOT_FLEET stance key itself is RETIRED and
+# fails the config load loudly if exported; registration/sim/solve host on
+# the ADR-042 fleet unconditionally. (This launcher used to export
+# APEXBOT_FLEET=fleet — do NOT restore it.)
+#
 # Conservative (HARD/LOUD) defaults now live in the CODE, not here (Z4KQXF).
 # Every invocation — run_bot.sh, a hand-run, a CI/harness — gets loud failure
 # by default; there is no liberal default posture anymore. Flags that follow
@@ -50,41 +56,56 @@ mkdir -p "$LOGDIR"
 # --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
-# Debug-visible instrumented runs (default ON here).
+# INFO-visible runs (default; log-volume cut OPBD7L).
 #
-# The Rust core's granular diagnostics ([solver-dbg],
-# [solver-st], [v2-calc-trace], ...) are gated behind the `debug` tracing
-# level AND the Python-side DEBUG logger (see docs/logging.md). Set BOTH below
-# so those lines reach logs/bot_run.log in these instrumented runs:
+# The default posture prints INFO status lines ([sim], [bundle]-summaries,
+# pump/block lifecycle) and WARN/ERROR only — no debug/trace diagnostics.
+# The Rust core's granular diagnostics ([solver-dbg], [solver-st],
+# [v2-calc-trace], [path] registered, [bundle] inline payload settle) stay in
+# the code but are gated behind the `debug` tracing level AND the Python-side
+# DEBUG logger (see docs/logging.md). To run an instrumented run, set BOTH:
 #
-#   * RUST_LOG        is the Rust `tracing` EnvFilter gate. Raising the
-#                     apexbot_* crates to `debug` makes the fine-grained
-#                     diagnostics visible while `info` keeps routine status
-#                     lines; the alloy/tungstenite targets are held at `warn`
-#                     to mirror the code's built-in default and stop their
-#                     lifecycle INFO noise from flooding the log.
-#   * APEXBOT_DEBUG=1 is the Python `logging` gate. Without it the crate-root
-#                     Python loggers stay at INFO and drop the debug records
-#                     before they reach the log/bot_run.log tee.
+#   * RUST_LOG         is the Rust `tracing` EnvFilter gate; raise apexbot_*
+#                      crates to `debug` (docs/logging.md has the recipes).
+#   * APEXBOT_DEBUG=1 is the Python `logging` gate for forwarded records.
 #
-# Both respect a pre-set value: set RUST_LOG / APEXBOT_DEBUG yourself to opt
-# out (e.g. RUST_LOG=warn ./run_bot.sh) or tighten the scope.
+# Duplication control:
+#   * APEXBOT_LOG_FMT=0  routes the Rust stderr `fmt` layer (the
+#     ANSI-escaped copy) to a sink. RUST records still reach the log exactly
+#     once via the Python-forwarding tunnel; without this every apexbot
+#     line is written twice into bot_run.log.
+#   * APEXBOT_WS_TRACE=0 silences the per-WS-log `[trace] ws-log` probe
+#     (it fires for EVERY relevant-topic log at info when =1).
+#
+# All values respect a pre-set environment: RUST_LOG=warn ./run_bot.sh opts
+# out; APEXBOT_LOG_FMT=1 restores the stderr mirror.
 # --------------------------------------------------------------------------
-DEFAULT_RUST_LOG="info,apexbot_bot=debug,apexbot_arbitrage=debug,apexbot_simulation=debug,apexbot_solvers=debug,alloy_pubsub=warn,alloy_transport=warn,alloy_transport_ws=warn,alloy_transport_ipc=warn,alloy_transport_http=warn,alloy_provider=warn,alloy_rpc=warn,alloy_network=warn,alloy_contract=warn,tungstenite=warn"
+DEFAULT_RUST_LOG="info,alloy_pubsub=warn,alloy_transport=warn,alloy_transport_ws=warn,alloy_transport_ipc=warn,alloy_transport_http=warn,alloy_provider=warn,alloy_rpc=warn,alloy_network=warn,alloy_contract=warn,tungstenite=warn"
 export RUST_LOG="${RUST_LOG:-$DEFAULT_RUST_LOG}"
-export APEXBOT_DEBUG="${APEXBOT_DEBUG:-1}"
+export APEXBOT_DEBUG="${APEXBOT_DEBUG:-0}"
+export APEXBOT_LOG_FMT="${APEXBOT_LOG_FMT:-0}"
 export APEXBOT_OTEL="${APEXBOT_OTEL:-1}"
 # SIMPIPE2 T4 soak arm: the ENGINE-side inline sim (worker seam). Default 0
 # (legacy option-A FFI pipeline); the soak flips 0/1 across equal windows.
 export APEXBOT_SOLVE_INLINE_SIM="${APEXBOT_SOLVE_INLINE_SIM:-1}"
 export APEXBOT_SIM_EXIT_ON_FAIL="${APEXBOT_SIM_EXIT_ON_FAIL:-0}"
-export APEXBOT_WS_TRACE="${APEXBOT_WS_TRACE:-1}"
+# [trace] ws-log is a per-WS-log probe (one info line per relevant log);
+# OFF by default so the log is not flooded — desync investigations set =1.
+export APEXBOT_WS_TRACE="${APEXBOT_WS_TRACE:-0}"
 # Publish-debounce window (ms), last dirty log -> settle decision. A/B'd on
 # 2026-09-04 (telemetry-latency-playbook S7): bursts complete in 1.3-27.5 ms
 # while the 50 ms code default settled full-length on ~every block — a fixed
 # settle tax. 15 ms cuts ~33 ms/block with no extra solve cycles observed.
 # Code default stays 50 ms; invalid/zero env values fall back to 50 ms.
 export APEXBOT_PUMP_DEBOUNCE_MS="${APEXBOT_PUMP_DEBOUNCE_MS:-15}"
+# Registration crawl hosting (PRG-5 hard cutover, epic IRUMXD): the crawl is
+# FLEET-HOSTED ONLY, and since LW-T9 (epic XR62VX) the stance key is retired:
+# APEXBOT_FLEET / fleet.stance in a config FAIL the config load loudly if
+# set — the fleet is unconditional. Alongside it, APEXBOT_REG_QUEUE_BOUND /
+# APEXBOT_REG_WORKERS (crawl shell) and APEXBOT_SOLVE_SIM_INFLIGHT
+# (solve.solve_sim_inflight, sim-slots shadow cap) all fail the load loudly
+# too; survivals are fleet.pool_state_updater_slots / fleet.sim_slot_cap and
+# solve.inline_sim_workers.
 # Typed-config parity (KAHU5W): every APEXBOT_* env above still works
 # (12-factor parity) but each key also has a typed TOML path — these exports
 # map to telemetry.otel, solve.solve_inline_sim, simulation.sim_exit_on_fail,
@@ -113,12 +134,23 @@ export APEXBOT_PUMP_DEBOUNCE_MS="${APEXBOT_PUMP_DEBOUNCE_MS:-15}"
 # and the sim-driver cap all derive from the detected cgroup budget inside
 # the Rust core (cpu_budget::leftover_worker_budget), leaving the I/O
 # headroom to the ambient runtime by construction. An operator export of
-# APEXBOT_SOLVE_CPUS / APEXBOT_INLINE_SIM_WORKERS / APEXBOT_SOLVE_SIM_INFLIGHT
+# APEXBOT_SOLVE_CPUS / APEXBOT_INLINE_SIM_WORKERS / APEXBOT_FLEET_SIM_SLOT_CAP
 # still wins when set explicitly - none are pre-set here.
+# (APEXBOT_SOLVE_SIM_INFLIGHT is retired — fails the load loudly, LW-T9.)
 
 # The actual bot invocation (uv rebuilds the Rust extension if any rust
 # source / Cargo.toml is newer than the installed build).
 BOT_CMD=(uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py)
+
+# Print the EFFECTIVE chain-1 RPC URIs — exactly what the bot's cascade
+# (apexbot.config.resolve_rpc_uris: CLI > OS env > config.toml) will resolve —
+# into console + log BEFORE the first provider call. A later-applied shell
+# export can shadow the devcontainer containerEnv (the resolver reads
+# os.environ), and this surfaces such a stomp immediately instead of as a
+# connection-refused chain-ID failure (2026-09-10 incident).
+log_resolved_rpcs() {
+    uv run python -c 'from apexbot.config import resolve_rpc_uris as _r; _h, _w = _r(1); print(f"[runner] resolved rpc http={_h} ws={_w}")' 2>/dev/null | tee -a "$LOG" >&2 || true
+}
 
 start() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
@@ -127,6 +159,7 @@ start() {
     fi
     : > "$LOG"
     : > "$PIDFILE"
+    log_resolved_rpcs
     # setsid: new session + no controlling terminal, so the launching shell
     # can exit without the pump dying (SIGHUP) and the tool shell's return
     # isn't entangled with the bot's life. exec is NOT used so `$!` is the
@@ -170,6 +203,7 @@ foreground() {
     : > "$LOG"
     : > "$PIDFILE"
     echo "[runner] starting bot $(date -Is)" | tee -a "$LOG" >&2
+    log_resolved_rpcs
     # Bot output goes to the log by direct fd redirection — authoritative and
     # immune to a closing console (no `tee` pipeline to SIGPIPE and drop the
     # tail). The console is only a live mirror fed by `tail -f`.

@@ -11,7 +11,7 @@ from apexbot.constants import ZERO_ADDRESS
 from apexbot.erc20.erc20 import Erc20Token
 from apexbot.provider import OfflineProvider
 from apexbot.provider.call_helpers import encode_function_calldata
-from apexbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
+from apexbot.uniswap.concentrated.types import LiquidityAtTick
 from apexbot.uniswap.v4_liquidity_pool import UniswapV4Pool
 from apexbot.uniswap.v4_types import (
     UniswapV4PoolExternalUpdate,

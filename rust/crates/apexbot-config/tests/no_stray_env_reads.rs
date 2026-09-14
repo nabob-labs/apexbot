@@ -18,12 +18,19 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
     MAP.get_or_init(|| {
         let mut m = BTreeMap::new();
         // (1) Infra — OS/tooling signal variables no static schema can own.
-        // TOKIO_WORKER_THREADS is read via the const ENV_VAR (computed name;
-        // the parser reports the identifier).
-        m.insert("crates/apexbot-core/src/runtime.rs", &["ENV_VAR"][..]);
+        // (SMTH6M: TOKIO_WORKER_THREADS was retired — the ambient runtime is
+        // sized from the cgroup budget via the typed `runtime.io_workers`
+        // key, and the legacy name is rejected by the loader.)
         m.insert(
             "crates/apexbot-python/src/python_log_layer.rs",
-            &["HOME", "RUST_LOG", "OTEL_EXPORTER_OTLP_ENDPOINT"][..],
+            &[
+                "HOME",
+                "RUST_LOG",
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                // Logging-infra tooling signal (same class as RUST_LOG): the
+                // stderr fmt-layer mirror gate. Output plumbing, not config.
+                "APEXBOT_LOG_FMT",
+            ][..],
         );
         // (2) Dev-test knobs in library code (offline tooling only).
         m.insert(
@@ -73,6 +80,12 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
             "crates/apexbot-python/src/diagnostics/thread_registry.rs",
             &["APEXBOT_STATE_LOCK_DIAG"][..], // test stance (feature-gated)
         );
+        m.insert(
+            "crates/apexbot-python/build.rs",
+            // The build-receipt work (1e1c0ddf7): the build script locates
+            // the repo receipt file itself (a build-time path, not config).
+            &["CARGO_MANIFEST_DIR", "APEXBOT_BUILD_NUMBER_FILE"][..],
+        );
         m
     })
 }
@@ -101,13 +114,23 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Skip build/package output trees (`target/` carries vendored
-            // crate copies that mirror crate sources and double-report) and
-            // agent worktrees (`.pi/` holds per-branch checkouts of this
-            // same repo, pre-cutover surfaces included).
+            // Skip non-source trees so a scan of the repo root sees only this
+            // checkout's crate sources:
+            //   - `target/` carries vendored crate copies that mirror crate
+            //     sources and double-report;
+            //   - hidden dirs are tooling/worktree state (`.git/`, and `.pi/`
+            //     per-branch checkouts of this same repo, pre-cutover surfaces
+            //     included);
+            //   - `autoresearch/` is the gitignored agent-harness scratch tree
+            //     holding full repo snapshots (same sources at an older
+            //     revision), which would otherwise double-report every hit.
             let fname = entry.file_name();
             let name = fname.to_str().unwrap_or("");
-            if name == "target" || name == ".pi" {
+            if name == "target"
+                || name == "autoresearch"
+                || name == "node_modules"
+                || name.starts_with('.')
+            {
                 continue;
             }
             collect_rs_files(&path, out);
