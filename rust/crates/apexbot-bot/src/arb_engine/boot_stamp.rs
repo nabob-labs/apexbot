@@ -20,11 +20,9 @@
 //! DIFFERENT boots would misclassify a divergent rider as identical
 //! (silencing a warn, never firing a false positive); the probability is
 //! about 2^-64 per pair — documented here as the accepted floor.
-
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use apexbot_core::op_warn;
 use apexbot_workers::dispatcher::FleetBoot;
-
+use std::sync::atomic::{AtomicU64, Ordering};
 /// The fleet roles a boot stamps (one ledger row per role, first writer
 /// wins). The census/thread-names identity stays KEYED BY ROLE (V5) —
 /// the ledger's rows are keyed the same way.
@@ -37,7 +35,6 @@ pub(crate) enum BootRole {
     /// The PoolStateUpdater-role fleet (registration intake).
     Registration,
 }
-
 impl BootRole {
     /// Ledger label (the census resource string verbatim, for grep-ability).
     #[must_use]
@@ -49,7 +46,6 @@ impl BootRole {
         }
     }
 }
-
 /// A construction-stamped fleet boot: the boot value PLUS who constructed
 /// it (`engine_id`) and what it hashed to (`cfg_hash`). NOT `Copy` — the
 /// ledger's rows own a `Vec` of rides, so the stamp moves once and the
@@ -65,10 +61,8 @@ pub(crate) struct BootStamp {
     /// builds; equal boots hash equal.
     pub(crate) cfg_hash: u64,
 }
-
 /// Monotonic engine construction counter (the stamp's identity half).
 static ENGINE_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Fold one byte buffer into the FNV-1a state.
 fn fnv_mix(state: u64, bytes: &[u8]) -> u64 {
     let mut state = state;
@@ -80,7 +74,6 @@ fn fnv_mix(state: u64, bytes: &[u8]) -> u64 {
     }
     state
 }
-
 /// FNV-1a 64-bit over the boot's fields, the f64 quota folded in
 /// BIT-EXACTLY via `f64::to_bits` (never a Debug-format byte stream).
 fn fnv1a_boot(boot: &FleetBoot) -> u64 {
@@ -141,7 +134,6 @@ fn fnv1a_boot(boot: &FleetBoot) -> u64 {
     );
     state
 }
-
 impl BootStamp {
     /// Stamp a construction boot: the NEXT engine id + the deterministic
     /// boot hash. Called by `with_core_cfg` (the packer) only.
@@ -153,13 +145,11 @@ impl BootStamp {
             boot,
         }
     }
-
     /// The stamp's boot value (`install_boot` hands this to the executor).
     #[must_use]
     pub(crate) fn boot(&self) -> FleetBoot {
         self.boot
     }
-
     /// Identical-boot check: the ledger's ONLY divergence test (R2/R3 —
     /// `engine_id` is identity, never a comparison key). Read by the
     /// F-suite's white-box probes (test builds).
@@ -169,19 +159,16 @@ impl BootStamp {
         self.cfg_hash == other.cfg_hash
     }
 }
-
 /// One fleet-boot ledger row: the role label, the winning stamp's engine
 /// id + cfg hash, and the identical-cfg riders that later installed the
 /// same boot.
 type Ride = (u64, u64);
 type LedgerRow = (&'static str, u64, u64, Vec<Ride>);
-
 /// The boot-audit ledger (the honesty molecule): first writer per role
 /// records the BOOT row; every later construction records a RIDE —
 /// silently when byte-identical (a legal rider), counted+warned in prod
 /// and `panic!`-illegal in tests when the cfg hash DIVERGES.
 static LEDGER: parking_lot::Mutex<Vec<LedgerRow>> = parking_lot::Mutex::new(Vec::new());
-
 /// Record a construction's fleet-boot install for `role` (called at each
 /// `install_boot`'s head). Divergent-cfg rides: prod = count + one warn;
 /// test = ILLEGAL (a `panic!` naming both engine ids + cfg hashes).
@@ -195,14 +182,14 @@ pub(crate) fn record_ride(role: BootRole, stamp: &BootStamp) {
             // DIFFERENT-cfg rider: prod = count + one warn per pair; test =
             // ILLEGAL by construction (the F2 fire drill).
             rides.push((stamp.engine_id, stamp.cfg_hash));
-            tracing::warn!(
-                target: "apexbot::fleet-boot-audit",
+            op_warn!(
+                domain = solver,
                 role = role.label(),
                 winner_engine = winner_engine,
                 winner_cfg = format_args!("{winner_cfg:016x}"),
                 rider_engine = stamp.engine_id,
                 rider_cfg = format_args!("{:016x}", stamp.cfg_hash),
-                "[fleet-boot-audit] mixed-boot fleet ride (YI5NGB): first-fleet-wins, rider cfg diverges"
+                "mixed-boot fleet ride (YI5NGB): first-fleet-wins, rider cfg diverges"
             );
             #[cfg(test)]
             panic_mixed_boot_ride_illegal_in_tests(*winner_cfg, stamp);
@@ -210,7 +197,6 @@ pub(crate) fn record_ride(role: BootRole, stamp: &BootStamp) {
         None => rows.push((role.label(), stamp.engine_id, stamp.cfg_hash, Vec::new())),
     }
 }
-
 /// The test-build arm of the ledger (YI5NGB): a divergent-cfg ride is
 /// ILLEGAL in tests by construction — the F2 fire drill. Prod builds never
 /// compile this (the warn + the ledger row carry the whole story there).
@@ -221,16 +207,17 @@ pub(crate) fn record_ride(role: BootRole, stamp: &BootStamp) {
 )]
 fn panic_mixed_boot_ride_illegal_in_tests(winner_cfg: u64, stamp: &BootStamp) {
     panic!(
-        "[fleet-boot-audit] (YI5NGB) mixed-boot rides are ILLEGAL in tests: engine {} (cfg_hash {winner_cfg:016x} won) rode a fleet booted for a different cfg (rider cfg_hash {:016x})",
+        "(YI5NGB) mixed-boot rides are ILLEGAL in tests: engine {} (cfg_hash {winner_cfg:016x} won) rode a fleet booted for a different cfg (rider cfg_hash {:016x})",
         stamp.engine_id,
         stamp.cfg_hash
     );
 }
-
 #[cfg(all(test, not(miri)))]
 #[expect(clippy::expect_used)]
 mod tests {
     use super::{fnv1a_boot, BootRole, BootStamp, LEDGER};
+    use crate::arb_engine::lifecycle::register_and_solve_path;
+    use crate::arb_engine::test_harness::fleet_boot_stamp;
     use crate::arb_engine::{ArbitrageEngine, BlockMetadata};
     use alloy::primitives::Address;
     use apexbot_config::BotConfigLoader;
@@ -238,20 +225,16 @@ mod tests {
     use apexbot_workers::dispatcher::FleetBoot;
     use apexbot_workers::posture::{PostureOwner, PosturePolicy};
     use hashbrown::HashSet;
-
     const GAMMA_03_TEST: u64 = 997;
     const FEE_DENOM_03_TEST: u64 = 1_000;
-
     fn usdc_test(amount: u64) -> alloy::primitives::aliases::U112 {
         use alloy::primitives::{aliases::U112, U256};
         (U256::from(amount) * U256::from(10u64).pow(U256::from(6))).to::<U112>()
     }
-
     fn weth_test(amount: u64) -> alloy::primitives::aliases::U112 {
         use alloy::primitives::{aliases::U112, U256};
         (U256::from(amount) * U256::from(10u64).pow(U256::from(18))).to::<U112>()
     }
-
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
             profile: apexbot_config::FleetProfile::Auto,
@@ -268,7 +251,6 @@ mod tests {
             ))),
         }
     }
-
     /// The hash is deterministic for byte-equal boots and diverges for the
     /// divergence knob — the F2/F3 premise (R3's accepted 2^-64 floor).
     #[test]
@@ -290,7 +272,6 @@ mod tests {
             "the stamp carries the value it hashed"
         );
     }
-
     /// Equal-boot stamps are a legal ride (`same_cfg`); divergent boots
     /// are not — the F2/F3 discriminator is the HASH, never the engine id.
     #[test]
@@ -304,7 +285,6 @@ mod tests {
         let c = BootStamp::of(other);
         assert!(!a.same_cfg(&c), "a divergent cfg is NOT a legal ride");
     }
-
     /// F2 (YI5NGB): the mixed-cfg fire drill — a SECOND engine's
     /// construction with a DIVERGENT cfg must make the ride ILLEGAL in
     /// tests.
@@ -330,10 +310,8 @@ mod tests {
         use crate::bot_core::state_lock::StateLock;
         use crate::bot_core::BotState;
         use std::sync::Arc;
-
         // Non-leak snapshot #1: the process holder is (still) untouched.
         let installed_before = apexbot_config::holder::installed();
-
         // Engine A: the default-cfg construction (leases its cfg from the
         // holder's schema DEFAULTS; never installs anything).
         let engine_a = ArbitrageEngine::new();
@@ -341,7 +319,6 @@ mod tests {
             !apexbot_config::holder::installed(),
             "an engine construction must never install the process holder"
         );
-
         // The DIVERGENT cfg, built from EXPLICIT LOCAL sources only (no
         // env layer, no file layer, no process-global read anywhere in
         // the chain).
@@ -355,7 +332,6 @@ mod tests {
             .load()
             .expect("the divergent cfg must load from explicit sources");
         let cfg_b = Arc::new(loaded.config);
-
         // Engine B: constructed DIRECTLY with the local cfg (its
         // construction's install_boot records a DIVERGENT-cfg ride — in
         // test builds that is a panic).
@@ -364,10 +340,8 @@ mod tests {
             let core = Arc::new(StateLock::new(BotState::new()));
             let _engine_b = ArbitrageEngine::with_core_cfg(core, &cfg_ref);
         }));
-
         // Non-leak snapshot #2, AFTER the ride.
         let installed_after = apexbot_config::holder::installed();
-
         let err = ride.expect_err("a divergent-cfg ride must be ILLEGAL in tests");
         let msg = err
             .downcast_ref::<String>()
@@ -378,7 +352,6 @@ mod tests {
             msg.contains("mixed-boot rides are ILLEGAL in tests") && msg.contains("(YI5NGB)"),
             "the panic must name the audit + the task: {msg}"
         );
-
         assert_eq!(
             installed_before, installed_after,
             "the divergent cfg must NEVER cross the process-global holder boundary"
@@ -398,14 +371,13 @@ mod tests {
             "the divergent-cfg ride must be recorded in the ledger before the panic"
         );
         assert_eq!(
-            engine_a.fleet_boot_stamp().boot(),
+            fleet_boot_stamp(&engine_a, ).boot(),
             apexbot_workers::dispatcher::FleetBoot::from_config(
                 &<::apexbot_config::BotConfig as Default>::default()
             ),
             "engine A's construction boot is the schema-default boot (the divergent cfg stayed local to B)"
         );
     }
-
     /// F3 (YI5NGB): the positive control — a second engine with a
     /// byte-IDENTICAL boot is a legal, silent rider: no panic, the shared
     /// fleet materializes exactly ONCE (`std::ptr::eq` on the `&'static`
@@ -421,9 +393,7 @@ mod tests {
         use crate::bot_core::BotState;
         use apexbot_solvers::mixed::PoolHop;
         use std::sync::Arc;
-
         let installed_before = apexbot_config::holder::installed();
-
         // Both engines: byte-identical default cfgs (the holder's schema
         // defaults) — the prod-twin shape.
         let mut engine_a = ArbitrageEngine::new();
@@ -432,21 +402,17 @@ mod tests {
             core_b,
             &Arc::new(<::apexbot_config::BotConfig as Default>::default()),
         );
-
         // White-box: the twins' stamps hash EQUAL (a legal ride by
         // construction) while the engine identities stay distinct.
         assert!(
-            engine_a
-                .fleet_boot_stamp()
-                .same_cfg(engine_b.fleet_boot_stamp()),
+            fleet_boot_stamp(&engine_a,).same_cfg(fleet_boot_stamp(&engine_b,)),
             "byte-identical twin constructions must produce identical cfg hashes"
         );
         assert_ne!(
-            engine_a.fleet_boot_stamp().engine_id,
-            engine_b.fleet_boot_stamp().engine_id,
+            fleet_boot_stamp(&engine_a,).engine_id,
+            fleet_boot_stamp(&engine_b,).engine_id,
             "two distinct construction identities over one shared boot value"
         );
-
         let hub_a = engine_a.register_v2_pool(
             Address::from([0xAA_u8; 20]),
             usdc_test(1_000_000),
@@ -463,8 +429,9 @@ mod tests {
         );
         // Two hops: the registration gate refuses structurally unroutable
         // single-hop paths (the A/B fixture's shape).
-        let path_a = engine_a
-            .register_and_solve_path(vec![
+        let path_a = register_and_solve_path(
+            &mut engine_a,
+            vec![
                 PoolHop {
                     pool_id: hub_a,
                     zero_for_one: true,
@@ -473,8 +440,9 @@ mod tests {
                     pool_id: hub_b,
                     zero_for_one: false,
                 },
-            ])
-            .expect("two-hop path registers over the default-cfg core");
+            ],
+        )
+        .expect("two-hop path registers over the default-cfg core");
         let b_hub_a = engine_b.register_v2_pool(
             Address::from([0xAA_u8; 20]),
             usdc_test(1_000_000),
@@ -489,8 +457,9 @@ mod tests {
             GAMMA_03_TEST,
             FEE_DENOM_03_TEST,
         );
-        let path_b = engine_b
-            .register_and_solve_path(vec![
+        let path_b = register_and_solve_path(
+            &mut engine_b,
+            vec![
                 PoolHop {
                     pool_id: b_hub_a,
                     zero_for_one: true,
@@ -499,13 +468,13 @@ mod tests {
                     pool_id: b_hub_b,
                     zero_for_one: false,
                 },
-            ])
-            .expect("two-hop path registers over the twin core");
-
+            ],
+        )
+        .expect("two-hop path registers over the twin core");
         // Both engines drive a solve: A's first solve MATERIALIZES the
         // fleet; B's rides it. The `&'static` handle identity across the
         // two submits PROVES the single shared fleet.
-        engine_a.rebuild_and_solve_affected(
+        engine_a.cycle.run_epoch(
             &crate::arb_engine::tests::test_keys::affected_keys(
                 &HashSet::from([hub_a, hub_b]),
                 &HashSet::new(),
@@ -513,9 +482,11 @@ mod tests {
             ),
             500,
             &BlockMetadata::default(),
+            &engine_a.registry,
+            &mut engine_a.delivery,
         );
         let handle_after_a = crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor();
-        engine_b.rebuild_and_solve_affected(
+        engine_b.cycle.run_epoch(
             &crate::arb_engine::tests::test_keys::affected_keys(
                 &HashSet::from([b_hub_a, b_hub_b]),
                 &HashSet::new(),
@@ -523,13 +494,14 @@ mod tests {
             ),
             501,
             &BlockMetadata::default(),
+            &engine_b.registry,
+            &mut engine_b.delivery,
         );
         let handle_after_b = crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor();
         assert!(
             std::ptr::eq(handle_after_a, handle_after_b),
             "the fleet must materialize EXACTLY ONCE: engine B must ride the shared executor"
         );
-
         let installed_after = apexbot_config::holder::installed();
         assert_eq!(
             installed_before, installed_after,
@@ -539,7 +511,7 @@ mod tests {
         // parallel F-suite stranger may co-record, so the row-level purity
         // claim is made for THIS test's engine B only — its (engine_id,
         // cfg_hash) pair is unique to F3's construction).
-        let my_stamp = engine_b.fleet_boot_stamp();
+        let my_stamp = fleet_boot_stamp(&engine_b);
         let rows = LEDGER.lock();
         let solve_row = rows
             .iter()

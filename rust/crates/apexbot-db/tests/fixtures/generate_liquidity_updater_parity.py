@@ -50,7 +50,7 @@ from sqlalchemy.orm import Session
 
 from apexbot.abi import encode as abi_encode
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.cli.pool import (
+from apexbot.updater.pool_updater_configs import (
     UNISWAP_V3_BURN_EVENT_HASH,
     UNISWAP_V3_MINT_EVENT_HASH,
     apply_v3_liquidity_updates,

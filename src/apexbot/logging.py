@@ -3,31 +3,31 @@
 This module owns two concerns:
 
 1. The package logger (``apexbot.logging``) for Python-side records.
-2. The **Rust bridge** loggers that ``pyo3-log`` forwards Rust ``log::`` records
-   into.
+2. The **Rust bridge** loggers that the Rust core's ``tracing`` subscriber
+   forwards records into.
 
-Rust ``log::info!`` / ``log::warn!`` / ``log::error!`` calls (e.g. in
-``block_pump.rs``, ``verify.rs``, ``register.rs``) are bridged to Python by
-``pyo3_log::init()`` (called from the ``apexbot_rs`` ``#[pymodule]``). The
-bridge forwards each Rust record to ``logging.getLogger(<rust target>.replace("::", "."))
-`` — so a ``log::info!`` in ``apexbot_bot::bot_core::block_pump`` lands on the
-Python logger ``apexbot_bot.bot_core.block_pump``.
+Rust ``tracing`` events — and ``log::`` records, bridged into ``tracing`` by
+``tracing_log::LogTracer`` — are forwarded to Python ``logging`` by the
+``PythonLogLayer`` installed by ``init_logging_subscriber`` in
+``rust/crates/apexbot-python/src/python_log_layer.rs`` during ``apexbot_rs``
+module init. The layer derives each record's Python logger name from the Rust
+target (``::`` → ``.``): an event for ``apexbot_bot::bot_core::block_pump``
+lands on the Python logger ``apexbot_bot.bot_core.block_pump``.
 
 Without base config those records are silent: the crate-root loggers
 (``apexbot_bot``, ``apexbot_core``, ``apexbot_rs``, ``apexbot_rpc``,
 ``apexbot_decoders``, ``apexbot_uniswap``) inherit the root logger's default
-``WARNING`` level and have no handler, so every Rust ``INFO``/``DEBUG`` record
-is dropped at the logger-level gate *before* reaching a handler (and
-``WARN``/``ERROR`` only escape via stdlib ``lastResort`` on stderr — bypassing
-this module's stdout handler and format). Worse, ``pyo3-log`` caches the
-effective level per Rust target on first use, so *later* Python-side
-``logging.basicConfig(...)`` calls from a caller never restore visibility.
+``WARNING`` level and have no handler, so every forwarded ``INFO``/``DEBUG``
+record is dropped at the Python logger-level gate *before* reaching a handler
+(and ``WARN``/``ERROR`` only escape via stdlib ``lastResort`` on stderr,
+bypassing this module's stdout handler and format).
 
 The fix lives here, in the base config that runs at ``import apexbot`` time —
 *before* any Rust code logs (Rust logs fire only once a pump/verify/register
 operation runs, never during import). Configuring the crate-root loggers up
-front means ``pyo3-log``'s first-use cache stores the lowered level for every
-target, so no caller wiring is required and no cache reset is needed.
+front at the lowered level makes forwarded records visible with no caller
+wiring. The Rust-side ``tracing`` ``EnvFilter`` (``RUST_LOG``) is the first
+gate; Python ``logging`` is the second.
 """
 
 import atexit
@@ -58,9 +58,9 @@ logger.setLevel(_LOG_LEVEL)
 # ``> >(tee -a "$LOG" > /dev/null) 2>&1``), ``sys.stdout`` is block-buffered;
 # ``StreamHandler.emit`` then calls ``stream.flush()`` which blocks on a full
 # pipe or on the ``BufferedWriter._write_lock`` futex under concurrent writers
-# — holding the GIL across the I/O wait. Under pyo3-log every Rust
-# ``log::info!`` acquires the GIL via ``Python::attach`` and runs the full
-# Python ``logging`` pipeline under it, so a slow stdout flush stalls every
+# — holding the GIL across the I/O wait. The Rust ``PythonLogLayer`` flushes
+# each batch to Python ``logging`` under one ``Python::attach`` and runs the
+# full Python ``logging`` pipeline under it, so a slow stdout flush stalls every
 # thread waiting on the GIL (the asyncio main loop, the pump's tokio worker).
 # The ``QueueHandler``/``QueueListener`` pair below decouples producers from
 # the slow writer: producers do a fast non-blocking ``put_nowait`` (no stream
@@ -70,6 +70,61 @@ logger.setLevel(_LOG_LEVEL)
 # writing). See ``tests/test_rust_logging_bridge.py`` (the
 # ``QueueHandler-not-StreamHandler`` + listener-drains guards).
 _STDOUT_HANDLER = logging.StreamHandler(sys.stdout)
+
+#: The closed target domains (ADR-043 §3). A Rust record's logger name is its
+#: target with `::` dotted (`apexbot::solver` → `apexbot.solver`), so the
+#: domain is the first segment in this set; a Python module name has no domain
+#: segment and falls back to its own last segment.
+_DOMAIN_AREAS = frozenset({
+    "state",
+    "path",
+    "solver",
+    "sim",
+    "pump",
+    "exec",
+    "verify",
+    "ingest",
+    "rpc",
+    "aave",
+    "diag",
+})
+
+
+def _area_for(logger_name: str) -> str:
+    """Derive the console area prefix from a record's logger name.
+
+    Returns:
+        The first logger-name segment that is a routed domain area (skipping
+        the root `apexbot` segment); the deepest segment when none match.
+
+    """
+    parts = logger_name.split(".")
+    for part in parts[1:] if len(parts) > 1 else parts:
+        if part in _DOMAIN_AREAS:
+            return part
+    return parts[-1] if parts else logger_name
+
+
+def _short_level(levelname: str) -> str:
+    return "WARN" if levelname == "WARNING" else levelname
+
+
+class _AreaFormatter(logging.Formatter):
+    """Console line: `LEVEL [area] message`.
+
+    The area is derived from the *record's logger name* — the closed domain
+    target for bridged Rust records, the owning module for Python-side ones —
+    never from an in-message `[tag]` prefix. ADR-043 §7: the target is the
+    single source of the area, so a message carries no routing information of
+    its own and there is exactly one thing to change when a record moves
+    between areas.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return f"{_short_level(record.levelname)} [{_area_for(record.name)}] {record.getMessage()}"
+
+
+_STDOUT_HANDLER.setFormatter(_AreaFormatter())
 
 # In-process queue + listener. ``SimpleQueue`` is ``thread.Lock``-based (no
 # ``Condition``, no notifier thread) — ``put_nowait`` is a few microseconds and never
@@ -92,9 +147,10 @@ atexit.register(_LOG_LISTENER.stop)
 
 logger.addHandler(_QUEUED_HANDLER)
 
-#: The Rust crate-root Python logger names that ``pyo3-log`` forwards ``log::``
-#: records into. Each Rust target ``apexbot_<crate>::...`` maps to the Python
-#: logger ``apexbot_<crate>.<...>``; the dotted crate root is the top ancestor
+#: The Rust crate-root Python logger names that the forwarding layer maps
+#: ``tracing`` events into. Each Rust target ``apexbot_<crate>::...`` maps to
+#: the Python logger ``apexbot_<crate>.<...>``; the dotted crate root is the
+#: top ancestor
 #: whose level and handlers gate every descendant record, so configuring only
 #: the root is sufficient — and ordering matters: this must run before the
 #: first Rust log call (it does, since ``log::`` only fires at pump/verify/
@@ -115,10 +171,9 @@ RUST_BRIDGE_LOGGER_NAMES = (
     "apexbot_uniswap",
     # The in-process sim engine + the settlement-arbitrage strategy. The divergence probe
     # (``[sim-divergence]``, ergo task 4C33DP / epic TR6GWT) + the bridge-probe
-    # (``[bridge-probe]``) emit ``log::info!`` from these crates; without
-    # configuring the crate-root here, pyo3-log's first-use cache stores the
-    # WARNING default and the records are dropped at the logger-level gate
-    # before reaching a handler (silent even with the env var on).
+    # (``[bridge-probe]``) emit events from these crates; without configuring
+    # the crate-root here their records are dropped at the Python logger-level
+    # gate before reaching a handler (silent even with the env var on).
     "apexbot_simulation",
     "apexbot_arbitrage",
 )
@@ -167,11 +222,10 @@ def set_log_level(level: int) -> None:
     """Set the apexbot + Rust-bridge log level from one knob.
 
     Mirrors the historical conftest behaviour of bumping the package logger to
-    ``DEBUG`` for the test run, extended to cover the Rust ``log::`` bridge so
-    Rust ``debug!`` records are not left behind by the crate-root level
-    ``pyo3-log`` cached at import (the cache is only consulted on the *first*
-    log per target; lowering the level here before that first call is effective
-    because no Rust path logs at import time).
+    ``DEBUG`` for the test run, extended to cover the Rust bridge loggers so
+    Rust ``debug!`` records are not left behind by the crate-root level set at
+    import. Lowering the level here is effective because no Rust path logs at
+    import time.
     """
     logger.setLevel(level)
     for name in RUST_BRIDGE_LOGGER_NAMES:

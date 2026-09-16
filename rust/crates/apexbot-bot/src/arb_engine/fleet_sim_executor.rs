@@ -23,8 +23,9 @@
 //! RZEWTX: the pooled-seat machinery (`WorkQueue`, `seat_loop`,
 //! `host_loop`, `apply_host_msg`/`pump` admission, the boot install/global
 //! boilerplate) is SHARED with the registration executor — ONE seat host
-//! (`arb_engine::seat_host`) parameterized by this module's [`SIM_ROLE`]
-//! descriptor. 6HE6RF: the solve executor's host-MESSAGE triple joins
+//! (`arb_engine::seat_host`) parameterized by the `FleetBootRegistry`'s
+//! `SIM_ROLE` descriptor (candidate 4 moved the descriptor row there; this
+//! module owns only the executor + boot fn). 6HE6RF: the solve executor's host-MESSAGE triple joins
 //! that machinery too (the ONE [`HostPump`] behind all three fleet
 //! hosts); its SEAT MODEL (per-seat keyed mailboxes, warm arenas) and
 //! typed submit seam stay in `fleet_solve_executor.rs` — the RZEWTX
@@ -43,46 +44,11 @@
 //! and never attaches the GIL on its hot path, so hosting the closure on
 //! fleet seats crosses the FFI only at the existing install/delivery
 //! seams (design doc §8: simulation never round-trips Python).
-
-use std::sync::OnceLock;
-
-use crate::arb_engine::boot_stamp::{BootRole, BootStamp};
-use apexbot_workers::budget::FleetBudget;
-use apexbot_workers::dispatcher::{BootError, FleetBoot, GrantKind};
-use apexbot_workers::role::WorkerRole;
-
-use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
-use crate::arb_engine::seat_host::{self, SeatHost, SeatRoleDesc};
-
-/// The sim executor's seat-host role descriptor — this module IS the role
-/// now; the machinery lives once in `seat_host`. `SimDriver` pooled seats
-/// granted `GrantKind::Sim` units, the budget's `sim_slot_cap` as the seat
-/// count, and the design-gate admission policy `Admit`: a Cordoned posture
-/// still admits sim leases (`SimPool` class — floored, not held; the floor
-/// is the host FSM's sim-intake lane, dispatcher-side). The seat pool is
-/// the pacing contract: a seat IS the granted slot.
-static SIM_ROLE: SeatRoleDesc = SeatRoleDesc {
-    role: WorkerRole::SimDriver,
-    grant: GrantKind::Sim,
-    boot_role: BootRole::Sim,
-    abort_tag: "[fleet-sim]",
-    noun: "sim",
-    host_thread: "work-fleet-sim-host",
-    stamp_missing:
-        "fleet sim boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
-    seats: sim_seats_of,
-};
-
-/// The queue-cap source: the budget's `SimDriver` slot cap (design doc §5 —
-/// today's `SimSlots` cap, `fleet.sim_slot_cap` terminal override).
-fn sim_seats_of(budget: &FleetBudget) -> usize {
-    budget.sim_slot_cap
-}
-
+use crate::arb_engine::seat_host::{self, SeatHost};
+use apexbot_workers::dispatcher::{BootError, FleetBoot};
 /// The fleet-hosted inline-sim executor. Shared by all engine cycles (the
-/// global static hands out `&'static`, mirroring the fleet solve
-/// executor's construction-once contract: warm pooled seats across
-/// cycles).
+/// registry's global slot hands out `&'static`, mirroring the fleet solve
+/// executor's construction-once contract: warm pooled seats across cycles).
 pub(crate) struct FleetSimExecutor {
     /// The shared pooled-seat host (the channel submit end + the unit
     /// sequence).
@@ -91,7 +57,6 @@ pub(crate) struct FleetSimExecutor {
     #[cfg(test)]
     sim_seats: usize,
 }
-
 impl FleetSimExecutor {
     /// Boot from a `FleetBoot` (quota + overrides + posture): boot the
     /// [`FleetHost`], spawn the pooled `SimDriver` seat threads (the
@@ -99,95 +64,38 @@ impl FleetSimExecutor {
     /// run the dispatch loop on the host thread. Fail-loud (the typed
     /// [`BootError`]) when the declared shares cannot host the quota.
     ///
+    /// candidate 4 (YUMQU3): the seat descriptor is read from the
+    /// `FleetBootRegistry` slot — this module owns no role static. Sim hosts
+    /// carry NO intake fault watch (`None`): their receipts are not
+    /// pyo3-owned (S2 scope cut), so they never enter Faulted.
+    ///
     /// # Errors
     /// [`BootError`] — the fleet budget sum check or a boot invariant.
     pub(crate) fn boot(boot: FleetBoot) -> Result<Self, BootError> {
-        let host = SeatHost::boot(&SIM_ROLE, boot)?;
+        let desc = crate::arb_engine::seat_host::FleetBootRegistry::process()
+            .sim()
+            .descriptor();
+        let host = SeatHost::boot(desc, boot, None)?;
         Ok(Self {
             #[cfg(test)]
             sim_seats: host.seat_count(),
             host,
         })
     }
-
     /// The budget's `SimDriver` slot cap (the pooled seat count). Test-facing
     /// (the scheduling sites submit without asking the cap).
     #[cfg(test)]
     pub(crate) fn sim_slot_cap(&self) -> usize {
         self.sim_seats
     }
-
     /// Test-facing: the resolved plan binding (FF-T4 — the tier the boot
     /// instantiated for this host).
     #[cfg(test)]
     pub(crate) fn host_plan_binding(&self) -> apexbot_workers::plan::Binding {
         self.host.plan_binding()
     }
-
-    /// The pre-existing submit body, RENAMED (was the inherent `spawn`,
-    /// sim:158-174): wraps into `Unit::new(.., Box::new(move |_ctx| work()))`
-    /// and `tx.send(HostMsg::Enqueue(unit))`, typed to `Err(())` on a closed
-    /// channel — the send VALUE carries the close arm; the abort lives in
-    /// the trait impl below — same process-exit semantics, one owner of the
-    /// abort (the shared seat host's `intake_spawn`). Private fn, in-crate.
-    fn try_send(&self, work: InnerWork) -> Result<(), ()> {
-        self.host.try_send(work)
-    }
-
-    /// Test-venue shim: the OLD name `spawn`, `#[cfg(test)]`-only, so the
-    /// in-file fixtures (sim:415..:546) keep compiling VERBATIM. Outside test
-    /// builds the inherent fn does not EXIST — the inherent-priority shadow
-    /// (§6 risk 6) is confined to test code that calls no port path, and the
-    /// port is the only `spawn` production callers can name.
-    #[cfg(test)]
-    fn spawn(&self, work: impl FnOnce() + Send + 'static) {
-        let _ = self.try_send(Box::new(work));
-    }
 }
-
-impl FleetIntake for FleetSimExecutor {
-    fn spawn(&self, work: InnerWork) {
-        if self.try_send(work).is_err() {
-            seat_host::intake_close_abort(&self.host);
-        }
-    }
-}
-
-static FLEET_SIM_BOOT: OnceLock<BootStamp> = OnceLock::new();
-// FF-T1 (BPHR6F): the slot parks the sticky boot OUTCOME — a refused
-// boot stores its typed BootError and every later submission re-surfaces
-// it (never a process abort, never a retry loop).
-static FLEET_SIM_EXECUTOR: OnceLock<Result<FleetSimExecutor, BootError>> = OnceLock::new();
-
-/// Install the CONSTRUCTION-STAMPED boot (YI5NGB): the engine's own typed
-/// boot descriptor (fleet quota + overrides + posture) parsed at ITS
-/// construction from the CALLER cfg, stamped with the engine id + a
-/// deterministic cfg hash. Never overrides an installed value (first
-/// engine wins, like the other stance statics) — every construction after
-/// the first RIDES, and the ride is ledgered (a divergent-cfg rider is
-/// counted + warned in prod, ILLEGAL in tests) on the `BootRole::Sim` row
-/// (the shared installer: `seat_host::install_boot`).
-pub(crate) fn install_boot(stamp: BootStamp) {
-    seat_host::install_boot(&FLEET_SIM_BOOT, &SIM_ROLE, stamp);
-}
-
-/// The process-wide fleet sim executor, built lazily on the first
-/// fleet-stance sim submission and persisting for the process lifetime
-/// (the shared materializer: `seat_host::global_executor` — the YI5NGB
-/// absence window stays closed by construction).
-///
-/// FF-T1 (BPHR6F): a refused boot surfaces the TYPED, STICKY `BootError`
-/// (every submission re-surfaces the same refusal) — the library never
-/// aborts the host process on the boot-refusal arm.
-pub(crate) fn global_fleet_sim_executor() -> Result<&'static FleetSimExecutor, BootError> {
-    seat_host::global_executor(
-        &SIM_ROLE,
-        &FLEET_SIM_BOOT,
-        &FLEET_SIM_EXECUTOR,
-        FleetSimExecutor::boot,
-    )
-}
-
+seat_host::impl_seat_hosted!(FleetSimExecutor, host);
 #[cfg(test)]
 // The panic-survival fixture panics deliberately (loud-assert test style;
 // the module-level expect is the documented-permitted form).
@@ -202,20 +110,15 @@ mod tests {
     /// directly so the expect fires WITHOUT a real `FleetHost` boot.
     #[test]
     fn fleet_sim_materializer_without_a_stamp_is_loud() {
-        if super::FLEET_SIM_BOOT.get().is_some() {
+        let slot = crate::arb_engine::seat_host::FleetBootRegistry::process().sim();
+        if slot.boot_installed() {
             eprintln!(
                 "skipping: another test already installed the sim boot stamp in this process"
             );
             return;
         }
         let closure = || {
-            let stamp = super::FLEET_SIM_BOOT.get().expect(
-                "fleet sim boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
-            );
-            match FleetSimExecutor::boot(stamp.boot()) {
-                Ok(_executor) => (),
-                Err(_err) => (),
-            }
+            let _ = slot.global_executor(FleetSimExecutor::boot);
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(closure));
         let err = result.expect_err("a stamp-less materialization must abort loud");
@@ -229,17 +132,13 @@ mod tests {
             "the expect must name the task: {msg}"
         );
     }
-
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
+    use super::FleetSimExecutor;
     use apexbot_workers::budget::BudgetOverrides;
     use apexbot_workers::dispatcher::FleetBoot;
     use apexbot_workers::posture::{FleetPosture, PostureOwner, PosturePolicy, ThrottleSample};
-
-    use super::FleetSimExecutor;
-
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     /// A FRESH hermetic posture owner (leaked to `'static`): every test
     /// boot gets its own owner, never the process global (7KAPBB isolation).
     fn hermetic_owner() -> &'static PostureOwner {
@@ -247,11 +146,9 @@ mod tests {
             PosturePolicy::doc_defaults(),
         )))
     }
-
     fn hermetic_boot() -> FleetBoot {
         hermetic_boot_with_owner(hermetic_owner())
     }
-
     fn hermetic_boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
         FleetBoot {
             profile: apexbot_config::FleetProfile::Auto,
@@ -261,7 +158,6 @@ mod tests {
             owner: Some(owner),
         }
     }
-
     /// Wait for a minimum receipt count without unbounded blocking
     /// (deadline-poll, the solve-parity fixture style).
     fn await_receipts<T: Send + 'static>(
@@ -284,7 +180,6 @@ mod tests {
         }
         got
     }
-
     /// The fleet's `SimDriver` seats must run each submitted sim to
     /// completion, every receipt delivered exactly once.
     #[test]
@@ -303,7 +198,6 @@ mod tests {
         let want: Vec<u64> = (0..32).collect();
         assert_eq!(got, want, "every sim unit completes exactly once");
     }
-
     /// Seats are the fleet `SimDriver` role: census thread-name pattern
     /// work-fleet-sim-{n} (GOQWCL rule — greppable, never the shared
     /// tokio-runtime-worker default).
@@ -331,7 +225,6 @@ mod tests {
             );
         }
     }
-
     /// A panicking sim must not kill the seat pool: the seat survives, the
     /// failure is logged loudly, and later sims drain normally.
     #[test]
@@ -355,7 +248,6 @@ mod tests {
         assert_eq!(got.iter().filter(|s| **s == "boom").count(), 1);
         assert_eq!(got.iter().filter(|s| **s == "ok").count(), 4);
     }
-
     /// The seat pool is the budget's `SimDriver` slot cap (design doc §5
     /// `SimDriver` slots = today's `SimSlots` cap; `fleet.sim_slot_cap` is the
     /// terminal override).
@@ -367,7 +259,6 @@ mod tests {
             apexbot_workers::budget::DEFAULT_SIM_SLOT_CAP
         );
     }
-
     /// The pacing contract the incumbent `SimSlots` semaphore provided: no
     /// more sims execute CONCURRENTLY than the budget's sim slot cap —
     /// the fleet's pooled seats now provide that bound by construction.
@@ -402,7 +293,6 @@ mod tests {
             "concurrent sims {seen} exceeded the budget slot cap {cap}"
         );
     }
-
     /// Census (PE4FPM/FPNT36): the booted host self-registers the fleet
     /// `SimDriver` resource row with the fleet seat naming.
     #[test]
@@ -415,7 +305,6 @@ mod tests {
         assert_eq!(row.thread_name, "work-fleet-sim-{n}");
         assert_eq!(row.count, apexbot_workers::budget::DEFAULT_SIM_SLOT_CAP);
     }
-
     /// A quota below the pinned-role floor fails loudly at boot (the §5
     /// fail-fast — never a runtime throttle storm).
     #[test]
@@ -452,7 +341,6 @@ mod tests {
             "a sub-serial-floor quota must refuse to boot loudly"
         );
     }
-
     /// The design-gate admission policy, BEHAVIORAL under the shared
     /// posture owner (RZEWTX; JCI2FW Part A dissolved the
     /// `CordonAdmission::Admit` descriptor arm — the role's `SimPool`
@@ -490,5 +378,329 @@ mod tests {
             4,
             "a Cordoned posture still admits (floors, never holds) SimPool sim intake"
         );
+    }
+}
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod fleet_sim_stance_tests {
+    //! ADR-042 F4 (task LTUE7I) fixtures: the inline-sim runtime on the
+    //! fleet (LW-T9: the legacy-arm half of the parity/identity matrix is
+    //! deleted with the stance — every sim rides the `SimDriver` seats).
+    //! Parity — `SimDriver` seats execute requests derived from the committed
+    //! heavy-CL capture corpus honestly (success AND failure payloads).
+    //! Identity — the hosting family is the fleet `work-fleet-sim-{n}`
+    //! `SimDriver` seats (census row included).
+    use crate::arb_engine::executor_ab_probe::load_corpus_fixture;
+    use crate::arb_engine::inline_sim::PipelinedSims;
+    use crate::arb_engine::inline_sim::{
+        AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
+        InlineSwapFamily, SimulatedPathResult,
+    };
+    use crate::arb_engine::solve_cycle::PathTimesHeap;
+    use crate::arb_engine::solve_cycle::SolveCycleShared;
+    use crate::arb_engine::BlockMetadata;
+    use alloy::primitives::{I256, U256};
+    use apexbot_solvers::mixed::{HopType, MixedPath, MixedPoolRef, SolvePathResult};
+    use hashbrown::HashMap;
+    use std::sync::Arc;
+    // ---- deterministic sim stub ------------------------------------------------
+    /// Deterministic primitive-payload sim: the payload is a pure function
+    /// of the request (so both stances assert on identical request streams),
+    /// and the executing thread's family is recorded for the identity
+    /// fixture. Exercises the failure-payload contract through both arms.
+    struct CorpusSim {
+        thread_names: parking_lot::Mutex<Vec<String>>,
+    }
+    impl CorpusSim {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                thread_names: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+    impl InlineSimulator for CorpusSim {
+        fn simulate_path(&self, request: InlineSimRequest) -> Option<SimulatedPathResult> {
+            self.thread_names.lock().push(
+                std::thread::current()
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            );
+            let hop0 = (request.optimal_input % U256::from(u64::MAX)).to::<u64>();
+            if request.path_id % 11 == 5 {
+                // Exercise the failure-payload contract through both arms.
+                return Some(SimulatedPathResult {
+                    path_id: request.path_id,
+                    gross_profit: U256::ZERO,
+                    net_profit: U256::ZERO,
+                    gas_used: 0,
+                    priority_fee: 0,
+                    base_fee_next: 0,
+                    execute_calldata: Vec::new(),
+                    access_list: None,
+                    captured_swaps: Vec::new(),
+                    hop_count: request.hops.len(),
+                    failure: Some(InlineSimFailure {
+                        fail_index: Some(1),
+                        revert_data: vec![0x08, 0xc3, 0x79, 0xa0],
+                        bucket: "revert".to_string(),
+                    }),
+                });
+            }
+            Some(SimulatedPathResult {
+                path_id: request.path_id,
+                gross_profit: U256::from(hop0 % 1_000_000 + 7),
+                net_profit: U256::from(hop0 % 1_000_000 + 3),
+                gas_used: 40_000
+                    + u64::try_from(request.hops.len()).unwrap_or(u64::from(u8::MAX)) * 3_000,
+                priority_fee: 3,
+                base_fee_next: 31,
+                execute_calldata: vec![
+                    0xa9,
+                    u8::try_from(request.path_id % 251).unwrap_or(1),
+                    u8::try_from(request.hops.len()).unwrap_or(u8::MAX),
+                ],
+                access_list: request.path_id.is_multiple_of(2).then(|| {
+                    vec![AccessListRow {
+                        address: alloy::primitives::Address::from([0x7au8; 20]),
+                        storage_keys: vec![U256::from(request.path_id)],
+                    }]
+                }),
+                captured_swaps: vec![CapturedSwapRow {
+                    emitter: alloy::primitives::Address::from([0x11u8; 20]),
+                    family: if request.hops.len() > 2 {
+                        InlineSwapFamily::V3
+                    } else {
+                        InlineSwapFamily::V2
+                    },
+                    amount0: I256::try_from(-i128::from(hop0 % 5_000_000_000u64))
+                        .unwrap_or(I256::ZERO),
+                    amount1: I256::try_from(i128::from(hop0 % 4_900_000_000u64))
+                        .unwrap_or(I256::ZERO),
+                    sqrt_price_x96: U256::from(1u128) << 96,
+                    liquidity: U256::from(1_000_000u64),
+                    tick: 0,
+                }],
+                hop_count: request.hops.len(),
+                failure: None,
+            })
+        }
+    }
+    // ---- corpus-derived request fan-out ------------------------------------------
+    const PARITY_REQUESTS: usize = 24;
+    /// Stride the committed capture corpus down to `want` items (the corpus
+    /// is the request-shape oracle — hop counts and magnitude spreads ride
+    /// the real capture, not synthesized round numbers).
+    fn strided_corpus(want: usize) -> Vec<Arc<apexbot_solvers::mixed::ResolvedMixedPath>> {
+        let items = load_corpus_fixture();
+        assert!(!items.is_empty(), "capture corpus must load");
+        let stride = items.len().saturating_sub(1) / want + 1;
+        items.into_iter().step_by(stride).take(want).collect()
+    }
+    fn pool_refs_for(
+        items: &[Arc<apexbot_solvers::mixed::ResolvedMixedPath>],
+    ) -> Vec<Arc<MixedPath>> {
+        items
+            .iter()
+            .map(|item| {
+                let hops = (0..item.hops.len().clamp(1, 4))
+                    .map(|i| MixedPoolRef {
+                        hop_type: HopType::V3,
+                        pool_key: u64::try_from(i).unwrap_or(u64::MAX),
+                        zero_for_one: i % 2 == 0,
+                    })
+                    .collect();
+                Arc::new(MixedPath { pools: hops })
+            })
+            .collect()
+    }
+    fn make_ctx(sim: Arc<CorpusSim>, pool_refs: Vec<Arc<MixedPath>>) -> Arc<SolveCycleShared> {
+        Arc::new(SolveCycleShared {
+            solve_block: 42,
+            epoch: 0,
+            metadata: BlockMetadata {
+                base_fee_per_gas: Some(30),
+                ..BlockMetadata::default()
+            },
+            runtime: ::apexbot_solvers::runtime::SolveRuntimeConfig::default(),
+            gate_capture: None,
+            walk_memo: Arc::new(::apexbot_solvers::mobius_v3_int::WalkMemo::new(
+                false, false,
+            )),
+            capture: None,
+            capture_mixed: None,
+            path_times: parking_lot::Mutex::new(PathTimesHeap::new()),
+            gate_total: parking_lot::Mutex::new(
+                ::apexbot_solvers::profit_envelope::GateStats::default(),
+            ),
+            solve_cpu_us: std::sync::atomic::AtomicU64::new(0),
+            walk_pieces_total: std::sync::atomic::AtomicU64::new(0),
+            walk_sims_total: std::sync::atomic::AtomicU64::new(0),
+            walk_word_steps_total: std::sync::atomic::AtomicU64::new(0),
+            walk_refine_sims_total: std::sync::atomic::AtomicU64::new(0),
+            walk_ternary_total: std::sync::atomic::AtomicU64::new(0),
+            walk_grid_total: std::sync::atomic::AtomicU64::new(0),
+            sims_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            gate_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            core: Arc::new(crate::bot_core::state_lock::StateLock::new(
+                crate::bot_core::BotState::new(),
+            )),
+            pool_refs,
+            worker_clamp: true,
+            inline_sim: Some(sim),
+            #[cfg(test)]
+            test_solve_delay: None,
+            #[cfg(test)]
+            test_solve_panic: None,
+        })
+    }
+    fn admitted_for(idx: usize, hops: usize) -> SolvePathResult {
+        SolvePathResult {
+            optimal_input: U256::from(1_000_000_000u64 + u64::try_from(idx).unwrap_or(0) * 7),
+            profit: U256::from(1_000u64 + u64::try_from(idx).unwrap_or(0)),
+            hop_outputs: (0..hops)
+                .map(|h| {
+                    U256::from(
+                        900_000_000u64
+                            + u64::try_from(idx).unwrap_or(0) * 13
+                            + u64::try_from(h).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+            consumed_inputs: (0..hops)
+                .map(|h| {
+                    U256::from(
+                        900_000_000u64
+                            + u64::try_from(idx).unwrap_or(0) * 3
+                            + u64::try_from(h).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+            state_nonces: vec![0; hops],
+            solver_pool_states: Vec::new(),
+        }
+    }
+    /// Schedule ONE sim through the production scheduler (`PipelinedSims::
+    /// schedule_one`, stance-routed) and join its receipt.
+    fn schedule_and_join(
+        ctx: &Arc<SolveCycleShared>,
+        idx: usize,
+        pid: u64,
+        hops: usize,
+    ) -> (bool, Option<SimulatedPathResult>) {
+        let mut pending = PipelinedSims::default();
+        let parent = tracing::Span::none();
+        let result = admitted_for(idx, hops);
+        let scheduled = pending.schedule_one(ctx, idx, pid, &result, &parent);
+        if !scheduled {
+            return (false, None);
+        }
+        pending
+            .join_all()
+            .next()
+            .map_or((true, None), |(jpid, payload)| {
+                assert_eq!(jpid, pid, "the receipt must carry its request's pid");
+                (true, payload)
+            })
+    }
+    /// FLEET FIXTURE (LTUE7I, LW-T9 single-arm): fleet `SimDriver` inline sims
+    /// honor the full request contract over the committed capture corpus —
+    /// every request schedules, successes carry field-equal payloads, and
+    /// the failure-payload contract is exercised end to end.
+    #[test]
+    fn fleet_sims_honor_the_request_contract_on_capture_corpus() {
+        let items = strided_corpus(PARITY_REQUESTS);
+        let pool_refs = pool_refs_for(&items);
+        let sim = CorpusSim::new();
+        let run_arm = || {
+            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone());
+            // Deterministic reverse order so receipts interleave like a
+            // real multi-bin fan-out (per-receipt channels, not the arm,
+            // carry order).
+            let mut joined: Vec<(u64, Option<SimulatedPathResult>)> = Vec::new();
+            for idx in (0..items.len()).rev() {
+                let pid = u64::try_from(idx).unwrap_or(u64::MAX);
+                let hops = items[idx].hops.len().clamp(1, 4);
+                let (scheduled, payload) = schedule_and_join(&ctx, idx, pid, hops);
+                assert!(scheduled, "every fixtured request must schedule");
+                joined.push((pid, payload));
+            }
+            joined.sort_unstable_by_key(|(pid, _)| *pid);
+            joined
+        };
+        let joined: Vec<(u64, Option<SimulatedPathResult>)> = run_arm();
+        assert!(!joined.is_empty(), "fixture must schedule sims");
+        assert!(
+            joined.iter().any(|(pid, _)| pid % 11 == 5),
+            "the fixture must exercise the failure-payload contract too"
+        );
+    }
+    /// IDENTITY FIXTURE (LTUE7I, LW-T9 single-arm): the ONLY sim hosting
+    /// family is the fleet `SimDriver` seats (`work-fleet-sim-{n}`) and the
+    /// executor's census row is registered (the `fleet_merge_slots` pattern
+    /// from the BCA77G work).
+    ///
+    /// Pinned-tier fixture (FF-T2): the seat-shape contract binds only on a
+    /// host whose auto-resolved fleet binding is pinned (see the host-tier
+    /// gate in the body). On the serial tier the sims ride
+    /// `work-fleet-serial-0` by design.
+    #[expect(
+        clippy::print_stderr,
+        reason = "the self-skip channel names the host tier that cannot host the pinned topology"
+    )]
+    #[test]
+    fn fleet_sims_run_on_simdriver_seats_with_the_census_row() {
+        // Host-tier gate (FF-T2): the identity contract under test is the
+        // PINNED binding's topology (pooled `work-fleet-sim-{n}` SimDriver
+        // seats + the census row). On a 2-5-core host the auto profile
+        // resolves the fleet to the serial binding — sims legitimately ride
+        // the named cycle lane (`work-fleet-serial-0`, whose own identity is
+        // covered by `serial_units_execute_on_the_named_serial_seat`) — so
+        // the pinned seat-shape assertion can only bind on a pinned-tier
+        // host. Skip there (the F-suite's documented self-skip channel)
+        // rather than asserting a topology this host cannot host.
+        match crate::arb_engine::seat_host::FleetBootRegistry::process()
+            .sim()
+            .global_executor(crate::arb_engine::fleet_sim_executor::FleetSimExecutor::boot)
+        {
+            Ok(executor)
+                if executor.host_plan_binding() == apexbot_workers::plan::Binding::Serial =>
+            {
+                eprintln!(
+                    "skipping: the fleet materialized the SERIAL binding on this \
+                     host (2-5 cores) — sims ride `work-fleet-serial-0` by design"
+                );
+                return;
+            }
+            Ok(_) => (),
+            Err(err) => {
+                eprintln!("skipping: the fleet sim boot was refused on this host ({err})");
+                return;
+            }
+        }
+        let items = strided_corpus(4);
+        let pool_refs = pool_refs_for(&items);
+        let sim = CorpusSim::new();
+        let run_arm = || {
+            sim.thread_names.lock().clear();
+            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone());
+            for (idx, item) in items.iter().enumerate() {
+                let pid = u64::try_from(idx).unwrap_or(u64::MAX);
+                let hops = item.hops.len().clamp(1, 4);
+                let (scheduled, _payload) = schedule_and_join(&ctx, idx, pid, hops);
+                assert!(scheduled, "every fixtured request must schedule");
+            }
+            sim.thread_names.lock().clone()
+        };
+        let fleet_names = run_arm();
+        assert!(
+            !fleet_names.is_empty() && fleet_names.iter().all(|n| n.starts_with("work-fleet-sim-")),
+            "fleet sims must run on fleet SimDriver seats, got {fleet_names:?}"
+        );
+        let row = apexbot_core::worker_census::snapshot()
+            .into_iter()
+            .find(|e| e.resource == "fleet_simdriver_slots")
+            .expect("fleet SimDriver slots must be census-registered");
+        assert_eq!(row.thread_name, "work-fleet-sim-{n}");
     }
 }

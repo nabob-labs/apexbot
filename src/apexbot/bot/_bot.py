@@ -5,9 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, cast
 
-from alembic.runtime.migration import MigrationContext
-from alembic.script import ScriptDirectory
-
 from apexbot._ffi import Bot as _Engine
 from apexbot._ffi import BotIo
 from apexbot.aerodrome.pools import AerodromeV2Pool
@@ -37,7 +34,7 @@ from apexbot.builders.type_resolution import (
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.config import ApexbotConfig, _init_config
 from apexbot.curve.curve_stableswap_liquidity_pool import CurveStableswapPool
-from apexbot.database.operations import get_alembic_config, get_scoped_sqlite_session
+from apexbot.database.operations import get_scoped_sqlite_session
 from apexbot.database.session_manager import DatabaseSessionManager
 from apexbot.exceptions.base import ApexbotValueError
 from apexbot.exceptions.pool import BrokenPool, TrackerAlreadyInitialized
@@ -57,7 +54,6 @@ from apexbot.uniswap.v3_types import UniswapV3PoolExternalUpdate
 from apexbot.uniswap.v4_liquidity_pool import ProtocolFee, UniswapV4Pool
 from apexbot.uniswap.v4_types import UniswapV4PoolExternalUpdate
 from apexbot.utils.bytes import to_0x_hex, to_bytes
-from apexbot.version import __version__
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -316,9 +312,6 @@ class Bot:
         # register the canonical ``UniswapV2Pool`` for their factories
         # (ADR-005 slice 7 step 4b) — the single V2 builder handles them.
 
-        # Check database migration version
-        self._check_database_version()
-
     def registration_fleet_hosted(self) -> bool:
         """Return the construction-time registration-intake stance (PRG-3/5).
 
@@ -385,29 +378,6 @@ class Bot:
     def provider(self) -> AlloyProvider:
         """The single RPC provider for this Bot's chain."""
         return self._provider
-
-    def _check_database_version(self) -> None:
-        """Warn if the database schema is out of date."""
-        try:
-            with self.db():
-                current_version = MigrationContext.configure(
-                    connection=self.db.connection(),
-                ).get_current_revision()
-        except Exception:  # ruff:ignore[blind-except]
-            return
-
-        latest_version = ScriptDirectory.from_config(
-            config=get_alembic_config(database_path=self.config.database.path),
-        ).get_current_head()
-
-        if current_version is not None and current_version != latest_version:
-            logger.warning(
-                f"The current database revision ({current_version}) does not match the latest "
-                f"({latest_version}) for {__package__} version {__version__}!"
-                "\n"
-                "Database-related features may raise exceptions if you continue. Perform database "
-                "migrations with 'apexbot database upgrade'.",
-            )
 
     @classmethod
     def from_config_file(cls) -> Bot:

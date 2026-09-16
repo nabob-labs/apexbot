@@ -11,22 +11,19 @@ name = "apexbot"
 # normalizes the semver form to PEP 440 (e.g. 0.6.0-alpha.3 -> 0.6.0a3).
 dynamic = ["version"]
 authors = [
-    { name="Nabob Labs" },
+    { name="nabob-labs" },
 ]
 description = "Python + Rust building blocks for Uniswap (V2, V3, V4), Curve V1, Solidly V2, Balancer V2 & Aave V3 arbitrage and liquidation bots on EVM-compatible blockchains"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "alembic ~= 1.19",
-    "click ~= 8.5",
     "pydantic ~= 2.13",
     "pydantic-settings ~= 2.15",
     "sqlalchemy ~= 2.0",
     "tenacity ~= 9.1",
     "tomlkit ~= 0.15",
-    "tqdm ~= 4.70",
 ]
-license = {text = "Apache-2.0"}
+license = {text = "Apache-2.0 license"}
 license-files = ["LICENSE"]
 classifiers = [
     "Programming Language :: Rust",
@@ -40,11 +37,11 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://www.apexcode.com"
-Repository = "https://github.com/nabob-labs/apexbot.git"
+Repository = "https://github.com/nabob-labs/apexbot"
 Tracker = "https://github.com/nabob-labs/apexbot/issues"
 
 [project.scripts]
-apexbot = "apexbot.cli:cli"
+apexbot = "apexbot._cli:main"
 
 [tool.ruff]
 line-length = 100
@@ -179,6 +176,9 @@ allow-star-arg-any = true
 "src/apexbot/uniswap/deployments.py" = [
     "import-outside-top-level",  # lazy import avoids circular dependency (deployment_loader → pool classes → this module)
 ]
+"src/apexbot/logging.py" = [
+    "PLR6301",  # `logging.Formatter.format(self, record)` is the protocol-signature override; the body legitimately ignores `self`
+]
 "src/apexbot/runner/**" = [
     # These rules were carried forward from the ``examples/*`` accommodation the
     # backrun driver was developed under (epic 5TSYKN relocates it un-rewritten).
@@ -229,10 +229,8 @@ testpaths = ["tests", "README.md"]
 norecursedirs = ["archive", ".hypothesis"]
 filterwarnings = [
     "error", # Fail on all warnings by default
-    "ignore::DeprecationWarning:websockets.legacy",
 ]
 markers = [
-    "arbitrum: tests requiring an Arbitrum One mainnet RPC",
     "base: tests requiring a Base mainnet RPC",
     "ethereum: tests requiring an Ethereum mainnet RPC",
     "slow: tests that are too slow for routine local runs (e.g. pathfinding)",
@@ -255,7 +253,6 @@ dev = [
     "ruff",
     "sybil",
     "ty",
-    "vyper",
     "vulture",
 ]
 
@@ -273,7 +270,6 @@ extra-paths = ["examples"]
 # models, enum members referenced dynamically).
 min_confidence = 80
 paths = ["src/apexbot"]
-exclude = ["src/apexbot/migrations"]  # Alembic, retention-gated per ADR-010
 
 [tool.uv]
 exclude-newer = "14 days"
@@ -311,9 +307,3 @@ profile = "dev"
 features = ["pyo3/extension-module", "apexbot-bot/hotpath", "apexbot-bot/hotpath-prometheus", "apexbot-solvers/hotpath", "apexbot-bot/allocator-ctrl", "otel", "mimalloc"]
 python-packages = ["apexbot"]
 
-[tool.alembic]
-# path to migration scripts.
-# this is typically a path given in POSIX (e.g. forward slashes)
-# format, relative to the token %(here)s which refers to the location of this
-# ini file
-script_location = "%(here)s/src/apexbot/migrations"

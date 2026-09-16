@@ -29,8 +29,9 @@ use std::path::Path;
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
+use crate::discovery_read::{fetch_discovery_rows_on_conn, DiscoveryPoolRow};
 use crate::error::DbError;
-use crate::migrate::{ensure_schema, SchemaState};
+use crate::migrate::{auto_heal_enabled, ensure_schema_at_open, SchemaState};
 use crate::read::{fetch_newest_update_block_on_conn, ExchangeFamily};
 use crate::snapshot::{
     fetch_liquidity_map_on_conn, fetch_liquidity_map_v4_on_conn,
@@ -89,21 +90,9 @@ impl SnapshotDb {
     ///
     /// # Errors
     /// [`DbError::Sqlite`] on a connection/PRAGMA/DDL failure,
-    /// [`DbError::AlembicStale`] / [`DbError::UnrecognizedSchema`] for stale
-    /// or unrecognized files.
+    /// [`DbError::UnrecognizedSchema`] for unrecognized files.
     pub fn open(path: &Path) -> Result<(Self, SchemaState), DbError> {
-        let conn = if path == Path::new(":memory:") {
-            Connection::open_in_memory()?
-        } else {
-            Connection::open(path)?
-        };
-        let state = Self::finish_open(&conn)?;
-        Ok((
-            Self {
-                conn: Mutex::new(conn),
-            },
-            state,
-        ))
+        Self::open_with(path)
     }
 
     /// Open an in-memory `SnapshotDb` (for tests). Same open sequence +
@@ -112,8 +101,12 @@ impl SnapshotDb {
     /// # Errors
     /// [`DbError::Sqlite`] on a connection/PRAGMA/DDL failure.
     pub fn open_in_memory() -> Result<(Self, SchemaState), DbError> {
-        let conn = Connection::open_in_memory()?;
-        let state = Self::finish_open(&conn)?;
+        Self::open_with(Path::new(":memory:"))
+    }
+
+    /// Wrap [`Self::finish_open`] in the handle.
+    fn open_with(path: &Path) -> Result<(Self, SchemaState), DbError> {
+        let (conn, state) = Self::finish_open(path)?;
         Ok((
             Self {
                 conn: Mutex::new(conn),
@@ -122,11 +115,23 @@ impl SnapshotDb {
         ))
     }
 
-    /// PRAGMAs + `ensure_schema` + `query_only=on` + `BEGIN`. Mirrors
-    /// `ApexbotDb::finish_open` then issues the held read tx.
-    fn finish_open(conn: &Connection) -> Result<SchemaState, DbError> {
+    /// A raw connection to `path` (`:memory:` supported) with the three
+    /// concurrency PRAGMAs already applied — the factory the ADR-052 D1
+    /// heal-at-open calls for the initial open and the post-heal reopen.
+    fn open_primed(path: &Path) -> Result<Connection, DbError> {
+        let conn = if path == Path::new(":memory:") {
+            Connection::open_in_memory()?
+        } else {
+            Connection::open(path)?
+        };
         conn.execute_batch(PRE_SCHEMA_PRAGMAS)?;
-        let state = ensure_schema(conn)?;
+        Ok(conn)
+    }
+
+    /// PRAGMAs + ADR-052 D1 heal-at-open + `query_only=on` + `BEGIN`. Mirrors
+    /// `ApexbotDb`'s open tail then issues the held read tx.
+    fn finish_open(path: &Path) -> Result<(Connection, SchemaState), DbError> {
+        let (conn, state) = ensure_schema_at_open(path, auto_heal_enabled(), Self::open_primed)?;
         conn.pragma_update(None, "query_only", "on")?;
         // Begin the held deferred read tx. `query_only=on` blocks
         // INSERT/UPDATE/DELETE but NOT transaction control (BEGIN/COMMIT) —
@@ -134,11 +139,8 @@ impl SnapshotDb {
         // established at the first SELECT inside (deferred behavior).
         conn.execute_batch("BEGIN;")?;
         match state {
-            SchemaState::AlembicStale { head, expected } => {
-                Err(DbError::AlembicStale { head, expected })
-            }
             SchemaState::Unrecognized => Err(DbError::UnrecognizedSchema),
-            other => Ok(other),
+            other => Ok((conn, other)),
         }
     }
 
@@ -207,6 +209,17 @@ impl SnapshotDb {
             s_live,
             advanced,
         })
+    }
+
+    /// Read every candidate pool for `chain_id` inside the held deferred read
+    /// transaction — the `build_paths.py` discovery enumeration over ONE
+    /// frozen DB cut (see [`crate::discovery_read`]).
+    ///
+    /// # Errors
+    /// Same error conditions as [`crate::discovery_read::fetch_discovery_rows_on_conn`].
+    pub fn fetch_discovery_rows(&self, chain_id: i64) -> Result<Vec<DiscoveryPoolRow>, DbError> {
+        let conn = self.lock();
+        fetch_discovery_rows_on_conn(&conn, chain_id)
     }
 
     /// Lock the underlying connection (for the `_on_conn` free functions).

@@ -32,20 +32,36 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
                 "APEXBOT_LOG_FMT",
             ][..],
         );
+        // The ADR-043 §4 filter branch: RUST_LOG is the tracing-convention
+        // override (it wins verbatim on every sink; the typed
+        // `telemetry.log_level`/`telemetry.diag` knobs apply otherwise).
+        // Output plumbing, not config (same class as the Python layer's).
+        m.insert("crates/apexbot-bot/src/telemetry.rs", &["RUST_LOG"][..]);
+        // Build scripts: cargo-provided manifest dir + the build-receipt
+        // override (ADR-051 D2 build identity). Compile-time plumbing, not
+        // runtime config.
+        m.insert(
+            "crates/apexbot-cli/build.rs",
+            &["CARGO_MANIFEST_DIR", "APEXBOT_BUILD_NUMBER_FILE"][..],
+        );
         // (2) Dev-test knobs in library code (offline tooling only).
         m.insert(
             "crates/apexbot-bot/src/profiling.rs",
             &["HOTPATH_SHUTDOWN_MS"][..],
         );
+        // 5WCRWZ T7: the CH-hop clamp (and its CLAMP_MARGIN dev-margin
+        // override) moved out of the deleted solver_dispatch.rs onto the
+        // cycle's solve_cycle.rs home. The probe-fixture names below are
+        // already enumerated on the executor_ab_probe entry.
         m.insert(
-            "crates/apexbot-bot/src/arb_engine/solver_dispatch.rs",
-            &[
-                "CLAMP_MARGIN",           // dev wei-margin override (cl-hop clamp lab)
-                "APEXBOT_PROBE_FIXTURE", // offline A/B probe (cfg(test))
-                "APEXBOT_PROBE_NS",      // offline A/B probe (cfg(test))
-                "APEXBOT_PROBE_PASSES",  // offline A/B probe (cfg(test))
-                "CARGO",                  // test-harness re-invocation (cfg(test))
-            ][..],
+            "crates/apexbot-bot/src/arb_engine/solve_cycle.rs",
+            &["CLAMP_MARGIN"][..], // dev wei-margin override (cl-hop clamp lab)
+        );
+        m.insert(
+            // 5WCRWZ T6: the probe fixture loader moved out of solver_dispatch
+            // into its own test-only module (corpus path override, cfg(test)).
+            "crates/apexbot-bot/src/arb_engine/executor_ab_probe.rs",
+            &["APEXBOT_PROBE_FIXTURE"][..],
         );
         m.insert(
             "crates/apexbot-bot/src/arb_engine/epoch_delta_parity.rs",
@@ -73,13 +89,20 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
             ][..],
         );
         m.insert(
-            "crates/apexbot-bot/src/bot_core/event_dispatch.rs",
-            &["APEXBOT_NO_PROGRESS_ABORT_TEST"][..],
-        );
-        m.insert(
             "crates/apexbot-python/src/diagnostics/thread_registry.rs",
             &["APEXBOT_STATE_LOCK_DIAG"][..], // test stance (feature-gated)
         );
+        // (4) The ADR-043 §5 retired-name boot detection: reads the env by
+        // iterating a closed list (`RETIRED_ENV_NAMES`), so the name is
+        // computed at the call site. Detection only — no alias is honored.
+        m.insert("crates/apexbot-core/src/telemetry.rs", &["name"][..]);
+        // (5) The ADR-052 D1 heal-at-open killswitch. A DB-open toggle read at
+        // the open path itself (NOT bot config): a `cargo add apexbot-db`
+        // consumer must be able to pin the pre-D1 posture without a BotConfig,
+        // and the name is a DB-open contract, not a tunable. Unset => heal on;
+        // only an explicit falsey word disables. (The scanner reports the
+        // computed-name const identifier, hence "AUTO_HEAL_ENV".)
+        m.insert("crates/apexbot-db/src/migrate.rs", &["AUTO_HEAL_ENV"][..]);
         m.insert(
             "crates/apexbot-python/build.rs",
             // The build-receipt work (1e1c0ddf7): the build script locates
@@ -200,8 +223,16 @@ fn no_stray_env_reads_outside_the_config_loader() {
         if rel.starts_with("crates/apexbot-config/") {
             continue;
         }
-        // Test-only stances: every tests/ and examples/ directory file.
-        if rel.contains("/tests/") || rel.contains("/examples/") {
+        // Test-only stances: every tests/ and examples/ directory file,
+        // wherever it sits in the tree - a crate-nested `crates/*/tests/`
+        // path OR a workspace-level `examples/`/`tests/` leading component
+        // (e.g. `examples/settlement_bot/`). Matching on path components
+        // rather than a `/tests/` substring keeps the leading-component
+        // case from slipping through.
+        let is_test_or_example = Path::new(rel.as_str())
+            .components()
+            .any(|c| matches!(c.as_os_str().to_str(), Some("tests" | "examples")));
+        if is_test_or_example {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(path) else {

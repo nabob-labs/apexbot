@@ -32,6 +32,7 @@
 //! (affect-cache misses, escalations) rides the injected `EscalationPort`
 //! — never an ambient `Handle`.
 
+use apexbot_core::op_info;
 use std::sync::Arc;
 
 use alloy::primitives::{Bytes, U256};
@@ -110,7 +111,7 @@ fn outputs_vec(req: &InlineSimRequest) -> Vec<u128> {
 
 impl InlineSimHook {
     /// Assemble the hook from the installed `PyO3` context (see
-    /// `PyArbitrageEngine::install_inline_simulator`).
+    /// `PyArbEngine::install_inline_simulator`).
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: Arc<AlloyProvider>,
@@ -409,7 +410,9 @@ impl InlineSimulator for InlineSimHook {
         //    the T2 clamp's read. Unknown/unresolvable hops degrade to `None`
         //    (the batch entry stays payload-less -> the legacy FFI path).
         let path_info = {
-            let core = self.bot_state.read();
+            let core = self
+                .bot_state
+                .read_at(apexbot_bot::bot_core::state_lock::LockSite::Python);
             match apexbot_bot::arb_engine::build_path_info(&core, &req.hops) {
                 Ok(pi) => pi,
                 Err(_) => return None,
@@ -419,7 +422,9 @@ impl InlineSimulator for InlineSimHook {
         // 2. The sim anchor — SHORT core read, dropped before any provider
         //    I/O (ULUWNI discipline).
         let anchor = {
-            let guard = self.bot_state.read();
+            let guard = self
+                .bot_state
+                .read_at(apexbot_bot::bot_core::state_lock::LockSite::Python);
             SimAnchorState::snapshot(&guard)
         };
 
@@ -488,11 +493,11 @@ impl InlineSimulator for InlineSimHook {
         };
         let verify_divergence = reverify || spotcheck;
         if verify_divergence {
-            tracing::info!(
-                target: "apexbot::diag",
+            op_info!(
+                domain = sim,
                 path_id = req.path_id,
                 reason = if reverify { "fail-retry" } else { "spot-check" },
-                "[sim-verify] divergence probe armed (on-demand verification)"
+                "divergence probe armed (on-demand verification)"
             );
         }
         let storage_memo = {
@@ -509,12 +514,12 @@ impl InlineSimulator for InlineSimHook {
                 // + OTel only).
                 let (hits, misses) = guard.1.stats();
                 if hits + misses > 0 {
-                    tracing::info!(
-                        target: "apexbot::diag",
+                    op_info!(
+                        domain = sim,
                         block_number = guard.0,
                         memo.hits = hits,
                         memo.misses = misses,
-                        "[inline-sim] storage memo stats (block retired)"
+                        "storage memo stats (block retired)"
                     );
                 }
                 *guard = (
@@ -831,6 +836,16 @@ mod spawn_span_parent_tests {
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing_subscriber::layer::SubscriberExt;
 
+    /// Install the process-wide subscriber, or report that another test owns
+    /// the slot. `set_global_default` is once-per-process and `cargo test` runs
+    /// these tests in parallel (the `python_log_layer` capture test wants the
+    /// same slot), so the loser must skip rather than panic.
+    fn install_global_or_skip(
+        subscriber: impl tracing::Subscriber + Send + Sync + 'static,
+    ) -> bool {
+        tracing::subscriber::set_global_default(subscriber).is_ok()
+    }
+
     #[test]
     fn sim_task_span_parents_under_the_caller_span() {
         let exporter = InMemorySpanExporter::default();
@@ -846,8 +861,14 @@ mod spawn_span_parent_tests {
         // block_pump header-span test: with_default is thread-local and the
         // spawned task runs on a runtime worker thread). This crate's test
         // binary installs it at most once.
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("global default already set by another test");
+        if !install_global_or_skip(subscriber) {
+            // Another test in this binary holds the process-wide global
+            // subscriber slot, so this test capture was never installed and
+            // any assertion below would read another test buffer. Each test
+            // is verified in isolation: `cargo test -p apexbot_rs --lib
+            // simulation::inline_hook`.
+            return;
+        }
 
         // Scope the solve span so it ENDS before the flush (an exporter only
         // receives closed spans).
@@ -905,8 +926,14 @@ mod spawn_span_parent_tests {
         ));
         let done: Arc<std::sync::atomic::AtomicU64> = Arc::default();
 
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("global default already set by another test");
+        if !install_global_or_skip(subscriber) {
+            // Another test in this binary holds the process-wide global
+            // subscriber slot, so this test capture was never installed and
+            // any assertion below would read another test buffer. Each test
+            // is verified in isolation: `cargo test -p apexbot_rs --lib
+            // simulation::inline_hook`.
+            return;
+        }
 
         {
             let solve = tracing::info_span!("apexbot.arb.solve", block.number = 3u64);

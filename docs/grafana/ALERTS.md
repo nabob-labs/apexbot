@@ -57,6 +57,15 @@ Half of submitted txs never confirming - fee/nonce/pool-contention problem.
       > 0.8
 More than 80% of found profit is being left on the table (unsubmitted).
 
+### Metric cardinality high (ADR-043 §9)
+    expr: apexbot_metric_series > 2000
+    for: 15m
+The `apexbot.metric_series` self-metric reports the live distinct-series
+count from every scrape (it includes its own series, so the floor is 1).
+Ordinary operation sits at a flat floor; a rising line means a label gained
+values — the collector falls over before the dashboards do. Raise the
+threshold deliberately or delete the offending label.
+
 ### Simulate error rate
     expr: sum(rate(apexbot_simulate_verdicts_total{outcome="error"}[10m]))
       / clamp_min(sum(rate(apexbot_simulate_verdicts_total[10m])), 0.001) > 0.1
@@ -93,7 +102,7 @@ shared instruments.
   `docs/grafana/hotpath-profiling.json` dashboard — the enablement and scrape
   recipe is [`HOTPATH.md`](HOTPATH.md).
 - Traces: Jaeger UI, service `apexbot-bot`. Per-block traces root at
-  `apexbot.epoch` (attrs `epoch.block` / `epoch.seq` plus the pre-solve gap
+  `apexbot.epoch.run` (attrs `epoch.block` / `epoch.seq` plus the pre-solve gap
   fields); the ADR-041 stage spans (`apexbot.stage.streaming` / `quiesced` /
   `publish` / `finalize` / `rewind`) and the solve arm nest under it. The
   `apexbot.pump.block` / `pump.log_wait` / `pump.apply_stream` spans are
@@ -155,7 +164,7 @@ Rule inventory (10 rules, 2 groups, 60s evaluation):
   race ends at the Published edge (submission/delivery subscribe there), not
   at solve; the retired drain-era header→solved endpoint no longer owns this
   signal. Triage with the dashboard stage-cycle waterfall (delivery / burst /
-  settle / streaming-age legs) plus a `apexbot.epoch` Jaeger trace.
+  settle / streaming-age legs) plus a `apexbot.epoch.run` Jaeger trace.
 - **ApexbotEpochStaleDrops** - `apexbot_epoch_stale_drops_total` > 0 for
   10m: the I3 rewind-generation fail-fast is dropping stage work as stale
   epochs (the loud warn in `BlockPump::reorg_flying_stale`). Early warning

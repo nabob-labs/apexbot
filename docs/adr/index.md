@@ -59,6 +59,16 @@ The load-bearing decisions behind the two-consumer architecture:
 | [040](ADR-040-per-bucket-failure-reactions.md) | Failure reactions are per-bucket | accepted |
 | [041](ADR-041-block-epoch-pipeline.md) | The block-epoch pipeline — one stage machine over a cheap-read data plane | implemented |
 | [042](ADR-042-role-switching-worker-fleet.md) | One role-switching worker fleet — a bounded, budgeted host for every execution resource | **proposed** |
+| [043](ADR-043-observability-standard.md) | The observability standard — four channels, a level rubric, one target taxonomy | **proposed** |
+| [044](ADR-044-fleet-intake-liveness.md) | Fleet intake liveness — BackstopTick + PostureEdge complete the host transition relation | **accepted** |
+| [045](ADR-045-solve-cycle-extraction.md) | The solve cycle as a deep module — ArbEngine regroups into registry + cycle + config | **accepted** |
+| [046](ADR-046-stage-handlers-pump-control-split.md) | StageHandlers stays the pure product seam; PumpControl is the driver-facing control seam | accepted |
+| [047](ADR-047-retire-subscriber-bus.md) | Retire the ADR-006 D4 subscriber bus — compile is the guard for retired modules | accepted |
+| [048](ADR-048-fleet-boot-registry.md) | Fleet boot registry — one keyed owner for the pooled roles' boot facts | accepted |
+| [049](ADR-049-engine-stage-driver-seam.md) | The engine's interface is one stage seam — the engine recedes to composition machinery | accepted |
+| [050](ADR-050-rust-native-engine-driver.md) | A public `EngineDriver` is the Rust driver seam — the engine stays crate-private behind the one stage seam | accepted |
+| [051](ADR-051-rust-owned-console.md) | The apexbot console is a Rust binary — one command model, an argv passthrough for Python | accepted |
+| [052](ADR-052-db-auto-upgrade-alembic-retirement.md) | The database upgrades itself at open — Alembic retires in-tree ahead of 0.7 | accepted |
 
 Numbering note: ADR-037 was assigned twice (engine mutex sharding; swap-simulation gate) — both kept as filed.
 

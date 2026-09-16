@@ -15,7 +15,7 @@ from apexbot.checksum_cache import get_checksum_address
 from apexbot.exceptions import ApexbotError
 from apexbot.exceptions.pool import ExternalUpdateError
 from apexbot.fork import AnvilFork
-from apexbot.uniswap.v3_libraries import MAX_SQRT_RATIO, MIN_SQRT_RATIO
+from apexbot.uniswap.math import MAX_SQRT_RATIO, MIN_SQRT_RATIO
 from tests.helpers.bot_factory import make_bot_with_provider
 from tests.helpers.contract_compat import make_contract
 

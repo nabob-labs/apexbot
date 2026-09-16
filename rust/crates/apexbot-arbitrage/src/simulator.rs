@@ -30,6 +30,7 @@
 // WETH9, PoolManager, Multicall3, balanceOf, getEthBalance, ERC6909, etc.) are
 // ubiquitous here — match the apexbot-simulation convention.
 #![expect(clippy::doc_markdown)]
+use apexbot_core::{diag, diag_trace, op_info};
 
 use std::collections::BTreeMap;
 
@@ -1137,10 +1138,9 @@ where
     // rather than silently dropping as `encode-failed`.
     if ::apexbot_config::holder::config().aave.bridge_probe {
         if let Some(desc) = scan_for_v4_v2_boundary_bridge(&path.path_info.hops, ctx.weth_address) {
-            tracing::info!(
-                path_id = path.path_id,
+            op_info!(domain = sim, path_id = path.path_id,
                 desc = %desc,
-                "[bridge-probe] V4 native to V2 WETH boundary; 3-hop composer does not encode this"
+                "V4 native to V2 WETH boundary; 3-hop composer does not encode this"
             );
         }
     }
@@ -1307,24 +1307,17 @@ where
         // fall back to the plain `record` (top-level revert data, no deep
         // attribution).
         if let Some(frame) = captured_call_trace.failing_frame() {
-            // Env-gated FULL call-trace dump (2LTKVO / W2UWZO): when a sim
-            // fails, print every frame (depth/target/selector/outcome) so the
-            // exact nested call sequence leading to the failing frame is
-            // attributable against the executor Vyper source — e.g. the
-            // `execute → v3c.swap → callback → v3a.swap → callback →
-            // V4_UNLOCK → unlockCallback → swap → …` chain that ends in a
-            // depth-8 empty-calldata PoolManager Halt.
-            if ::apexbot_config::holder::config().trace.dump_call_trace {
-                #[expect(clippy::print_stderr)] // env-gated diagnostic call-trace dump
-                {
-                    eprintln!(
-                        "[sim-trace] path={} first_fail_call={} full_call_trace\n{}",
-                        path.path_id,
-                        fail_idx,
-                        captured_call_trace.render_debug()
-                    );
-                }
-            }
+            // FULL call-trace dump (2LTKVO / W2UWZO): when a sim fails, emit
+            // every frame (depth/target/selector/outcome) so the exact nested
+            // call sequence leading to the failing frame is attributable
+            // against the executor Vyper source — e.g. the `execute → v3c.swap
+            // → callback → v3a.swap → callback → V4_UNLOCK → unlockCallback →
+            // swap → …` chain that ends in a depth-8 empty-calldata
+            // PoolManager Halt. TRACE on `sim` (forensic).
+            diag_trace!(domain = sim, path_id = path.path_id, first_fail_call = fail_idx,
+                full_call_trace = %captured_call_trace.render_debug(),
+                "[sim-trace]"
+            );
             let frame_revert_data = match &frame.outcome {
                 Some(apexbot_simulation::FrameOutcome::Revert { data, .. }) => data.clone(),
                 _ => alloy::primitives::Bytes::new(),
@@ -1626,26 +1619,8 @@ fn decode_balance(data: &alloy::primitives::Bytes) -> U256 {
 // state-divergence-vs-composer-bug test for `CurrencyNotSettled`. Conservative
 // default ON (a single atomic load per failed path); set `=0` to disable.
 
-// KAHU5W: the reverted-swap diagnostic gate moved onto the typed schema
-// key 'simulation.sim_log_reverted_swaps' (APEXBOT_SIM_LOG_REVERTED_SWAPS);
-// the env-name constant and the generic flag helpers are retired with it.
-
 /// The `[sim-revert-swap]` log prefix — verbatim so log greps return here.
 const SIM_REVERT_SWAP_LOG_PREFIX: &str = "[sim-revert-swap]";
-
-static LOG_REVERTED_SWAPS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// `true` iff the reverted-swap diagnostic is enabled (conservative default
-/// ON via [`flag_default_on`]); cached so the per-failed-path cost is a single
-/// atomic load.
-fn log_reverted_swaps_enabled() -> bool {
-    // KAHU5W: typed schema key `simulation.sim_log_reverted_swaps`.
-    *LOG_REVERTED_SWAPS_ENABLED.get_or_init(|| {
-        ::apexbot_config::holder::config()
-            .simulation
-            .sim_log_reverted_swaps
-    })
-}
 
 /// The positive (output) side of a captured swap's signed amounts — the
 /// amount the swapper RECEIVED (the hop's output). `None` if neither side
@@ -1714,7 +1689,7 @@ fn negative_side_magnitude(
 /// hop 0 (the V4 swap) means the V4 swap diverged (solver calc or engine
 /// state); a match on hop 0 but mismatch on hop 1 means V3 hop B diverged;
 /// all-match-but-still-`CurrencyNotSettled` points at the composer/encoding.
-/// Conservative default ON (`APEXBOT_SIM_LOG_REVERTED_SWAPS`); `=0` to disable.
+/// Conservative default ON (`the reverted-swap diagnostic`); `=0` to disable.
 /// One captured reverted swap attributed to its path hop. Built by
 /// [`match_reverted_swaps_to_hops`] so the log layer formats instead of
 /// re-deriving (and so the attribution is unit-tested independently of the
@@ -1851,11 +1826,12 @@ fn log_reverted_swaps_vs_hop_outputs(
     hops: &[HopInfo],
     hop_outputs: &[u128],
 ) {
-    if !log_reverted_swaps_enabled() || reverted_swaps.is_empty() {
+    if reverted_swaps.is_empty() {
         return;
     }
     let matches = match_reverted_swaps_to_hops(reverted_swaps, hops, hop_outputs);
-    tracing::info!(
+    op_info!(
+        domain = sim,
         path_id,
         reverted_swaps = reverted_swaps.len(),
         hop_outputs = hop_outputs.len(),
@@ -1865,8 +1841,7 @@ fn log_reverted_swaps_vs_hop_outputs(
         let hop_str = m
             .hop_index
             .map_or_else(|| "unmatched".into(), |i| i.to_string());
-        tracing::info!(
-            path_id,
+        diag!(domain = sim, path_id,
             hop = %hop_str,
             emit = m.emit_index,
             family = ?m.family,
@@ -2797,14 +2772,7 @@ mod tests {
 
     #[test]
     fn conservative_flag_default_on_and_parse() {
-        // Conservative default (Z4KQXF): unset ⇒ enabled (HARD/LOUD). The
-        // typed schema default is ON (KAHU5W: loader owns the env read).
-        assert!(
-            ::apexbot_config::holder::config()
-                .simulation
-                .sim_log_reverted_swaps
-        );
-        // The falsey/prase contract now lives in apexbot_config::parse_bool_flag.
+        // The falsey/parse contract lives in apexbot_config::parse_bool_flag.
         assert!(!::apexbot_config::parse_bool_flag("0").unwrap());
         assert!(::apexbot_config::parse_bool_flag("1").unwrap());
         assert!(::apexbot_config::parse_bool_flag("yes").unwrap());

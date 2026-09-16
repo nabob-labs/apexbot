@@ -40,7 +40,7 @@ from apexbot._ffi import Bot
 from apexbot.aerodrome.pools import AerodromeV3Pool
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.fork import AnvilFork
-from apexbot.uniswap.v3_libraries import MAX_SQRT_RATIO, MIN_SQRT_RATIO
+from apexbot.uniswap.math import MAX_SQRT_RATIO, MIN_SQRT_RATIO
 from tests.aerodrome.test_aerodrome_pools import AERODROME_V3_QUOTER_ABI
 from tests.helpers.contract_compat import make_contract
 from tests.helpers.erc20_factory import make_erc20

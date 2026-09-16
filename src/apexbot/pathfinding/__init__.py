@@ -9,14 +9,23 @@ the deep pathfinding logic from :mod:`._pathfinding`. Importers should use::
 rather than reaching into ``apexbot._ffi`` directly.
 """
 
-from apexbot._ffi import build_path_graph, find_paths_rust
+from apexbot._ffi import (
+    build_path_graph,
+    call_blocking_on_ambient_runtime,
+    discovery_batch_size,
+    find_paths_async_rust,
+    find_paths_rust,
+)
 
 from ._pathfinding import PathStep, find_paths, find_paths_async
 
 __all__ = [
     "PathStep",
     "build_path_graph",
+    "call_blocking_on_ambient_runtime",
+    "discovery_batch_size",
     "find_paths",
     "find_paths_async",
+    "find_paths_async_rust",
     "find_paths_rust",
 ]

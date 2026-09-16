@@ -1,184 +1,178 @@
-# Controlling Tracing / Logging
+# Controlling logging, tracing, and telemetry
 
-How to control what the bot writes to stderr / `logs/bot_run.log`, the level at
-which each message appears, and how to dial a noisy diagnostic up or down.
+The operational form of the observability standard; the binding decision record
+is [ADR-043](adr/ADR-043-observability-standard.md). This is the single source
+of truth for what the bot emits, at what level, and how to dial it up or down.
 
-There are two independent knobs that both must allow a record before you see it:
+apexbot has two first-class consumers — the pure-Rust MEV bot and the
+Python-driven bot — so the contract is split between the **core** (which emits
+signals and owns no sink) and the **wiring** (which installs sinks and chooses
+levels).
 
-1. **`RUST_LOG`** — the Rust `tracing` level filter (a `EnvFilter`). Gates the
-   **Rust core's** `tracing::info!` / `tracing::debug!` / `tracing::warn!` /
-   `tracing::error!` / `tracing::trace!` events *before* they reach either
-   sink.
-2. **`APEXBOT_DEBUG`** — the **Python `logging`** level (INFO by default,
-   DEBUG when set). Gates Python-side records and Rust records that *survive*
-   step 1 once they are forwarded into Python `logging`.
+## The four channels
 
-So a Rust `debug!` line requires **both** `RUST_LOG` to include that target at
-`debug` (or above) **and** `APEXBOT_DEBUG=1` (for the Python-forwarded copy).
-The plain `[debug-...]` lines you see on stderr with no timestamp prefix are the
-`fmt`-layer copy, which is controlled by `RUST_LOG` alone.
+| Channel | Consumer | Default | Content |
+| --- | --- | --- | --- |
+| Console log | operator | on | process lifecycle and outcomes |
+| Span (OTel) | investigator | when `telemetry.otel` | per-operation timing + structured context |
+| Metric (Prometheus) | alerting | on | aggregates, low cardinality |
+| Forensic file | repro | opt-in | full-field dumps |
 
----
+A fact is emitted on exactly one channel; it is never restated as a per-event
+INFO line. Any fact that paging depends on is carried by *both* the console and
+a metric, because OTel can be unavailable when it matters.
 
-## The two tunnels (how a Rust record reaches you)
+The Rust core reaches Python `logging` and the stderr `fmt` writer through one
+`tracing` subscriber (`init_logging_subscriber` in
+`rust/crates/apexbot-python/src/python_log_layer.rs`); `log::` records are
+bridged in by `tracing_log::LogTracer`. Prometheus metrics are declared in
+`apexbot-bot/src/instruments.rs`.
 
-When the `apexbot_rs` Python module initializes
-(`init_logging_subscriber` in `crates/apexbot-python/src/python_log_layer.rs`),
-it installs one `tracing_subscriber::Registry` with two layers sharing a
-single `EnvFilter`:
+## Levels
 
-- **`fmt` layer → stderr** — ANSI-colored, `[timestamp] LEVEL target: msg`.
-- **`PythonLogLayer` → Python `logging`** — batches records (lock-free queue,
-  256/batch or 50 ms flush) and forwards them to the Python logger named after
-  the Rust target with `::` → `.` (e.g. `apexbot_bot.bot_core.block_pump`).
-  This is why **every Rust line appears twice** in a teed log: once as the
-  `fmt` stderr line (with timestamp/level) and once as the plain
-  `[prefix] ...` Python copy.
+| Level | Use | Budget |
+| --- | --- | --- |
+| ERROR | abort, integrity loss, shutdown seam; mirrored by a metric | rare |
+| WARN | degraded but continuing: tripwire, quarantine, retry exhaustion, verify failure, posture cordon, auto-recovering seam | O(events) |
+| INFO | process lifecycle and outcomes: one block summary per block, one line per submit decision, per-phase boot/backfill/pump lines | O(1)/block + O(submits) |
+| DEBUG | per-entity detail: per-pool, per-path, per-candidate, per-sim, per-log, phase timing, verify diagnostics | O(entities) |
+| TRACE | per-hop/per-field dumps and raw traces | unbounded (opt-in) |
 
-The `EnvFilter` is:
+The rubric is deliberately asymmetric: if a line is per-pool or per-path, it is
+DEBUG. The console firehose that motivated the standard was per-entity lines
+emitted at INFO.
 
-- `RUST_LOG` if that env var is set;
-- otherwise a default of `info` globally, with a handful of third-party
-  `alloy_*` / `tungstenite` targets throttled to `warn` (they emit routine
-  lifecycle INFO noise that is not apexbot-originated).
+## Targets
 
-Python `logging` base config lives in `src/apexbot/logging.py`. It wires the
-crate-root loggers (`apexbot_bot`, `apexbot_core`, `apexbot_rs`,
-`apexbot_rpc`, `apexbot_decoders`, `apexbot_uniswap`,
-`apexbot_simulation`, `apexbot_arbitrage`) to a stdout
-`QueueHandler`/`QueueListener` pair. Rust records are forwarded to these
-loggers, so the Python side is the **second gate**.
+The closed domain set is `apexbot::state`, `apexbot::path`,
+`apexbot::solver`, `apexbot::sim`, `apexbot::pump`, `apexbot::exec`,
+`apexbot::verify`, `apexbot::ingest`, `apexbot::rpc`, and
+`apexbot::aave`. Every diagnostic is a DEBUG event under its domain; there
+is no separate `diag` target. Engine diagnostics are emitted within an active
+engine span, which is what makes them visible in Jaeger.
 
----
+Span names are `apexbot.<area>.<verb>` and metric names are
+`apexbot.<noun>_<unit>`. The console formatter derives its `[area]` prefix
+from the target, so there is no hand-written tag to keep in sync.
 
-## Quick reference
+## The control surface
 
-| I want to … | Set this |
-|---|---|
-| Raise the Rust core to `debug` everywhere | `RUST_LOG=debug` |
-| Raise the Rust core to `debug` **and** let Python loggers pass `debug` | `RUST_LOG=debug APEXBOT_DEBUG=1` |
-| Keep `info` default but see the fine-grained solver/sim diagnostics | `RUST_LOG=info,apexbot_bot=debug,apexbot_arbitrage=debug` |
-| Silence third-party `alloy`/`tungstenite` entirely | `RUST_LOG=alloy=off,tungstenite=off` (or rely on the built-in `=warn` default) |
-| Get just `warn`/`error` (quietest useful run) | `RUST_LOG=warn` |
-| Disable ALL Rust core logs from the console | `RUST_LOG=off` |
-| Silence the Rust `fmt` stderr copy (single-tunnel logging) | `APEXBOT_LOG_FMT=0` |
+| Knob | Class | Shape |
+| --- | --- | --- |
+| `telemetry.log_level` | behavior | closed enum `off\|error\|warn\|info\|debug\|trace` |
+| `telemetry.diag` | verbosity | validated map `{ domain = "level" }`, ships empty |
+| `telemetry.forensic` | behavior + sink | one capped, rotating file target |
+| `telemetry.otel`, `telemetry.metrics_addr` | behavior | driver wiring |
 
-`RUST_LOG` directives are comma-separated `target=level` pairs, applied
-most-specific-first. `level` is one of `trace`, `debug`, `info`, `warn`,
-`error`, `off`. A bare `RUST_LOG=info` sets the global default; add
-`target=debug` overrides per crate / module. See
+`telemetry.diag` is the **console escalation** knob: it raises named domains
+on the console without touching the OTel side (which already carries
+`apexbot` at `debug`). Keys are validated at config load against the closed
+domain set, so a typo is a boot error naming the offending key and the valid
+set — never a silent no-op. The map is validated even when `RUST_LOG`
+overrides it, with one WARN that it is being ignored.
+
+### Precedence
+
+Precedence is a branch, not an ordering:
+
+1. If `RUST_LOG` is present it is used as-is on every sink, the config log
+   knobs are ignored, and the active source is named once at startup.
+2. Otherwise `telemetry.log_level` + `telemetry.diag` compile into one
+   `EnvFilter` (the console filter).
+3. The OTel spans layer is an independent fixed default,
+   `warn,apexbot=debug`, whenever `telemetry.otel` is on.
+
+`RUST_LOG` is directives of the form `target=level`, comma-separated, applied
+most-specific-first; see
 [`tracing-subscriber`'s EnvFilter docs](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html).
 
----
+## Operator recipes
 
-## Debug-named diagnostics gated at `debug`
+| I want to … | Do this |
+| --- | --- |
+| Quietest useful run (warn/error only) | `RUST_LOG=warn ./run_bot.sh` |
+| Default operator posture | `./run_bot.sh` |
+| Keep `info` but raise one domain on the console | `[telemetry.diag] sim = "debug"` (or the env equivalent) |
+| Full Rust + Python debug | `RUST_LOG=debug APEXBOT_DEBUG=1` then the bot |
+| Just the Rust core at debug | `RUST_LOG=info,apexbot=debug` |
+| Full diagnostic stream in Jaeger only | leave the defaults — the OTel layer already runs `apexbot=debug` |
+| Prometheus scrape | `curl http://127.0.0.1:9464/metrics` (override `telemetry.metrics_addr`) |
+| Jaeger traces | see the [bot-telemetry skill](../.agents/skills/bot-telemetry/SKILL.md) |
 
-The following noisy diagnostics are emitted at `debug` level, so they are
-**invisible under the default `info` filter**. Re-enable them by raising the
-relevant crate to `debug` (`RUST_LOG=apexbot_bot=debug,apexbot_arbitrage=debug`).
-They were historically `info`/`warn` and flooded `bot_run.log` — that spam is
-why they were demoted. They are intentionally **kept in the code**, just gated.
+## The console writer
 
-| prefix | crate target | what it does |
-|---|---|---|
-| `[solver-dbg]` | `apexbot_bot` | solve-entry debug trace (`rebuild_and_solve_affected`, `solve_all`) |
-| `[solver-st]` | `apexbot_bot` | per-path solver pool-state dump for cross-referencing against sim |
-| `[v2-calc-trace]` | `apexbot_arbitrage` | V2 reserves slot-8 read immediately before each path sim |
+**Exactly one console-emitting writer per process** (ADR-043 §6). In the
+Python driver the binding is present, so the Rust→Python bridge
+owned by `logging.py` writes the console and the `fmt` layer is routed to
+`io::sink()`; in a standalone Rust binary the `fmt` layer owns it. A record is
+never written twice — the owner is *derived* from binding-present, not
+switched by an env var.
 
-These are all "leftover debug tracing" — useful when investigating a specific
-mismatch (e.g. the path-11354 / path-142603 fixes), but far too loud to print
-every block by default. To debug one of them, run with the crate set to
-`debug`:
+Every console line is `LEVEL [area] message`, where the area is derived from
+the record's logger name — the closed domain target for bridged Rust records
+(`apexbot::solver` → `solver`), the owning segment for a Python-side record.
+The message itself carries no `[tag]`: a tag would state the routing decision a
+second time and drift from it (ADR-043 §7, enforced by the message sweep in
+`observability_naming.rs`).
 
-```bash
-RUST_LOG=info,apexbot_bot=debug,apexbot_arbitrage=debug APEXBOT_DEBUG=1 \
-    uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py
-```
+The bridge's queue is **bounded** (8192 records): a stalled TTY or full pipe
+cannot stall the per-log pump. A push past the ceiling drops the record and
+counts it as `apexbot.log_dropped_total{sink="console"}`, so the ceiling is
+visible in Prometheus rather than silent.
 
-or, for just the V2 calc trace:
+## Retired verbosity flags
 
-```bash
-RUST_LOG=info,apexbot_arbitrage=debug APEXBOT_DEBUG=1 \
-    uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py
-```
+The former per-diagnostic `APEXBOT_*` env flags are retired (no aliases);
+each maps to a domain and is now a DEBUG event under it. A boot-time WARN
+scans the process environment for any retired name and prints the equivalent
+domain. The mapping and the disposition of the four default-ON streams
+(`verify_dbg`, `v2_calc_trace`, `dump_call_trace`,
+`sim_log_reverted_swaps`) live in
+[ADR-043 §5](adr/ADR-043-observability-standard.md).
 
----
+`APEXBOT_LOG_FMT` is retired with them: the console owner is now derived, so
+the two-tunnel switch has no equivalent knob. Setting it warns at boot.
 
-## Env-gated hard/loud diagnostics (independent of level)
+## Implementation status
 
-Several diagnostics are additionally gated by **dedicated env flags** that work
-*whatever* `RUST_LOG` level is active. Most are **default-ON** (conservative /
-loud) and are disabled by setting the flag to a falsey value (`0`, `false`,
-`off`, `no`, `""`). `APEXBOT_DEBUG` does not affect them — they are checked in
-code, not by the tracing filter.
+The standard is being migrated in five phases (ergo epic `RAYW7I`). Until a
+phase lands, its knob is not yet live; the tables above describe the target
+contract and this section tracks the gap.
 
-| env var | default | gates |
-|---|---|---|
-| `APEXBOT_VERIFY_DBG` | ON | structural verify diagnostics / divergence set |
-| `APEXBOT_DUMP_CALL_TRACE` | ON | full revm call trace on a sim failure |
-| `APEXBOT_V2_CALC_TRACE` | ON | V2 reserves slot-8 read before each sim (see `[v2-calc-trace]` above) |
-| `APEXBOT_SIM_LOG_REVERTED_SWAPS` | ON | per-hop actual-vs-predicted on revert |
-| `APEXBOT_SIM_EXIT_ON_FAIL` | 1 | stop on first sim failure (`=0` for a soak run) |
-| `APEXBOT_WS_COMPLETENESS` | ON | per-block `eth_getLogs` vs WS delivery cross-check (aborts loudly on a live WS drop) |
-| `APEXBOT_DRAIN_DBG` | **OFF** | per-event debug-drain log for a specific pool address (opt-in) |
-| `APEXBOT_TRACE_REGISTER_SEED` | **OFF** | registration-seed trace (opt-in) |
-| `APEXBOT_PUMP_DEBOUNCE_MS` | 50 | publish-debounce window (ms) — last dirty log → settle decision. Invalid/zero/empty falls back to 50. Lower to cut the per-block settle tax (see S7 in `docs/telemetry-latency-playbook.md`); the 2026-09-04 A/B at 15 ms cut ~33 ms/block with no extra solve cycles |
-| `APEXBOT_LOG_FMT` | ON | the stderr `fmt` layer copy of every Rust record. Set falsey (`0`/`off`/`""`) to write the fmt layer to a sink — a driver that tees BOTH stdout and stderr into one file (`run_bot.sh`) then records every apexbot line exactly once via the Python-forwarded copy (halves the run log; drops the ANSI-escaped fmt lines from the file). Set =1 to restore the stderr mirror |
+- **Phase 1** (docs + ADR) — landed.
+- **Phase 2** — telemetry facade + closed domain targets landed.
+- **Phase 3** — landed. Every verbosity key in ADR-043 §5 is retired; the
+  probes are unconditional DEBUG (or TRACE for the forensic dumps) events on
+  their domain, and the per-entity INFO firehose is demoted. Two keys were
+  reclassified from the §5 retire table into the behavior-flag list:
+  `state_lock.trace` and `state_lock.diag` gate diagnostic *collection* cost,
+  not log emission, so they keep their boolean config (the ADR table is
+  corrected accordingly).
+- **Phase 4** — landed: `telemetry.log_level` (closed enum, defaults to the
+  wiring default) and `telemetry.diag` (validated map, ships empty) resolve
+  both record-layer filters through `apexbot_bot::telemetry::resolve_filters`;
+  an explicit `RUST_LOG` is a branch that wins verbatim on every sink (the
+  config knobs are ignored, with one WARN naming the active source). The
+  console writer is single-owner and bounded with its drop counter;
+  `APEXBOT_LOG_FMT` is retired (boot-time WARN). `telemetry.forensic`
+  remains the one unimplemented knob of this phase.
+- **Phase 5** — landed: the naming gate (`apexbot-bot/tests/
+  observability_naming.rs` sweeps production sources; spans are
+  `apexbot.<area>.<verb>`, metrics `apexbot.<area>.<noun>` — the block-epoch
+  root span is now `apexbot.epoch.run`), the message sweep (no `[area]` tag in
+  a production message; the console `_AreaFormatter` derives it from the logger
+  name instead), the metric-cardinality gate
+  (`metric_cardinality.rs`: label names are a closed reviewed allowlist and
+  unbounded-looking names fail outright), and the `apexbot.metric_series`
+  self-metric + `ApexbotMetricCardinalityHigh` alert. Tracked successors for
+  the rest: `ZJUEXH` (behavioral volume gate), `RL7X4C` (golden snapshots for
+  boot / one block / one revert) — both landed; every `[area]` message tag is
+  deleted (147 in `src`, plus tests/examples) and the console prefix is derived
+  (`4QYTPH`).
 
-### INFO-only defaults (log-volume cut OPBD7L)
+## See also
 
-The per-registration `[path] registered` event and the `[bundle] inline
-payload settle` event were demoted to `debug`: on a live run they produced
-~half of a 10 G `logs/bot_run.log` and duplicated detail that is already in
-OTel (the `apexbot.path.register` span / `apexbot.arb.merge` span events —
-the Jaeger record filter is uncapped) and in the Python `[sim]` summary.
-Re-enable a diagnosis with `RUST_LOG=info,apexbot_bot=debug` +
-`APEXBOT_DEBUG=1`. `run_bot.sh` now defaults to INFO-only posture (see its
-header).
-
-`run_bot.sh` documents this set in its header. To run a long-lived soak that
-trades through the routine thin-margin/no-profit reverts (instead of trapping on
-the first one), override the fail-fast:
-
-```bash
-APEXBOT_SIM_EXIT_ON_FAIL=0 ./run_bot.sh
-```
-
----
-
-## Python-side control
-
-- **`APEXBOT_DEBUG=1`** — sets the apexbot + Rust-bridge Python logger levels
-  to `DEBUG` (else `INFO`). This is the Python-side gate that, together with
-  `RUST_LOG`, controls whether Rust `debug!` records reach the Python-forwarded
-  copy.
-- **`APEXBOT_DEBUG_FUNCTION_CALLS=1`** — enables the `@log_function_call`
-  decorator annotations (very noisy; opt-in).
-
----
-
-## Practical example: quiet default vs. deep dive
-
-**Default (quiet):** the shipped defaults give you INFO-level operational logs
-(the `[sim]`, `[solver]`, `[dispatch]` status lines) with the debug diagnostics
-muted and the `alloy`/`tungstenite` lifecycle noise throttled to `warn`:
-
-```bash
-./run_bot.sh
-```
-
-**Deep dive (everything):** full Rust + Python debug, all hard/loud gates
-explicitly on:
-
-```bash
-RUST_LOG=debug APEXBOT_DEBUG=1 \
-    uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py
-```
-
-**Targeted (a single subsystem):** only the V2 calc + solver internals, keeping
-the rest at info:
-
-```bash
-RUST_LOG=info,apexbot_bot=debug,apexbot_arbitrage=debug APEXBOT_DEBUG=1 \
-    uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py
-```
+- [ADR-043](adr/ADR-043-observability-standard.md) — the decision record.
+- [Bot configuration keys](rust-config-keys.md) — the generated key table.
+- [Bot telemetry skill](../.agents/skills/bot-telemetry/SKILL.md) — Jaeger and
+  Prometheus workflows.

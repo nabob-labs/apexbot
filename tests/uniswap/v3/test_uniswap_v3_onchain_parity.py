@@ -54,7 +54,7 @@ from apexbot.checksum_cache import get_checksum_address
 from apexbot.constants import MAX_INT256
 from apexbot.exceptions.pool import IncompleteSwap
 from apexbot.fork import AnvilFork
-from apexbot.uniswap.v3_libraries import MAX_SQRT_RATIO, MIN_SQRT_RATIO
+from apexbot.uniswap.math import MAX_SQRT_RATIO, MIN_SQRT_RATIO
 from apexbot.uniswap.v3_liquidity_pool import UniswapV3Pool
 
 # RPC URI is overridable via tests.env (see ETHEREUM_ARCHIVE_NODE_HTTP_URI);

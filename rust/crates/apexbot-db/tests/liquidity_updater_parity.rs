@@ -88,7 +88,16 @@ fn v4_events() -> Vec<(u64, u64, i32, i32, I256)> {
 
 /// Copy the frozen initial-state fixture DB to a tmp path so the Rust apply
 /// mutates a throwaway, not the committed file. Returns the tmp path.
+/// Pin the ADR-052 D1 heal-at-open killswitch (`APEXBOT_DB_AUTO_HEAL=0`) so
+/// these fixture-backed parity tests keep the historical `LegacyAlembic`
+/// read-only open and never rewrite the committed fixtures.
+fn pin_auto_heal_off() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var(apexbot_db::AUTO_HEAL_ENV, "0"));
+}
+
 fn copy_fixture_to_tmp(src: &str, suffix: &str) -> PathBuf {
+    pin_auto_heal_off();
     let src = PathBuf::from(FIXTURE_DIR).join(src);
     let tmp = std::env::temp_dir().join(format!(
         "apexbot_db_liquidity_updater_parity_{suffix}_{}.db",
@@ -202,7 +211,7 @@ fn expected_for(name: &str) -> Expected {
 fn v3_apply_matches_python_oracle() {
     let tmp = copy_fixture_to_tmp("liquidity_updater_v3_initial.db", "v3");
     let (db, state) = ApexbotDb::open_for_writes(&tmp).unwrap();
-    assert_eq!(state, SchemaState::AlembicCurrent);
+    assert_eq!(state, SchemaState::LegacyAlembic);
 
     let exp = expected_for("liquidity_updater_v3_expected.json");
 
@@ -254,7 +263,7 @@ fn v3_apply_matches_python_oracle() {
 fn v4_apply_matches_python_oracle() {
     let tmp = copy_fixture_to_tmp("liquidity_updater_v4_initial.db", "v4");
     let (db, state) = ApexbotDb::open_for_writes(&tmp).unwrap();
-    assert_eq!(state, SchemaState::AlembicCurrent);
+    assert_eq!(state, SchemaState::LegacyAlembic);
 
     let exp = expected_for("liquidity_updater_v4_expected.json");
 
@@ -386,7 +395,7 @@ fn v3_fork_pool_apply_matches_oracle() {
     // FORK table.
     let tmp = copy_fixture_to_tmp("liquidity_updater_v3_initial.db", "v3fork");
     let (db, state) = ApexbotDb::open_for_writes(&tmp).unwrap();
-    assert_eq!(state, SchemaState::AlembicCurrent);
+    assert_eq!(state, SchemaState::LegacyAlembic);
 
     let exp = expected_for("liquidity_updater_v3_expected.json");
 

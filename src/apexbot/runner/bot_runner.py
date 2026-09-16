@@ -15,7 +15,11 @@ machine requires.
 
 The driver is ``stays-python`` (asyncio loop, SIGINT, deployment policy): it
 controls the Rust engine but owns no pool state (ADR-003: ``Bot`` is the
-single state owner; ADR-006: ``Bot`` is the per-chain orchestrator). It
+single state owner; ADR-006: ``Bot`` is the per-chain orchestrator).
+**Sequencing supersedure (ADR-050, 2026-09-14):** the start/run sequencing
+described here is Rust-owned in ``EngineDriver``; only asyncio/SIGINT/
+deployment policy stays ``stays-python`` — see the RSP-9 sweep in
+``docs/architecture/rust-settlement-bot-parity.md``. It
 delegates path registration to :mod:`~apexbot.runner.build_paths` and the
 main loop to :mod:`~apexbot.runner.consume`.
 
@@ -796,39 +800,36 @@ class BotRunner:
             f"Entering main loop.",
         )
 
-    async def _pump_finished_watchdog(self) -> bool:
-        """Poll the Rust pump task; when it finishes outside ``stop()``, shut down.
+    async def _pump_finished_watchdog(self) -> None:
+        """Await the Rust pump's completion event, then cancel the consumer.
 
         The hotpath timed exit (``HOTPATH_SHUTDOWN_MS``) makes the pump return
-        normally after writing its report. Without a watcher the runner's idle
-        consumer task keeps the process alive forever on a dead engine —
+        normally after writing its report. Without this watcher the runner's
+        idle consumer task keeps the process alive forever on a dead engine —
         ``run_bot.sh`` then reports "running" while nothing progresses (the
         post-unwind wedge: gil-probe idle for minutes after the pump exited).
-        Join-handle completion also covers a pump panic, so this doubles as a
-        panic fail-safe. Injected/test engines that lack ``pump_finished``
-        simply get no watchdog (no behavioral change on those paths).
+        The completion surface also fires on a pump panic (the pump task owns
+        the channel's only sender; unwinding drops it), so this doubles as a
+        panic fail-safe.
 
-        Returns True when a real pump finished outside stop() (the consumer was
-        cancelled here), False when there is no pump-finished surface at all —
-        callers must NOT treat False as "pump ended", or an injected/fake-engine
-        session deadlocks awaiting a consumer nobody cancelled (the fail-fast
-        channel must still own that path).
+        The await is the real Rust-backed completion future for every engine —
+        there is no injected-engine/no-surface bypass: test doubles satisfy the
+        same awaitable contract (a fake pump that never finishes parks here
+        forever, which is exactly the pre-finish consumer shape).
+
+        Returns once the pump finished; the consumer was cancelled here, so the
+        session watch observes the pump end as ``WatchdogTripped``.
         """
-        engine = self.engine_registry.engine if self.engine_registry is not None else None
-        pump_finished = getattr(engine, "pump_finished", None) if engine is not None else None
-        if pump_finished is None:
-            return False
-        while True:
-            await asyncio.sleep(0.5)
-            if pump_finished():
-                bot_logger.warning(
-                    "[shutdown] pump task completed outside stop() — "
-                    "cancelling the consumer for a graceful teardown"
-                )
-                main_task = self._result_consumer_task
-                if main_task is not None and not main_task.done():
-                    main_task.cancel()
-                return True
+        registry = self.engine_registry
+        assert registry is not None
+        await registry.engine.pump_finished_future()
+        bot_logger.warning(
+            "[shutdown] pump task completed outside stop() — "
+            "cancelling the consumer for a graceful teardown"
+        )
+        main_task = self._result_consumer_task
+        if main_task is not None and not main_task.done():
+            main_task.cancel()
 
     # ── Actor builders (production path — only used when not injected) ──
     @staticmethod
@@ -980,12 +981,21 @@ class BotRunner:
         self._phase = _Phase.CLOSED
         registry = getattr(self, "engine_registry", None)
         engine = getattr(registry, "engine", None) if registry is not None else None
-        if engine is None:
-            return
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception as exc:
+                bot_logger.warning(f"[shutdown] engine.stop() failed: {exc!r}")
+        # ADR-043 §6: flush the telemetry providers BEFORE this runner — and
+        # the Rust core's tokio runtime behind it — is torn down. An OTLP batch
+        # flushed after runtime teardown exports nothing, so the tail of a run
+        # would be silently lost. None-safe when telemetry is off.
         try:
-            engine.stop()
+            from apexbot.telemetry import flush_telemetry as _flush_telemetry
+
+            _flush_telemetry()
         except Exception as exc:
-            bot_logger.warning(f"[shutdown] engine.stop() failed: {exc!r}")
+            bot_logger.debug(f"[shutdown] telemetry flush failed: {exc!r}")
 
 
 # get_snapshots

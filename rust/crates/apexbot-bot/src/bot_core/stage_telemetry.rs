@@ -42,6 +42,7 @@
 //! — per-epoch context rides the SPANS, not the histograms; the instruments
 //! file's closed-set label law forbids unbounded epoch labels on metrics.
 
+use apexbot_core::op_warn;
 use std::time::{Duration, Instant};
 
 use tracing::Span;
@@ -259,12 +260,13 @@ impl StageTelemetry {
             );
             open.span.record("queue.force_closed", true);
         }
-        tracing::warn!(
+        op_warn!(
+            domain = state,
             stage = kind.slug(),
             epoch.block = epoch.block(),
             epoch.seq = epoch.seq(),
             stall_secs = age.as_secs(),
-            "[pump] stage interval expired without a transition; stage span force-closed"
+            "stage interval expired without a transition; stage span force-closed"
         );
         if kind == OpenKind::Rewind {
             self.rewind_opened_at = None;
@@ -490,7 +492,7 @@ mod otel_tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let mut tel = StageTelemetry::new();
-        let root = tracing::info_span!("apexbot.epoch", epoch.block = 100u64);
+        let root = tracing::info_span!("apexbot.epoch.run", epoch.block = 100u64);
         tel.on_first_log(&root, Epoch::at(100));
         // Age the interval past the max age, then run the force-close.
         if let Some(open) = tel.open.as_mut() {

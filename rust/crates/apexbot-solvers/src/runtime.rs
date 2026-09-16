@@ -41,8 +41,6 @@ pub struct SolveRuntimeConfig {
     pub memo_on: bool,
     /// APEXBOT_SOLVER_WALK_MEMO_STATS (recomposition census).
     pub memo_stats: bool,
-    /// APEXBOT_GATE_TRACE: opt-in compose tracing in the profit envelope.
-    pub gate_trace: bool,
 }
 
 impl Default for SolveRuntimeConfig {
@@ -55,7 +53,6 @@ impl Default for SolveRuntimeConfig {
             sampled_compose_lines: 48,
             memo_on: false,
             memo_stats: false,
-            gate_trace: false,
         }
     }
 }

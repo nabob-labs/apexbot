@@ -41,11 +41,12 @@
 //! update_block=N` — the served engine word, the RPC fallback value, the
 //! XOR delta (which bits differ), and the engine's `update_block` (the lag
 //! signal). Independent of the divergence-observation gate
-//! (`APEXBOT_SIM_DIVERGENCE_LOG`): serving is a behavior change, observation
+//! (`the sim-divergence probe`): serving is a behavior change, observation
 //! is not; both can be on together (dev) — the two log prefixes are distinct.
 
 #![cfg_attr(test, allow(clippy::unreadable_literal))]
 
+use apexbot_core::op_info;
 use std::sync::OnceLock;
 
 use alloy::primitives::{Address, U256};
@@ -126,8 +127,7 @@ pub fn serve_tracked_slot(
     let probe = anchor.probe_tracked_storage_slot(address, index)?;
     let served = U256::from_be_bytes(probe.engine_word.0);
     let delta_xor = served ^ rpc_value;
-    tracing::info!(
-        pool_addr = %format!("{address:?}"),
+    op_info!(domain = sim, pool_addr = %format!("{address:?}"),
         slot = %index,
         kind = ?probe.kind,
         served = %hex_padded_u256(served),
@@ -236,6 +236,12 @@ mod tests {
     #[test]
     fn serve_returns_engine_v2_reserves_when_gate_on() {
         let _g = SERVE_TEST_GUARD.lock().unwrap();
+        // A tracked V2-reserves read below bumps the process-global divergence
+        // tally; hold the crate-wide probe guard so the probe module's absolute
+        // counts cannot be raced from this sibling module.
+        let _tally = crate::sim::evm::divergence_probe::TALLY_TEST_GUARD
+            .lock()
+            .unwrap();
         let core = v2_bot_state(1_000_000, 2_000_000, 18_012_345);
         let anchor = SimAnchorState::snapshot(&core);
         // The fallback returns a DIFFERENT reserves value — simulating a
@@ -267,6 +273,12 @@ mod tests {
     #[test]
     fn serve_falls_through_to_rpc_when_gate_off() {
         let _g = SERVE_TEST_GUARD.lock().unwrap();
+        // A tracked V2-reserves read below bumps the process-global divergence
+        // tally; hold the crate-wide probe guard so the probe module's absolute
+        // counts cannot be raced from this sibling module.
+        let _tally = crate::sim::evm::divergence_probe::TALLY_TEST_GUARD
+            .lock()
+            .unwrap();
         let core = v2_bot_state(1_000_000, 2_000_000, 18_012_345);
         let anchor = SimAnchorState::snapshot(&core);
         // The fallback returns a DIFFERENT value; with serving OFF the sim
@@ -288,6 +300,12 @@ mod tests {
     #[test]
     fn serve_falls_through_for_untracked_slot() {
         let _g = SERVE_TEST_GUARD.lock().unwrap();
+        // A tracked V2-reserves read below bumps the process-global divergence
+        // tally; hold the crate-wide probe guard so the probe module's absolute
+        // counts cannot be raced from this sibling module.
+        let _tally = crate::sim::evm::divergence_probe::TALLY_TEST_GUARD
+            .lock()
+            .unwrap();
         let core = v2_bot_state(1_000_000, 2_000_000, 18_012_345);
         let anchor = SimAnchorState::snapshot(&core);
         // Slot 6 (price0CumulativeLast) is NOT tracked by the engine → even
@@ -312,6 +330,12 @@ mod tests {
     #[test]
     fn serve_falls_through_for_unregistered_address() {
         let _g = SERVE_TEST_GUARD.lock().unwrap();
+        // A tracked V2-reserves read below bumps the process-global divergence
+        // tally; hold the crate-wide probe guard so the probe module's absolute
+        // counts cannot be raced from this sibling module.
+        let _tally = crate::sim::evm::divergence_probe::TALLY_TEST_GUARD
+            .lock()
+            .unwrap();
         let core = v2_bot_state(1_000_000, 2_000_000, 18_012_345);
         let anchor = SimAnchorState::snapshot(&core);
         let unknown = address!("1111111111111111111111111111111111111111");
@@ -334,6 +358,12 @@ mod tests {
     #[test]
     fn serve_v2_reserves_zeroes_timestamp_bits() {
         let _g = SERVE_TEST_GUARD.lock().unwrap();
+        // A tracked V2-reserves read below bumps the process-global divergence
+        // tally; hold the crate-wide probe guard so the probe module's absolute
+        // counts cannot be raced from this sibling module.
+        let _tally = crate::sim::evm::divergence_probe::TALLY_TEST_GUARD
+            .lock()
+            .unwrap();
         // The engine does NOT track blockTimestampLast (high 32 bits). The
         // served word MUST have those bits zeroed (the sim's swap callback
         // does not read the timestamp; a stale/racy ts served from the engine

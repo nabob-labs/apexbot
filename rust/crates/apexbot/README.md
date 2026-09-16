@@ -7,10 +7,10 @@ The umbrella for the standalone Rust core: one `cargo add apexbot` gives a pure-
 ## Usage
 
 ```toml
-apexbot = "0.6.0-alpha.5"
+apexbot = "0.6"
 ```
 
-Or: `cargo add apexbot` (the pre-release version must be pinned explicitly, e.g. "0.6.0-alpha.5").
+Or: `cargo add apexbot` (pre-release versions must be pinned explicitly, e.g. "0.6.0-alpha.5").
 
 ## Quickstart
 

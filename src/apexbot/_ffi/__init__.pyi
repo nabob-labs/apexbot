@@ -7,7 +7,7 @@ This module provides high-performance implementations of common operations used 
 Python package.
 """
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any, overload
 
 from apexbot.types.chain import HexAddress
@@ -59,7 +59,6 @@ from . import simulation as simulation
 from . import solady as solady
 from . import solidly_math as solidly_math
 from . import submission as submission
-from . import subscriber as subscriber
 from . import v2_math as v2_math
 from .db import (
     ExchangeRow,
@@ -133,8 +132,63 @@ def call_on_ambient_runtime(fn: object) -> object:
 
     """
 
+def call_blocking_on_ambient_runtime[T](fn: Callable[[], T]) -> Awaitable[T]:
+    """Run ``fn()`` on the shared runtime's blocking pool and await its result.
+
+    The async sibling of :func:`call_on_ambient_runtime` for a *blocking*
+    prep step (FYZMAF): the callable runs on a ``tokio`` blocking thread
+    (entering the shared runtime there) while the asyncio loop keeps pumping
+    other coroutines, and the result (or exception) is delivered to the
+    awaiting coroutine. Use it to keep a synchronous prep/read off the event
+    loop.
+
+    Args:
+        fn: A zero-argument callable; its return value (or exception) is
+            passed through unchanged.
+
+    Returns:
+        An awaitable resolving with whatever ``fn`` returns.
+
+    """
+
 def build_fingerprint() -> str: ...
 def build_number() -> int: ...
+def cli_main(args: list[str]) -> int:
+    """Run the Rust-owned apexbot console with ``args`` (``sys.argv[1:]``).
+
+    ADR-051 D3: the Python console script is a passthrough. ``args`` is parsed
+    by the SAME clap tree the ``apexbot`` binary uses and executed by the
+    clap-free semantics core, so both entry surfaces share one command model.
+    The GIL is released for the whole run. Returns the process exit code:
+    clap owns ``--help``/``--version``/usage codes, a refused typed config is
+    ``2``, and every command maps through the single typed error site
+    (including the fleet boot refusal, ``EX_CONFIG`` 78).
+
+    Args:
+        args: the console argv, verbatim (without the program name).
+
+    Returns:
+        The process exit code.
+
+    """
+
+def discovery_batch_size() -> int:
+    """Return the typed `pathfinding.discovery_batch_size` (4IOEVT).
+
+    Env name `APEXBOT_DISCOVERY_BATCH_SIZE`, default 1000, positive-clamped
+    to `>= 1`. Read from the process-wide installed `BotConfig` (the loader
+    is the only env reader). The Python discovery pipeline forwards this to
+    `find_paths_async`.
+    """
+
+def verification_retry_policy_defaults() -> tuple[int, float, float, float]:
+    """Return the shared core verification-retry policy defaults (6LC4JB).
+
+    Returns ``(max_attempts, base_delay, max_delay, jitter)``, in seconds for
+    the float fields, read from ``apexbot_core::retry::RetryPolicy`` — the one
+    declaration site the Python ``VerificationRetryPolicy`` dataclass uses.
+    """
+
 def runtime_status() -> dict[str, Any]:
     """FF-T5 (NT7HJC): the runtime fleet status.
 
@@ -168,6 +222,29 @@ def find_paths_rust(
 class PathIterator:
     def __iter__(self) -> PathIterator: ...
     def __next__(self) -> list[tuple[int, int]]: ...
+
+def find_paths_async_rust(
+    edges: list[tuple[int, int, int, int]],
+    start_token_id: int,
+    end_token_id: int,
+    min_depth: int,
+    max_depth: int | None,
+    include_reverse: bool,
+    pool_type_per_depth: list[set[int] | None] | None = ...,
+    batch_size: int = ...,
+) -> PathBatchIterator: ...
+
+class PathBatchIterator:
+    """A batched async iterator over the lazy arbitrage DFS (4IOEVT).
+
+    Each `__anext__` returns up to `batch_size` paths as
+    `list[list[tuple[int, int]]]` and raises `StopAsyncIteration` at
+    exhaustion. Dropping the iterator sets its cooperative cancel flag, so an
+    abandoned sweep releases a mid-search Rust DFS promptly.
+    """
+
+    def __aiter__(self) -> PathBatchIterator: ...
+    def __anext__(self) -> Awaitable[list[list[tuple[int, int]]]]: ...
 
 # A plain ``str`` holding an EIP-55 checksummed 20-byte hex address
 # (``0x`` + 40 chars with the correct checksum casing). Rust FFI entry
@@ -310,8 +387,6 @@ class LiquidityPool:
     @property
     def balancer_pow_version(self) -> int: ...
     def get_balancer_tokens(self) -> list[Erc20Token] | None: ...
-    @property
-    def dex_name(self) -> str | None: ...
     @property
     def aerodrome_stable(self) -> bool: ...
     @property
@@ -673,6 +748,7 @@ class Bot:
         The driver reads this ONCE at pipeline construction.
         """
 
+    def record_registration_skip(self, reason: str) -> None: ...
     def submit_registration_unit(self, fn: object) -> IntakeReceipt:
         """Submit one pool-build callable to the fleet intake (PRG-3).
 
@@ -811,6 +887,23 @@ class Bot:
         stable_swap: bool = False,
         fee_denominator: int | None = None,
     ) -> int: ...
+    def register_v2_pool_test_only(
+        self,
+        address: str,
+        token0: str,
+        token1: str,
+        reserve0: int,
+        reserve1: int,
+        gamma_numer0: int,
+        fee_denom0: int,
+        gamma_numer1: int,
+        fee_denom1: int,
+        factory: str,
+        update_block: int,
+        variant: str,
+        stable_swap: bool,
+        fee_denominator: int | None,
+    ) -> int: ...
     def build_v2_pool(
         self, address: str, block: int | None = None
     ) -> tuple[int, str, str, str, str]: ...
@@ -883,6 +976,15 @@ class Bot:
     ) -> None: ...
     def calculate_tokens_out(self, pool_id: int, zero_for_one: bool, amount_in: int) -> int: ...
     def calculate_tokens_in(self, pool_id: int, zero_for_one: bool, amount_out: int) -> int: ...
+    def curve_get_dy(
+        self,
+        pool_id: int,
+        i: int,
+        j: int,
+        dx: int,
+        block_number: int,
+        override_balances: list[int] | None = None,
+    ) -> int: ...
     def pool_count(self) -> int: ...
     def chain_id(self) -> int: ...
     def dispatch_log(
@@ -893,6 +995,7 @@ class Bot:
         block_number: int = 0,
     ) -> None: ...
     def get_pool(self, pool_id: int) -> LiquidityPool | None: ...
+    def py_pool(self, pool_id: int) -> Pool | None: ...
     def unregister_pool(self, address: str, pool_id: bytes | None = None) -> bool: ...
     def register_v3_pool(
         self,
@@ -962,17 +1065,6 @@ class Bot:
         pool_id_hex: str,
         snapshot_block: int | None,
     ) -> Coroutine[Any, Any, None]: ...
-    def run_v3_registration_lifecycle_sync(
-        self,
-        address: str,
-        snapshot_block: int | None,
-    ) -> None: ...
-    def run_v4_registration_lifecycle_sync(
-        self,
-        pool_manager_address: str,
-        pool_id_hex: str,
-        snapshot_block: int | None,
-    ) -> None: ...
     def register_curve_pool(
         self,
         address: str,
@@ -1121,6 +1213,9 @@ class ArbitrageEngine:
     def subscribe(self, rpc_url: str) -> int: ...
     def resume(self) -> None: ...
     def stop(self) -> None: ...
+    # Resolves when the pump task stops (cooperative exit, stream end,
+    # abort, or panic) — the awaitable replacement for polling pump_finished.
+    def pump_finished_future(self) -> Coroutine[Any, Any, None]: ...
     def last_processed_block(self) -> int | None: ...
     def set_last_processed_block(self, block: int) -> None: ...
 
@@ -1302,6 +1397,15 @@ class BootRefused(RuntimeError):
     ``isinstance`` for the fail-fast path.
     """
 
+class FleetIntakeFaultedError(RuntimeError):
+    """The fleet registration intake faulted (spike S2 / VXP27K).
+
+    Raised when the sticky lane-death latch resolves held intake units
+    terminally: every waiting receipt stops parking and surfaces this typed
+    error instead. Sticky until a fresh process; subclasses
+    ``RuntimeError`` so broad handlers keep working.
+    """
+
 class PathRegistryFullError(ValueError):
     """The engine path registry is at its configured registered-path cap.
 
@@ -1417,6 +1521,7 @@ class Pool:
     def identity(self) -> tuple[str, str | None]: ...
     @property
     def dex_name(self) -> str | None: ...
+    def calculate_tokens_out(self, zero_for_one: bool, amount_in: int) -> int | None: ...
     def reserve_pair(self) -> ReservePairView: ...
     def concentrated_liquidity(self) -> ConcentratedLiquidityView: ...
     def balance_vector(self) -> BalanceVectorView: ...
@@ -1464,15 +1569,14 @@ class BalanceVectorView:
 # ------------------------------------------------------------------
 # Drainer lifecycle pyfunctions (top-level, module-lifecycle). Registered
 # outside c_api::register: shutdown_log_drainer by the tracing log layer
-# (python_log_layer::register_pyfunction, called from the module init)
-# and shutdown_subscriber_drainer by the pub/sub subscriber seam.
-# Both are idempotent; call before interpreter finalization.
+# (python_log_layer::register_pyfunction, called from the module init).
+# The drainer is idempotent; call before interpreter finalization.
 # ------------------------------------------------------------------
 def shutdown_log_drainer() -> None:
     """Flush + stop the batched Python log drainer thread (idempotent)."""
 
-def shutdown_subscriber_drainer() -> None:
-    """Stop the pool-state subscriber drainer thread (idempotent)."""
+def flush_telemetry() -> None:
+    """Flush telemetry providers (spans + metrics) before teardown (ADR-043)."""
 
 # ------------------------------------------------------------------
 # Simulation seam (per-block profitability pipeline)
@@ -1515,6 +1619,7 @@ __all__ = [
     "HighFeePoolRejectedError",
     "HookedPoolRejectedError",
     "LiquidityPool",
+    "PathBatchIterator",
     "PathIterator",
     "Pool",
     "PoolAlreadyRegisteredError",
@@ -1531,6 +1636,7 @@ __all__ = [
     "build_number",
     "build_path_graph",
     "cancel",
+    "cli_main",
     "compute_aerodrome_v2_pool_address",
     "compute_aerodrome_v3_pool_address",
     "concentrated_liquidity_math",
@@ -1541,22 +1647,24 @@ __all__ = [
     "deployments",
     "dex_identity",
     "diagnostics",
+    "discovery_batch_size",
     "execution",
     "executor",
+    "find_paths_async_rust",
     "find_paths_rust",
     "fleet",
+    "flush_telemetry",
     "fork",
     "pool",
     "price",
     "provider",
     "runtime_status",
     "shutdown_log_drainer",
-    "shutdown_subscriber_drainer",
     "simulation",
     "solady",
     "solidly_math",
     "solve_balancer_weighted_basket",
     "submission",
-    "subscriber",
     "to_checksum_address",
+    "verification_retry_policy_defaults",
 ]

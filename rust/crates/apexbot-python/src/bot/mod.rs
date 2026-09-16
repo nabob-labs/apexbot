@@ -4,6 +4,8 @@
 //! relocates the other `bot` / `bot::pool` wrappers alongside.
 //! (ergo UG6FKN task WXHGOH.)
 
+use apexbot_core::diag;
+use apexbot_core::op_warn;
 pub mod build_flights;
 pub mod deployments;
 pub mod dex_identity;
@@ -12,7 +14,6 @@ pub mod intake;
 pub mod pool;
 pub mod pump;
 pub mod py_bot_io;
-pub mod subscriber;
 #[cfg(feature = "auto-initialize")]
 pub mod test_gil;
 pub mod token;
@@ -68,7 +69,7 @@ use pyo3::Bound;
 /// `alloy::rpc::types::Log` the `BlockPump` feeds `Bot::dispatch_log`. Hex
 /// strings accept an optional `0x` prefix. This is the marshalling seam for
 /// the Python-facing `dispatch_log` (ADR-006, deferred §17 closure): it lets
-/// an offline test drive the full pump→dispatch→notify→solve loop without a
+/// an offline test drive the full pump→dispatch→solve loop without a
 /// live WS node, reusing the existing pure-logic dispatcher untouched.
 fn build_rpc_log(
     address: &str,
@@ -128,7 +129,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// Python constructs a `PyBot` (or receives a shared handle), registers
 /// pools/tokens, then reads results. `PyBot` owns a [`Bot`] via `Arc` and hands
 /// out clones of its shared `Arc<RwLock<BotState>>` (`state_arc`) so
-/// `PyLiquidityPool` / `PyErc20Token` / `ArbitrageEngine` all reach ONE
+/// `PyLiquidityPool` / `PyErc20Token` / the engine wrapper all reach ONE
 /// Rust-owned `BotState`; `BlockPump` clones the same `Arc<Bot>` so its
 /// `dispatch_log` writes flow through to the engine's reads (N handles → one
 /// state — the Polars three-layer invariant, preserved + generalized by D4).
@@ -136,7 +137,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 pub struct PyBot {
     bot: Arc<Bot>,
     /// ADR-006 D4 (T3): the pump lifecycle state, shared with the
-    /// `PyArbitrageEngine` this bot owns. `None` until an engine is
+    /// `PyArbEngine` this bot owns. `None` until an engine is
     /// constructed against this bot (the engine attaches its `Arc<PumpState>`
     /// back here during `new()`). Once attached, the three pump methods —
     /// `subscribe`, `backfill_from_snapshot`, `resume` — are drivable from
@@ -190,7 +191,7 @@ impl PyBot {
             // thread's last_span for the pymethod name.
             note_state_intent("with_state", StateLockMode::Read, StateLockPhase::Wants);
             // T1-scan-exempt: sanctioned accessor — guard inside py.detach by definition.
-            let guard = core.read();
+            let guard = core.read_at(apexbot_bot::bot_core::state_lock::LockSite::Python);
             let _intent = StateIntentGuard::held("with_state", StateLockMode::Read);
             f(&guard)
         })
@@ -214,7 +215,7 @@ impl PyBot {
                 StateLockPhase::Wants,
             );
             // T1-scan-exempt: sanctioned accessor — guard inside py.detach by definition.
-            let mut guard = core.write();
+            let mut guard = core.write_at(apexbot_bot::bot_core::state_lock::LockSite::Python);
             let _intent = StateIntentGuard::held("with_state_mut", StateLockMode::Write);
             f(&mut guard)
         })
@@ -456,8 +457,8 @@ impl PyBot {
     }
 
     /// ADR-006 D4 (T3): attach the pump lifecycle state owned by a
-    /// `PyArbitrageEngine` constructed against this bot. Called from
-    /// `PyArbitrageEngine::new` when `py_bot` is supplied. After this, the
+    /// `PyArbEngine` constructed against this bot. Called from
+    /// `PyArbEngine::new` when `py_bot` is supplied. After this, the
     /// pump methods on `PyBot` drive the same `PumpState` the engine reads.
     pub(crate) fn attach_pump_state(&self, pump: Arc<crate::bot::pump::PumpState>) {
         *self.pump.lock() = Some(pump);
@@ -469,7 +470,7 @@ impl PyBot {
     fn pump_state(&self) -> PyResult<Arc<crate::bot::pump::PumpState>> {
         self.pump.lock().clone().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
-                "No engine attached to this Bot. Construct a ArbitrageEngine(py_bot=...) \
+                "No engine attached to this Bot. Construct an engine against it (py_bot=...) \
                  before calling pump lifecycle methods on Bot.",
             )
         })
@@ -527,7 +528,7 @@ impl PyBot {
     ///
     /// ADR-027 completion (ergo 6VGMLY): the block-clock pipe is
     /// coordinator-owned, so this method lives on `PyBot` (the pump-lifecycle
-    /// handle) — NOT on `ArbitrageEngine`, which is out of the block path
+    /// handle) — NOT on the engine wrapper, which is out of the block path
     /// entirely. The receiver is born on the shared `PumpState` beside the
     /// pipe's sender and is handed out exactly once.
     ///
@@ -550,7 +551,7 @@ impl PyBot {
                 Some(p) => p.clone(),
                 None => {
                     return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "no pump state: construct an ArbitrageEngine against this Bot first",
+                        "no pump state: construct an engine against this Bot first",
                     ))
                 }
             }
@@ -642,7 +643,8 @@ impl PyBot {
                         .close_with_canary(s_snapshot, chain)
                         .map_err(|e| crate::db::db_err_to_py(&e))?;
                     if report.advanced {
-                        tracing::warn!(
+                        op_warn!(
+                            domain = state,
                             s_snapshot = report.s_snapshot.unwrap_or(0),
                             s_live = report.s_live.unwrap_or(0),
                             "DB advanced during startup — operator discipline violation"
@@ -715,8 +717,7 @@ impl PyBot {
                 match py.detach(|| apexbot_db::ApexbotDb::open_for_writes(&path_buf)) {
                     Ok((db, _state)) => std::sync::Arc::new(ApexbotDbConstruction::new(db)),
                     Err(e) => {
-                        tracing::debug!(
-                            path = %path,
+                        diag!(domain = state, path = %path,
                             %e,
                             "Construction-I/O DB open failed; falling back to NoDb"
                         );
@@ -760,7 +761,7 @@ impl PyBot {
     /// Subscribe to the WS `newHeads` + logs streams (ADR-006 D4 T3).
     ///
     /// The Bot-owned pump entry point — delegates to the shared `PumpState`
-    /// attached when a `ArbitrageEngine` was constructed against this bot.
+    /// attached when an engine wrapper was constructed against this bot.
     /// Blocks (sync, via the shared tokio runtime) until the first block is
     /// observed, then returns the first WS block number (the backfill target).
     ///
@@ -821,7 +822,7 @@ impl PyBot {
     fn run_v3_registration_lifecycle<'py>(
         &self,
         py: Python<'py>,
-        address: String,
+        address: &str,
         snapshot_block: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.pump_state()?
@@ -835,8 +836,8 @@ impl PyBot {
     fn run_v4_registration_lifecycle<'py>(
         &self,
         py: Python<'py>,
-        pool_manager_address: String,
-        pool_id_hex: String,
+        pool_manager_address: &str,
+        pool_id_hex: &str,
         snapshot_block: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.pump_state()?.run_v4_registration_lifecycle(
@@ -1627,7 +1628,7 @@ impl PyBot {
         // T1-scan-exempt: test-only seam (pure-Rust test callers, no GIL held).
         self.bot
             .state_arc()
-            .write()
+            .write_at(apexbot_bot::bot_core::state_lock::LockSite::Python)
             .register_v2_pool(&RegisterV2PoolParams {
                 address: addr,
                 token0: t0,
@@ -1829,13 +1830,12 @@ impl PyBot {
     /// This is the Python-facing mirror of the `BlockPump`'s per-log call to
     /// `Bot::dispatch_log`: decode via the registered `LogDecoder`s, apply the
     /// decoded event to the shared `BotState` under a write guard, release it,
-    /// then notify every attached `PoolStateSubscriber` (touched-pool tracking
-    /// is the `EpochDelta` ledger's byproduct of the same apply — LXDY4C) so
+    /// then record the touched pool into the `EpochDelta` ledger (LXDY4C) so
     /// the next solve reads fresh keys.
     ///
     /// Reconstructs an `alloy::rpc::types::Log` from the WS-log shape Python
     /// passes — `(address, topics, data, block_number)` — so an offline test
-    /// can drive the full pump→dispatch→notify→solve loop without a live node.
+    /// can drive the full pump→dispatch→solve loop without a live node.
     /// No-op if no decoder recognizes the log or the pool isn't registered.
     ///
     /// Args:
@@ -1896,7 +1896,7 @@ impl PyBot {
     /// handles aliasing to a different pool on recreate.
     ///
     /// V2/V3 path only — `PyBot` exposes `register_v2/v3_pool` (no V4;
-    /// V4 registration lives on `ArbitrageEngine`, and its symmetric
+    /// V4 registration lives on the engine wrapper, and its symmetric
     /// unregister belongs there too — see ADR-007 Consequences).
     ///
     /// Returns `True` if a pool was found and removed; `False` if the address
@@ -1922,7 +1922,7 @@ impl PyBot {
     ) -> PyResult<bool> {
         let addr = parse_address(address)?;
         // V4 on PyBot is intentionally not exposed: registration for V4 lives
-        // on ArbitrageEngine (bot::engine), so the symmetric V4 unregister
+        // on the engine wrapper (bot::engine), so the symmetric V4 unregister
         // belongs there too (ADR-007 Consequences / Deferred). A `Some` here
         // would be a caller bug — surface it rather than silently no-op.
         if pool_id.is_some() {
@@ -3394,6 +3394,9 @@ mod tests {
         let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../apexbot-db/tests/fixtures/parity.db");
         if p.exists() {
+            // Pin the ADR-052 D1 heal-at-open killswitch so this read never
+            // rewrites the committed fixture.
+            std::env::set_var(apexbot_db::AUTO_HEAL_ENV, "0");
             Some(p)
         } else {
             None

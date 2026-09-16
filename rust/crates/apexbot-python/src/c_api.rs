@@ -42,15 +42,39 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::build_info::build_number, m)?)?;
     m.add_function(wrap_pyfunction!(crate::build_info::build_fingerprint, m)?)?;
 
+    // ADR-051 D3: the Python console entry (apexbot._cli:main) forwards argv
+    // verbatim into the Rust console. Registered unconditionally - the console
+    // passthrough is core, not a feature.
+    m.add_function(wrap_pyfunction!(crate::cli::cli_main, m)?)?;
+
     // FF-T5 (NT7HJC): the runtime fleet status — budget, plan,
     // census ("apexbot.runtime_status()").
     m.add_function(wrap_pyfunction!(crate::runtime_status::runtime_status, m)?)?;
+
+    // 4IOEVT: the typed discovery-delivery batch size
+    // (`pathfinding.discovery_batch_size` / `APEXBOT_DISCOVERY_BATCH_SIZE`).
+    // The Python discovery pipeline reads it and forwards it to
+    // `find_paths_async`.
+    m.add_function(wrap_pyfunction!(crate::config::discovery_batch_size, m)?)?;
+
+    // 6LC4JB: the shared core verification-retry policy defaults, so the
+    // Python driver shell reads them from the one Rust-owned declaration site.
+    m.add_function(wrap_pyfunction!(
+        crate::config::verification_retry_policy_defaults,
+        m
+    )?)?;
 
     // Ambient-runtime driver seam (VJGZJ2): lets a Python driver satisfy the
     // ambient-runtime-only policy on the verify seams. Unconditional —
     // apexbot-core (the runtime singleton) is.
     m.add_function(wrap_pyfunction!(
         crate::ambient_runtime::call_on_ambient_runtime,
+        m
+    )?)?;
+    // FYZMAF: the async sibling — offload a blocking Python prep step to the
+    // shared runtime's blocking pool so the asyncio loop keeps turning.
+    m.add_function(wrap_pyfunction!(
+        crate::ambient_runtime::call_blocking_on_ambient_runtime,
         m
     )?)?;
 
@@ -83,12 +107,20 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Pathfinding graph + DFS (feature = "pathfinding")
     #[cfg(feature = "pathfinding")]
     m.add_function(wrap_pyfunction!(crate::pathfinding::find_paths_rust, m)?)?;
+    // 4IOEVT: the batched async DFS iterator Python's find_paths_async drives.
+    #[cfg(feature = "pathfinding")]
+    m.add_function(wrap_pyfunction!(
+        crate::pathfinding::find_paths_async_rust,
+        m
+    )?)?;
     // The build_path_graph seam choreographs a apexbot-db read + a
     // apexbot-pathfinding graph build, so it needs BOTH features.
     #[cfg(all(feature = "pathfinding", feature = "db"))]
     m.add_function(wrap_pyfunction!(crate::pathfinding::build_path_graph, m)?)?;
     #[cfg(feature = "pathfinding")]
     m.add_class::<crate::pathfinding::PathIterator>()?;
+    #[cfg(feature = "pathfinding")]
+    m.add_class::<crate::pathfinding::PathBatchIterator>()?;
 
     // Balancer V2 math library functions (feature = "balancer-math")
     #[cfg(feature = "balancer-math")]
@@ -166,7 +198,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Uniswap mixed V2/V3/V4 engine (feature = "bot")
     #[cfg(feature = "bot")]
-    m.add_class::<crate::bot::engine::PyArbitrageEngine>()?;
+    m.add_class::<crate::bot::engine::PyArbEngine>()?;
     // Block-stream async iterator (epic 6W35AI) — the authoritative
     // `newHeads`-derived block clock, consumed by Python in parallel with
     // the result-batch iterator. See `engine::result_channel::BlockStream`.
@@ -197,6 +229,15 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "BootRefused",
         m.py().get_type::<crate::bot::engine::BootRefused>(),
+    )?;
+
+    // TB4QGX T6: the Faulted intake drain (spike S2) surfaces as a typed
+    // receipt exception.
+    #[cfg(feature = "bot")]
+    m.add(
+        "FleetIntakeFaultedError",
+        m.py()
+            .get_type::<crate::bot::engine::FleetIntakeFaultedError>(),
     )?;
 
     // Typed pool-admission exceptions (Plan 102, F2EVV6): a unified
@@ -312,11 +353,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `apexbot.fleet`; the operator op is `set_fleet_posture`).
     #[cfg(feature = "simulation")]
     crate::fleet::add_fleet_module(m)?;
-
-    // Pub/sub seam: register a Python callback as a `PoolStateSubscriber`
-    // against the Rust `LogDispatcher` fan-out (ZBD4MS) (feature = "bot")
-    #[cfg(feature = "bot")]
-    crate::bot::subscriber::add_subscriber_module(m)?;
 
     // `QuantAMM` closed-form N-token Balancer weighted basket solver
     // (feature = "bot") — `solve_balancer_weighted_basket`.

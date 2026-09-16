@@ -37,12 +37,12 @@ naming the shared defaults every member crate inherits:
 
 ```toml
 [workspace.package]
-version = "0.6.0-alpha.10"
+version = "0.6.0-alpha.3"
 edition = "2021"
 license = "Apache-2.0 license"
-rust-version = "1.97"
-repository = "https://github.com/nabob-labs/apexbot.git"
-authors = ["Nabob Labs"]
+publish = false
+repository = "https://github.com/nabob-labs/apexbot"
+authors = ["nabob-labs"]
 ```
 
 Every member crate's `[package]` table then writes the inherited fields as

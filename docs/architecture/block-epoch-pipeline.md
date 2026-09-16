@@ -230,7 +230,7 @@ machine). Source: `rust/crates/apexbot-ingestion/src/`
   wrapper (Z4Z6VO) guarding `BotState`; hold-tracking forensics off by default
   (`APEXBOT_STATE_LOCK_DIAG`), the blocked-wait warn threshold (500 ms) always on.
 - `bot_core/stage_telemetry.rs` + `bot_core/pump_telemetry.rs` — BF43PM: one
-  `apexbot.epoch` ROOT per block epoch (carrying `epoch.block` + `epoch.seq`) and
+  `apexbot.epoch.run` ROOT per block epoch (carrying `epoch.block` + `epoch.seq`) and
   one `apexbot.stage.<stage>` span per transition (`stage.from`→`stage.to`,
   `queue.age_us`); open rows (`streaming`, `rewind`) are force-closed past
   `STAGE_MAX_AGE_SECS` by `force_close_aged` (the SONJQA/G3 law). Metric series
@@ -241,7 +241,7 @@ machine). Source: `rust/crates/apexbot-ingestion/src/`
   collapsed into one. Owns the two genuine-async-boundary channels retained from
   ADR-006/027: the block clock (`BlockClockPipe`, header ticks, never queued behind
   solver work) and the result batch written at the Published edge.
-- `arb_engine/solver_dispatch.rs` — the detached solve cycle (unconditional
+- `arb_engine/solve_cycle.rs` — the detached solve cycle (unconditional
   since the WFF6MM cutover; the `APEXBOT_DETACHED_SOLVES` stance retired with
   the in-cycle arm): the solve cycle enqueues and returns, collapsing the
   engine-`Mutex` hold on the solve path to enqueue-end.
@@ -316,7 +316,7 @@ holds on the solve path collapse to enqueue-length, so the solve is uncontended 
 
 The proto-pump waterfall names are fully retired: `apexbot.pump.block`,
 `apexbot.pump.log_wait`, and `apexbot.pump.apply_stream` no longer exist as
-spans; the per-header beat became the `apexbot.epoch` root and the opaque
+spans; the per-header beat became the `apexbot.epoch.run` root and the opaque
 children became `apexbot.stage.<stage>` rows. The operational lesson they
 encoded survives as the watchdog's span force-close bound
 (`LOG_WAIT_MAX_AGE_SECS` / `STAGE_MAX_AGE_SECS`).

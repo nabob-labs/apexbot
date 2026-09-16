@@ -24,19 +24,6 @@ pub enum DbError {
     #[error("required row not found: {0}")]
     MissingRow(String),
 
-    /// The `alembic_version` row does not match [`crate::schema::ALEMBIC_HEAD`].
-    ///
-    /// The Rust core is a **reader** of Alembic-headed DBs, never a migrator;
-    /// the operator must run the Python Alembic upgrade (`alembic upgrade head`)
-    /// — the writer/orchestration migration in Epic AZGJUN owns Alembic stamps.
-    #[error("alembic schema is stale: head={head:?} expected={expected:?}; run the Python Alembic upgrade (`alembic upgrade head`)")]
-    AlembicStale {
-        /// The `version_num` actually stamped in the DB.
-        head: String,
-        /// The constant the Rust core expects ([`crate::schema::ALEMBIC_HEAD`]).
-        expected: String,
-    },
-
     /// The opened file is neither an Alembic-stamped apexbot DB nor an empty
     /// fresh-standalone file — likely a foreign `SQLite` file passed by mistake.
     #[error(
@@ -61,6 +48,46 @@ pub enum DbError {
         old_count: i64,
         /// Row count on the freshly-copied new DB.
         new_count: i64,
+    },
+
+    /// The DB is stamped at a schema version NEWER than this binary's
+    /// [`crate::schema::RUST_SCHEMA_VERSION`] — the binary is older than the
+    /// database. ADR-052 D2 forward-lock: a hard halt (never a warning), and
+    /// nothing is written ahead of the running binary.
+    #[error("the binary is older than the database (schema {db} > binary {binary})")]
+    SchemaAhead {
+        /// The schema version stamped in the DB.
+        db: u32,
+        /// The schema version this binary understands.
+        binary: u32,
+    },
+
+    /// The Rust-owned forward-migration registry has no step producing
+    /// `version`, yet the DB's stamp is behind the binary — the registry has a
+    /// gap (a build-time defect). The run refuses rather than skip the gap.
+    #[error("no Rust-owned migration step registered for schema version {version}")]
+    MissingMigrationStep {
+        /// The missing step's schema version.
+        version: u32,
+    },
+
+    /// A forward-migration step failed; its own transaction rolled back
+    /// (ADR-052 D2) and the DB's stamp remains at the last-good `at`, with the
+    /// step named so the failure "refuses loudly".
+    #[error(
+        "migration step {version} ({name}) failed with the schema stamp at {at}; \
+         the step rolled back and the DB was left at {at}"
+    )]
+    MigrationStepFailed {
+        /// The version the step would have produced.
+        version: u32,
+        /// The step's stable name.
+        name: &'static str,
+        /// The last-good schema stamp the DB was left at.
+        at: u32,
+        /// The underlying SQLite failure.
+        #[source]
+        cause: rusqlite::Error,
     },
 }
 

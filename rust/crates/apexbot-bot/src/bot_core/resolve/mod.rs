@@ -22,6 +22,8 @@
 //! shared surface is only the file + the thin `ResolvedHop` wrap + nonce
 //! return.
 
+use apexbot_core::diag;
+use apexbot_core::op_error;
 pub(crate) mod balancer_stable;
 pub(crate) mod balancer_weighted;
 pub(crate) mod cl;
@@ -349,11 +351,10 @@ impl MissingHopReason {
 
 /// Log a hop invalidation at `debug` (path context + hop index + reason).
 fn log_invalidation(pool_ref: &MixedPoolRef, hop_index: usize, reason: MissingHopReason) {
-    tracing::debug!(
-        ?pool_ref,
+    diag!(domain = state, ?pool_ref,
         hop = hop_index,
         %reason,
-        "[resolve-path] hop invalidates the path"
+        "hop invalidates the path"
     );
 }
 
@@ -397,7 +398,11 @@ pub(crate) fn resolve_hops(
     // so reaching here is a programming error. Return no deficits rather than
     // fabricating a responsible pool that could never clear.
     if pool_refs.len() < 2 {
-        tracing::error!(hops = pool_refs.len(), "resolve_hops: path has <2 hops");
+        op_error!(
+            domain = state,
+            hops = pool_refs.len(),
+            "resolve_hops: path has <2 hops"
+        );
         return Vec::new();
     }
 

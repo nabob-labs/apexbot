@@ -29,6 +29,9 @@
 use crate::mobius_v3_int::{build_cl_crossing_table, ClCrossingTable};
 use crate::runtime::SolveRuntimeConfig;
 use alloy::primitives::{aliases::I512, U256, U512};
+use apexbot_core::diag;
+#[cfg(not(feature = "hotpath"))]
+use apexbot_core::op_warn;
 use apexbot_math::v2::IntHopState;
 use apexbot_pools::int_v3_hop::{IntTickRangeCrossing, IntV3TickRangeSequence};
 
@@ -153,23 +156,16 @@ impl Line {
     }
 }
 
-#[expect(clippy::print_stderr, reason = "opt-in dev diagnostics, off in prod")]
+/// T5 diagnostics: per-hop compose-boundary trace, emitted at DEBUG on the
+/// `solver` domain (the `gate_trace` runtime flag is retired).
 fn trace_boundary(hop_idx: usize, hop_lines: usize, survivors: usize, next: &[Line]) {
     let min0 = next
         .iter()
         .map(|l| l.eval(&U256::ZERO))
         .min()
         .unwrap_or(I512::ZERO);
-    eprintln!(
-        "[gate-trace] boundary {hop_idx}: hop_lines={hop_lines} next(post-prune/sample)={survivors} min-eval(0)={min0}"
-    );
-}
-
-/// T5 diagnostics: opt-in compose tracing (`trace.gate_trace` /
-/// `APEXBOT_GATE_TRACE`), packed by the owner into the runtime config —
-/// the gate itself reads no environment anywhere.
-fn gate_trace_enabled(cfg: &SolveRuntimeConfig) -> bool {
-    cfg.gate_trace
+    diag!(domain = solver, hop_idx, hop_lines, survivors, min_eval_0 = %min0,
+        "boundary");
 }
 
 /// Target coefficient width after sound-reduction: two operands of this
@@ -810,7 +806,7 @@ fn classify_cl_rejection(seq: &IntV3TickRangeSequence) -> String {
 /// degenerate-path capture harness (M6776W). Each range carries the 8
 /// primitive fields the offline replay harness needs to reconstruct an
 /// `IntV3TickRangeSequence` (decimal-string big-ints, matching the
-/// `HeavyClPathCapture` JSONL schema in `solver_dispatch.rs`).
+/// `HeavyPathCapture` JSONL schema in `arb_engine/solver_capture.rs`).
 fn cl_seq_to_json(seq: &IntV3TickRangeSequence) -> serde_json::Value {
     serde_json::Value::Array(
         seq.ranges
@@ -850,7 +846,7 @@ fn cl_seq_to_json(seq: &IntV3TickRangeSequence) -> serde_json::Value {
 /// Serialize-to-string happens BEFORE the lock so the critical section is
 /// just the open + write.
 ///
-/// The JSONL schema matches `HeavyClPathCapture`'s format so the existing
+/// The JSONL schema matches `HeavyPathCapture`'s format so the existing
 /// offline replay harness (
 /// `apexbot-solvers/tests/profit_envelope_tests.rs` golden-capture suite)
 /// can load these fixtures directly.
@@ -1606,11 +1602,9 @@ fn path_profit_bound_inner(
                     format!("ReserveCap(zero={})", reserve_out.is_zero())
                 }
             };
-            tracing::debug!(
-                target: "apexbot_solvers::profit_envelope",
-                hop_index = hop_idx,
+            diag!(domain = solver, hop_index = hop_idx,
                 family = %family,
-                "[gate] degenerate hop rejected (impossible to bound — solved unscreened)"
+                "degenerate hop rejected (impossible to bound — solved unscreened)"
             );
             // M6776W golden capture: serialize the full per-hop state when a
             // capture harness is configured so the pool states can be replayed
@@ -1784,9 +1778,7 @@ fn path_profit_bound_inner(
                 cache.map.insert(chain.clone(), next.clone());
             }
         }
-        if gate_trace_enabled(&deps.runtime) {
-            trace_boundary(hop_idx, hop_ls_len_dbg, next.len(), &next);
-        }
+        trace_boundary(hop_idx, hop_ls_len_dbg, next.len(), &next);
         lines2 = next;
     }
     gate_tls(|t| t.compose_ns += phase_compose.elapsed().as_nanos());
@@ -1796,13 +1788,11 @@ fn path_profit_bound_inner(
     #[cfg(not(feature = "hotpath"))]
     if lines.len() > 200 {
         let hop_counts: Vec<usize> = all_hops.iter().map(|(ls, _)| ls.len()).collect();
-        tracing::warn!(
-                    target: "apexbot::solver",
-        gate_lines = lines.len(),
-                    gate_hop_line_counts = ?hop_counts,
-                    gate_domain = %domain,
-                    "[gate] composed tangent-line explosion"
-                );
+        op_warn!(domain = solver, gate_lines = lines.len(),
+            gate_hop_line_counts = ?hop_counts,
+            gate_domain = %domain,
+            "composed tangent-line explosion"
+        );
     }
     // Discrete concave max of f(x) = min_lines(x) − x over [0, xmax].
     if xmax.is_zero() {
@@ -2078,7 +2068,7 @@ impl MergeFallbackReason {
 /// order, so legacy's stable-sort tie machinery sees identical relative
 /// order for every pair that exists).
 ///
-/// Safety: APEXERATE-FREE pair selection is impossible to prove for tie /
+/// Safety: DEGENERATE-FREE pair selection is impossible to prove for tie /
 /// ceil-collision inputs, so this routine falls back to the frozen legacy
 /// chain whenever selection is ambiguous:
 ///   - any flat line (b == 0) or negative-slope line on either side (the
@@ -2113,10 +2103,10 @@ fn compose_boundary_merged(
                 MergeFallbackReason::CmpOverflow => t.merge_fb_cmp_overflow += 1,
             }
         });
-        tracing::debug!(
-            target: "apexbot_solvers::profit_envelope",
+        diag!(
+            domain = solver,
             reason = reason.key(),
-            "[gate] compose merge fell back to legacy pair product"
+            "compose merge fell back to legacy pair product"
         );
         compose_boundary_reference(hop_lines, chain, upper, cap)
     };

@@ -25,6 +25,12 @@ const SWEEP_ARTIFACTS: &[&str] = &[
     // APEXBOT_RPC_HTTP_CHAINID_<chain_id>).
     "APEXBOT_RPC_HTTP_CHAINID_",
     "APEXBOT_V",
+    // ADR-051 D8: the family wildcard in the cli-core operator doc comment
+    // (the loader owns the four concrete APEXBOT_FLEET_CORDON_* keys).
+    "APEXBOT_FLEET_CORDON_",
+    // The retired click per-flag envvar fallback named in the argv doc
+    // comment; the console models these inputs as argv only.
+    "APEXBOT_CHUNK_SIZE",
 ];
 
 /// Build-receipt keys (commit 1e1c0ddf7): compile-time build-artifact
@@ -36,6 +42,10 @@ const BUILD_ARTIFACT_KEYS: &[&str] = &[
     "APEXBOT_BUILD_FINGERPRINT",
     "APEXBOT_BUILD_NUMBER",
     "APEXBOT_BUILD_NUMBER_FILE",
+    // ADR-051 D2: the console cargo:rustc-env build-identity outputs
+    // (apexbot-cli/build.rs), the same class as the Python build receipt.
+    "APEXBOT_CLI_BUILD_FINGERPRINT",
+    "APEXBOT_CLI_BUILD_NUMBER",
 ];
 
 /// Real static env keys the config crate reads BEFORE/OUTSIDE the schema:
@@ -44,6 +54,26 @@ const BUILD_ARTIFACT_KEYS: &[&str] = &[
 /// be an option inside the file it locates, so it is deliberately NOT a
 /// schema key.
 const BOOTSTRAP_KEYS: &[&str] = &["APEXBOT_CONFIG"];
+
+/// Driver-domain keys resolved by `resolvers.rs` (ADR-051 D8): the database
+/// path, the session chain id, and the per-chain RPC URIs are console inputs
+/// that never lived in the typed file layer, so they are deliberately NOT
+/// schema keys. The resolvers read them through the loader's `EnvVars` seam
+/// and tag each with its own `Source`.
+const DRIVER_DOMAIN_KEYS: &[&str] = &[
+    "APEXBOT_DB_PATH",
+    "APEXBOT_DEFAULT_CHAIN_ID",
+    // ADR-051 D8: the operator-socket override, a console shell-environment
+    // input resolved by cli-core's resolve_socket cascade.
+    "APEXBOT_OPERATOR_SOCKET",
+];
+
+/// DB-open toggles read by the persistence layer itself (`apexbot-db`), not
+/// the typed config schema: the ADR-052 D1 heal-at-open killswitch is a
+/// `cargo add apexbot-db` contract (a consumer must be able to pin the pre-D1
+/// posture without a `BotConfig`), so it is deliberately NOT a schema key.
+/// Unset => heal on; only an explicit falsey word disables.
+const DB_OPEN_KEYS: &[&str] = &["APEXBOT_DB_AUTO_HEAL"];
 
 /// RETIRED keys the loader guards for one release (P6YXA6 hard cutover):
 /// they fail the load loudly and point at the replacement rather than
@@ -55,14 +85,33 @@ const RETIRED_KEYS: &[&str] = &[
     "APEXBOT_FLEET",
     "APEXBOT_SOLVE_SIM_INFLIGHT",
     "APEXBOT_DETACHED_SOLVES",
+    // ADR-043 §5 retired verbosity flags. These literals live in
+    // `apexbot_core::telemetry::RETIRED_ENV_NAMES` (the boot-time detection
+    // list) because the scanner sweeps the crates; the names are detected and
+    // warned about, never honored.
+    "APEXBOT_VERIFY_DBG",
+    "APEXBOT_V2_CALC_TRACE",
+    "APEXBOT_SIM_LOG_REVERTED_SWAPS",
+    "APEXBOT_SIM_DIVERGENCE_LOG",
+    "APEXBOT_DUMP_CALL_TRACE",
+    "APEXBOT_DUMP_TICK_MAPS",
+    "APEXBOT_WS_TRACE",
+    "APEXBOT_DRAIN_DBG",
+    "APEXBOT_TRACE_DISPATCH",
+    "APEXBOT_TRACE_REGISTER_SEED",
+    "APEXBOT_TRACE_LIQUIDITY",
+    "APEXBOT_TRACE_TICK",
+    "APEXBOT_GATE_TRACE",
+    "APEXBOT_AAVE_EVTRACE",
+    "APEXBOT_AAVE_TX_TRACE",
+    // ADR-043 §6: the retired stderr-fmt two-tunnel switch.
+    "APEXBOT_LOG_FMT",
 ];
 
 /// Real static keys the artifact regex cannot capture (digit-terminated
 /// matches expand to these full names).
 const SWEEP_EXPANSIONS: &[&str] = &[
     "APEXBOT_JAEGER_E2E",
-    // KAHU5W: the V2 in APEXBOT_V2_CALC_TRACE ends the artifact match.
-    "APEXBOT_V2_CALC_TRACE",
     "APEXBOT_V3_FIXTURE_RPC",
     "APEXBOT_V3_FIXTURE_BLOCK",
 ];
@@ -117,6 +166,8 @@ fn schema_covers_the_full_key_inventory() {
             !SWEEP_ARTIFACTS.contains(&k.as_str())
                 && !BOOTSTRAP_KEYS.contains(&k.as_str())
                 && !BUILD_ARTIFACT_KEYS.contains(&k.as_str())
+                && !DRIVER_DOMAIN_KEYS.contains(&k.as_str())
+                && !DB_OPEN_KEYS.contains(&k.as_str())
                 && !RETIRED_KEYS.contains(&k.as_str())
         })
         .cloned()
@@ -154,6 +205,8 @@ fn snapshot_fallback_agrees_with_schema() {
             !SWEEP_ARTIFACTS.contains(&k.as_str())
                 && !BOOTSTRAP_KEYS.contains(&k.as_str())
                 && !BUILD_ARTIFACT_KEYS.contains(&k.as_str())
+                && !DRIVER_DOMAIN_KEYS.contains(&k.as_str())
+                && !DB_OPEN_KEYS.contains(&k.as_str())
                 && !RETIRED_KEYS.contains(&k.as_str())
         })
         .cloned()

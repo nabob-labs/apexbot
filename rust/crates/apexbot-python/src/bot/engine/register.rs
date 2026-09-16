@@ -1,26 +1,25 @@
-//! `PyO3` wrapper for the `ArbitrageEngine` — register `#[pymethods]` slice.
+//! `PyO3` wrapper for the engine stage surface — register `#[pymethods]` slice.
 //!
 //! Split out of the former monolithic `py_binding.rs` (ergo UG6FKN task 74W2Z6),
 //! mirroring `crates/apexbot-bot/src/arb_engine/`'s per-concern
-//! layout. `PyO3` allows multiple `#[pymethods] impl PyArbitrageEngine { … }`
+//! layout. `PyO3` allows multiple `#[pymethods] impl PyArbEngine { … }`
 //! blocks per type, so each concern file contributes one slice.
 
 use super::{
-    mpsc, ArbitrageEngine, Arc, Bot, DynamicFeePoolRejectedError, EngineStages,
-    HookedPoolRejectedError, PoolHop, PyArbitrageEngine, PyBot, PyList, ReorgCoordinator,
+    Arc, Bot, DynamicFeePoolRejectedError, EngineStages, HookedPoolRejectedError, PoolHop,
+    PyArbEngine, PyBot, PyList,
 };
 use crate::prelude::*;
 
 use apexbot_bot::bot_core::state_lock::StateLock;
 
 #[pymethods]
-impl PyArbitrageEngine {
+impl PyArbEngine {
     #[new]
     #[pyo3(signature = (py_bot=None))]
     #[expect(clippy::needless_pass_by_value)]
     fn new(py: Python<'_>, py_bot: Option<Py<PyBot>>) -> Self {
         let py_bot_ref = py_bot.as_ref();
-        let (result_tx, result_rx) = mpsc::unbounded_channel();
         // ADR-006 D1+D4: if a `PyBot` is supplied, adopt its shared
         // `Arc<RwLock<BotState>>` so the engine reads/writes the SAME core that
         // `PyBot`/`PyLiquidityPool`/`PyErc20Token` share — and clone its `Arc<Bot>`
@@ -28,42 +27,36 @@ impl PyArbitrageEngine {
         // reads (dissolving the dual-`BotState` split —
         // `rust-owned-bot.md` §17 stale-state root cause). Without one, allocate
         // a standalone core + wrap it in a fresh `Bot` (no-pyo3 / legacy path).
-        let (engine, bot) = if let Some(bot) = py_bot_ref {
+        let (core, bot) = if let Some(bot) = py_bot_ref {
             let bot = bot.borrow(py).bot_arc();
-            (ArbitrageEngine::with_core(bot.state_arc()), bot)
+            (bot.state_arc(), bot)
         } else {
             let core = Arc::new(StateLock::new(apexbot_bot::bot_core::BotState::new()));
             let bot = Arc::new(Bot::with_core(Arc::clone(&core)));
-            (ArbitrageEngine::with_core(core), bot)
+            (core, bot)
         };
-        let mut engine = engine;
-        engine.set_result_channel(result_tx);
-        let (block_tx, block_rx) = mpsc::unbounded_channel();
-        let engine = Arc::new(parking_lot::Mutex::new(engine));
-        // SZJUKL seam retirement: the pump drives the engine — a StageHandlers
-        // implementation — directly through the stage hooks; the dissolved
-        // `SolveCoordinator`/`EngineHandle` fan-out/wrapper layer is gone
-        // (hard cutover, Q6). Python polls the engine's own cursor
+        // SZJUKL seam retirement / 5TBT7L Q2b: the stage surface IS the engine
+        // seam — it builds the engine internally from the shared core, so this
+        // crate never names the engine type. The pump drives it through the
+        // stage hooks. Python polls the engine's own cursor
         // (`last_processed_block`): stage work runs INLINE in the
         // single-writer driver, so the cursor is drain-consistent by
         // construction (no `drain_lock` to wait on).
-        let stages = Arc::new(EngineStages::new(Arc::clone(&engine)));
         // The stage surface consumes the SAME epoch ledger `Bot::dispatch_log`
-        // records into — one dirty-tracking mechanism (LXDY4C).
-        stages.set_delta(bot.active_delta());
-        // The block-clock pipe lives on the stage surface — header ticks
-        // never touch the engine's solve state (a chain fact, not engine
-        // business; B2/ADR-027 lineage). The receiver lives on the shared
-        // `PumpState`; `PyBot::block_stream` hands it to Python once.
-        stages.set_block_channel(block_tx);
-        let reorg_coordinator = Arc::new(ReorgCoordinator::new(Arc::clone(&bot)));
-        let pump = Arc::new(crate::bot::pump::PumpState::new(
-            Arc::clone(&engine),
-            stages,
-            Arc::clone(&reorg_coordinator),
+        // records into — one dirty-tracking mechanism (LXDY4C). The ledger
+        // is injected at construction; the stage surface owns no swap.
+        let stages = Arc::new(EngineStages::with_core(core, bot.active_delta()));
+        // ADR-050 D7: the public Rust `EngineDriver` owns the pump session
+        // (result/block channels, reorg coordinator, shutdown, subscribe
+        // state, verify provider); the PyO3 wrapper is a second adapter onto
+        // it, exactly like a pure-Rust consumer. The block-clock receiver is
+        // taken by `PyBot::block_stream` through the shared `PumpState`.
+        let driver = Arc::new(apexbot_bot::arb_engine::EngineDriver::from_stages(
             Arc::clone(&bot),
-            parking_lot::Mutex::new(Some(block_rx)),
+            Arc::clone(&stages),
         ));
+        let result_rx = driver.take_result_receiver();
+        let pump = Arc::new(crate::bot::pump::PumpState::new(Arc::clone(&driver)));
         if let Some(parent) = py_bot_ref {
             parent.borrow(py).attach_pump_state(Arc::clone(&pump));
         }
@@ -73,9 +66,9 @@ impl PyArbitrageEngine {
         // construction; warmed lazily by the first block's cold RPCs.
         let warm_code_cache = apexbot_simulation::WarmCodeCacheInner::shared_default();
         Self {
-            engine,
+            stages,
             pump,
-            result_rx: Arc::new(parking_lot::Mutex::new(Some(result_rx))),
+            result_rx: Arc::new(parking_lot::Mutex::new(result_rx)),
             warm_code_cache,
         }
     }
@@ -113,34 +106,26 @@ impl PyArbitrageEngine {
             return Err(pyo3::exceptions::PyValueError::new_err(msg));
         }
 
-        let engine = Arc::clone(&self.engine);
-        // YLYJM2: release the GIL across the engine `Mutex` acquisition +
-        // `register_path` (which internally takes `core.read()`) so the live
-        // pump + asyncio loop keep making GIL progress while the main thread
-        // awaits `engine.lock()`. `PoolHop` is `Send`; the error maps to a
-        // `PyErr` OUTSIDE the closure (GIL-held).
+        let stages = Arc::clone(&self.stages);
+        // YLYJM2: release the GIL across the stage-surface registration
+        // (which internally takes `core.read()`) so the live pump + asyncio
+        // loop keep making GIL progress. `PoolHop` is `Send`; the error maps
+        // to a `PyErr` OUTSIDE the closure (GIL-held).
         //
         // PRG-4: the refusal is TYPED — a full registry surfaces as the
         // benign `PathRegistryFullError` stop; everything else stays a
         // `ValueError` with the legacy message. The `created` flag derives
-        // from the path-count delta under the engine lock (dedup returns
+        // from the path-count delta inside the stage surface (dedup returns
         // the existing id without growth), so the crawl keeps its
         // new-vs-duplicate accounting without Python-side dedup state.
         let (path_id, created) = py.detach(move || {
-            let mut engine = engine.lock();
-            let registered_before = engine.path_count();
-            let path_id = engine
+            stages
                 .register_path(hops)
-                .map_err(map_path_registration_err)?;
-            let created = engine.path_count() != registered_before;
-            Ok::<(u64, bool), pyo3::PyErr>((path_id, created))
+                .map_err(map_path_registration_err)
         })?;
-        // SZJUKL: no engine-side PoolStateSubscriber registration. The
-        // retired `EngineSubscriber` adapter was only ever a liveness probe
-        // (LXDY4C): touched-pool dirty tracking is BYPRODUCT of log
-        // application (`Bot::dispatch_log` records the block's
-        // `EpochDelta`, which `on_resolve` consumes). The dispatcher's
-        // `Weak` fan-out now carries only Python's own subscribers.
+        // SZJUKL: no engine-side registration. Touched-pool dirty tracking
+        // is a BYPRODUCT of log application (`Bot::dispatch_log` records the
+        // block's `EpochDelta`, which `on_resolve` consumes).
         Ok((path_id, created))
     }
 
@@ -179,19 +164,14 @@ impl PyArbitrageEngine {
             return Err(pyo3::exceptions::PyValueError::new_err(msg));
         }
 
-        let engine = Arc::clone(&self.engine);
-        // YLYJM2: release the GIL across the engine `Mutex` acquisition +
-        // `register_and_solve_path` (engine.lock() + core.read() + the single
-        // eager `solve_path`). See `register_path`. `PoolHop` is `Send`; the
-        // error maps to a `PyErr` OUTSIDE the closure.
+        let stages = Arc::clone(&self.stages);
+        // YLYJM2: release the GIL across the stage-surface registration +
+        // the single eager `solve_path`. See `register_path`. `PoolHop` is
+        // `Send`; the error maps to a `PyErr` OUTSIDE the closure.
         let (path_id, created) = py.detach(move || {
-            let mut engine = engine.lock();
-            let registered_before = engine.path_count();
-            let path_id = engine
+            stages
                 .register_and_solve_path(hops)
-                .map_err(map_path_registration_err)?;
-            let created = engine.path_count() != registered_before;
-            Ok::<(u64, bool), pyo3::PyErr>((path_id, created))
+                .map_err(map_path_registration_err)
         })?;
         // No engine-side subscription — see `register_path` (SZJUKL).
         Ok((path_id, created))
@@ -216,8 +196,7 @@ impl PyArbitrageEngine {
     /// (operator override).
     #[pyo3(signature = (cap=None))]
     fn set_path_cap(&self, cap: Option<u64>) {
-        self.engine
-            .lock()
+        self.stages
             .set_path_cap(cap.map(|c| usize::try_from(c).unwrap_or(usize::MAX)));
     }
 
@@ -226,7 +205,7 @@ impl PyArbitrageEngine {
     /// so the `dup` telemetry needs this witness.
     #[getter]
     fn path_dedups(&self) -> u64 {
-        self.engine.lock().path_dedups()
+        self.stages.path_dedups()
     }
 
     #[expect(clippy::needless_pass_by_value)]
@@ -268,13 +247,15 @@ impl PyArbitrageEngine {
         self.pump.stop()
     }
 
-    /// `true` once the spawned pump task has finished — cooperative timed
-    /// exit (`HOTPATH_SHUTDOWN_MS`), WS stream end, or abort/panic. The
-    /// Python runner's pump watchdog polls this so a completed pump triggers
-    /// the ordinary graceful shutdown instead of the runner idling forever
-    /// on a dead engine.
-    fn pump_finished(&self) -> bool {
-        self.pump.pump_finished()
+    /// Awaitable pump-completion surface: resolves once the spawned pump task
+    /// finishes — cooperative timed exit (`HOTPATH_SHUTDOWN_MS`), WS stream
+    /// end, abort, or panic. The Python runner awaits this instead of polling,
+    /// so a completed pump triggers the ordinary graceful shutdown within one
+    /// event-loop turn. A consumer that awaits it AFTER the pump already ended
+    /// still resolves (the completion is a retained broadcast, not a one-shot
+    /// signal consumed at creation).
+    fn pump_finished_future<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.pump.pump_finished_future(py)
     }
 }
 

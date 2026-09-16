@@ -57,6 +57,15 @@ apexbot-uniswap.workspace = true
 # standalone Rust consumer.
 apexbot-workers.workspace = true
 
+[features]
+# OTel observability passthrough (Gap G6 / ergo ZOBXVC): forward
+# `apexbot-bot/otel` so a `cargo add apexbot, features = ["otel"]`
+# consumer reaches `apexbot::bot::{otel, metrics, instruments}`. Those
+# modules are `#[cfg(feature = "otel")]` in apexbot-bot, so without this
+# passthrough they are unreachable through the umbrella — the gap that left
+# the pure-Rust settlement-bot example with no telemetry at all.
+otel = ["apexbot-bot/otel"]
+
 [dev-dependencies]
 async-trait = "0.1"
 alloy = { version = "^2.4", features = ["full"] }

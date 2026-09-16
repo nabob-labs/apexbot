@@ -1,0 +1,56 @@
+[package]
+name = "apexbot-cli-core"
+description = "Command semantics + the database command arms for the apexbot console (ADR-051 D1) - pyo3-free and clap-free."
+keywords = ["cli", "console", "database", "mev"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# The clap-free / indicatif-free semantics home (ADR-051 D1/D2). Two front ends
+# (the Rust argv facade and the Python passthrough) map into this crate; it owns
+# WHAT a command means, never HOW argv is spelled (clap) or painted (indicatif).
+# `just check-cli-core-purity` asserts the absence of both.
+#
+# The exchange/pool/aave arms (ergo FTVJ6L) delegate to the pure-Rust Tier-2
+# cores directly - the same seams the Python driver reaches through PyO3:
+# apexbot-uniswap (deployments registry), apexbot-pool-updater (chunk loop +
+# on-chain-truth verify), apexbot-aave (market run + row flips via apexbot-db).
+[dependencies]
+apexbot-aave.workspace = true
+apexbot-config.workspace = true
+apexbot-db.workspace = true
+apexbot-pool-updater.workspace = true
+apexbot-rpc.workspace = true
+apexbot-uniswap.workspace = true
+# Address/bytes primitives + the alloy `Provider` trait the block-tag
+# resolution path reads `eth_getBlockByNumber` through.
+alloy = { version = "^2.4", features = ["full"] }
+# The updater cores own their runtime; the arms build a short-lived one only to
+# resolve a tag+offset block identifier (or drive an on-chain verify) before the
+# core's own runtime is built.
+tokio = { version = "^1.53", features = ["rt-multi-thread", "time", "net", "io-util"] }
+# Plain rusqlite (no `bundled`) - the on-conn read/write seams take a
+# `&rusqlite::Connection` (the chunk's Transaction). The bundled libsqlite3-sys
+# link is owned solely by apexbot-db.
+rusqlite = { version = "^0.40" }
+# The operator command-channel JSON codec (ADR-051 D6): one request/response
+# line each way, encoded/decoded at exactly one site (`crate::operator`).
+# The crate already depends on tokio's `net` feature for the UDS transport.
+serde_json = "^1"
+# The ported `logger.info` success lines (the click handlers log through Python's
+# logging; the Rust core keeps the same run receipts on the tracing sink).
+tracing = { version = "^0.1" }
+
+[dev-dependencies]
+# Fixture construction (fresh / Alembic-stamped / stale / foreign SQLite DBs).
+# `bundled` is already unified in via apexbot-db; named explicitly so a cold
+# test build never needs a system SQLite.
+apexbot-db.workspace = true
+rusqlite = { version = "^0.40", features = ["bundled"] }
+tempfile = { version = "^3.27" }

@@ -12,7 +12,7 @@
 //!
 //! # Env gate (zero cost when off)
 //!
-//! Gated by `APEXBOT_SIM_DIVERGENCE_LOG=1` (set at launch). Default OFF → a
+//! Gated by `arm the sim-divergence probe` (set at launch). Default OFF → a
 //! single atomic load per `storage_ref` (the `OnceLock<bool>` init reads the
 //! env once), zero per-SLOAD work otherwise. Same discipline as the
 //! `hotpath` runtime gate — opt-in, off by default, no rebuild to toggle.
@@ -47,6 +47,7 @@
     test,
     allow(clippy::unreadable_literal, clippy::decimal_bitwise_operands)
 )]
+use apexbot_core::{diag, op_info};
 
 use std::sync::{Mutex, OnceLock};
 
@@ -54,53 +55,8 @@ use alloy::primitives::{Address, B256, U256};
 
 use apexbot_bot::bot_core::{divergence_probe::TrackedSlotProbe, SimAnchorState};
 
-/// The env-var name gating the divergence probe (set at launch). Off by
-/// default — the sim's behavior is identical whether on or off (observation
-/// only, never serves).
-pub const SIM_DIVERGENCE_LOG_ENV: &str = "APEXBOT_SIM_DIVERGENCE_LOG";
-
 /// The `[sim-divergence]` log prefix — verbatim so log greps return here.
 const SIM_DIVERGENCE_LOG_PREFIX: &str = "[sim-divergence]";
-
-static PROBE_ENABLED: OnceLock<bool> = OnceLock::new();
-
-/// Test-only override for [`probe_enabled`]: `-1` = unset (use the env-cached
-/// value), `0` = forced off, `1` = forced on. Lets the divergence tests flip
-/// the gate deterministically without racing the process-global `OnceLock`
-/// env cache (which caches whatever the first read saw). Production never sets
-/// this (cfg(test)-only).
-#[cfg(test)]
-static TEST_FORCE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-
-/// `true` iff `APEXBOT_SIM_DIVERGENCE_LOG=1` is set at first read; cached so
-/// the per-SLOAD cost is a single atomic load. (`#[cfg(test)]`:
-/// [`force_probe_enabled_for_tests`] overrides this.)
-fn probe_enabled() -> bool {
-    #[cfg(test)]
-    {
-        let forced = TEST_FORCE.load(std::sync::atomic::Ordering::Acquire);
-        if forced != -1 {
-            return forced != 0;
-        }
-    }
-    // KAHU5W: typed schema key `simulation.sim_divergence_log`.
-    *PROBE_ENABLED.get_or_init(|| {
-        ::apexbot_config::holder::config()
-            .simulation
-            .sim_divergence_log
-    })
-}
-
-/// Test-only gate override (`-1`/unset → use the env cache, `0` → off, `1` →
-/// on). Production never calls this (cfg(test)).
-#[cfg(test)]
-pub fn force_probe_enabled_for_tests(on: Option<bool>) {
-    match on {
-        Some(true) => TEST_FORCE.store(1, std::sync::atomic::Ordering::Release),
-        Some(false) => TEST_FORCE.store(0, std::sync::atomic::Ordering::Release),
-        None => TEST_FORCE.store(-1, std::sync::atomic::Ordering::Release),
-    }
-}
 
 /// On-disk, process-wide divergence accumulator (one entry per divergent slot
 /// observation). Testable via [`divergence_tally_snapshot`]; production logs a
@@ -165,6 +121,16 @@ pub fn divergence_tally_snapshot() -> DivergenceTally {
     tally().lock().map(|acc| acc.to_tally()).unwrap_or_default()
 }
 
+/// Serializes every lib-binary test that can bump the process-global
+/// divergence tally. `observe_storage_read` is reached by ANY
+/// `BotStateDb::storage_ref` read of a tracked slot — this module's probe tests
+/// and the sibling `serving.rs` V2-serving tests alike — so the absolute
+/// `slots_compared` pins can only hold while no other read interleaves. (The
+/// guard used to live inside this module's test module, which could not
+/// exclude the sibling-module readers.)
+#[cfg(test)]
+pub(crate) static TALLY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The masked RPC comparison: `true` iff the engine's tracked fields
 /// (packed in `probe.engine_word`, untracked bits zeroed) match the RPC word
 /// masked to the engine's tracked-bit range.
@@ -190,9 +156,6 @@ pub fn observe_storage_read(
     index: U256,
     rpc_value: U256,
 ) {
-    if !probe_enabled() {
-        return;
-    }
     observe_storage_read_forced(anchor, address, index, rpc_value);
 }
 
@@ -221,8 +184,7 @@ pub fn observe_storage_read_forced(
     if matched {
         return;
     }
-    tracing::info!(
-        pool_addr = %format!("{address:?}"),
+    op_info!(domain = sim, pool_addr = %format!("{address:?}"),
         slot = %index,
         kind = ?probe.kind,
         engine = %hex_padded(probe.engine_word),
@@ -260,15 +222,12 @@ fn hex_padded_u256(word: U256) -> String {
 
 /// Log a `[sim-divergence] summary` line with the current tally (slots
 /// compared, divergent slots, divergent pools). Idempotent + cheap; safe to
-/// call from a driver per-batch or at shutdown. A no-op when the probe is
-/// off (the tally is all-zeros + the env gate cached false → the summary
-/// would spam a zero-line every block otherwise).
+/// call from a driver per-batch or at shutdown. Emitted at `debug`, so it is
+/// silent unless the `sim` diagnostics stream is enabled at the sink.
 pub fn dump_divergence_summary() {
-    if !probe_enabled() {
-        return;
-    }
     let tally = divergence_tally_snapshot();
-    tracing::info!(
+    diag!(
+        domain = sim,
         slots_compared = tally.slots_compared,
         divergent_slots = tally.divergent_slots,
         divergent_pairs = tally.divergent_pairs,
@@ -409,6 +368,8 @@ mod tests {
 
     #[test]
     fn storage_ref_returns_rpc_value_unchanged_when_probe_on_or_off() {
+        // Reading a tracked slot below bumps the process-global tally.
+        let _tally = TALLY_TEST_GUARD.lock().unwrap();
         let core = v3_pool(U256::from(1u128) << 96, 1_000_000, -5010, 18_000_000);
         let anchor = SimAnchorState::snapshot(&core);
         // rpc serves slot0 = a DIFFERENT tick → would diverge IF the probe
@@ -428,29 +389,19 @@ mod tests {
         );
     }
 
-    // The tally-touching tests share a process-global accumulator + a test-only
-    // gate override; serialize them so parallel test threads don't race the
-    // counter / the `AtomicI8` force-setter.
-    static TALLY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn observe_logs_divergence_when_engine_lags_rpc_and_tally_accumulates() {
         let _g = TALLY_TEST_GUARD.lock().unwrap();
-        // This test asserts the probe's behavior when ENABLED. Because
-        // `probe_enabled()` caches in a `OnceLock`, we cannot toggle it per-test
-        // reliably. Instead we exercise the divergence path directly:
-        // build an engine V3 pool whose tick disagrees with a fixed rpc slot0,
-        // call observe_storage_read, then assert the tally diverged_slots==1
-        // (the env gate is the only thing between observe + the tally; if the
-        // env is NOT set, observe is a no-op and the tally stays 0 — which is
-        // itself the "silent when off" contract recorded in the next test).
+        // The probe is always on (the gate flag was retired), so exercise the
+        // divergence path directly: build an engine V3 pool whose tick disagrees
+        // with a fixed rpc slot0, call observe_storage_read, then assert the
+        // tally diverged_slots == 1.
         reset_divergence_tally();
         let core = v3_pool(U256::from(1u128) << 96, 1_000_000, -5010, 18_000_000);
         let anchor = SimAnchorState::snapshot(&core);
         let rpc_word = rpc_slot0_with_tick(U256::from(1u128) << 96, 5010);
 
         // Force the probe ON for THIS test (deterministic — no env-gate race).
-        force_probe_enabled_for_tests(Some(true));
 
         observe_storage_read(&anchor, V3_ADDR, U256::ZERO, rpc_word);
 
@@ -458,7 +409,6 @@ mod tests {
         assert_eq!(tally.slots_compared, 1, "one tracked slot compared");
         assert_eq!(tally.divergent_slots, 1, "the tick diverged");
         assert_eq!(tally.divergent_pools, 1, "one distinct pool");
-        force_probe_enabled_for_tests(None);
     }
 
     #[test]
@@ -470,13 +420,11 @@ mod tests {
         let anchor = SimAnchorState::snapshot(&core);
         // rpc slot0 with the SAME tick as the engine → no divergence.
         let rpc_word = rpc_slot0_with_tick(sqrt, -5010);
-        force_probe_enabled_for_tests(Some(true));
 
         observe_storage_read(&anchor, V3_ADDR, U256::ZERO, rpc_word);
         let tally = divergence_tally_snapshot();
         assert_eq!(tally.slots_compared, 1, "compared once");
         assert_eq!(tally.divergent_slots, 0, "matched → not flagged");
-        force_probe_enabled_for_tests(None);
     }
 
     #[test]
@@ -486,7 +434,6 @@ mod tests {
         reset_divergence_tally();
         let core = v3_pool(U256::from(1u128) << 96, 1_000_000, 0, 18_000_000);
         let anchor = SimAnchorState::snapshot(&core);
-        force_probe_enabled_for_tests(Some(true));
         observe_storage_read(
             &anchor,
             V3_ADDR,
@@ -495,6 +442,5 @@ mod tests {
         );
         let tally = divergence_tally_snapshot();
         assert_eq!(tally.slots_compared, 0, "untracked slot never compared");
-        force_probe_enabled_for_tests(None);
     }
 }

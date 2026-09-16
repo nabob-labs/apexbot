@@ -4,12 +4,24 @@ pub use apexbot_core as core;
 /// Foundational utilities — errors, hex, EIP-55 addresses, shared runtime.
 pub use apexbot_core::{address_utils, errors, hex_utils, runtime};
 
+/// The observability facade (ADR-043): closed `apexbot::<domain>` targets,
+/// the `diag!`/`op_info!`/`op_warn!`/`op_error!`/`op_span!` macros, and the
+/// panic hook. Re-exported so a `cargo add apexbot` consumer emits on the
+/// same standard as the `PyO3` binding.
+pub use apexbot_core::telemetry;
+pub use apexbot_core::{diag, op_error, op_info, op_span, op_warn, telemetry_target};
+
 /// `examples/path*_solver_fixture.rs` investigate-runner dialect.
 pub mod investigation;
 
 /// The per-chain state owner + the unified multi-DEX arb engine (`bot_core`,
 /// `arb_engine`); the stateless solver math lives in [`crate::solvers`].
 pub use apexbot_bot as bot;
+/// ADR-050 / Gap G1 (`5XOGRK`): the public Rust driver seam over the
+/// crate-private engine. `cargo add apexbot` reaches the full
+/// subscribe→resume(+auto-backfill)→stop ritual (also available as
+/// `apexbot::bot::arb_engine::EngineDriver`).
+pub use apexbot_bot::arb_engine::{DriverError, EngineDriver, PhaseError};
 /// `BotState` state-owner surface, re-exported alongside [`crate::bot`].
 pub use apexbot_bot::bot_core;
 /// WS ingestion (subscriptions, topic filter, backfill fetch, watchdog

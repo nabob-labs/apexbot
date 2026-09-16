@@ -5,6 +5,8 @@ T2-T5 landing before the 0.7.0 retirement is executed in T6 / the
 `OXKANZ` release checkpoint. ADR-010's retention/cutover path remains in
 force until `heal` ships and is proven.
 
+**Implemented and extended: the heal machinery ships at open via the auto-heal described by [ADR-052](ADR-052-db-auto-upgrade-alembic-retirement.md) (2026-09-15)**
+
 ## Context
 
 ADR-010 established the in-place `cutover` (the fast ownership flip
@@ -180,7 +182,7 @@ from ADR-010).
 ## Consequences
 
 - **Positive:** Alembic retirement (0.7.0) becomes **non-breaking** —
-  any legacy DB (`alembic_current`, `alembic_stale`, or unrecognized
+  any legacy DB (an `alembic_version` marker, or unrecognized
   with content) can `apexbot database heal` into a `RustOwned` DB
   regardless of its old state. The incoherent migration chain's
   forward-buildability stops mattering; the chain can be deleted

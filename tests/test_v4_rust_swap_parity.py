@@ -22,7 +22,7 @@ from apexbot.abi import encode as abi_encode
 from apexbot.constants import ZERO_ADDRESS
 from apexbot.crypto import keccak256
 from apexbot.uniswap.concentrated.types import LiquidityAtTick
-from apexbot.uniswap.v3_libraries import MIN_SQRT_RATIO as MIN_SQRT_PRICE
+from apexbot.uniswap.math import MIN_SQRT_RATIO as MIN_SQRT_PRICE
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v4_pool_factory import make_v4_pool
 

@@ -159,25 +159,21 @@ fn serialize_tick_info_map(ticks: &HashMap<i32, TickInfo>) -> String {
         .join(";")
 }
 
-/// Dump the snapshot-seed tick map (Db snapshot + backfill) under
-/// `APEXBOT_DUMP_TICK_MAPS=1`, so it can be compared against the map that
-/// later went into the verifier (UO3JM4/ADR-021 re-assembly aid). No-op unless
-/// the flag is set — zero cost in default runs.
+/// Emit the snapshot-seed tick map (Db snapshot + backfill) at TRACE on
+/// `state`, so it can be compared against the map that later went into the
+/// verifier (UO3JM4/ADR-021 re-assembly aid). Forensic: silent unless the sink
+/// enables `apexbot=trace`.
 pub(crate) fn dump_tick_map_seed(
     pool_ident: &str,
     seed: &(HashMap<i32, TickInfo>, PoolTickCoverage),
 ) {
-    if crate::bot_core::stance::config().trace.dump_tick_maps {
-        tracing::info!(
-            target: crate::telemetry::DIAGNOSTIC_TARGET,
-            pool = %pool_ident,
-            seed_origin = "db-snapshot",
-            coverage = ?seed.1,
-            tick_count = seed.0.len(),
-            seed_map = %serialize_tick_info_map(&seed.0),
-            "tick-map snapshot-seed (APEXBOT_DUMP_TICK_MAPS=1; UO3JM4 re-assembly aid)"
-        );
-    }
+    apexbot_core::diag_trace!(domain = state, pool = %pool_ident,
+        seed_origin = "db-snapshot",
+        coverage = ?seed.1,
+        tick_count = seed.0.len(),
+        seed_map = %serialize_tick_info_map(&seed.0),
+        "tick-map snapshot-seed (UO3JM4 re-assembly aid)"
+    );
 }
 
 /// Assemble a V3 pool's tick map with `Db → Chain` precedence.

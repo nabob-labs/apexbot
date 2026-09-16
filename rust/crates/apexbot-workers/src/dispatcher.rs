@@ -17,6 +17,7 @@
 //! loud-abort tripwire (log at error + `std::process::abort`), mirroring the
 //! executor discipline.
 
+use apexbot_core::{op_error, op_info};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -515,13 +516,11 @@ impl FleetHost {
         // tier refuses with its own typed refusal until the arm lands
         // (FF-T4) — never a silent narrow.
         let plan = crate::plan::plan(boot.quota_cpus, boot.profile, &boot.overrides)?;
-        tracing::info!(
-            target: "apexbot::fleet",
-            plan = plan.id,
+        op_info!(domain = pump, plan = plan.id,
             binding = %plan.binding,
             budget_cpus = plan.budget_cpus,
             oversubscribed = plan.oversubscribed,
-            "[fleet] boot plan resolved"
+            "boot plan resolved"
         );
         // FF-T4 (Z6XTDX): BOTH bindings boot — the projection is
         // binding-derived (pinned: the floor-checked budget; serial: the
@@ -692,6 +691,13 @@ impl FleetHost {
     #[must_use]
     pub fn posture_admits_role(&self, role: WorkerRole) -> bool {
         self.posture.admits_lease(role.cordon_class())
+    }
+
+    /// The sticky lane-death hold (read-through). The Faulted transition
+    /// (TB4QGX T6) keys on THIS typed latch — never on elapsed cordon time.
+    #[must_use]
+    pub fn lane_death_held(&self) -> bool {
+        self.posture.lane_death_held()
     }
 
     /// The sim intake cap in the current posture (read through the shared
@@ -884,12 +890,12 @@ impl FleetHost {
         // admission arithmetic (`queue_cap`, intake caps) while the layout
         // keeps serving the boot table geometry; see the asymmetry note on
         // [`FleetHost::queue_cap`] before "unifying" the two.
-        tracing::info!(
-            target: "apexbot::fleet",
+        op_info!(
+            domain = pump,
             quota = new_quota_cpus,
             solver_pins = self.budget.solver_pin_count,
             sim_driver_slots = self.budget.sim_slot_cap,
-            "[fleet-budget] quota re-detected — shares re-declared, sum re-checked"
+            "quota re-detected — shares re-declared, sum re-checked"
         );
         Ok(())
     }
@@ -937,13 +943,13 @@ impl FleetHost {
             .map_or(0, VecDeque::len);
         if len >= cap {
             self.overflow_count += 1;
-            tracing::error!(
-                target: "apexbot::fleet",
+            op_error!(
+                domain = pump,
                 role = unit.role.label(),
                 len,
                 cap,
                 overflows = self.overflow_count,
-                "[fleet-dispatch] queue FULL — loud overflow (ADR-021: classify, stop, never silently drop)"
+                "queue FULL — loud overflow (ADR-021: classify, stop, never silently drop)"
             );
             return Err((
                 EnqueueError::QueueFull {
@@ -972,6 +978,17 @@ impl FleetHost {
 
     fn take_from_role(&mut self, role: WorkerRole) -> Option<Unit> {
         self.role_queue_mut(role)?.pop_front()
+    }
+
+    /// Drain a role's queued (not-yet-granted) units, returning how many
+    /// were removed. The Faulted arm (TB4QGX T6) resolves them terminally;
+    /// granted in-flight units are untouched (they complete naturally).
+    pub fn drain_role_queue(&mut self, role: WorkerRole) -> usize {
+        self.role_queue_mut(role).map_or(0, |queue| {
+            let drained = queue.len();
+            queue.clear();
+            drained
+        })
     }
 
     fn return_unit(&mut self, unit: Unit) {
@@ -1257,13 +1274,11 @@ impl FleetHost {
                 Ok(to)
             }
             Err(rejected) => {
-                tracing::error!(
-                    target: "apexbot::fleet",
-                    slot,
+                op_error!(domain = pump, slot,
                     from = ?rejected.from,
                     transition = ?rejected.transition,
                     reason = %rejected.reason,
-                    "[fleet-fsm] transition REJECTED — off the T-table"
+                    "transition REJECTED — off the T-table"
                 );
                 Err(HostError::Transition(rejected))
             }
@@ -1399,10 +1414,8 @@ impl FleetHost {
     /// Always: [`HostError::StrandedPipe`] (the default handler aborts
     /// before returning).
     pub fn strand_unit(&mut self, slot: SlotId) -> Result<(), HostError> {
-        tracing::error!(
-            target: "apexbot::fleet",
-            slot,
-            "[fleet-deadlock] stranded result pipe: a dead host abandons a unit with in-flight result sends — loud abort (design doc §10.3)"
+        op_error!(domain = pump, slot,
+            "stranded result pipe: a dead host abandons a unit with in-flight result sends — loud abort (design doc §10.3)"
         );
         (self.tripwire)("stranded result pipe: unit abandoned mid-drain");
         Err(HostError::StrandedPipe(slot))

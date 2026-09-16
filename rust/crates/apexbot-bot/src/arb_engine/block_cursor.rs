@@ -13,13 +13,15 @@
 //! - engine struct (`arb_engine/mod.rs`): the four field defs + their
 //!   init (`results_block`, `last_processed_block`, `last_solved_block`,
 //!   `has_logs_this_block`) → one `cursor: BlockCursor`.
-//! - `event_routing.rs::finalize_block`: the hand-written guarded
-//!   four-field transition → [`BlockCursor::finalize`].
-//! - `event_routing.rs::solve_dirty` / `process_updates` tails and
-//!   `lifecycle.rs::set_last_processed_block`: unconditional
+//! - the retired `event_routing.rs::finalize_block` (now
+//!   `engine_stages.rs::StageHandlers::on_finalize`): the hand-written
+//!   guarded four-field transition → [`BlockCursor::finalize`].
+//! - the retired `event_routing.rs::solve_dirty` / `process_updates` tails
+//!   (now `engine_stages.rs::run_engine_cycle` / the `mod.rs` `process_updates`
+//!   test harness) and `lifecycle.rs::set_last_processed_block`: unconditional
 //!   `last_processed_block = Some(n)` writes →
 //!   [`BlockCursor::advance_processed`].
-//! - `solver_dispatch.rs` solve stamps (the empty-fanout early return, the
+//! - `solve_cycle.rs` solve stamps (the empty-fanout early return, the
 //!   detached enqueue tail, the in-cycle tail) and
 //!   `lifecycle.rs::solve_all_paths`: unconditional `results_block = n`
 //!   writes → [`BlockCursor::advance_solved`].
@@ -51,9 +53,6 @@
 //! anchor backwards and re-emit a batch at a regressed `solve_block`.
 //! [`BlockCursor::advance_solved`] clamps at the max. Everything else here
 //! is behavior-preserving.
-
-use super::ArbitrageEngine;
-
 /// The engine block cursor — one owner of the engine-side block-coordinate
 /// residue (6XB6NJ; the module docs carry the fold map, the monotone
 /// discipline, and the one intentional strengthening).
@@ -90,7 +89,6 @@ pub(crate) struct BlockCursor {
     /// by `finalize`. Owned by the engine since LEZJAS.
     has_logs_this_block: bool,
 }
-
 impl BlockCursor {
     /// The guarded combined finalize transition — the engine's
     /// `finalize_block` boundary. The `block > last_solved_block` guard is
@@ -119,7 +117,6 @@ impl BlockCursor {
         self.results_block = self.results_block.max(block);
         true
     }
-
     /// Monotone processed-cursor advance (`last_processed_block`): stores
     /// `Some(max(prev, block))` — a late/stale entry can never move the
     /// processed boundary backwards.
@@ -127,7 +124,6 @@ impl BlockCursor {
         let prev = self.last_processed_block.unwrap_or(0);
         self.last_processed_block = Some(prev.max(block));
     }
-
     /// The solve-anchor stamp (`results_block`): monotone-max, so a
     /// late/stale stamp can never regress a real solve's anchor (the ONE
     /// intentional 6XB6NJ strengthening — see the module docs).
@@ -140,7 +136,6 @@ impl BlockCursor {
     pub(crate) fn advance_solved(&mut self, block: u64) {
         self.results_block = self.results_block.max(block);
     }
-
     /// Monotone solved-boundary advance (`last_solved_block`) — the
     /// ADR-006 D4 mid-flight-inherit stamp (a late engine inherits the
     /// pump's current solved block on join). Behavior-preserving: the
@@ -148,13 +143,11 @@ impl BlockCursor {
     pub(crate) fn advance_solved_boundary(&mut self, block: u64) {
         self.last_solved_block = self.last_solved_block.max(block);
     }
-
     /// Record that at least one forward log applied this block (cleared by
     /// the next [`Self::finalize`]).
     pub(crate) fn record_logs(&mut self) {
         self.has_logs_this_block = true;
     }
-
     /// Whether a real solve has anchored `results_block` (`!= 0`): the
     /// delivery policy's publish gate (a 0 anchor would sim at block 0 —
     /// the 0x841820 code-less panic) and the sim-diag solve-block fallback
@@ -164,31 +157,28 @@ impl BlockCursor {
     pub(crate) const fn is_anchored(&self) -> bool {
         self.results_block != 0
     }
-
     /// The solve-anchor stamp (KNEUQX span tagging + batch `solve_block`).
     #[must_use]
     pub(crate) const fn results_block(&self) -> u64 {
         self.results_block
     }
-
     /// The processed boundary (`None` = nothing processed yet).
     #[must_use]
     pub(crate) const fn last_processed_block(&self) -> Option<u64> {
         self.last_processed_block
     }
-
     /// The solved boundary (the finalize one-shot guard's left side).
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const fn last_solved_block(&self) -> u64 {
         self.last_solved_block
     }
-
     /// Whether any forward log applied since the last [`Self::finalize`].
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const fn has_logs_this_block(&self) -> bool {
         self.has_logs_this_block
     }
-
     /// White-box test seam (6XB6NJ): byte-identical replacement for the
     /// tests' direct `engine.results_block = n` writes (the field moved
     /// into the cursor). Plain assignment on purpose — tests force an
@@ -196,17 +186,5 @@ impl BlockCursor {
     #[cfg(test)]
     pub(crate) fn set_results_block_for_test(&mut self, block: u64) {
         self.results_block = block;
-    }
-}
-
-// The engine's white-box seam for the cursor (6XB6NJ): the tests that used
-// to poke the `results_block` engine field directly now go through here.
-impl ArbitrageEngine {
-    /// Test-only: force the solve-anchor stamp to an arbitrary value —
-    /// byte-identical replacement for the pre-cursor direct field write
-    /// (`engine.results_block = n`). NOT part of the production interface.
-    #[cfg(test)]
-    pub(crate) fn set_results_block_for_test(&mut self, block: u64) {
-        self.cursor.set_results_block_for_test(block);
     }
 }

@@ -28,13 +28,13 @@ from apexbot.uniswap.deployments import (
     UniswapV3ExchangeDeployment,
 )
 from apexbot.uniswap.math import (
-    get_tick_word_and_bit_position as cl_get_tick_word_and_bit_position,
-)
-from apexbot.uniswap.v3_libraries import (
     MAX_SQRT_RATIO,
     MAX_TICK,
     MIN_SQRT_RATIO,
     MIN_TICK,
+)
+from apexbot.uniswap.math import (
+    get_tick_word_and_bit_position as cl_get_tick_word_and_bit_position,
 )
 from apexbot.uniswap.v3_liquidity_pool import UniswapV3Pool
 from apexbot.uniswap.v3_types import (

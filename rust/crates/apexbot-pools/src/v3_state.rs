@@ -2215,7 +2215,7 @@ mod apply_inherent_tests {
             .expect("should build a sequence");
 
         let liqs: Vec<u128> = seq.ranges.iter().map(|r| r.liquidity).collect();
-        eprintln!("[drain-test] range liquidities: {liqs:?}");
+        eprintln!("range liquidities: {liqs:?}");
 
         assert_eq!(
             liqs[0], 5_407_362_545_736_161_987,
@@ -2242,7 +2242,7 @@ mod apply_inherent_tests {
             .build_int_v3_sequence(1, 100, false)
             .expect("should build an ofz sequence");
         let ofz_r0 = seq_ofz.ranges[0].liquidity;
-        eprintln!("[drain-test] ofz r0 liquidity: {ofz_r0}");
+        eprintln!("ofz r0 liquidity: {ofz_r0}");
         assert_eq!(
             ofz_r0, 5_407_362_545_736_161_987,
             "ofz r0 must NOT drain (gt exclusive)"
@@ -2794,10 +2794,10 @@ mod tests {
 
     /// Word-of parity: the Rust sparse miss-detection model (`word_of`, used by
     /// both V3 + V4 `vX_simulate_swap` to decide whether the current tick's
-    /// bitmap word is "known") must match the Python companion's bitmap word
-    /// computation (`position(tick // tick_spacing)[0]` in
-    /// `v3_libraries/tick_bitmap.py`). Both use floored division (`div_euclid`
-    /// == Python `//`) + arithmetic right-shift (`>> 8`), so they agree for
+    /// bitmap word is "known") must match the bitmap word computation
+    /// (`position(tick // tick_spacing)[0]`, the canonical word-position math
+    /// in [`crate::tick_bitmap`]). Both use floored division (`div_euclid` ==
+    /// `//`) + arithmetic right-shift (`>> 8`), so they agree for
     /// negative non-multiple current ticks — the regime a crossing swap's
     /// post-step price lives in. This test locks that equivalence so the V4
     /// crossing-swap divergence under the fetch seam (slice 4) is NOT
@@ -2806,7 +2806,7 @@ mod tests {
     /// divergence lives elsewhere (fee accounting / boundary-tick walk / fetch
     /// merge semantics) and must be fork-validated.
     #[test]
-    fn word_of_matches_python_bitmap_word_position_for_edge_ticks() {
+    fn word_of_matches_bitmap_word_position_for_edge_ticks() {
         // (tick, tick_spacing) covering: positive + negative, multiples +
         // non-multiples of spacing, and cross-word boundaries.
         let cases: &[(i32, i32)] = &[

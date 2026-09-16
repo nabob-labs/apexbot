@@ -28,15 +28,11 @@
 //! added; the pre-existing Solidly/Balancer/Curve encoding gap is preserved
 //! (out of scope for the flatten — a future `HopInfo::Solidly` /
 //! `HopInfo::Balancer` task).
-
-use apexbot_executor::composers::{HopInfo, PathInfo, V2HopInfo, V3HopInfo, V4HopInfo};
-use thiserror::Error;
-
+use super::ArbitrageEngine;
 use crate::bot_core::BotState;
 use ::apexbot_solvers::mixed::{HopType, MixedPoolRef};
-
-use super::ArbitrageEngine;
-
+use apexbot_executor::composers::{HopInfo, PathInfo, V2HopInfo, V3HopInfo, V4HopInfo};
+use thiserror::Error;
 /// Why [`ArbitrageEngine::path_info_for`] could not build a `PathInfo`.
 #[derive(Debug, Error)]
 pub enum PathInfoBuildError {
@@ -50,7 +46,6 @@ pub enum PathInfoBuildError {
     )]
     UnsupportedHopType { hop_type: HopType, pool_id: u64 },
 }
-
 /// Build the `composers::PathInfo` for a hop list straight off the shared
 /// core — the ENGINE-LOCK-FREE form (SIMPIPE2 T4): the inline-sim hook runs
 /// in the SOLVE WORKER while the calling cycle holds the engine `Mutex`, so
@@ -73,72 +68,38 @@ pub fn build_path_info(
     }
     Ok(PathInfo::new(hops))
 }
-
-impl ArbitrageEngine {
-    /// Build the engine-facing `composers::PathInfo` for `path_id` by
-    /// resolving each registered hop's identity from the shared `BotState`.
-    ///
-    /// Returns:
-    /// - `None` if `path_id` was never registered.
-    /// - `Some(Err(..))` if a hop's identity is missing or its family has no
-    ///   command-stream encoder arm.
-    ///
-    /// # Lock discipline
-    ///
-    /// Acquires the `BotState` read lock once for the whole projection
-    /// (engine-then-core is the only nested order — no re-entry into the
-    /// engine under the core lock).
-    #[must_use]
-    pub fn path_info_for(&self, path_id: u64) -> Option<Result<PathInfo, PathInfoBuildError>> {
-        let path = self.path_pools.get(&path_id)?;
-        let core = self.core.read();
-        let mut hops = Vec::with_capacity(path.pools.len());
-        for pool_ref in &path.pools {
-            match build_hop_info(&core, pool_ref) {
-                Ok(hop) => hops.push(hop),
-                Err(e) => return Some(Err(e)),
-            }
+/// Build the engine-facing `composers::PathInfo` for `path_id` by
+/// resolving each registered hop's identity from the shared `BotState`.
+///
+/// Returns:
+/// - `None` if `path_id` was never registered.
+/// - `Some(Err(..))` if a hop's identity is missing or its family has no
+///   command-stream encoder arm.
+///
+/// # Lock discipline
+///
+/// Acquires the `BotState` read lock once for the whole projection
+/// (engine-then-core is the only nested order — no re-entry into the
+/// engine under the core lock). A crate-internal free function (T5): the
+/// stage surface owns the public seam.
+#[must_use]
+pub(crate) fn path_info_for(
+    engine: &ArbitrageEngine,
+    path_id: u64,
+) -> Option<Result<PathInfo, PathInfoBuildError>> {
+    let path = engine.registry.get(path_id)?;
+    let core = engine
+        .core
+        .read_at(crate::bot_core::state_lock::LockSite::Solver);
+    let mut hops = Vec::with_capacity(path.pools.len());
+    for pool_ref in &path.pools {
+        match build_hop_info(&core, pool_ref) {
+            Ok(hop) => hops.push(hop),
+            Err(e) => return Some(Err(e)),
         }
-        Some(Ok(PathInfo::new(hops)))
     }
-
-    /// Human-readable hop summary for telemetry, e.g.
-    /// `"path_id=7 [V2:0xabc..(zfo=1) -> V3:0xdef..(zfo=0)]"`.
-    ///
-    /// Telemetry-only: resolves each hop's concrete pool identity from the
-    /// shared `BotState` so a trace field names the POOLS in a path, not just
-    /// the numeric id (the operator-facing ask: "clearly see which pools are
-    /// in the path"). Unresolvable identities degrade to the raw `pool_id`.
-    #[must_use]
-    pub fn describe_path(&self, path_id: u64) -> String {
-        let Some(path) = self.path_pools.get(&path_id) else {
-            return format!("path_id={path_id} (unregistered)");
-        };
-        let core = self.core.read();
-        let hops: Vec<String> = path
-            .pools
-            .iter()
-            .map(|r| describe_hop(&core, r.hop_type, r.pool_key, r.zero_for_one))
-            .collect();
-        format!("path_id={path_id} [{}]", hops.join(" -> "))
-    }
-
-    /// [`Self::describe_path`] with a per-path cache: paths are immutable
-    /// after registration, so the hop description is built once and reused
-    /// every block when the activation telemetry formats span fields.
-    #[must_use]
-    pub fn describe_path_cached(&self, path_id: u64) -> std::sync::Arc<str> {
-        if let Some(hit) = self.path_description_cache.lock().get(&path_id) {
-            return std::sync::Arc::clone(hit);
-        }
-        let rendered: std::sync::Arc<str> = std::sync::Arc::from(self.describe_path(path_id));
-        self.path_description_cache
-            .lock()
-            .insert(path_id, std::sync::Arc::clone(&rendered));
-        rendered
-    }
+    Some(Ok(PathInfo::new(hops)))
 }
-
 /// Telemetry helper: render one hop as `FAMILY:pool(zfo=N)`. Unresolvable
 /// identities degrade to the raw `pool_id` rather than failing — this only
 /// ever feeds trace fields, never solver or encoder logic.
@@ -172,7 +133,6 @@ pub(crate) fn describe_hop(
         other => format!("{other:?}:pool_id={pool_id}"),
     }
 }
-
 /// Resolve one registered hop to its encoder descriptor.
 ///
 /// `pool_ref.pool_key` is the `BotState` `pool_id` (set at `register_path`
@@ -251,7 +211,6 @@ fn build_hop_info(core: &BotState, pool_ref: &MixedPoolRef) -> Result<HopInfo, P
         }),
     }
 }
-
 /// V2 fee in bips-of-10000 from the `(gamma_numer, fee_denom)` retained
 /// fraction. Mirrors `int(Fraction(denom - gamma, denom) * 10000)` (Python
 /// `int()` truncates toward zero).
@@ -277,34 +236,27 @@ fn v2_fee_bips(gamma: u64, denom: u64) -> u16 {
         .expect("fee_bips <= 10000 <= u16::MAX under the gamma <= denom guard");
     fee_bips
 }
-
 #[expect(clippy::expect_used, clippy::panic, clippy::similar_names)]
 #[cfg(test)]
 mod tests {
-    use hashbrown::HashMap;
-
-    use alloy::primitives::{aliases::U112, Address, U256};
-    use apexbot_executor::composers::HopInfo;
-
+    use crate::arb_engine::lifecycle::register_path;
     use crate::arb_engine::ArbitrageEngine;
     use crate::bot_core::{PoolTickCoverage, RegisterV3PoolParams, RegisterV4PoolParams};
     use ::apexbot_decoders::v4_swap_decoder::V4PoolId;
     use ::apexbot_pools::v4_state::V4PoolKey;
     use ::apexbot_solvers::mixed::PoolHop;
-
+    use alloy::primitives::{aliases::U112, Address, U256};
+    use apexbot_executor::composers::HopInfo;
+    use hashbrown::HashMap;
     fn usdc(amount: u64) -> U112 {
         (U256::from(amount) * U256::from(10u64).pow(U256::from(6))).to::<U112>()
     }
-
     fn weth(amount: u64) -> U112 {
         (U256::from(amount) * U256::from(10u64).pow(U256::from(18))).to::<U112>()
     }
-
     const GAMMA_03: u64 = 997;
     const FEE_DENOM_03: u64 = 1000;
-
     const SQRT_PRICE_1_1: u128 = 79_228_162_514_264_337_593_543_950_336;
-
     /// A V2 0.3% hop resolves to `V2HopInfo { fee: 30, zfo: true }` — the
     /// exact `int(Fraction(1000-997, 1000) * 10000)` value the Python
     /// `build_hops_from_pools` produced.
@@ -326,8 +278,9 @@ mod tests {
             GAMMA_03,
             FEE_DENOM_03,
         );
-        let path_id = engine
-            .register_path(vec![
+        let path_id = register_path(
+            &mut engine,
+            vec![
                 PoolHop {
                     pool_id,
                     zero_for_one: true,
@@ -336,11 +289,10 @@ mod tests {
                     pool_id: pool2_id,
                     zero_for_one: true,
                 },
-            ])
-            .expect("register_path");
-
-        let path = engine
-            .path_info_for(path_id)
+            ],
+        )
+        .expect("register_path");
+        let path = super::path_info_for(&engine, path_id)
             .expect("path exists")
             .expect("v2 supported");
         assert_eq!(path.hops.len(), 2);
@@ -353,7 +305,6 @@ mod tests {
         assert_eq!(v2.fee, 30);
         assert!(v2.zfo);
     }
-
     /// Telemetry: `describe_path` names the CONCRETE pool addresses (the
     /// operator ask — "which pools are in the path"), degrading to raw
     /// `pool_id` for unregistered ids.
@@ -375,8 +326,9 @@ mod tests {
             GAMMA_03,
             FEE_DENOM_03,
         );
-        let path_id = engine
-            .register_path(vec![
+        let path_id = register_path(
+            &mut engine,
+            vec![
                 PoolHop {
                     pool_id: pid,
                     zero_for_one: true,
@@ -385,18 +337,20 @@ mod tests {
                     pool_id: pid2,
                     zero_for_one: true,
                 },
-            ])
-            .expect("register_path");
-
-        let desc = engine.describe_path(path_id);
+            ],
+        )
+        .expect("register_path");
+        let desc = engine.cycle.describe_path(path_id, &engine.registry);
         assert!(
             desc.contains("V2:0x4444"),
             "describe_path must carry the concrete pool address: {desc}"
         );
         assert!(desc.contains("zfo=1"), "zfo flag missing: {desc}");
-        assert_eq!(engine.describe_path(99_999), "path_id=99999 (unregistered)");
+        assert_eq!(
+            engine.cycle.describe_path(99_999, &engine.registry),
+            "path_id=99999 (unregistered)"
+        );
     }
-
     /// Reverse direction selects `fee_token1` (identical fee here) + `zfo: false`.
     #[test]
     fn v2_path_reverse_direction_sets_zfo_false() {
@@ -416,8 +370,9 @@ mod tests {
             GAMMA_03,
             FEE_DENOM_03,
         );
-        let path_id = engine
-            .register_path(vec![
+        let path_id = register_path(
+            &mut engine,
+            vec![
                 PoolHop {
                     pool_id,
                     zero_for_one: false,
@@ -426,10 +381,10 @@ mod tests {
                     pool_id: pool2_id,
                     zero_for_one: true,
                 },
-            ])
-            .expect("register_path");
-        let path = engine
-            .path_info_for(path_id)
+            ],
+        )
+        .expect("register_path");
+        let path = super::path_info_for(&engine, path_id)
             .expect("path exists")
             .expect("v2 supported");
         let HopInfo::V2(v2) = &path.hops[0] else {
@@ -438,7 +393,6 @@ mod tests {
         assert!(!v2.zfo);
         assert_eq!(v2.fee, 30);
     }
-
     #[test]
     fn v3_path_projects_to_hop_info() {
         let mut engine = ArbitrageEngine::new();
@@ -467,8 +421,9 @@ mod tests {
             GAMMA_03,
             FEE_DENOM_03,
         );
-        let path_id = engine
-            .register_path(vec![
+        let path_id = register_path(
+            &mut engine,
+            vec![
                 PoolHop {
                     pool_id,
                     zero_for_one: true,
@@ -477,10 +432,10 @@ mod tests {
                     pool_id: pool2_id,
                     zero_for_one: true,
                 },
-            ])
-            .expect("register_path");
-        let path = engine
-            .path_info_for(path_id)
+            ],
+        )
+        .expect("register_path");
+        let path = super::path_info_for(&engine, path_id)
             .expect("path exists")
             .expect("v3 supported");
         let HopInfo::V3(v3) = &path.hops[0] else {
@@ -492,7 +447,6 @@ mod tests {
         assert_eq!(v3.fee, 3000);
         assert!(v3.zfo);
     }
-
     #[test]
     fn v4_path_projects_to_hop_info_with_pool_id_hex() {
         let mut engine = ArbitrageEngine::new();
@@ -527,8 +481,9 @@ mod tests {
             GAMMA_03,
             FEE_DENOM_03,
         );
-        let path_id = engine
-            .register_path(vec![
+        let path_id = register_path(
+            &mut engine,
+            vec![
                 PoolHop {
                     pool_id,
                     zero_for_one: true,
@@ -537,10 +492,10 @@ mod tests {
                     pool_id: pool2_id,
                     zero_for_one: true,
                 },
-            ])
-            .expect("register_path");
-        let path = engine
-            .path_info_for(path_id)
+            ],
+        )
+        .expect("register_path");
+        let path = super::path_info_for(&engine, path_id)
             .expect("path exists")
             .expect("v4 supported");
         let HopInfo::V4(v4) = &path.hops[0] else {
@@ -555,14 +510,12 @@ mod tests {
         assert_eq!(v4.hook_address, Address::ZERO);
         assert!(v4.zfo);
     }
-
     /// Unknown `path_id` → `None` (matches "no Python `PathInfo` in the registry").
     #[test]
     fn unknown_path_id_returns_none() {
         let engine = ArbitrageEngine::new();
-        assert!(engine.path_info_for(999).is_none());
+        assert!(super::path_info_for(&engine, 999).is_none());
     }
-
     /// A multi-hop V2→V3 path projects to a two-hop `PathInfo` in order.
     #[test]
     fn multi_hop_path_projects_in_order() {
@@ -592,8 +545,9 @@ mod tests {
             init_hash: alloy::primitives::B256::ZERO,
             ..Default::default()
         });
-        let path_id = engine
-            .register_path(vec![
+        let path_id = register_path(
+            &mut engine,
+            vec![
                 PoolHop {
                     pool_id: v2,
                     zero_for_one: true,
@@ -602,10 +556,10 @@ mod tests {
                     pool_id: v3,
                     zero_for_one: false,
                 },
-            ])
-            .expect("register_path");
-        let path = engine
-            .path_info_for(path_id)
+            ],
+        )
+        .expect("register_path");
+        let path = super::path_info_for(&engine, path_id)
             .expect("path exists")
             .expect("supported");
         assert_eq!(path.hops.len(), 2);

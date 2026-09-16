@@ -19,6 +19,7 @@
 //! those belong in trace span fields (click from a dashboard anomaly to an
 //! example trace), and unbounded label sets will explode the scraper.
 
+use apexbot_core::{op_info, op_warn};
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +38,15 @@ pub const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9464";
 
 /// Env var overriding the scrape endpoint.
 const METRICS_ADDR_ENV: &str = "APEXBOT_METRICS_ADDR";
+
+/// Live distinct-series count, refreshed by every [`render`] (the scrape path)
+/// and reported by the `apexbot.metric_series` observable gauge (ADR-043 §9).
+///
+/// The gauge callback MUST NOT call [`prometheus::Registry::gather`] itself:
+/// it runs inside the exporter's collect, so a nested gather re-enters the
+/// registry lock and deadlocks the scrape. Reading this atomic keeps the
+/// callback re-entrancy-free; the reported value lags one scrape.
+static SERIES_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Errors from metrics initialization.
 #[derive(Debug, Error)]
@@ -68,7 +78,28 @@ pub fn build_prometheus_provider(
         .with_resource(crate::otel::bot_resource())
         .with_reader(exporter)
         .build();
+    install_metric_series_self_metric(&provider);
     Ok((provider, registry))
+}
+
+/// ADR-043 §9: expose the live distinct-series count so a cardinality blowup
+/// is visible BEFORE the collector falls over.
+///
+/// The value is taken from the registry at scrape time and includes this
+/// gauge's own series, so the floor is 1 and no threshold can be tuned to
+/// zero. It is the metric-side twin of the log-volume gate: an unexpected jump
+/// is a diff, not a surprise.
+fn install_metric_series_self_metric(provider: &SdkMeterProvider) {
+    let _self_metric = provider
+        .meter(METER_NAME)
+        .u64_observable_gauge("apexbot.metric_series")
+        .with_description(
+            "Live distinct Prometheus series count (cardinality twin, ADR-043 section 9)",
+        )
+        .with_callback(|observer| {
+            observer.observe(SERIES_COUNT.load(Ordering::Relaxed), &[]);
+        })
+        .build();
 }
 
 /// Render a registry to the Prometheus text exposition format (what
@@ -83,7 +114,15 @@ pub fn render(registry: &prometheus::Registry) -> String {
     if encoder.encode(&registry.gather(), &mut buf).is_err() {
         return String::new();
     }
-    String::from_utf8(buf).unwrap_or_default()
+    let text = String::from_utf8(buf).unwrap_or_default();
+    // ADR-043 §9: refresh the series-count self-metric from the scrape we just
+    // rendered (sample lines are everything that is not a `#` comment).
+    let series = text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .count() as u64;
+    SERIES_COUNT.store(series, Ordering::Relaxed);
+    text
 }
 
 /// Serve `/metrics` until `stop` is set: one accept loop of blocking I/O on
@@ -226,12 +265,30 @@ pub fn init_global_metrics_with_addr(addr: SocketAddr) -> Result<(), MetricsInit
             serve_on_listener(&listener, &body, &body_stop);
         });
     if spawned.is_err() {
-        tracing::warn!("metrics scrape thread spawn failed - endpoint inactive");
+        op_warn!(
+            domain = pump,
+            "metrics scrape thread spawn failed - endpoint inactive"
+        );
         stop.store(true, Ordering::Relaxed);
     } else {
-        tracing::info!(addr = %addr, "Prometheus metrics endpoint active");
+        op_info!(domain = pump, addr = %addr, "Prometheus metrics endpoint active");
     }
     Ok(())
+}
+
+/// Count a log record dropped by a bounded console queue (ADR-043 §6).
+/// Renders as `apexbot.log_dropped_total{sink}` — a silent ceiling is not
+/// acceptable, so the drop is observable. No-ops before
+/// [`init_global_metrics`] (telemetry off), same discipline as every other
+/// observation site.
+pub fn record_log_drop(sink: &'static str) {
+    static LOG_DROPS: OnceLock<Option<opentelemetry::metrics::Counter<u64>>> = OnceLock::new();
+    let counter = LOG_DROPS.get_or_init(|| {
+        try_global_meter().map(|meter| meter.u64_counter("apexbot.log_dropped_total").build())
+    });
+    if let Some(counter) = counter {
+        counter.add(1, &[opentelemetry::KeyValue::new("sink", sink)]);
+    }
 }
 
 /// The process-global meter for recording instruments, or `None` before
@@ -242,6 +299,17 @@ pub fn init_global_metrics_with_addr(addr: SocketAddr) -> Result<(), MetricsInit
 #[must_use]
 pub fn try_global_meter() -> Option<opentelemetry::metrics::Meter> {
     GLOBAL.get().map(|g| g.provider.meter(METER_NAME))
+}
+
+/// Flush the metrics provider WITHOUT stopping the scrape server.
+///
+/// The pre-teardown flush (ADR-043 §6): the OTLP exporter needs the tokio
+/// runtime for its final batch, so a flush after runtime teardown exports
+/// nothing. No-ops when init has not run.
+pub fn flush_global_metrics() {
+    if let Some(global) = GLOBAL.get() {
+        let _ = global.provider.force_flush();
+    }
 }
 
 /// Stop the scrape server and flush provider state (clean-shutdown path).

@@ -36,7 +36,7 @@
 //! `solve_probe_executor`, `fleet_solver_slots`, `fleet_simdriver_slots`,
 //! `fleet_resolve_slots`, `fleet_merge_slots`,
 //! `fleet_pool_state_updater_slots`,
-//! `detached_solve_bins`, `subscriber_drainer`, `metrics_scrape`,
+//! `detached_solve_bins`, `metrics_scrape`,
 //! `rust_log_drainer`, `gil_probe`.
 //!
 //! # Future fleet crate
@@ -98,10 +98,8 @@ pub fn set_export_hook(hook: fn(&[WorkerCensusEntry])) {
 pub fn emit_boot_table() {
     let table = snapshot();
     BOOT_DUMPED.get_or_init(|| {
-        tracing::info!(
-            target: "apexbot::worker-census",
-            entries = ?table,
-            "[worker-census] boot table full",
+        crate::op_info!(domain = pump, entries = ?table,
+            "boot table full",
         );
     });
 }
@@ -131,13 +129,13 @@ pub fn register(entry: WorkerCensusEntry) {
         table.sort_by(|a, b| a.resource.cmp(b.resource));
     }
     if late {
-        tracing::info!(
-            target: "apexbot::worker-census",
+        crate::op_info!(
+            domain = pump,
             resource = announced.0,
             count = announced.1,
             thread_name = announced.2,
             sizing = announced.3,
-            "[worker-census] registered after boot dump — new spawn site must register",
+            "registered after boot dump — new spawn site must register",
         );
     }
     if let Some(hook) = EXPORT_HOOK.get() {
@@ -282,7 +280,12 @@ mod tests {
         let sunk = std::sync::Arc::clone(&rec);
         tracing::subscriber::with_default(sunk, emit_boot_table);
         let logged = rec.0.lock().unwrap().clone();
-        assert!(logged.contains("[worker-census]"), "tag missing: {logged}");
+        // The area is derived from the target, not carried in the message
+        // (ADR-043 section 7) - the table itself must stay intact.
+        assert!(
+            !logged.contains("[worker-census]"),
+            "tag left in message: {logged}"
+        );
         assert!(
             logged.contains("census-probe-boot"),
             "boot table missing the registered resource: {logged}"

@@ -12,8 +12,7 @@ tags:
   - swapbased
   - liquidity
 related_files:
-  - ../../src/apexbot/cli/pool.py
-  - ../../src/apexbot/cli/exchange.py
+  - ../rust-cli.md
   - ../../src/apexbot/database/models/pools.py
   - ../../src/apexbot/database/models/base.py
   - ../../src/apexbot/uniswap/v3_liquidity_pool.py
@@ -54,14 +53,14 @@ V4 uses separate `ManagedPool` database tables with PoolManager contract referen
 
 ## Commands
 
-All CLI commands are implemented in [`src/apexbot/cli/pool.py`](../../src/apexbot/cli/pool.py) and [`src/apexbot/cli/exchange.py`](../../src/apexbot/cli/exchange.py).
+The command vocabulary is **Rust-owned**: [`apexbot-cli`](../../rust/crates/apexbot-cli/src/argv.rs) declares it over `apexbot-cli-core`'s [pool](../../rust/crates/apexbot-cli-core/src/pool.rs) and [exchange](../../rust/crates/apexbot-cli-core/src/exchange.rs) arms. The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the domain behaviour below is unchanged.
 
 ### `apexbot pool update`
 
 Update pool metadata and liquidity positions for all activated exchanges.
 
 ```bash
-apexbot pool update [--chunk SIZE] [--to-block BLOCK]
+apexbot pool update [--chunk SIZE] [--to-block BLOCK] [--verify-chunk|--no-verify-chunk] [--verify-all|--no-verify-all] [--verify-all-interval BLOCKS]
 ```
 
 #### Parameters
@@ -98,20 +97,24 @@ apexbot pool update --chunk 5000
 
 ### `apexbot exchange activate`
 
-Activate an exchange for pool tracking. Creates database entry if not exists.
+Activate an exchange for pool tracking. Creates the database entry if it does
+not exist; idempotent when already active.
 
 ```bash
-apexbot exchange activate [base_aerodrome_v2 | base_aerodrome_v3 | base_pancakeswap_v2 | base_pancakeswap_v3 | base_sushiswap_v2 | base_sushiswap_v3 | base_swapbased_v2 | base_uniswap_v2 | base_uniswap_v3 | base_uniswap_v4 | ethereum_pancakeswap_v2 | ethereum_pancakeswap_v3 | ethereum_sushiswap_v2 | ethereum_sushiswap_v3 | ethereum_uniswap_v2 | ethereum_uniswap_v3 | ethereum_uniswap_v4]
+apexbot exchange activate --chain <CHAIN> --name <NAME>
 ```
 
-V4 exchanges additionally create a PoolManagerTable entry.
+`CHAIN` is a chain slug (`base`, `ethereum`) or a numeric chain id; `NAME` is the
+DEX slug (`aerodrome_v2`, `uniswap_v3`, `uniswap_v4`, …). ADR-051 D5 collapses
+the retired per-`(chain, DEX)` click verbs onto this one data-driven pair.
+V4 exchanges additionally create a `PoolManagerTable` entry.
 
 ### `apexbot exchange deactivate`
 
-Deactivate an exchange (pools not updated).
+Deactivate an exchange (its pools are not updated).
 
 ```bash
-apexbot exchange deactivate [exchange_name]
+apexbot exchange deactivate --chain <CHAIN> --name <NAME>
 ```
 
 ## Supported Exchanges
@@ -266,6 +269,6 @@ The command uses Web3 connections from apexbot config file. Each active chain mu
 
 ## Dependencies
 
-- **Database**: SQLAlchemy ORM
-- **Blockchain**: Web3.py for RPC calls
-- **Math**: Uniswap V3/V4 libraries (tick bitmap, tick math, liquidity math)
+- **Database**: SQLAlchemy ORM (nominal models; the updater's writes are Rust-owned)
+- **Blockchain**: Rust `apexbot-rpc` / `apexbot-pool-updater` for RPC calls
+- **Math**: Rust `apexbot-math` + `apexbot-pools` (tick bitmap, tick math, liquidity math)

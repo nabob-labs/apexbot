@@ -1,8 +1,8 @@
-"""Database session management and Alembic configuration."""
+"""Database session management helpers."""
 
 from typing import TYPE_CHECKING
 
-from apexbot.database.operations import get_alembic_config, get_scoped_sqlite_session
+from apexbot.database.operations import get_scoped_sqlite_session
 from apexbot.database.session_manager import DatabaseSessionManager
 
 if TYPE_CHECKING:
@@ -14,6 +14,5 @@ if TYPE_CHECKING:
 
 __all__ = (
     "DatabaseSessionManager",
-    "get_alembic_config",
     "get_scoped_sqlite_session",
 )

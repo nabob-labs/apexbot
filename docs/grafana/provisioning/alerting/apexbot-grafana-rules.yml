@@ -169,7 +169,7 @@ groups:
             apexbot_quarantine_events_total counter and the
             solver_state_desync errors kind are gone: the ADR-021 publish
             tripwire was retired with MROOY7 task 2UVG3E. Urgent root-cause
-            work: enable APEXBOT_SIM_DIVERGENCE_LOG for the engine-vs-RPC
+            work: enable the sim-divergence probe for the engine-vs-RPC
             divergence dump. The bot keeps trading its other paths.
         data:
           - refId: A
@@ -269,7 +269,7 @@ groups:
             where submission/delivery subscribe - has its 5m p95 above 2s.
             Warning level: money is landing but late. Investigated with the
             dashboard stage-cycle waterfall (delivery / burst / settle /
-            streaming-age legs) and a apexbot.epoch trace from Jaeger.
+            streaming-age legs) and a apexbot.epoch.run trace from Jaeger.
         data:
           - refId: A
             relativeTimeRange: { from: 600, to: 0 }
@@ -308,6 +308,35 @@ groups:
               expr: >-
                 sum(rate(apexbot_epoch_stale_drops_total[5m])) > 0
                 or vector(0)
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: apexbot-metric-cardinality
+        title: ApexbotMetricCardinalityHigh
+        condition: C
+        for: 15m
+        annotations:
+          summary: apexbot metric cardinality high - series count growing
+          description: >-
+            The ADR-043 section 9 self-metric (distinct Prometheus series)
+            climbed past the operator ceiling. A steady floor is expected
+            (instruments + labels); a rising line means a bounded label gained
+            values (or a new instrument with an unbounded key landed) and the
+            collector will fall over before the dashboards do. Raise the
+            threshold deliberately, or delete the offending label.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expr: 'apexbot_metric_series > 2000'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true

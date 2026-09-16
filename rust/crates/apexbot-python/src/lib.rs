@@ -23,6 +23,8 @@
 //!
 //! See individual module documentation for usage examples.
 
+use apexbot_core::diag;
+use apexbot_core::op_info;
 // Opt-in allocator swap for churn-heavy workloads (missed-WS-pong follow-up,
 // RSS-growth investigation). The measured pathology was glibc free-page
 // retention across per-thread arenas (system vs in-use spread of gigabytes,
@@ -62,8 +64,16 @@ pub mod c_api;
 /// Gated on `any(pool, aave-updater)` (whichever seam needs it).
 #[cfg(any(feature = "pool", feature = "aave-updater"))]
 pub mod cancel;
+/// The Python-side console seam (ADR-051 D3): argv passthrough into the
+/// Rust-owned console. Unconditional - the console is core.
+pub mod cli;
 #[cfg(feature = "concentrated-liquidity-math")]
 pub mod concentrated_liquidity_math;
+/// Typed `BotConfig` accessors for the Python driver shell (4IOEVT). The
+/// loader (the ONLY env reader) installs the process-wide config; these
+/// getters expose its typed fields to Python without a second declaration
+/// site. Unconditional — apexbot-config is always a dependency.
+pub mod config;
 pub mod conversion;
 pub mod crypto;
 #[cfg(feature = "curve-math")]
@@ -140,13 +150,13 @@ pub use apexbot_abi::{abi_types, decoder, encoder, signature_parser};
 pub use apexbot_rpc::{contract, provider, subscription};
 
 // The bot state (`BotState`, reorg journal, verifier, pump,
-// V2/V3/V4 state) + Möbius solvers + the unified `ArbitrageEngine` live in the
+// V2/V3/V4 state) + Möbius solvers + the unified arbitrage engine live in the
 // `apexbot-bot` workspace member — one crate by ADR-003 (the state/solver seam
 // is genuine domain coupling, not over-abstracted). Re-exported as
 // `crate::bot_core` / `crate::arb_engine` so every existing call site in the
 // binding layer keeps resolving. The `#[pyclass]`/`#[pyfunction]` wrappers
 // (`PyBot`, `PyLiquidityPool`, `PyErc20Token`, `PyDexIdentity`,
-// `PyArbitrageEngine`, the `Verification*Error`/`*RejectedError` exception
+// `PyArbEngine`, the `Verification*Error`/`*RejectedError` exception
 // types) live in the `bot` / `bot::pool` / `bot::token` /
 // `bot::dex_identity` modules and the `bot::engine` subdir (they need `conversion::alloy` / `conversion::cache`).
 #[cfg(feature = "bot")]
@@ -246,7 +256,7 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
         Err(e) => {
             #[expect(clippy::print_stderr)]
             {
-                eprintln!("[config] invalid configuration - boot refused: {e}");
+                eprintln!("invalid configuration - boot refused: {e}");
             }
             #[expect(clippy::exit)]
             std::process::exit(2);
@@ -267,7 +277,7 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
                 // pre-abort stderr marker).
                 #[expect(clippy::print_stderr)]
                 {
-                    eprintln!("[failure_policy] invalid override - boot refused: {e}");
+                    eprintln!("invalid override - boot refused: {e}");
                 }
                 #[expect(clippy::exit)]
                 std::process::exit(2);
@@ -281,8 +291,7 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
                 .map(|(k, a)| format!("{k}={a}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            tracing::info!(
-                count = overrides.len(),
+            op_info!(domain = pump, count = overrides.len(),
                 overrides = %pairs,
                 "failure_policy overrides installed"
             );
@@ -294,7 +303,7 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
             // DELIBERATE fail-loud import seam (see the Ok arm above).
             #[expect(clippy::print_stderr)]
             {
-                eprintln!("[failure_policy] invalid override table - boot refused: {e}");
+                eprintln!("invalid override table - boot refused: {e}");
             }
             #[expect(clippy::exit)]
             std::process::exit(2);
@@ -302,6 +311,10 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     python_log_layer::init_logging_subscriber();
+
+    // ADR-043 §5 migration safety net: loudly name any retired verbosity env
+    // name still present in the environment (detection, not compatibility).
+    apexbot_core::telemetry::warn_retired_env_names();
 
     // GOQWCL (incident 2026-08-21): bind pyo3-async-runtimes to the shared
     // bot runtime instead of letting the first `future_into_py` call lazily
@@ -311,27 +324,20 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ONE runtime, created deterministically at import.
     if pyo3_async_runtimes::tokio::init_with_runtime(apexbot_core::runtime::get_runtime()).is_err()
     {
-        tracing::debug!("[init] pyo3_async_runtimes already bound to a runtime");
+        diag!(
+            domain = pump,
+            "pyo3_async_runtimes already bound to a runtime"
+        );
     }
 
-    // Soak-2026-08-22 forensics: every worker panic gets a loud, timestamped
-    // ERROR with the thread name BEFORE the default hook runs. The v4 TLS
-    // AccessError abort surfaced with zero preceding context - the default
-    // hook's stderr output raced the abort and we could not tell whether a
-    // panic or an external shutdown initiated runtime teardown. This hook
-    // guarantees a first-mover log line through our subscriber (which the
-    // PythonLogLayer forwards to Python logging) for ANY panic anywhere.
-    {
-        let default_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            tracing::error!(
-                thread = std::thread::current().name().unwrap_or("<unnamed>"),
-                payload = %info,
-                "[teardown] panic captured - runtime may be unwinding"
-            );
-            default_hook(info);
-        }));
-    }
+    // Soak-2026-08-22 forensics + ADR-043 §2: the panic hook lives in the
+    // observability facade (apexbot_core::telemetry::install_panic_hook) so
+    // the pure-Rust core and this binding share ONE contract — exactly one
+    // ERROR carrying the panic payload + thread name, with the active span
+    // marked ERROR so the OTel layer exports it as a span exception. The hook
+    // chains the previous hook, so the default backtrace still prints, and
+    // fires for ANY panic anywhere (PythonLogLayer forwards it to Python).
+    apexbot_core::telemetry::install_panic_hook();
 
     // PE4FPM: dump the ONE structured worker-census boot line with the full
     // table (see apexbot_core::worker_census). Resources that boot lazily

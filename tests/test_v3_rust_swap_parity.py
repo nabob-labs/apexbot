@@ -16,7 +16,7 @@ import pytest
 
 from apexbot._ffi import Bot
 from apexbot.uniswap.concentrated.types import LiquidityAtTick
-from apexbot.uniswap.v3_libraries import MIN_SQRT_RATIO
+from apexbot.uniswap.math import MIN_SQRT_RATIO
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v3_pool_factory import make_v3_pool
 

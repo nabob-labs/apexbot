@@ -36,6 +36,7 @@
 //! CurrencyNotSettled) + captured-swap-mismatch failures (the V2 non-reverting
 //! case). The dispatch feedback (step 7) iterates `outcome.failures` only.
 
+use apexbot_core::op_error;
 use std::collections::{HashMap, HashSet};
 
 use alloy::primitives::{Address, U256};
@@ -426,10 +427,9 @@ impl FeeOnTransferRegistry {
             .get(&token)
             .is_some_and(|r| Self::confirmed_within_window(r, current_block));
         if confirmed && self.is_verified_non_fot(token) {
-            tracing::error!(
-                %token,
+            op_error!(domain = exec, %token,
                 current_block,
-                "[fot] verified non-FoT token accumulated FoT suspicion — false positive; clearing record"
+                "verified non-FoT token accumulated FoT suspicion — false positive; clearing record"
             );
             return false;
         }
@@ -493,7 +493,7 @@ impl FeeOnTransferRegistry {
     fn assert_not_verified_non_fot(&self, token: Address, confirmed: bool) -> bool {
         assert!(
             !(confirmed && self.verified_non_fot.contains(&token)),
-            "[fot] verified non-FoT token confirmed as fee-on-transfer: {token:?} — classifier bug; refusing to silently drop a real token"
+            "verified non-FoT token confirmed as fee-on-transfer: {token:?} — classifier bug; refusing to silently drop a real token"
         );
         confirmed
     }

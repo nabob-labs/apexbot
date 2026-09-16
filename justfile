@@ -27,6 +27,13 @@ version:
 bump-version version:
     cargo set-version --workspace {{ version }} --manifest-path rust/Cargo.toml
 
+#
+# Release-checklist step (schema-carrying releases): bump the Rust schema
+# ritual in lockstep — `RUST_SCHEMA_VERSION` in `apexbot-db/src/schema.rs` →
+# append the matching `MigrationStep` to `RUST_MIGRATIONS` in
+# `apexbot-db/src/migrate.rs` → extend the fixture matrix (one DB per released
+# revision). Verify the publish chain with `just publish-dry-run`.
+
 # ========== Rust Development ==========
 
 # Run the standalone-Rust-consumer smoke (ADR-005 standalone claim). Proves a
@@ -55,7 +62,8 @@ test-standalone:
 test: test-rust test-python
 
 # Run every pre-push gate manually, in hook order and fail-fast — the
-# commitlint push-range re-lint, then the Rust/Python code linters, then the
+# object-DB GC brake, the commitlint push-range re-lint, then the Rust/Python
+# code linters, then the
 # Rust and Python build + test tracks, exactly as the installed prek pre-push
 # hook runs them (prek.toml, stages = ["pre-push"]). The installed hook and
 # ci.yml stay authoritative on an actual push; this is for checking the gates
@@ -76,6 +84,7 @@ pre-push:
         "$@"
     }
 
+    run_gate "Object DB GC"            scripts/hooks/object-gc.sh
     run_gate "commitlint (push range)" scripts/hooks/commitlint-push.sh
     run_gate "Rust clippy"             just lint-rust-check
     run_gate "Python lint"             just lint-python-check
@@ -115,7 +124,7 @@ lint-rust:
 # Lint Rust (check-only; non-mutating). Mirrors the clippy gate CI runs,
 # minus `--fix`, so a pre-commit run cannot dirty staged files. Stricter than
 # CI's `lint-rust`: fails on any warning `--fix` would have auto-applied.
-lint-rust-check: check-no-inner-allow
+lint-rust-check: check-no-inner-allow check-engine-impl-blocks check-cli-shell-purity
     cargo clippy --all-targets --all-features --manifest-path rust/Cargo.toml -- --deny warnings
 
 # Forbid file-level inner "#![allow]" - clippy's allow_attributes catches only the
@@ -123,6 +132,7 @@ lint-rust-check: check-no-inner-allow
 # misses. One reasoned outer #[allow(..., reason = "...")] remains permitted for
 # the legitimate cross-target conditional suppressions #[expect] cannot express.
 check-no-inner-allow:
+    @command -v rg >/dev/null 2>&1 || { echo "ERROR: ripgrep (rg) is required for check-no-inner-allow" >&2; exit 1; }
     @if rg -n '#!\[allow\(' rust/crates -g '*.rs'; then \
         echo "ERROR: inner #![allow] is forbidden - use #[expect], or a reasoned outer #[allow] for cross-target conditionals" >&2; \
         exit 1; \
@@ -139,13 +149,111 @@ fmt-check:
 check-no-pyo3-in-cores:
     #!/usr/bin/env bash
     set -euo pipefail
-    for crate in apexbot-core apexbot-math apexbot-abi apexbot-rpc apexbot-ingestion apexbot-bot apexbot-decoders apexbot-uniswap apexbot-pathfinding apexbot apexbot-price apexbot-db apexbot-pool-updater apexbot-aave apexbot-execution apexbot-executor apexbot-submission apexbot-simulation apexbot-pools apexbot-solvers apexbot-order-index apexbot-arbitrage apexbot-fork apexbot-execution-sample; do
+    for crate in apexbot-core apexbot-math apexbot-abi apexbot-rpc apexbot-ingestion apexbot-bot apexbot-cli apexbot-cli-core apexbot-decoders apexbot-uniswap apexbot-pathfinding apexbot apexbot-price apexbot-db apexbot-pool-updater apexbot-aave apexbot-execution apexbot-executor apexbot-submission apexbot-simulation apexbot-pools apexbot-solvers apexbot-order-index apexbot-arbitrage apexbot-fork apexbot-execution-sample; do
         if cargo tree --manifest-path rust/Cargo.toml -p "$crate" 2>/dev/null | grep -qi 'pyo3 v'; then
             echo "ERROR: $crate pulls pyo3 under default features (must be feature-gated)." >&2
             exit 1
         fi
     done
     echo "OK: core crates + umbrella are pyo3-free under default features"
+
+check-cli-core-purity:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # ADR-051 D1/D2: apexbot-cli-core is the semantics home both front ends map
+    # into. It must stay clap-free (argv spelling is the facade's job) and
+    # indicatif-free (progress rendering is the facade's job). Mirrors
+    # check-no-pyo3-in-cores: walk the resolved dep graph, not just the manifest.
+    tree=$(cargo tree --manifest-path rust/Cargo.toml -p apexbot-cli-core --prefix none 2>/dev/null)
+    offenders=$(printf '%s\n' "$tree" | sed 's/ (.*//' | awk '{print $1}' | grep -E '^(clap|clap_derive|clap_builder|indicatif)$' || true)
+    if [ -n "$offenders" ]; then
+        echo "ERROR: apexbot-cli-core must not depend on clap or indicatif (ADR-051 D1/D2)." >&2
+        printf '%s\n' "$offenders" >&2
+        exit 1
+    fi
+    echo "OK: apexbot-cli-core is clap-free and indicatif-free"
+
+# Enforce the ADR-051 D2 dependency charter for the argv facade: `apexbot-cli`
+# may name workspace members (the clap-free semantics crate + the sink crates)
+# plus a small, explicit external allowlist - argv spelling (clap), progress
+# rendering (indicatif), the SIGINT runtime (tokio) and the sink stack (tracing
+# / tracing-subscriber). Anything else is a layering regression: the facade
+# maps argv into `apexbot-cli-core` and must never reach a domain-engine crate
+# on its own. Mirrors check-cli-core-purity / check-no-pyo3-in-cores.
+check-cli-shell-purity:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    manifest=rust/crates/apexbot-cli/Cargo.toml
+    [ -f "$manifest" ] || { echo "ERROR: $manifest not found" >&2; exit 1; }
+    # The declared allowlist: the facade's argv/interaction/sink plumbing.
+    allow='^(clap|indicatif|tokio|tracing|tracing-subscriber)$'
+    # Walk the dependency tables the crate may name. A workspace member
+    # (`.workspace = true`) is always allowed; every other entry must be on the
+    # allowlist. dev-dependencies are covered too - the charter is about what
+    # the crate may name, not only what the binary links.
+    offenders=$(awk '
+        /^\[(dependencies|build-dependencies|dev-dependencies)\]/ { in_deps = 1; next }
+        /^\[/ { in_deps = 0; next }
+        in_deps && /^[A-Za-z0-9_-]+[[:space:]]*=/ {
+            if ($0 ~ /workspace[[:space:]]*=[[:space:]]*true/) next
+            name = $1
+            sub(/[[:space:]]*=.*/, "", name)
+            print name
+        }
+    ' "$manifest" | grep -Ev "$allow" || true)
+    if [ -n "$offenders" ]; then
+        echo "ERROR: apexbot-cli may depend only on workspace members + the argv/sink allowlist (ADR-051 D2)." >&2
+        echo "  allowlist: clap, indicatif, tokio, tracing, tracing-subscriber" >&2
+        printf '  offender: %s\n' $offenders >&2
+        exit 1
+    fi
+    echo "OK: apexbot-cli lists only workspace members + argv/sink plumbing"
+
+
+# Structural gate for epic 5TBT7L (arch review #11, candidate 2): the engine
+# seam deepens until `EngineStages` is the ONE external driver surface and
+# every `impl ArbitrageEngine` block outside `arb_engine/mod.rs` is dissolved.
+# T6 flipped it GREEN and wired it into the Rust hygiene set
+# (`lint-rust-check` + the `rust-engine-impl-blocks` pre-commit hook + CI).
+# The `{` anchor keeps the prose mention of `impl ArbitrageEngine` in
+# mod.rs's module-tree comment from being counted as a block.
+#
+# Two assertions:
+#   1. exactly ONE `impl ArbitrageEngine` block, in arb_engine/mod.rs.
+#   2. `ArbitrageEngine` appears in apexbot-python/src exactly ONCE - the
+#      pyclass `name = "ArbitrageEngine",` compat string (the deliberate
+#      Python-API name exemption). Any other hit is a seam regression.
+check-engine-impl-blocks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v rg >/dev/null 2>&1 || { echo "ERROR: ripgrep (rg) is required for check-engine-impl-blocks" >&2; exit 1; }
+    matches=$(rg -n 'impl ArbitrageEngine\s*\{' rust/crates/apexbot-bot/src || true)
+    count=$(printf '%s\n' "$matches" | grep -c 'impl ArbitrageEngine' || true)
+    if [ "$count" -ne 1 ] || ! printf '%s\n' "$matches" | grep -q 'arb_engine/mod.rs'; then
+        echo "ERROR: 'impl ArbitrageEngine' is not consolidated to arb_engine/mod.rs (epic 5TBT7L)." >&2
+        echo "  expected exactly 1 block, in arb_engine/mod.rs; found $count" >&2
+        echo "  census (file: blocks):" >&2
+        printf '%s\n' "$matches" | cut -d: -f1 | sort | uniq -c | awk '{printf "    %s: %s\n", $2, $1}' >&2
+        echo "  matches:" >&2
+        printf '%s\n' "$matches" >&2
+        exit 1
+    fi
+    py_matches=$(rg -n 'ArbitrageEngine' rust/crates/apexbot-python/src || true)
+    if [ -z "$py_matches" ]; then
+        py_count=0
+    else
+        py_count=$(printf '%s\n' "$py_matches" | grep -c 'ArbitrageEngine' || true)
+    fi
+    if [ "$py_count" -ne 1 ] || ! printf '%s\n' "$py_matches" | grep -q 'name = "ArbitrageEngine",'; then
+        echo "ERROR: 'ArbitrageEngine' must name the pyclass compat string exactly once in apexbot-python (epic 5TBT7L)." >&2
+        echo "  expected exactly 1 hit, 'name = \"ArbitrageEngine\",'; found $py_count" >&2
+        echo "  census (file: hits):" >&2
+        printf '%s\n' "$py_matches" | cut -d: -f1 | sort | uniq -c | awk '{printf "    %s: %s\n", $2, $1}' >&2
+        echo "  matches:" >&2
+        printf '%s\n' "$py_matches" >&2
+        exit 1
+    fi
+    echo "ok: exactly one impl ArbitrageEngine block, in arb_engine/mod.rs; apexbot-python names ArbitrageEngine only as the pyclass compat string"
 
 # Build Rust extension module (correct for Python extension)
 build-rust-extension:
@@ -391,6 +499,173 @@ rebuild-tier3-artifacts:
     tier3-oracle/build-tier3-pancake-v3-swap-harness.sh
     tier3-oracle/build-tier3-pancake-v2-swap-harness.sh
 
+# ========== CRAP Metric (cyclomatic complexity x coverage) ==========
+#
+# `cargo-crap` scores every function as CRAP = CC^2 x (1 - cov/100)^3 + CC —
+# high where a function is both hard to understand and barely tested. Two
+# tools, two steps, two recipes: `cargo-llvm-cov` produces the LCOV, `cargo
+# crap` scores it.
+#
+#   just crap-coverage          # slow: instrumented rebuild + Rust tests + LCOV
+#   just crap --summary         # fast: reuse the LCOV, print the per-crate roll-up
+#   CRAP_LCOV=target/scoped.info CRAP_PACKAGES="-p apexbot-config" just crap-coverage
+#
+# Env overrides (all paths relative to rust/): CRAP_LCOV, CRAP_PACKAGES,
+# CRAP_FEATURES, CRAP_THRESHOLD (default 30), CRAP_BASELINE. Tooling:
+# cargo-llvm-cov + cargo-crap (cargo install --locked <name>); CI on a rustup
+# toolchain also needs `rustup component add llvm-tools-preview` and must leave
+# LLVM_COV/LLVM_PROFDATA unset - cargo-llvm-cov finds the component itself.
+#
+# Deliberately NOT wired into `pre-push` or the CI matrix yet: the coverage
+# build is a full instrumented rebuild of the workspace (10-20 min cold) and the
+# first run surfaced 340 functions over threshold — this is a repair backlog to
+# work through by hand, not a gate to switch on. Use these recipes to iterate;
+# promote `crap-gate` / `crap-ci` to a real CI job once the bulk of the
+# fixes land, and `crap-baseline` / `crap-regression` to track the movement
+# while it happens. .cargo-crap.toml holds the threshold + exclusions.
+#
+# Read the output knowing three things (all measured, see ergo DRBR7Z):
+#   1. It measures the RUST suite only. pytest drives the same core through the
+#      PyO3 seam and contributes no coverage here, so the binding layer
+#      (`apexbot_rs`, ~60% of the findings) and the Python-driven updaters
+#      score as untested even though pytest exercises them. Merging pytest
+#      coverage (instrumented cdylib + LLVM_PROFILE_FILE) is not built yet.
+#   2. `?` counts as a decision point, so `?`-chained plumbing — module
+#      registration, Py-dict conversion — scores far above its real branching.
+#      The CC-141 outlier of the first run was such a function.
+#   3. A function cargo-crap walks but the coverage build never compiled has no
+#      coverage data and scores pessimistically (CC^2 + CC). `crap-coverage`
+#      therefore enables apexbot-bot/otel — instruments.rs / metrics.rs /
+#      otel.rs are `#[cfg(feature = "otel")]` and were 98 phantom 0% functions
+#      without it. The mirror case is unavoidable and harmless: with otel ON the
+#      `#[cfg(not(feature = "otel"))]` no-op stub twin in apexbot-bot/src/lib.rs
+#      is not compiled, so its ~68 one-line stubs also report no coverage data
+#      (CC 1 each, CRAP 2 — they never surface in the report).
+#
+# All paths below are relative to the `rust/` cargo workspace root (the recipes
+# cd there, because cargo-crap discovers members via `cargo metadata`).
+
+# LCOV artifact: written by `crap-coverage`, read by `crap`/`crap-gate`.
+# `rust/target/` is gitignored. CRAP_LCOV=target/scoped.info just crap
+crap_lcov := env_var_or_default("CRAP_LCOV", "target/lcov.info")
+
+# Packages to analyze. Empty = the whole workspace; set it to cargo-style
+# selectors for a fast scoped loop (this also drops the feature flag, which
+# only makes sense workspace-wide). CRAP_PACKAGES="-p apexbot-config -p apexbot-core"
+crap_packages := env_var_or_default("CRAP_PACKAGES", "")
+
+# Features for the coverage build. Only apexbot-bot/otel: it compiles the
+# telemetry modules the walker would otherwise see as never-built. Deliberately
+# NOT pyproject's [tool.maturin] dev list — `pyo3/extension-module` must never
+# be set on a test build, and hotpath/allocator-ctrl gate no walked source file.
+crap_features := env_var_or_default("CRAP_FEATURES", "apexbot-bot/otel")
+
+# CRAP score at or above which `crap-gate` fails. CRAP_THRESHOLD=50 just crap-gate
+crap_threshold := env_var_or_default("CRAP_THRESHOLD", "30")
+
+# JSON baseline for `crap-baseline` (written) / `crap-regression` (read).
+crap_baseline := env_var_or_default("CRAP_BASELINE", "target/crap-baseline.json")
+
+# Generate the LCOV coverage report that cargo-crap scores (slow: instrumented test run).
+crap-coverage *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+        echo "ERROR: cargo-llvm-cov not found. Install: cargo install --locked cargo-llvm-cov" >&2
+        exit 1
+    fi
+    # apexbot-python's test harnesses link libpython, same reason `test-rust`
+    # exports this (resolve before cd'ing: uv wants the Python project root).
+    python_libdir="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # LLVM tool discovery. With a rustup toolchain cargo-llvm-cov locates
+    # llvm-tools-preview by itself and these must stay UNSET. On a system-rustc
+    # host (Fedora: sysroot /usr, no llvm-tools component) point it at the
+    # distro LLVM, whose major version must match the rustc-bundled one:
+    # compare `llvm-profdata --version` with `rustc -vV` (both say LLVM 22.1.8
+    # here) — a mismatch fails the merge, not the build.
+    if [[ -z "${LLVM_COV:-}" && -z "${LLVM_PROFDATA:-}" ]] \
+        && command -v llvm-cov >/dev/null 2>&1 && command -v llvm-profdata >/dev/null 2>&1; then
+        export LLVM_COV="$(command -v llvm-cov)"
+        export LLVM_PROFDATA="$(command -v llvm-profdata)"
+    fi
+    cd rust
+    read -r -a pkg_args <<< "{{ crap_packages }}"
+    scope=(--workspace)
+    if [ "${#pkg_args[@]}" -gt 0 ]; then
+        scope=()
+    fi
+    # The feature list names workspace members, so it is only addressable when
+    # the whole workspace is selected - keep it for a scoped run only if the
+    # caller set CRAP_FEATURES explicitly (CRAP_FEATURES= disables it).
+    features=()
+    if [ -n "{{ crap_features }}" ] && { [ "${#pkg_args[@]}" -eq 0 ] || [ -n "${CRAP_FEATURES:-}" ]; }; then
+        features=(--features "{{ crap_features }}")
+    fi
+    mkdir -p "$(dirname "{{ crap_lcov }}")"
+    # --no-fail-fast: one red test must not cost us the whole coverage report;
+    # the run still exits non-zero, so a red suite never scores as green.
+    cargo llvm-cov "${scope[@]}" "${features[@]}" "${pkg_args[@]}" --no-fail-fast \
+        --lcov --output-path "{{ crap_lcov }}" {{ args }}
+
+# Score the existing LCOV with cargo-crap (fast; run crap-coverage first).
+crap *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v cargo-crap >/dev/null 2>&1 || { echo "ERROR: cargo-crap not found. Install: cargo install --locked cargo-crap" >&2; exit 1; }
+    cd rust
+    [ -f "{{ crap_lcov }}" ] || {
+        echo "ERROR: no LCOV at rust/{{ crap_lcov }} — run 'just crap-coverage' first." >&2
+        echo "       (a coverage-free cargo-crap run scores every function as 0% covered)" >&2
+        exit 1
+    }
+    read -r -a pkg_args <<< "{{ crap_packages }}"
+    scope=(--workspace)
+    [ "${#pkg_args[@]}" -gt 0 ] && scope=()
+    cargo crap "${scope[@]}" "${pkg_args[@]}" --lcov "{{ crap_lcov }}" {{ args }}
+
+# CI gate: exit 1 when any function exceeds CRAP_THRESHOLD (--format github/sarif pass through).
+crap-gate *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v cargo-crap >/dev/null 2>&1 || { echo "ERROR: cargo-crap not found. Install: cargo install --locked cargo-crap" >&2; exit 1; }
+    cd rust
+    [ -f "{{ crap_lcov }}" ] || { echo "ERROR: no LCOV at rust/{{ crap_lcov }} — run 'just crap-coverage' first." >&2; exit 1; }
+    read -r -a pkg_args <<< "{{ crap_packages }}"
+    scope=(--workspace)
+    [ "${#pkg_args[@]}" -gt 0 ] && scope=()
+    cargo crap "${scope[@]}" "${pkg_args[@]}" --lcov "{{ crap_lcov }}" \
+        --threshold {{ crap_threshold }} --fail-above {{ args }}
+
+# Write the JSON baseline that crap-regression compares against (run on the default branch).
+crap-baseline *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v cargo-crap >/dev/null 2>&1 || { echo "ERROR: cargo-crap not found. Install: cargo install --locked cargo-crap" >&2; exit 1; }
+    cd rust
+    [ -f "{{ crap_lcov }}" ] || { echo "ERROR: no LCOV at rust/{{ crap_lcov }} — run 'just crap-coverage' first." >&2; exit 1; }
+    mkdir -p "$(dirname "{{ crap_baseline }}")"
+    cargo crap --workspace --lcov "{{ crap_lcov }}" \
+        --format json --sort file --output "{{ crap_baseline }}" {{ args }}
+    echo "✓ baseline written: rust/{{ crap_baseline }} ($(wc -c < "{{ crap_baseline }}") bytes)"
+
+# CI gate: exit 1 when any function's CRAP score rose since the baseline.
+crap-regression *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v cargo-crap >/dev/null 2>&1 || { echo "ERROR: cargo-crap not found. Install: cargo install --locked cargo-crap" >&2; exit 1; }
+    cd rust
+    [ -f "{{ crap_lcov }}" ] || { echo "ERROR: no LCOV at rust/{{ crap_lcov }} — run 'just crap-coverage' first." >&2; exit 1; }
+    [ -f "{{ crap_baseline }}" ] || { echo "ERROR: no baseline at rust/{{ crap_baseline }} — run 'just crap-baseline' first." >&2; exit 1; }
+    read -r -a pkg_args <<< "{{ crap_packages }}"
+    scope=(--workspace)
+    [ "${#pkg_args[@]}" -gt 0 ] && scope=()
+    cargo crap "${scope[@]}" "${pkg_args[@]}" --lcov "{{ crap_lcov }}" \
+        --baseline "{{ crap_baseline }}" --fail-regression {{ args }}
+
+# CI entrypoint: fresh coverage + the threshold gate in one command.
+crap-ci: crap-coverage crap-gate
+
 # ========== Code Quality ==========
 
 # Lint Markdown files
@@ -538,8 +813,65 @@ setup-git-hooks:
     echo "    pre-commit : Markdown lint + PLC0415 noqa guard (staged files)"
     echo "                + instant checks (Rust/Python fmt, Rust no-pyo3)"
     echo "    commit-msg : commitlint against .commitlintrc.yml (relaxed rules)"
-    echo "    pre-push   : commitlint push-range + Rust/Python lint (clippy/ty)"
-    echo "                 + build & test suite (rust build/test, python build/test)"
+    echo "    pre-push   : object-DB GC + commitlint push-range + Rust/Python lint"
+    echo "                 (clippy/ty) + build & test suite (rust build/test,"
+    echo "                 python build/test)"
     echo "    Bypass: git push --no-verify (CI still runs)."
     echo "✓ commit template configured."
 
+
+# ========== Settlement-Bot Parity Gate (RSP-8 / ergo 23DLCY) ==========
+#
+# The executable successor to the parity ledger
+# (docs/architecture/rust-settlement-bot-parity.md): the fixture boot gate
+# (Rust integration test + Python PyO3 probe against the shared oracle
+# tests/standalone_parity/fixtures/settlement_bot_boot.json) plus the
+# recorded dual-driver decision diff. CI-safe and offline (no RPC); the live
+# anvil arm is opt-in via APEXBOT_DUAL_DRIVER_GATE=1 + APEXBOT_FORK_RPC
+# (tests/standalone_parity/dual_driver_gate.py --live).
+test-settlement-parity:
+    cargo test --manifest-path rust/Cargo.toml -p apexbot-settlement-bot-example --test boot_gate
+    uv run pytest tests/standalone_parity/test_settlement_bot_boot_gate.py tests/standalone_parity/test_settlement_bot_dual_driver_gate.py -q
+    uv run python tests/standalone_parity/dual_driver_gate.py --recorded
+
+# ========== No-Python Console Gate (ADR-051 D10 / ergo EA6DY7) ==========
+#
+# The Rust-owned console (`apexbot`) must build and run with NO Python in the
+# path. This recipe builds the `apexbot-cli` binary, then runs the fixed argv
+# smoke set (--help / --version / `database inspect` over committed
+# Alembic-stamped fixtures copied to a temp dir / `exchange activate`+`deactivate`
+# idempotence on a fresh DB copy) and diffs the machine-checkable stdout against
+# the checked-in oracle
+# (.github/workflows/cli-no-python-expected.txt). Bash + sed + diff only — no
+# Python, no uv. Mirrors the `cli-no-python` CI job.
+#
+# Seeded-divergence proof (the comparator must be able to fail), selectable by
+# APEXBOT_CLI_GATE_SEED (both must exit 0, i.e. the injected divergence WAS
+# caught):
+#   APEXBOT_CLI_GATE_SEED=expected just ci-no-python-cli-gate
+#       mutate one expected line in a temp oracle copy; the diff must trip.
+#   APEXBOT_CLI_GATE_SEED=live just ci-no-python-cli-gate
+#       point `database inspect` at a Rust-owned DB copy (real binary, real
+#       different output); the diff must trip.
+# Authoring aid only: APEXBOT_CLI_GATE_DUMP_ACTUAL=1 prints the normalized
+# capture so the oracle can be regenerated deliberately.
+ci-no-python-cli-gate:
+    cargo build -p apexbot-cli --manifest-path rust/Cargo.toml
+    bash .github/workflows/cli-no-python-gate.sh
+
+# ADR-052 D6: Alembic is retired in-tree. No `alembic` reference may survive in any
+# Python source under src/, and the migration-scripts package must be gone.
+# Mirrors check-no-pyo3-in-cores: a permanent, mechanical sweep gate.
+check-no-alembic:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v rg >/dev/null 2>&1 || { echo "ERROR: ripgrep (rg) is required for check-no-alembic" >&2; exit 1; }
+    if [ -d src/apexbot/migrations ]; then
+        echo "ERROR: src/apexbot/migrations still exists (retired per ADR-052 D6)." >&2
+        exit 1
+    fi
+    if rg -n -i --glob '*.py' 'alembic' src/; then
+        echo "ERROR: Alembic references remain in src/**/*.py (retired per ADR-052 D6)." >&2
+        exit 1
+    fi
+    echo "OK: no Alembic references remain in src/**/*.py"

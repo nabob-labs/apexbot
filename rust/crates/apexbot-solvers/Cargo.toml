@@ -24,6 +24,8 @@ num-integer = { version = "^0.1" }
 apexbot-math.workspace = true
 apexbot-pools.workspace = true
 apexbot-uniswap.workspace = true
+# Observability facade macros (ADR-043): domain-targeted events.
+apexbot-core.workspace = true
 # Hot solver maps: foldhash cl-cache tables + visited walk guard.
 hashbrown.workspace = true
 # hotpath: solver-phase profiling (ADR-005 core, pyo3-free). Non-optional,

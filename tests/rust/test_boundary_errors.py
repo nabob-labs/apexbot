@@ -8,8 +8,13 @@ import pytest
 
 from apexbot._ffi.abi import decode, decode_single, encode_single
 from apexbot._ffi.contract import encode_function_call
-from apexbot.uniswap.math import get_sqrt_ratio_at_tick, get_tick_at_sqrt_ratio
-from apexbot.uniswap.v3_libraries import MAX_SQRT_RATIO, MAX_TICK, MIN_TICK
+from apexbot.uniswap.math import (
+    MAX_SQRT_RATIO,
+    MAX_TICK,
+    MIN_TICK,
+    get_sqrt_ratio_at_tick,
+    get_tick_at_sqrt_ratio,
+)
 
 
 class TestTickMathBoundaryErrors:

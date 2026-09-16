@@ -1,16 +1,19 @@
-//! Console-vs-trace telemetry split (2026-08-22 logging audit).
+//! Console-vs-trace telemetry split (ADR-043 section 4).
 //!
-//! High-frequency diagnostic events use the [`DIAGNOSTIC_TARGET`] target so
-//! the console sinks (stderr fmt + the Python log forwarder) can cap them via
-//! [`DIAGNOSTIC_CONSOLE_CAP_DIRECTIVE`] while the `OTel` layer keeps full
-//! detail: a Jaeger trace answers "what did the engine do" without the stdout
-//! firehose, and stdout stays operator-grade. Warn and above always pass
-//! every sink (the cap directive is at warn).
+//! High-frequency diagnostic events use the [`DIAGNOSTIC_TARGET`] target;
+//! [`resolve_filters`] resolves each record layer's `EnvFilter` from the typed
+//! telemetry config: the console sinks (stderr fmt + the Python log forwarder)
+//! run at `telemetry.log_level` (or the wiring default) plus per-domain
+//! `telemetry.diag` escalations, while the `OTel` layer keeps
+//! `warn,apexbot=debug` — a Jaeger trace answers "what did the engine do"
+//! without the stdout firehose, and stdout stays operator-grade. Warn and
+//! above pass every sink.
 //!
 //! Convention: any event that is per-header/per-event/per-solve noise on the
-//! console but signal inside a trace gets `target: DIAGNOSTIC_TARGET`. An
-//! explicit `RUST_LOG` override bypasses the cap entirely (power-user
-//! contract: you asked for exactly what `RUST_LOG` says, on every sink).
+//! console but signal inside a trace gets `target: DIAGNOSTIC_TARGET`.
+//!
+//! An explicit `RUST_LOG` is a branch: it wins verbatim on every sink and the
+//! config knobs are ignored (one WARN names the active source).
 
 /// Target for high-frequency diagnostic events (see module docs).
 pub const DIAGNOSTIC_TARGET: &str = "apexbot::diag";
@@ -54,8 +57,99 @@ pub mod error_reason {
     pub const SIM_RPC: &str = "rpc";
 }
 
-/// `EnvFilter` directive capping [`DIAGNOSTIC_TARGET`] at warn on console sinks.
-pub const DIAGNOSTIC_CONSOLE_CAP_DIRECTIVE: &str = "apexbot::diag=warn";
+/// Third-party transport crates whose routine INFO is throttled to warn on
+/// every sink (their WARN/ERROR still pass).
+pub const ALLOY_NOISE_TARGETS: &[&str] = &[
+    "alloy_pubsub",
+    "alloy_transport",
+    "alloy_transport_ws",
+    "alloy_transport_ipc",
+    "alloy_transport_http",
+    "alloy_provider",
+    "alloy_rpc",
+    "alloy_network",
+    "alloy_contract",
+    "tungstenite",
+];
+
+/// Console wiring default for the Python driver (ADR-043 section 6).
+pub const CONSOLE_WIRING_DEFAULT_PYTHON: &str = "info";
+/// Console wiring default for the standalone Rust bot (ADR-043 section 6).
+pub const CONSOLE_WIRING_DEFAULT_RUST: &str = "warn";
+/// `OTel` record-layer default (ADR-043 section 4): all of apexbot at debug,
+/// everything else at warn.
+pub const OTEL_RECORD_DEFAULT: &str = "warn,apexbot=debug";
+
+/// The resolved filter directives for the two record layers (ADR-043 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterPlan {
+    /// Console (stderr fmt + Python forwarder) directives.
+    pub console: String,
+    /// `OTel` record-layer directives.
+    pub otel: String,
+    /// True when an explicit `RUST_LOG` supplied both; the config knobs are
+    /// then ignored (with one WARN naming the active source).
+    pub rust_log: bool,
+}
+
+/// Resolve the console + `OTel` record filters (ADR-043 §4).
+///
+/// Precedence is a BRANCH: an explicit `RUST_LOG` is used verbatim on both
+/// layers and `telemetry.log_level` / `telemetry.diag` are ignored (one WARN
+/// names the active source). Otherwise the console layer is `wiring_default`,
+/// overridden by `telemetry.log_level` and escalated per-domain by the
+/// validated `telemetry.diag` map; the `OTel` layer keeps its
+/// `warn,apexbot=debug` default.
+#[must_use]
+pub fn resolve_filters(wiring_default: &str) -> FilterPlan {
+    use std::fmt::Write as _;
+    if let Ok(raw) = std::env::var("RUST_LOG") {
+        if !raw.trim().is_empty() {
+            warn_config_filters_ignored_once();
+            return FilterPlan {
+                console: raw.clone(),
+                otel: raw,
+                rust_log: true,
+            };
+        }
+    }
+    let cfg = ::apexbot_config::holder::config();
+    let level = cfg
+        .telemetry
+        .log_level
+        .map_or_else(|| wiring_default.to_string(), |l| l.to_string());
+    let mut console = level;
+    for target in ALLOY_NOISE_TARGETS {
+        let _ = write!(console, ",{target}=warn");
+    }
+    for (domain, level) in &cfg.telemetry.diag {
+        let _ = write!(console, ",apexbot::{domain}={level}");
+    }
+    let mut otel = OTEL_RECORD_DEFAULT.to_string();
+    for target in ALLOY_NOISE_TARGETS {
+        let _ = write!(otel, ",{target}=warn");
+    }
+    FilterPlan {
+        console,
+        otel,
+        rust_log: false,
+    }
+}
+
+/// Emit the "config knobs ignored under `RUST_LOG`" WARN exactly once.
+fn warn_config_filters_ignored_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let cfg = ::apexbot_config::holder::config();
+        if cfg.telemetry.log_level.is_some() || !cfg.telemetry.diag.is_empty() {
+            apexbot_core::op_warn!(
+                domain = pump,
+                source = "RUST_LOG",
+                "RUST_LOG is set; telemetry.log_level and telemetry.diag are ignored (RUST_LOG is the active filter source)"
+            );
+        }
+    });
+}
 
 /// Surface a failure through every telemetry sink, idiomatically:
 ///
@@ -126,6 +220,68 @@ pub(crate) fn make_trace_root(span: &tracing::Span) {
 #[cfg(not(feature = "otel"))]
 pub(crate) fn make_trace_root(_span: &tracing::Span) {}
 
+/// `Some(span)` when a real subscriber backs `span`, `None` when the ambient
+/// dispatch is `tracing`'s no-op [`NoSubscriber`](tracing::subscriber::NoSubscriber).
+///
+/// `NoSubscriber::new_span` mints the sentinel id `0xDEAD` — neither
+/// `Span::make_with` nor the span macro's `always`-interest short-circuit
+/// consults the current dispatch's `enabled()` — so a span created while the
+/// no-op subscriber is ambient is an UNBACKED handle. Reusing it as an
+/// explicit `parent:` after a real subscriber arrives panics inside
+/// `Registry::clone_span` ("tried to clone Id(57005), but no span exists with
+/// that ID"): the sentinel exists in no real registry. Loop-carried spans (the
+/// pump's per-epoch block root and the reorg-window root outlive many blocks)
+/// must pass through here at CREATION time — the check is only meaningful
+/// against the dispatch that minted the span — so a subscriber installed
+/// mid-run degrades the parent to a root span instead of aborting the pump.
+#[must_use]
+pub(crate) fn subscriber_backed_span(span: &tracing::Span) -> Option<tracing::Span> {
+    if tracing::dispatcher::get_default(|dispatch| {
+        dispatch.is::<tracing::subscriber::NoSubscriber>()
+    }) {
+        return None;
+    }
+    Some(span.clone())
+}
+
+/// A long-lived process hits the same callsite before and after any subscriber
+/// exists; the guard is keyed on the dispatch, not on the span's id.
+#[cfg(test)]
+fn unbacked_span() -> tracing::Span {
+    tracing::info_span!("test.unbacked")
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)] // the pins assert loudly
+mod span_backing_tests {
+    //! Pins the sentinel-id hazard behind [`super::subscriber_backed_span`].
+
+    #[test]
+    fn no_subscriber_spans_are_unbacked_and_real_registry_spans_survive() {
+        // With the no-op subscriber ambient, a span is backed by no real
+        // registry: `NoSubscriber::new_span` returns the 0xDEAD sentinel (it is
+        // reached without an `enabled()` check — see `Span::make_with`), and a
+        // later `Registry::clone_span` of that id panics. The guard is the
+        // dispatch, so it drops the handle whatever the span's id looks like.
+        tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+            assert!(
+                super::subscriber_backed_span(&super::unbacked_span()).is_none(),
+                "a NoSubscriber handle must never be kept as a parent"
+            );
+        });
+
+        // A real registry-backed handle survives, and parenting to it in its
+        // own registry is safe — the exact call shape that panicked while a
+        // sentinel handle survived to the publish stage.
+        let subscriber = tracing_subscriber::registry();
+        tracing::subscriber::with_default(subscriber, || {
+            let backed = tracing::info_span!("test.backed");
+            let kept = super::subscriber_backed_span(&backed).expect("registry-backed span");
+            drop(tracing::info_span!(parent: kept, "test.child"));
+        });
+    }
+}
+
 /// No-op without the `otel` feature (nothing to flush).
 #[cfg(not(feature = "otel"))]
 pub fn flush_before_exit() {}
@@ -159,7 +315,7 @@ pub fn record_exception_keyed(
             exception_type = kind,
             fingerprint = %primary_id,
             block_number = block,
-            "[error] repeat suppressed by cooldown"
+            "repeat suppressed by cooldown"
         );
     }
     admitted

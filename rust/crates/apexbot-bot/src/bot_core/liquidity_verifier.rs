@@ -22,6 +22,7 @@
 //!
 //! On ANY mismatch, returns `Err` — the bot must not operate with stale tick data.
 
+use apexbot_core::{diag, op_info};
 use hashbrown::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -110,7 +111,7 @@ impl From<VerificationMismatch> for LiquidityVerifyError {
 /// ascending tick order into a compact, byte-stable `tick:lg,ln;...` string, so
 /// two dumps of the same map are directly comparable and the exact map that
 /// went into a consumer (the verifier) can be rebuilt. Used for the
-/// `APEXBOT_DUMP_TICK_MAPS` desync aid.
+/// tick-map desync forensic dump.
 fn serialize_liquidity_map<S: std::hash::BuildHasher>(
     map: &HashMap<i32, (u128, i128), S>,
 ) -> String {
@@ -147,8 +148,8 @@ fn serialize_divergences(ds: &[TickDivergence]) -> String {
 }
 
 /// Emit the `[dbg-verify] TICK-MAP DESYNC` diagnostic on ANY divergence: the
-/// full divergence set (always) + the full engine/on-chain maps (gated behind
-/// `APEXBOT_DUMP_TICK_MAPS=1`). UO3JM4/ADR-021 re-assembly aid — lets an
+/// full divergence set as an INFO event, plus the full engine/on-chain maps as
+/// a forensic TRACE event. UO3JM4/ADR-021 re-assembly aid — lets an
 /// investigation re-assemble the exact map that went into the verifier.
 //
 // The argument list mirrors the tracing event's field-for-field diagnostic
@@ -166,10 +167,7 @@ fn log_tick_map_desync(
     observed_map: &HashMap<i32, (u128, i128)>,
     divergences: &[TickDivergence],
 ) {
-    let dump_maps = crate::bot_core::stance::config().trace.dump_tick_maps;
-    tracing::info!(
-        target: crate::telemetry::DIAGNOSTIC_TARGET,
-        pool = %pool_ident,
+    op_info!(domain = verify, pool = %pool_ident,
         block_tag = %block_tag,
         tick_spacing,
         active_tick,
@@ -178,9 +176,14 @@ fn log_tick_map_desync(
         total_ticks,
         divergence_count = divergences.len(),
         divergences = %serialize_divergences(divergences),
-        engine_map = %(if dump_maps { serialize_liquidity_map(stored_map) } else { "omitted; set APEXBOT_DUMP_TICK_MAPS=1".to_string() }),
-        observed_map = %(if dump_maps { serialize_liquidity_map(observed_map) } else { "omitted; set APEXBOT_DUMP_TICK_MAPS=1".to_string() }),
-        "[dbg-verify] TICK-MAP DESYNC (full divergence set + engine/on-chain maps; UO3JM4 re-assembly aid)"
+        "TICK-MAP DESYNC (divergence set)"
+    );
+    // Full engine/on-chain maps: forensic TRACE on `verify`.
+    apexbot_core::diag_trace!(domain = verify, pool = %pool_ident,
+        block_tag = %block_tag,
+        engine_map = %serialize_liquidity_map(stored_map),
+        observed_map = %serialize_liquidity_map(observed_map),
+        "TICK-MAP DESYNC full maps (UO3JM4 re-assembly aid)"
     );
 }
 
@@ -273,7 +276,7 @@ pub async fn verify_v3_liquidity_map<S: std::hash::BuildHasher>(
     let observed: HashMap<i32, (u128, i128)> = rows.into_iter().collect();
     // Scan EVERY tick (not just until the first divergence) so a single
     // verify failure surfaces the FULL divergence set under
-    // `APEXBOT_VERIFY_DBG`. A Mint-without-its-Burn leaves the upper tick
+    // `verify_dbg`. A Mint-without-its-Burn leaves the upper tick
     // divergent while the lower tick is +L vs 0 — one row per divergent tick
     // reveals that pairing without re-running. The returned error keeps the
     // EXACT historical message for the first mismatch (tests pin it); only
@@ -298,14 +301,13 @@ pub async fn verify_v3_liquidity_map<S: std::hash::BuildHasher>(
         }
     }
     if let Some(msg) = first_mismatch {
-        if crate::bot_core::stance::config().verify.verify_dbg && !all_mismatches.is_empty() {
-            tracing::warn!(
-                %pool_address,
+        if !all_mismatches.is_empty() {
+            diag!(domain = verify, %pool_address,
                 phase,
                 block_number,
                 divergent_tick_count = all_mismatches.len(),
                 rows = ?all_mismatches,
-                "[verify-dbg] V3 divergence set"
+                "V3 divergence set"
             );
         }
         return Err(LiquidityVerifyError::Mismatch(VerificationMismatch {
@@ -541,9 +543,7 @@ pub async fn verify_v3_pool<T: TickMap + ?Sized>(
         if our_gross != on_chain_gross {
             // TEMP DEBUG: dump journal depth + update_block for the failing pool
             // so we can tell whether ANY events were applied since the snapshot seed.
-            tracing::info!(
-                target: crate::telemetry::DIAGNOSTIC_TARGET,
-                pool_addr = %pool_addr,
+            op_info!(domain = verify, pool_addr = %pool_addr,
                 tick_idx = d.tick,
                 block_tag = %block_tag,
                 engine_gross = our_gross,
@@ -552,7 +552,7 @@ pub async fn verify_v3_pool<T: TickMap + ?Sized>(
                 update_block = pool.dbg_update_block(),
                 journal_len = pool.dbg_journal_len(),
                 total_ticks = tick_data.len(),
-                "[dbg-verify] LIQUIDITY MISMATCH"
+                "LIQUIDITY MISMATCH"
             );
             crate::telemetry::record_exception(
                 crate::telemetry::error_kind::VERIFY_MISMATCH,

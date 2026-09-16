@@ -121,6 +121,12 @@ fn fixture_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("APEXBOT_FIXTURE_DB") {
         return PathBuf::from(p);
     }
+    // The default is the checked-in `parity.db` fixture shared with
+    // `apexbot-db`'s parity tests; that it is read-only is load-bearing.
+    // Pin the ADR-052 D1 heal-at-open so this smoke never rewrites it (the
+    // read fns in `apexbot-bot`/`apexbot-db` open it through the same
+    // `SnapshotDb::open` path every consumer uses).
+    std::env::set_var(apexbot::db::AUTO_HEAL_ENV, "0");
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("apexbot-db")
@@ -172,7 +178,10 @@ fn fixture_snapshot_seed_block() -> Option<u64> {
     snapshot_bot
         .load_snapshot_from_db(&snap.0, 8453)
         .expect("load_snapshot_from_db on the fixture DB returns Ok");
-    let seed_block = snapshot_bot.state_arc().read().snapshot_seed_block();
+    let seed_block = snapshot_bot
+        .state_arc()
+        .read_at(apexbot_bot::bot_core::state_lock::LockSite::Core)
+        .snapshot_seed_block();
     // Fixture DB has V3 ticks at chain 8453 (aerodrome_v3, last_update_block
     // = 12_345_000) AND an empty V4 family (uniswap_v4 exchange row,
     // last_update_block = 12_340_000) → S = MIN(V3, V4) = 12_340_000
@@ -190,8 +199,9 @@ fn fixture_snapshot_seed_block() -> Option<u64> {
 
 #[expect(clippy::too_many_lines)]
 fn main() {
-    // 2b reaches ArbitrageEngine for the standalone lifecycle slice.
-    use apexbot::bot::arb_engine::{ArbitrageEngine, EnginePhase};
+    // 2b reaches EngineStages — the ONE external seam a standalone consumer
+    // crosses (the engine type is crate-private machinery, epic 5TBT7L Q2b).
+    use apexbot::bot::arb_engine::{EnginePhase, EngineStages};
 
     // 1. Construct the Rust-owned per-chain bot state (no Python).
     let mut bot = BotState::new();
@@ -231,13 +241,19 @@ fn main() {
         .expect("standalone: register V2");
     assert_eq!(pool_id, 1, "first registered pool gets id 1");
 
-    // 2b. Standalone engine lifecycle (ZU7RAF): the core `ArbitrageEngine`
-    //    owns EnginePhase — a cargo-add apexbot consumer observes + guards it.
-    let engine = ArbitrageEngine::new();
-    assert_eq!(engine.current_phase(), EnginePhase::Created);
-    assert!(engine.current_phase().allow_subscribe("subscribe").is_ok());
-    engine.set_phase(EnginePhase::Subscribed);
-    assert_eq!(engine.current_phase(), EnginePhase::Subscribed);
+    // 2b. Standalone stage-surface lifecycle (ZU7RAF): the seam owns
+    //    EnginePhase — a cargo-add apexbot consumer observes + guards it.
+    let lifecycle_core = Arc::new(apexbot::bot_core::state_lock::StateLock::new(
+        BotState::new(),
+    ));
+    let stages = EngineStages::with_core(
+        lifecycle_core,
+        Arc::new(apexbot::bot_core::EpochDelta::new(0u64)),
+    );
+    assert_eq!(stages.current_phase(), EnginePhase::Created);
+    assert!(stages.current_phase().allow_subscribe("subscribe").is_ok());
+    stages.set_phase(EnginePhase::Subscribed);
+    assert_eq!(stages.current_phase(), EnginePhase::Subscribed);
 
     // 3. Run a swap calc through the Rust core (the `apexbot-v2-math`
     //    `IntHopState` constant-product path). The same code path the PyO3 binding ships to
@@ -473,7 +489,7 @@ fn registration_lifecycle_standalone_slice() {
         },
     );
     let pid = core
-        .write()
+        .write_at(apexbot_bot::bot_core::state_lock::LockSite::Core)
         .register_v3_pool(&RegisterV3PoolParams {
             address: addr,
             token0: address!("000000000000000000000000000000000000000A"),
@@ -489,7 +505,10 @@ fn registration_lifecycle_standalone_slice() {
         })
         .expect("standalone: Tracked V3 registration");
     assert_eq!(
-        core.read().get_v3_pool(pid).unwrap().registration_lifecycle,
+        core.read_at(apexbot_bot::bot_core::state_lock::LockSite::Core)
+            .get_v3_pool(pid)
+            .unwrap()
+            .registration_lifecycle,
         RegistrationLifecycle::Quarantined,
         "Tracked registers Quarantined (DFQYM5)"
     );
@@ -508,7 +527,10 @@ fn registration_lifecycle_standalone_slice() {
         ))
         .expect("standalone: lifecycle must pass");
     assert_eq!(
-        core.read().get_v3_pool(pid).unwrap().registration_lifecycle,
+        core.read_at(apexbot_bot::bot_core::state_lock::LockSite::Core)
+            .get_v3_pool(pid)
+            .unwrap()
+            .registration_lifecycle,
         RegistrationLifecycle::Live,
         "Tracked lands Live only after verification"
     );

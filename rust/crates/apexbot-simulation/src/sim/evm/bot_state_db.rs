@@ -53,6 +53,7 @@
 
 use alloy::primitives::Address;
 use apexbot_bot::bot_core::SimAnchorState;
+use apexbot_core::op_warn;
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{StorageKey, StorageValue, B256, KECCAK_EMPTY};
 use revm::state::AccountInfo;
@@ -250,8 +251,9 @@ where
                     "code-less (KECCAK_EMPTY)"
                 };
                 let provenance = self.code_probe_provenance(address, info.as_ref());
-                tracing::warn!(
-                    "[codeless-probe] tracked pool {address} resolved {state} @ block {:?}; {provenance}",
+                op_warn!(
+                    domain = sim,
+                    "tracked pool {address} resolved {state} @ block {:?}; {provenance}",
                     self.code_probe_block,
                 );
                 panic!(
@@ -269,7 +271,7 @@ where
     /// Two env-gated diagnostics run here, both DEFAULT OFF so production
     /// behavior is unchanged (single atomic load each — zero per-SLOAD work):
     ///
-    /// - `APEXBOT_SIM_DIVERGENCE_LOG=1` ([`super::divergence_probe`]): pure
+    /// - `arm the sim-divergence probe` ([`super::divergence_probe`]): pure
     ///   observation — compares the engine's packed typed state against the
     ///   RPC value, logs a `[sim-divergence]` line on mismatch, accumulates
     ///   the tally. Never changes what the sim reads.

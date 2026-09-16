@@ -12,6 +12,8 @@
 //! these are inherent methods on `BotState`, and `bot_core/mod.rs` remains the
 //! assembly + re-export hub.
 
+use apexbot_core::diag;
+use apexbot_core::op_warn;
 use hashbrown::{HashMap, HashSet};
 
 use alloy::primitives::{Address, U256};
@@ -26,10 +28,12 @@ use apexbot_pools::v4_state::{
     BufferedV4LiquidityUpdate, BufferedV4SwapEvent, V4PoolKey, V4StateSync, V4_DYNAMIC_FEE_FLAG,
 };
 
+use super::apply_telemetry::{
+    drain_dbg_log_buf, trace_apply_route_v3, trace_apply_route_v4, trace_apply_swap_v3,
+    trace_apply_swap_v4,
+};
 use super::{
-    drain_dbg_log_buf, drain_dbg_pool_match, trace_apply_route_v3, trace_apply_route_v4,
-    trace_apply_swap_v3, trace_apply_swap_v4, trace_watch_tick, verify_dbg_enabled, BotState,
-    BufferedV3PoolEvent, BufferedV4PoolEvent, ConcentratedLiquidityPoolMut, PoolEntry,
+    BotState, BufferedV3PoolEvent, BufferedV4PoolEvent, ConcentratedLiquidityPoolMut, PoolEntry,
     PoolTickCoverage, RegisterV3PoolError, RegisterV3PoolParams, RegisterV4PoolError,
     RegisterV4PoolParams, RegistrationLifecycle, TickInfo, V3PoolIdentity, V3PoolState,
     V4PoolIdentity, V4PoolState, V4SwapUpdate,
@@ -117,22 +121,19 @@ impl BotState {
 
         // [diag] registration-seed probe: log every V3 pool's seed scalar state
         // (update_block + sqrtPriceX96 + tick) so a solver-state mismatch can be
-        // traced to its seed. Gated on `APEXBOT_TRACE_REGISTER_SEED=1` (off by
-        // default; run_bot.sh sets it for diagnosis). A pool seeded with an
+        // traced to its seed. Always-on DEBUG on the `state` domain (the
+        // the register-seed probe gate is retired). A pool seeded with an
         // `update_block` well behind the head + an old sqrt is the stale-seed
         // hypothesis; a head-fresh seed points the finger at a post-registration
         // rewind instead.
-        if crate::bot_core::stance::config().trace.trace_register_seed {
-            tracing::info!(
-                pool_addr = %format!("{:x}", params.address),
-                family = "V3",
-                seed_update_block = params.update_block,
-                seed_sqrt = %params.sqrt_price_x96,
-                seed_tick = params.tick,
-                coverage = ?params.coverage,
-                "[diag] register-v3-seed"
-            );
-        }
+        diag!(domain = path, pool_addr = %format!("{:x}", params.address),
+            family = "V3",
+            seed_update_block = params.update_block,
+            seed_sqrt = %params.sqrt_price_x96,
+            seed_tick = params.tick,
+            coverage = ?params.coverage,
+            "register-v3-seed"
+        );
 
         let pool_id = self.next_pool_id;
         self.next_pool_id += 1;
@@ -620,51 +621,39 @@ impl BotState {
     /// to `restore_before_block` and `update_block` stayed frozen at the
     /// registration block.
     pub fn apply_backfill_buffer_v3(&mut self, address: &Address) {
-        // Debug-drain gate: log per-event apply when `APEXBOT_DRAIN_DBG` is set
-        // to this pool's address. Diagnoses same-block Mint+Bun net-zero races
-        // where one half is lost between fetch and drain.
-        let dbg = crate::bot_core::drain_dbg_pool_match(*address);
+        // Drain diagnostics: per-event apply at DEBUG on `pump` (the
+        // drain-dbg gate is retired). Diagnoses same-block Mint+Burn
+        // net-zero races where one half is lost between fetch and drain.
         let Some(&key) = self.pool_addresses.get(address) else {
-            if dbg {
-                tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] backfill NOT REGISTERED");
-            }
+            diag!(domain = pump, pool_addr = %format!("{address:x}"), "backfill NOT REGISTERED");
             return;
         };
         let Some(buffered) = self.v3_buffer.drain_backfill(address) else {
-            if dbg {
-                tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] backfill EMPTY");
-            }
+            diag!(domain = pump, pool_addr = %format!("{address:x}"), "backfill EMPTY");
             return;
         };
-        if dbg {
-            tracing::info!(
-                pool_addr = %format!("{address:x}"),
-                count = buffered.len(),
-                "[dbg-drain] backfill"
-            );
-        }
+        diag!(domain = pump, pool_addr = %format!("{address:x}"),
+            count = buffered.len(),
+            "backfill"
+        );
         for update in buffered {
-            if dbg {
-                match &update {
-                    BufferedV3PoolEvent::Liquidity(u) => {
-                        tracing::info!(
-                            pool_addr = %format!("{address:x}"),
-                            tick_lower = u.tick_lower,
-                            tick_upper = u.tick_upper,
-                            delta = u.liquidity_delta,
-                            block = u.block_number,
-                            "[dbg-drain] backfill apply liq"
-                        );
-                    }
-                    BufferedV3PoolEvent::Swap(s) => {
-                        tracing::info!(
-                            pool_addr = %format!("{address:x}"),
-                            liquidity = s.liquidity,
-                            tick = s.tick,
-                            block = s.block_number,
-                            "[dbg-drain] backfill apply swap"
-                        );
-                    }
+            match &update {
+                BufferedV3PoolEvent::Liquidity(u) => {
+                    diag!(domain = pump, pool_addr = %format!("{address:x}"),
+                        tick_lower = u.tick_lower,
+                        tick_upper = u.tick_upper,
+                        delta = u.liquidity_delta,
+                        block = u.block_number,
+                        "backfill apply liq"
+                    );
+                }
+                BufferedV3PoolEvent::Swap(s) => {
+                    diag!(domain = pump, pool_addr = %format!("{address:x}"),
+                        liquidity = s.liquidity,
+                        tick = s.tick,
+                        block = s.block_number,
+                        "backfill apply swap"
+                    );
                 }
             }
             if let Some(state) = self
@@ -675,12 +664,11 @@ impl BotState {
             {
                 let ub_before = state.update_block;
                 Self::apply_buffered_v3_event(state, update);
-                if dbg && state.update_block < ub_before {
-                    tracing::warn!(
-                        pool_addr = %format!("{address:x}"),
+                if state.update_block < ub_before {
+                    op_warn!(domain = state, pool_addr = %format!("{address:x}"),
                         ub_before,
                         ub_after = state.update_block,
-                        "[dbg-drain] update_block REWIND (backfill)"
+                        "update_block REWIND (backfill)"
                     );
                 }
             }
@@ -693,11 +681,8 @@ impl BotState {
     /// Same journal + `update_block` contract as
     /// [`apply_backfill_buffer_v3`] — see its docs.
     pub fn apply_pump_buffer_v3(&mut self, address: &Address) {
-        let dbg = crate::bot_core::drain_dbg_pool_match(*address);
         let Some(&key) = self.pool_addresses.get(address) else {
-            if dbg {
-                tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] pump NOT REGISTERED");
-            }
+            diag!(domain = pump, pool_addr = %format!("{address:x}"), "pump NOT REGISTERED");
             return;
         };
         // YLYJM2: drain ONLY fully-completed blocks. The cutoff is the pump's
@@ -707,38 +692,32 @@ impl BotState {
         // in-progress block stay buffered.
         let cutoff = self.pump_complete_cutoff;
         if cutoff == 0 {
-            if dbg {
-                tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] pump NO-COMPLETE (no tombstone yet)");
-            }
+            diag!(domain = pump, pool_addr = %format!("{address:x}"), "pump NO-COMPLETE (no tombstone yet)");
             return;
         }
         let Some(buffered) = self.v3_buffer.drain_pump_completed(address, cutoff) else {
-            if dbg {
-                tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] pump EMPTY (no completed blocks)");
-            }
+            diag!(domain = pump, pool_addr = %format!("{address:x}"), "pump EMPTY (no completed blocks)");
             return;
         };
-        if dbg {
-            tracing::info!(pool_addr = %format!("{address:x}"), count = buffered.len(), "[dbg-drain] pump");
-        }
+        diag!(domain = pump, pool_addr = %format!("{address:x}"), count = buffered.len(), "pump");
         for update in buffered {
-            if dbg {
-                match &update {
-                    BufferedV3PoolEvent::Liquidity(u) => tracing::info!(
-                        pool_addr = %format!("{address:x}"),
+            match &update {
+                BufferedV3PoolEvent::Liquidity(u) => {
+                    diag!(domain = pump, pool_addr = %format!("{address:x}"),
                         tick_lower = u.tick_lower,
                         tick_upper = u.tick_upper,
                         delta = u.liquidity_delta,
                         block = u.block_number,
-                        "[dbg-drain] pump apply liq"
-                    ),
-                    BufferedV3PoolEvent::Swap(s) => tracing::info!(
-                        pool_addr = %format!("{address:x}"),
+                        "pump apply liq"
+                    );
+                }
+                BufferedV3PoolEvent::Swap(s) => {
+                    diag!(domain = pump, pool_addr = %format!("{address:x}"),
                         liquidity = s.liquidity,
                         tick = s.tick,
                         block = s.block_number,
-                        "[dbg-drain] pump apply swap"
-                    ),
+                        "pump apply swap"
+                    );
                 }
             }
             if let Some(state) = self
@@ -749,12 +728,11 @@ impl BotState {
             {
                 let ub_before = state.update_block;
                 Self::apply_buffered_v3_event(state, update);
-                if dbg && state.update_block < ub_before {
-                    tracing::warn!(
-                        pool_addr = %format!("{address:x}"),
+                if state.update_block < ub_before {
+                    op_warn!(domain = state, pool_addr = %format!("{address:x}"),
                         ub_before,
                         ub_after = state.update_block,
-                        "[dbg-drain] update_block REWIND (pump)"
+                        "update_block REWIND (pump)"
                     );
                 }
             }
@@ -917,9 +895,9 @@ impl BotState {
         // this pool — independent of the imported seed stamp — so the pin can
         // classify the stamp's freshness claim (the load-time tripwire).
         let witnessed = self.v3_event_horizon(&address);
-        // Capture the pin scalars + an optional watch-tick snapshot in an
-        // inner scope so the `&mut state` borrow of `self.pools` ends before
-        // the diagnostic reads `self.v3_buffer` (a second `&self` borrow).
+        // Capture the pin scalars in an inner scope so the `&mut state`
+        // borrow of `self.pools` ends before the diagnostic reads
+        // `self.v3_buffer` (a second `&self` borrow).
         let diag = {
             let Some(&pool_id) = self.pool_addresses.get(&address) else {
                 return;
@@ -933,9 +911,6 @@ impl BotState {
                 return;
             };
             if state.coverage == PoolTickCoverage::Tracked {
-                let watch = trace_watch_tick()
-                    .and_then(|t| state.tick_data.get(&t))
-                    .map(|info| (info.liquidity_gross, info.liquidity_net));
                 let liquidity_clock = state.tick_data_block;
                 // OB7UNY two-stamp: the pin pairs the TICK MAP with its own
                 // LIQUIDITY clock (`tick_data_block`), not the price clock —
@@ -966,47 +941,20 @@ impl BotState {
                     pinned_block,
                     liquidity_clock,
                     state.tick_data.len(),
-                    watch,
                     verdict,
                 ))
             } else {
                 None
             }
         };
-        if let Some((tick_data_block, seed_block, tick_count, watch, verdict)) = diag {
-            let pool_match = drain_dbg_pool_match(address);
-            if verify_dbg_enabled() {
-                tracing::info!(
-                    pool_addr = %format!("{address:x}"),
-                    tick_data_block,
-                    tick_count,
-                    pump_count = self.v3_buffer.pump_count_at_or_below(&address, tick_data_block),
-                    last_complete_block = self.pump_complete_cutoff(),
-                    "[verify-dbg] V3 pin"
-                );
-            }
-            // Per-pool watch-tick probe: log (gross, net) at `APEXBOT_TRACE_TICK`
-            // right at the pin, so a ghost-value tick (e.g. an un-burned Mint
-            // upper tick) is visible at the moment step-2 verify compares it.
-            if pool_match {
-                if let Some((g, n)) = watch {
-                    tracing::info!(
-                        pool_addr = %format!("{address:x}"),
-                        tick_data_block,
-                        watch_tick = ?trace_watch_tick(),
-                        gross = %g,
-                        net = %n,
-                        "[trace] pin watch-tick"
-                    );
-                } else {
-                    tracing::info!(
-                        pool_addr = %format!("{address:x}"),
-                        tick_data_block,
-                        watch_tick = ?trace_watch_tick(),
-                        "[trace] pin watch-tick absent"
-                    );
-                }
-            }
+        if let Some((tick_data_block, seed_block, tick_count, verdict)) = diag {
+            diag!(domain = verify, pool_addr = %format!("{address:x}"),
+                tick_data_block,
+                tick_count,
+                pump_count = self.v3_buffer.pump_count_at_or_below(&address, tick_data_block),
+                last_complete_block = self.pump_complete_cutoff(),
+                "V3 pin"
+            );
             // FUWYUR stamp provenance (7HUYWM) — the load-time tripwire. The
             // seed stamp (`seed_block`) is honest only if independent of it,
             // something witnessed state at/beyond it: the tombstone-confirmed
@@ -1018,23 +966,21 @@ impl BotState {
             // provenance covers freshness-claim honesty.
             match verdict {
                 PinProvenance::SeedTrustOnly { witnessed_horizon } if witnessed_horizon > 0 => {
-                    tracing::warn!(
-                        pool_addr = %format!("{address:x}"),
+                    op_warn!(domain = state, pool_addr = %format!("{address:x}"),
                         seed_block,
                         cutoff,
                         witnessed_horizon,
-                        "[provenance] V3 re-seed-after-activity: a fresher seed stamp arrived \n                         after the engine had already witnessed events for this pool                          (FUWYUR lie shape)"
+                        "V3 re-seed-after-activity: a fresher seed stamp arrived \n                         after the engine had already witnessed events for this pool                          (FUWYUR lie shape)"
                     );
                 }
                 PinProvenance::CorroboratedByDelivery
                 | PinProvenance::WitnessedBeyondCutoff
                 | PinProvenance::SeedTrustOnly { .. } => {
-                    tracing::debug!(
-                        pool_addr = %format!("{address:x}"),
+                    diag!(domain = state, pool_addr = %format!("{address:x}"),
                         seed_block,
                         cutoff,
                         verdict = ?verdict,
-                        "[provenance] V3 pin stamp classified"
+                        "V3 pin stamp classified"
                     );
                 }
             }
@@ -1872,7 +1818,7 @@ impl BotState {
         // Flush the retained pump tail first (backfill already fully drained
         // during `apply_backfill_buffer_v3`).
         if let Some(buffered) = self.v3_buffer.drain_pump(&address) {
-            if verify_dbg_enabled() {
+            {
                 use ::apexbot_pools::liquidity_event::LiquidityEvent;
                 let blocks: Vec<u64> = buffered.iter().map(LiquidityEvent::block_number).collect();
                 let mut sorted = blocks.clone();
@@ -1882,12 +1828,11 @@ impl BotState {
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                tracing::info!(
-                    pool_addr = %format!("{address:x}"),
+                diag!(domain = verify, pool_addr = %format!("{address:x}"),
                     drained_tail = buffered.len(),
                     blocks = ?blocks,
                     distinct_blocks = ?distinct,
-                    "[verify-dbg] V3 set_live"
+                    "V3 set_live"
                 );
             }
             for event in buffered {
@@ -1925,7 +1870,7 @@ impl BotState {
             return;
         };
         if let Some(buffered) = self.v4_buffer.drain_pump(&key) {
-            if verify_dbg_enabled() {
+            {
                 use ::apexbot_pools::liquidity_event::LiquidityEvent;
                 let blocks: Vec<u64> = buffered.iter().map(LiquidityEvent::block_number).collect();
                 let mut sorted = blocks.clone();
@@ -1935,13 +1880,12 @@ impl BotState {
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                tracing::info!(
-                    pool_manager = %format!("{pool_manager:x}"),
+                diag!(domain = verify, pool_manager = %format!("{pool_manager:x}"),
                     pool_id = %apexbot_core::hex_utils::encode_hex(&pool_id),
                     drained_tail = buffered.len(),
                     blocks = ?blocks,
                     distinct_blocks = ?distinct,
-                    "[verify-dbg] V4 set_live"
+                    "V4 set_live"
                 );
             }
             for event in buffered {
@@ -2017,13 +1961,12 @@ impl BotState {
         if total == 0 {
             return;
         }
-        if verify_dbg_enabled() {
-            tracing::info!(
-                v3 = v3_addrs.len(),
-                v4 = v4_keys.len(),
-                "[verify-dbg] release-all quarantined"
-            );
-        }
+        diag!(
+            domain = verify,
+            v3 = v3_addrs.len(),
+            v4 = v4_keys.len(),
+            "release-all quarantined"
+        );
         for addr in v3_addrs {
             self.set_v3_pool_live(addr);
         }
@@ -2180,38 +2123,33 @@ impl BotState {
             }
         };
         if let Some((tick_data_block, seed_block, verdict)) = diag {
-            if verify_dbg_enabled() {
-                tracing::info!(
-                    pool_manager = %format!("{pool_manager:x}"),
-                    pool_id = %apexbot_core::hex_utils::encode_hex(pool_id),
-                    tick_data_block,
-                    pump_count = self.v4_buffer.pump_count_at_or_below(&key, tick_data_block),
-                    last_complete_block = self.pump_complete_cutoff(),
-                    "[verify-dbg] V4 pin"
-                );
-            }
+            diag!(domain = verify, pool_manager = %format!("{pool_manager:x}"),
+                pool_id = %apexbot_core::hex_utils::encode_hex(pool_id),
+                tick_data_block,
+                pump_count = self.v4_buffer.pump_count_at_or_below(&key, tick_data_block),
+                last_complete_block = self.pump_complete_cutoff(),
+                "V4 pin"
+            );
             // FUWYUR stamp provenance (7HUYWM, V4 twin) — see the V3 pin.
             match verdict {
                 PinProvenance::SeedTrustOnly { witnessed_horizon } if witnessed_horizon > 0 => {
-                    tracing::warn!(
-                        pool_manager = %format!("{pool_manager:x}"),
+                    op_warn!(domain = state, pool_manager = %format!("{pool_manager:x}"),
                         pool_id = %apexbot_core::hex_utils::encode_hex(pool_id),
                         seed_block,
                         cutoff,
                         witnessed_horizon,
-                        "[provenance] V4 re-seed-after-activity: a fresher seed stamp arrived \n                         after the engine had already witnessed events for this pool                          (FUWYUR lie shape)"
+                        "V4 re-seed-after-activity: a fresher seed stamp arrived \n                         after the engine had already witnessed events for this pool                          (FUWYUR lie shape)"
                     );
                 }
                 PinProvenance::CorroboratedByDelivery
                 | PinProvenance::WitnessedBeyondCutoff
                 | PinProvenance::SeedTrustOnly { .. } => {
-                    tracing::debug!(
-                        pool_manager = %format!("{pool_manager:x}"),
+                    diag!(domain = state, pool_manager = %format!("{pool_manager:x}"),
                         pool_id = %apexbot_core::hex_utils::encode_hex(pool_id),
                         seed_block,
                         cutoff,
                         verdict = ?verdict,
-                        "[provenance] V4 pin stamp classified"
+                        "V4 pin stamp classified"
                     );
                 }
             }

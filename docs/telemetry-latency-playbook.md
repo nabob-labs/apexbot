@@ -8,8 +8,8 @@ the Jaeger-side investigation guide.
 
 Sources of truth:
 
-- Spans/events: `rust/crates/apexbot-bot/src/arb_engine/solver_dispatch.rs`
-  (the `[solve-phase]` family), `bot_core/block_pump.rs` (`apexbot.epoch` root + pre-solve
+- Spans/events: `rust/crates/apexbot-bot/src/arb_engine/solve_cycle.rs`
+  (the `[solve-phase]` family), `bot_core/block_pump.rs` (`apexbot.epoch.run` root + pre-solve
   gap fields), `bot_core/stage_telemetry.rs` (`apexbot.stage.*` per-transition spans),
   `arb_engine/engine_handle.rs` (`apexbot.arb.solve`).
 - Metrics: `rust/crates/apexbot-bot/src/instruments.rs` (`apexbot_*` families).
@@ -62,8 +62,8 @@ OTel context: simulate/bundle spans exported as ROOT traces, correlated only
 by the `current_block` tag. The bridge (`telemetry::publish_block_context` at
 batch send + `telemetry::simulate_dispatch_span` at the Python seam) parents
 the dispatch fan-out to the published block's span, so ONE Jaeger trace now
-carries `apexbot.epoch → arb.solve → simulate.dispatch → bundle.*` (the per-epoch
-`apexbot.epoch` root succeeded the retired `pump.block` waterfall, BF43PM). The lookup
+carries `apexbot.epoch.run → arb.solve → simulate.dispatch → bundle.*` (the per-epoch
+`apexbot.epoch.run` root succeeded the retired `pump.block` waterfall, BF43PM). The lookup
 falls back to the closest earlier block because Python's `current_block` can
 be one ahead (the batch is dispatched after the next header arrives). If
 simulate spans reappear as roots, the registry capture (batch send) or the
@@ -137,7 +137,7 @@ Diagnose by reading the phase split before touching code:
 4. **Resolve wall grows superlinearly** with resolved count → re-projection of
    structurally-invalid paths (see S3).
 
-Tracing locations: `solver_dispatch.rs::rebuild_and_solve_affected` (all four
+Tracing locations: `solve_cycle.rs::run_epoch` (all four
 phase events); `engine_handle.rs:129` (span open); per-path timing already in
 the closure (`t0`/`micros`, feeds `slowest.paths`).
 
@@ -152,7 +152,7 @@ Hypotheses ranked:
    `ResolvedMixedPath` per work item). Profile allocations if cpu_us itself is
    fine but wall balloons only at large sets.
 3. Something inside `solve_path` taking a lock — audit any new code for
-   `Mutex`/`RwLock` under the par_iter in `solver_dispatch.rs`.
+   `Mutex`/`RwLock` under the par_iter in `solve_cycle.rs`.
 
 ### S3. Invalidity rate > ~50% of resolved
 
@@ -184,7 +184,7 @@ twin simulators are `v3_simulate_swap`/`v4_simulate_swap` in apexbot-pools.
 
 ### S5. Pump block span ≫ solve span total
 
-`apexbot.epoch` (successor of the retired `apexbot.pump.block`) should wrap the epoch tightly.
+`apexbot.epoch.run` (successor of the retired `apexbot.pump.block`) should wrap the epoch tightly.
 If epoch duration exceeds
 the sum of child solves by a lot, time is going to: header decode, log decode,
 state apply (each has a Prometheus histogram: `apexbot_log_decode`,
@@ -197,7 +197,7 @@ new spans.
 
 ### S7. header_to_publish dominated by a flat settle wait
 
-Decompose the pre-solve gap first — `apexbot.epoch` root fields (recorded at the settle point):
+Decompose the pre-solve gap first — `apexbot.epoch.run` root fields (recorded at the settle point):
 `header_to_first_log_us` (header → first relevant log), `log_burst_us`
 (first → last relevant log, i.e. the apply work), `settle_wait_us` (last log →
 settle decision). The settle wait is the publish debounce — it costs roughly
@@ -243,7 +243,7 @@ Known incident class, not a bot bug:
 
 ## Telemetry inventory (quick reference)
 
-Jaeger spans: `apexbot.epoch` (trace ROOT per block epoch, attrs
+Jaeger spans: `apexbot.epoch.run` (trace ROOT per block epoch, attrs
 `epoch.block`/`epoch.seq`), `apexbot.stage.{streaming,quiesced,publish,finalize,rewind}`
 (one span per ADR-041 stage transition; `streaming`/`rewind` hold open, the rest are point
 spans), `apexbot.arb.solve` (child, per solve cycle), `apexbot.path.register`

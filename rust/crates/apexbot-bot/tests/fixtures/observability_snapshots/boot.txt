@@ -1,0 +1,19 @@
+# observability snapshot: boot
+# regenerate: UPDATE_GOLDEN=1 cargo test -p apexbot-bot --features otel --test observability_snapshots
+## console
+INFO apexbot::state: message=boot probe
+INFO apexbot::path: message=boot probe
+INFO apexbot::solver: message=boot probe
+INFO apexbot::sim: message=boot probe
+INFO apexbot::pump: message=boot probe
+INFO apexbot::exec: message=boot probe
+INFO apexbot::verify: message=boot probe
+INFO apexbot::ingest: message=boot probe
+INFO apexbot::rpc: message=boot probe
+INFO apexbot::aave: message=boot probe
+WARN apexbot::diag: message=diagnostic emitted outside an engine span (this warning fires once; ADR-043 §3) context=observability_snapshots
+DEBUG apexbot::sim: message=boot probe (debug)
+## spans
+## series
+apexbot_metric_series{otel_scope_name}
+target_info{service_name,service_version,telemetry_sdk_language,telemetry_sdk_name,telemetry_sdk_version}

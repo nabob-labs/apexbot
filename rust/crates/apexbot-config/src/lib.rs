@@ -43,10 +43,15 @@
 //! "Migrate env reads onto `BotConfig`" task and re-validate their fallback
 //! semantics there.
 //!
-//! # Dynamic (non-schema) env names
+//! # Dynamic (non-schema) env names and driver-domain resolvers
 //!
 //! `APEXBOT_RPC_WS_CHAINID_<chain_id>` carries a numeric suffix at runtime
 //! and is intentionally NOT a static key (documented next to `SCHEMA`).
+//!
+//! A second family is not typed at all: the console's driver-domain values
+//! (database path, session chain id, node URIs, ADR-051 D8) never lived in
+//! the file layer, so [`resolvers`] reads them through the same [`EnvVars`]
+//! seam and `Source` provenance without re-adding file vocabulary.
 
 pub mod doc;
 pub mod error;
@@ -56,6 +61,7 @@ pub mod error;
 /// [`holder::config`] instead. A plain VALUE holder — zero env access.
 pub mod holder;
 pub mod loader;
+pub mod resolvers;
 pub mod schema;
 #[doc(hidden)]
 pub mod schema_macro;
@@ -64,8 +70,53 @@ pub use error::ConfigError;
 pub use loader::{
     standard_file_path, BotConfigLoader, EnvVars, LoadedConfig, MapEnv, ProcessEnv, Source,
 };
-pub use schema::{AnchorSweep, FleetConfig, FleetProfile, QuiesceMode};
+pub use resolvers::{
+    node_http_env_name, node_ws_env_name, resolve_chain_id, resolve_database_path,
+    resolve_node_http_uri, resolve_node_uris, resolve_node_ws_uri, Resolved, ResolvedNodeUris,
+    DB_PATH_DEFAULT, DB_PATH_ENV, DEFAULT_CHAIN_ID_ENV, RPC_HTTP_ENV_PREFIX, RPC_WS_ENV_PREFIX,
+};
+pub use schema::{AnchorSweep, FleetConfig, FleetProfile, LogLevel, QuiesceMode};
 pub use schema::{BaseKind, BotConfig, KeyDecl, ValueKind, SCHEMA};
+
+/// The closed set of observability domains (ADR-043 section 3). A
+/// `TelemetryConfig::diag` entry naming anything else is a boot error, so a
+/// typo cannot silently no-op an escalation.
+pub const OBSERVABILITY_DOMAINS: &[&str] = &[
+    "state", "path", "solver", "sim", "pump", "exec", "verify", "ingest", "rpc", "aave",
+];
+
+/// Parse and validate the diag map: a comma-separated `domain=level` list
+/// (the env encoding of the `[telemetry.diag]` table). Every domain must be
+/// in [`OBSERVABILITY_DOMAINS`] and every level must parse into the generated
+/// level enum; the first problem fails the load.
+///
+/// # Errors
+///
+/// Returns a description for a malformed entry, an unknown domain, or an
+/// unparsable level.
+pub fn parse_level_map<T>(raw: &str) -> Result<std::collections::BTreeMap<String, T>, String>
+where
+    T: std::str::FromStr<Err = String>,
+{
+    let mut out = std::collections::BTreeMap::new();
+    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((domain, level)) = part.split_once('=') else {
+            return Err(format!(
+                "invalid diag entry {part:?} (expected domain=level, comma-separated)"
+            ));
+        };
+        let domain = domain.trim();
+        if !OBSERVABILITY_DOMAINS.contains(&domain) {
+            return Err(format!(
+                "unknown telemetry domain {domain:?} (expected one of: {})",
+                OBSERVABILITY_DOMAINS.join(" ")
+            ));
+        }
+        let level = T::from_str(level.trim())?;
+        out.insert(domain.to_string(), level);
+    }
+    Ok(out)
+}
 
 /// Parse a boolean flag value using the bot-wide truthy/falsey word lists.
 ///

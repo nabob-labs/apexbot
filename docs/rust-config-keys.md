@@ -26,10 +26,11 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
+| `APEXBOT_LOG_LEVEL` | `telemetry.log_level` | `Option<LogLevel(Off|Error|Warn|Info|Debug|Trace)>` | `(unset: wiring default)` | Console wiring default level, used only when RUST_LOG is absent (off\|error\|warn\|info\|debug\|trace). The standalone Rust bot wiring defaults to warn; the Python driver to info. |
+| `APEXBOT_TELEMETRY_DIAG` | `telemetry.diag` | `map<string, LogLevel>` | `(empty)` | Per-domain console escalation from a validated map: [telemetry.diag] with sim = "debug", or the env form sim=debug,solver=trace. A typo'd domain is a boot error. Ignored with one WARN when RUST_LOG is set. |
 | `APEXBOT_OTEL` | `telemetry.otel` | `bool` | `true` | Enable the OTel OTLP span layer and the Prometheus metrics endpoint; `0`/empty opts out. |
 | `APEXBOT_METRICS_ADDR` | `telemetry.metrics_addr` | `string` | `127.0.0.1:9464` | Prometheus scrape endpoint bind address (only active when otel is on). |
 | `APEXBOT_JAEGER_ENDPOINT` | `telemetry.jaeger_endpoint` | `string` | `http://127.0.0.1:4318` | OTLP endpoint used by the opt-in Jaeger E2E test. |
-| `APEXBOT_LOG_FMT` | `telemetry.log_fmt_stderr` | `bool` | `true` | Keep the stderr fmt-layer mirror of every record (including the Python logging bridge); 0 routes the fmt layer to the sink so a driver teeing both sinks records each line once. |
 | `APEXBOT_JAEGER_E2E` | `telemetry.jaeger_e2e` | `bool` | `false` | Gate for the network-accessible Jaeger E2E test (Jaeger must be reachable at jaeger_endpoint). |
 ## `allocator`
 
@@ -65,16 +66,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `APEXBOT_TRACE_DISPATCH` | `trace.dispatch` | `bool` | `false` | Trace pump dispatch fan-out (presence historically enabled; loader parses a bool). |
-| `APEXBOT_DRAIN_DBG` | `trace.drain_dbg` | `Option<string>` | `(unset)` | Per-pool drain/pump debug trace for the given pool hex address (no 0x or with). |
-| `APEXBOT_DUMP_CALL_TRACE` | `trace.dump_call_trace` | `bool` | `true` | Dump simulator call traces (default ON; `0` disables). |
-| `APEXBOT_DUMP_TICK_MAPS` | `trace.dump_tick_maps` | `bool` | `false` | Dump assembled tick maps for offline comparison (UO3JM4 re-assembly aid). |
-| `APEXBOT_TRACE_LIQUIDITY` | `trace.trace_liquidity` | `bool` | `false` | Global liquidity-events trace for EVERY V3/V4 liquidity mutation across all pools. |
-| `APEXBOT_TRACE_REGISTER_SEED` | `trace.trace_register_seed` | `bool` | `false` | Trace pool registration seeding progress. |
-| `APEXBOT_TRACE_TICK` | `trace.trace_tick` | `Option<i32>` | `(unset)` | Watch one known-divergent tick (signed decimal) across mutations in the pin/drain probes. |
-| `APEXBOT_WS_TRACE` | `trace.ws_trace` | `bool` | `false` | Catch-all WS-log trace (one line per relevant log; high volume by design). |
-| `APEXBOT_GATE_TRACE` | `trace.gate_trace` | `bool` | `false` | T5 profit-envelope compose tracing gate (profit_envelope TRACE). |
-| `APEXBOT_V2_CALC_TRACE` | `trace.v2_calc_trace` | `bool` | `true` | V2-calc slot-8 read probe in the arbitrage dispatcher (KAHU5W: added during the env migration — previously an undeclared key parsed by a generic presence/flag helper at the site; conservative default ON, falsey opts out). |
 | `APEXBOT_HOTPATH` | `trace.hotpath` | `bool` | `false` | Construct the hotpath profiling guard (default OFF; build must enable the profiling feature too). |
 ## `solve`
 
@@ -112,6 +103,8 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `APEXBOT_FLEET_CORDON_DUTY_WINDOW_MS` | `fleet.cordon_duty_window_ms` | `duration-ms (u64)` | `5000` | Trailing window (ms) over which throttled-time duty is evaluated. |
 | `APEXBOT_FLEET_CORDON_EXIT_CLEAN_MS` | `fleet.cordon_exit_clean_ms` | `duration-ms (u64)` | `10000` | Clean-window hysteresis (ms) required before cordon exits (design doc §6: 10 s of clean windows). |
 | `APEXBOT_FLEET_CORDON_SIM_INTAKE_FLOOR` | `fleet.cordon_sim_intake_floor` | `Option<usize>` | `(unset; half the slot cap)` | SimDriver new-lease cap while cordoned; in-flight sims are never cancelled (default: half the slot cap). |
+| `APEXBOT_FLEET_INTAKE_BACKSTOP_MS` | `fleet.intake_backstop_ms` | `duration-ms (u64)` | `250` | Backstop recv-timeout (ms) armed iff a host intake backlog is non-empty; on timeout the host re-runs the grant pump, so a posture lift with no further message still drains held units (TB4QGX T2). Clamped to >= 1 ms at the site so a garbage value cannot collapse into a busy-spin. |
+| `APEXBOT_FLEET_INTAKE_NO_PROGRESS_TICKS` | `fleet.intake_no_progress_ticks` | `usize` | `8` | Consecutive admitted-but-no-progress host intake passes (backlog non-empty, admission admits, yet no dequeue and no grant) before the host fails LOUDLY (TB4QGX T4). Legitimate WaitCap/WaitPosture holds never count, and only real progress resets the counter. Clamped to >= 1 at the site so a garbage value cannot trip on the first pass. |
 ## `capture`
 
 | Env var | TOML key | Type | Default | Description |
@@ -129,26 +122,26 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `APEXBOT_VERIFY_DBG` | `verify.verify_dbg` | `bool` | `true` | Structural visibility probes diagnosing liquidity-map verification misses (default ON; `0` disables). |
 | `APEXBOT_VERIFY_SPOTCHECK_PERMYRIAD` | `verify.verify_spotcheck_permyriad` | `u64` | `0` | Per-myriad (1/10_000) sampling rate for verify spot-checks (0 = off). |
 ## `simulation`
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `APEXBOT_SIM_DIVERGENCE_LOG` | `simulation.sim_divergence_log` | `bool` | `false` | Log engine-vs-RPC divergence probes on failed sims (`1` enables). |
 | `APEXBOT_SIM_EXECUTE_GAS` | `simulation.sim_execute_gas` | `Option<u64>` | `(unset; EIP-7825 TX_GAS_LIMIT_CAP)` | Override the execute() gas limit (decimal u64; garbage/0 falls back at the site while migrating). |
 | `APEXBOT_SIM_EXIT_ON_FAIL` | `simulation.sim_exit_on_fail` | `bool` | `false` | Abort the process when a sim fails (the live trap used to capture V3-hop fixtures). |
-| `APEXBOT_SIM_LOG_REVERTED_SWAPS` | `simulation.sim_log_reverted_swaps` | `bool` | `true` | Log reverted-swap pools during sims (default ON; `0` disables). |
 | `APEXBOT_SIM_SERVE_ENGINE_STATE` | `simulation.sim_serve_engine_state` | `bool` | `false` | Serve engine state to the sim/evm layer (`1` enables; behavior change, default off). |
 | `APEXBOT_PROBE_FIXTURE` | `simulation.probe_fixture` | `Option<path>` | `(unset)` | Corpus fixture for the offline executor A/B probe (ignore-listed test). |
 | `APEXBOT_PROBE_NS` | `simulation.probe_ns` | `string` | `1,2,4,8,16` | Comma-separated thread-count arms for the offline executor A/B probe. |
 | `APEXBOT_PROBE_PASSES` | `simulation.probe_passes` | `usize` | `3` | Passes per arm for the offline executor A/B probe. |
+## `pathfinding`
+
+| Env var | TOML key | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `APEXBOT_DISCOVERY_BATCH_SIZE` | `pathfinding.discovery_batch_size` | `usize` | `1000` | Discovery-sweep delivery batch size (paths per async batch): the worker thread collects this many paths before the async consumer yields them and gives the event loop one turn. A value <= 1 falls back to the legacy per-path delivery. |
 ## `aave`
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `APEXBOT_AAVE_EVTRACE` | `aave.aave_evtrace` | `bool` | `false` | Trace Aave transaction-processor events (`1` enables). |
-| `APEXBOT_AAVE_TX_TRACE` | `aave.aave_tx_trace` | `bool` | `false` | Trace Aave updater transaction application (`1` enables). |
 | `APEXBOT_BRIDGE_PROBE` | `aave.bridge_probe` | `bool` | `false` | In-tree bridge-probe observation surface in the arbitrage simulator (presence gates). |
 ## `offline`
 
@@ -168,5 +161,4 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | --- | --- | --- | --- | --- |
 | `APEXBOT_ALLOC_TRACK` | `test_hooks.alloc_track` | `bool` | `false` | Allocation-tracking gate for the math/pools bench suites (`1` enables). |
 | `APEXBOT_SELF_ABORT_TEST` | `test_hooks.self_abort_test` | `bool` | `false` | Block-pump self-abort hatch (presence gates in tests). |
-| `APEXBOT_NO_PROGRESS_ABORT_TEST` | `test_hooks.no_progress_abort_test` | `bool` | `false` | No-progress abort hatch gate (test scaffolding; `1` enables). |
 | `APEXBOT_UNUSED_TEST_FLAG` | `test_hooks.unused_test_flag` | `bool` | `true` | Default-ON flag-parse probe (asserted by the bot-core unit tests). |

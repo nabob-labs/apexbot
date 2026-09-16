@@ -11,6 +11,8 @@
 //! monotonic milliseconds so the FSM is deterministic under test; callers
 //! feed `Instant::now()` deltas from their throttle poller.
 
+use apexbot_core::diag;
+use apexbot_core::{op_info, op_warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -360,6 +362,14 @@ impl PostureStateMachine {
         &self.counters
     }
 
+    /// The sticky lane-death hold (FF-T4): once set, no clean window can
+    /// ever lift it — the `FleetHost` Faulted transition (TB4QGX T6) keys on
+    /// THIS typed latch, never on elapsed cordon time.
+    #[must_use]
+    pub const fn lane_death_held(&self) -> bool {
+        self.lane_death_hold
+    }
+
     /// The active policy (operator-channel re-tune reads it through here).
     #[must_use]
     pub const fn policy(&self) -> &PosturePolicy {
@@ -410,10 +420,8 @@ impl PostureStateMachine {
                     // An existing (throttle) cordon UPGRADES to the
                     // sticky hold: no state transition, but the cause
                     // is new and loud.
-                    tracing::warn!(
-                        target: "apexbot::fleet",
-                        lane_deaths = self.counters.lane_deaths,
-                        "[fleet-posture] lane-death HOLD upgrades an existing cordon — sticky, clean-window exit disabled"
+                    op_warn!(domain = pump, lane_deaths = self.counters.lane_deaths,
+                        "lane-death HOLD upgrades an existing cordon — sticky, clean-window exit disabled"
                     );
                     return PostureChange::Held;
                 }
@@ -501,11 +509,9 @@ impl PostureStateMachine {
     fn enter(&mut self, reason: EnterReason) -> PostureChange {
         self.state = FleetPosture::Cordoned;
         self.counters.entered += 1;
-        tracing::warn!(
-            target: "apexbot::fleet",
-            reason = ?reason,
+        op_warn!(domain = pump, reason = ?reason,
             entered = self.counters.entered,
-            "[fleet-posture] cordon ENTER — deferrable intake held, sim intake floored; in-flight units complete"
+            "cordon ENTER — deferrable intake held, sim intake floored; in-flight units complete"
         );
         PostureChange::Entered(reason)
     }
@@ -528,11 +534,11 @@ impl PostureStateMachine {
         }
         self.state = FleetPosture::Nominal;
         self.counters.exited += 1;
-        tracing::info!(
-            target: "apexbot::fleet",
+        op_info!(
+            domain = pump,
             exited = self.counters.exited,
             clean_ms = self.policy.exit_clean_ms,
-            "[fleet-posture] cordon EXIT after clean-window hysteresis"
+            "cordon EXIT after clean-window hysteresis"
         );
         PostureChange::Exited
     }
@@ -630,6 +636,15 @@ impl PostureOwner {
     /// Feed one throttle-poll delta. Publishes to the feed ONLY on a real
     /// transition (`Held` ticks are silent — a subscriber never sees a
     /// spurious edge).
+    ///
+    /// # Feeder-site contract (TB4QGX T3, ADR-044)
+    /// A BOT-side caller of this method MUST also wake the fleet hosts on a
+    /// non-`Held` change (the apexbot-bot host waker,
+    /// `arb_engine::fleet_wake::wake_hosts`), which emits ONE untrusted,
+    /// seq-stamped `PostureEdge` per host. This crate cannot know about host
+    /// channels (layering), so the wake is the caller's obligation; the
+    /// host's `BackstopTick` bounds the damage if a feeder forgets, and the
+    /// hint never carries a posture value — hosts re-read the live owner.
     pub fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) -> PostureChange {
         let (change, posture) = {
             let mut machine = self.machine.lock();
@@ -646,6 +661,12 @@ impl PostureOwner {
     /// the feed on a real transition like [`Self::observe_throttle`]
     /// (an idempotent hold-upgrade returns `Held` and stays silent —
     /// the detection site owns the loud lane-death log).
+    ///
+    /// # Feeder-site contract (TB4QGX T3, ADR-044)
+    /// A BOT-side caller of this method MUST also wake the fleet hosts on a
+    /// non-`Held` change; see [`Self::observe_throttle`]. On the lane-death
+    /// (`Faulted`) arm the wake still fires, and the host drains its held
+    /// receipts terminally instead of parking them.
     pub fn observe_cause(&self, cause: PostureCause) -> PostureChange {
         let (change, posture) = {
             let mut machine = self.machine.lock();
@@ -725,6 +746,14 @@ impl PostureOwner {
         *self.machine.lock().counters()
     }
 
+    /// The sticky lane-death hold (read-through). A host keys its Faulted
+    /// transition on this TYPED latch, never on elapsed cordon time (a long
+    /// recoverable EventBurst/Duty cordon must not fault).
+    #[must_use]
+    pub fn lane_death_held(&self) -> bool {
+        self.machine.lock().lane_death_held()
+    }
+
     /// Mirror the machine's state into the feed — compare-then-publish, so
     /// the sequence (and every subscriber's edge) moves ONLY on a real
     /// posture change.
@@ -750,9 +779,9 @@ static PROCESS_OWNER: OnceLock<PostureOwner> = OnceLock::new();
 #[must_use]
 pub fn install_process_owner(policy: PosturePolicy) -> &'static PostureOwner {
     if PROCESS_OWNER.set(PostureOwner::new(policy)).is_err() {
-        tracing::debug!(
-            target: "apexbot::fleet",
-            "[fleet-posture] process owner already installed — first-wins, keeping the existing owner"
+        diag!(
+            domain = pump,
+            "process owner already installed — first-wins, keeping the existing owner"
         );
     }
     process()

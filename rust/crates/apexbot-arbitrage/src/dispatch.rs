@@ -32,6 +32,8 @@
 //!   from `simulator` at this crate's root) the companion renders.
 //!   the companion renders.
 
+use apexbot_core::diag;
+use apexbot_core::op_info;
 // Solidity/EVM + Rust-ecosystem identifiers (tokio, JoinSet, bps, PathSuppression,
 // MAX_SIMULATE_CONCURRENT, etc.) are ubiquitous here.
 
@@ -57,7 +59,7 @@ use crate::{
 // Diagnostics
 // ─────────────────────────────────────────────────────────────────────────
 
-/// `APEXBOT_V2_CALC_TRACE` env-gated diagnostic: immediately before each
+/// `the V2-calc probe` env-gated diagnostic: immediately before each
 /// candidate path's sim, read every V2 hop's reserves slot (slot 8) from the
 /// SHARED per-block `CacheDB` and log the decoded `reserve0`/`reserve1` plus
 /// the hop's token orientation. `_v2_get_amount_out` (`V2_SWAP_CALC`, cmd
@@ -70,26 +72,18 @@ use crate::{
 ///
 /// The output is emitted at `debug` level, so it is gated behind the tracing
 /// filter (`RUST_LOG=...=debug` / `=trace`) rather than appearing on stderr by
-/// default. `APEXBOT_V2_CALC_TRACE` (conservative default ON via
-/// `flag_default_on`) additionally gates the slot-8 read itself: set it to a
-/// falsey value to skip the read work entirely. The `debug` level is the
-/// primary noise gate — the env var only controls whether the (cheap) reads
-/// run.
+/// default — the `debug` level is the gate.
 fn v2_calc_trace(handle: &mut BlockSimHandle<'_>, sim_path: &SimulatePath) {
-    if !::apexbot_config::holder::config().trace.v2_calc_trace {
-        return;
-    }
     for hop in &sim_path.path_info.hops {
         if let HopInfo::V2(v2) = hop {
             let cache_db = &mut handle.evm_mut().ctx.journaled_state.database;
             let word = match cache_db.storage_ref(v2.pool_address, U256::from(8u64)) {
                 Ok(w) => w,
                 Err(e) => {
-                    tracing::debug!(
-                        path_id = sim_path.path_id,
+                    diag!(domain = sim, path_id = sim_path.path_id,
                         pair = ?v2.pool_address,
                         %e,
-                        "[v2-calc-trace] slot8 read failed"
+                        "slot8 read failed"
                     );
                     break;
                 }
@@ -97,8 +91,7 @@ fn v2_calc_trace(handle: &mut BlockSimHandle<'_>, sim_path: &SimulatePath) {
             let mask112 = (U256::from(1_u128) << U256::from(112)) - U256::from(1_u128);
             let reserve0 = (word & mask112).to::<u128>(); // low 112 = token0 reserve
             let reserve1 = ((word >> U256::from(112)) & mask112).to::<u128>(); // next 112
-            tracing::debug!(
-                path_id = sim_path.path_id,
+            diag!(domain = sim, path_id = sim_path.path_id,
                 pair = ?v2.pool_address,
                 token0 = ?v2.token0_address,
                 token1 = ?v2.token1_address,
@@ -106,7 +99,7 @@ fn v2_calc_trace(handle: &mut BlockSimHandle<'_>, sim_path: &SimulatePath) {
                 fee = v2.fee,
                 reserve0 = reserve0,
                 reserve1 = reserve1,
-                "[v2-calc-trace] pair reserves slot8 before path execute"
+                "pair reserves slot8 before path execute"
             );
             break;
         }
@@ -589,7 +582,7 @@ pub fn dispatch_profitable_results(
     //      time — the result is stale and would revert on-chain.
     let stale_before = candidates.len();
     if let Some(ref arc) = bot_state {
-        let guard = arc.read();
+        let guard = arc.read_at(apexbot_bot::bot_core::state_lock::LockSite::Sim);
         candidates.retain(|c| !candidate_is_stale(&guard, c));
     }
     outcome.stale_dropped = stale_before - candidates.len();
@@ -660,7 +653,7 @@ pub fn dispatch_profitable_results(
             // DO NOT re-point the projection at the arbitrary-key probe, and
             // do not extend this guard across anything below it.
             let anchor = {
-                let guard = arc.read();
+                let guard = arc.read_at(apexbot_bot::bot_core::state_lock::LockSite::Sim);
                 apexbot_bot::bot_core::SimAnchorState::snapshot(&guard)
             };
             // The warm-code cache arc; degrade to a fresh per-call cache if
@@ -707,7 +700,7 @@ pub fn dispatch_profitable_results(
                     .map(|c| {
                         let pid = c.path_id;
                         let sim_path = c.to_simulate_path();
-                        // `APEXBOT_V2_CALC_TRACE` — env-gated diagnostic that
+                        // `the V2-calc probe` — env-gated diagnostic that
                         // reads every V2 hop's reserves slot (slot 8) straight
                         // from the SHARED per-block CacheDB immediately before
                         // this candidate's `simulate_path_on_evm` run. This is
@@ -767,11 +760,10 @@ pub fn dispatch_profitable_results(
             apexbot_simulation::sim::evm::sim_metrics::snapshot(),
             lab_before,
         );
-        tracing::info!(
-            target: apexbot_bot::telemetry::DIAGNOSTIC_TARGET,
+        op_info!(
+            domain = sim,
             current_block,
-            fanout_ms = u64::try_from(lab_fanout_started.elapsed().as_millis())
-                .unwrap_or(u64::MAX),
+            fanout_ms = u64::try_from(lab_fanout_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "{}",
             apexbot_simulation::sim::evm::sim_metrics::format_delta(&lab, fanout_candidate_count)
         );
@@ -1355,7 +1347,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<std::time::Duration>();
         let writer = std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let _guard = writer_state.write(); // parks behind the fan-out's read (pre-fix)
+            let _guard = writer_state.write_at(apexbot_bot::bot_core::state_lock::LockSite::Sim); // parks behind the fan-out's read (pre-fix)
             tx.send(start.elapsed()).expect("report wait");
         });
 

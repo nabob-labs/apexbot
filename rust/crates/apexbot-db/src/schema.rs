@@ -7,23 +7,32 @@
 //! value; mirrors Python's `IntMappedToString` `TypeDecorator`), addresses are
 //! `VARCHAR(42)` checksum strings, V4 `pool_hash` is `VARCHAR(66)` 0x-hex.
 
-/// The Alembic `version_num` the Rust core treats as current.
-///
-/// This is the tip of `src/apexbot/migrations/versions/` — verified as the head
-/// because no migration declares it as a `down_revision`. Bumped in lockstep
-/// with a new Alembic migration landing in Epic AZGJUN (the writer path stays
-/// Alembic-owned; the Rust core only reads).
-pub const ALEMBIC_HEAD: &str = "2606a6c7f5ee";
-
 /// The embedded full-schema DDL, applied ONLY on the fresh-standalone open path
-/// (a `cargo add apexbot-db` consumer's own empty file). An Alembic-stamped
-/// production DB is NEVER touched by this — see [`crate::migrate::ensure_schema`].
+/// (a `cargo add apexbot-db` consumer's own empty file). A legacy DB carrying
+/// the `alembic_version` marker table is never touched by this — see
+/// [`crate::migrate::ensure_schema`].
 pub const SCHEMA_HEAD: &str = include_str!("schema_head.sql");
 
 /// The private Rust-owned schema-version stamp, written to
-/// `_apexbot_db_schema_version` only on the fresh-standalone path so future
-/// Rust-owned schema bumps (post-Alembic-retirement) can be tracked independently
-/// of Alembic. Bumped when a Rust-owned `ALTER` script ships; out of scope here.
+/// `_apexbot_db_schema_version` on the fresh-standalone, cutover, and heal
+/// paths so Rust-owned schema bumps (post-Alembic-retirement) are tracked
+/// independently of Alembic.
+///
+/// # Bump ritual (mechanical — three steps, in this order)
+///
+/// 1. **Bump this constant** (`RUST_SCHEMA_VERSION = N + 1`).
+/// 2. **Append the step** to [`crate::migrations::RUST_MIGRATIONS`]: a
+///    [`crate::migrations::MigrationStep`] with `version = N + 1` and the
+///    `ALTER`/DDL SQL that upgrades schema `N` to `N + 1`. The
+///    registry must stay contiguous from `1` — `apply_forward_migrations`
+///    refuses a gap with [`crate::error::DbError::MissingMigrationStep`].
+/// 3. **Extend the release matrix** (ADR-052 D5): add the `N`-stamped fixture
+///    so the open → version-lock → current chain is proven for the prior
+///    release.
+///
+/// The open path applies pending steps automatically (ADR-052 D2), so no
+/// consumer calls a migration verb; a binary older than the DB refuses with
+/// [`crate::error::DbError::SchemaAhead`] and never writes ahead.
 pub const RUST_SCHEMA_VERSION: u32 = 1;
 
 /// Name of the private Rust-owned schema stamp table.

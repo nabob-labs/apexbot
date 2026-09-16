@@ -47,6 +47,9 @@ pub enum BaseKind {
     F64,
     /// Small closed variant set (generated enum type).
     Enum(&'static str, &'static [&'static str]),
+    /// A validated domain -> level map (the generated key type is
+    /// `BTreeMap<String, E>`; the element enum name is carried for docs).
+    Map(&'static str),
 }
 
 impl fmt::Display for BaseKind {
@@ -64,6 +67,7 @@ impl fmt::Display for BaseKind {
             Self::U128 => f.write_str("u128 (decimal text)"),
             Self::F64 => f.write_str("f64"),
             Self::Enum(name, variants) => write!(f, "{name}({})", variants.join("|")),
+            Self::Map(name) => write!(f, "map<string, {name}>"),
         }
     }
 }
@@ -137,14 +141,16 @@ crate::config_schema! {
     }
 
     telemetry TelemetryConfig {
+        log_level [opt enum LogLevel Off Error Warn Info Debug Trace] = None, env = "APEXBOT_LOG_LEVEL", def = "(unset: wiring default)",
+            doc = "Console wiring default level, used only when RUST_LOG is absent (off|error|warn|info|debug|trace). The standalone Rust bot wiring defaults to warn; the Python driver to info.";
+        diag [map LogLevel] = ::std::collections::BTreeMap::new(), env = "APEXBOT_TELEMETRY_DIAG", def = "(empty)",
+            doc = "Per-domain console escalation from a validated map: [telemetry.diag] with sim = \"debug\", or the env form sim=debug,solver=trace. A typo'd domain is a boot error. Ignored with one WARN when RUST_LOG is set.";
         otel [bool] = true, env = "APEXBOT_OTEL", def = "true",
             doc = "Enable the OTel OTLP span layer and the Prometheus metrics endpoint; `0`/empty opts out.";
         metrics_addr [string] = String::from("127.0.0.1:9464"), env = "APEXBOT_METRICS_ADDR", def = "127.0.0.1:9464",
             doc = "Prometheus scrape endpoint bind address (only active when otel is on).";
         jaeger_endpoint [string] = String::from("http://127.0.0.1:4318"), env = "APEXBOT_JAEGER_ENDPOINT", def = "http://127.0.0.1:4318",
             doc = "OTLP endpoint used by the opt-in Jaeger E2E test.";
-        log_fmt_stderr [bool] = true, env = "APEXBOT_LOG_FMT", def = "true",
-            doc = "Keep the stderr fmt-layer mirror of every record (including the Python logging bridge); 0 routes the fmt layer to the sink so a driver teeing both sinks records each line once.";
         jaeger_e2e [bool] = false, env = "APEXBOT_JAEGER_E2E", def = "false",
             doc = "Gate for the network-accessible Jaeger E2E test (Jaeger must be reachable at jaeger_endpoint).";
     }
@@ -204,26 +210,6 @@ crate::config_schema! {
     }
 
     trace TraceConfig {
-        dispatch [bool] = false, env = "APEXBOT_TRACE_DISPATCH", def = "false",
-            doc = "Trace pump dispatch fan-out (presence historically enabled; loader parses a bool).";
-        drain_dbg [opt string] = None, env = "APEXBOT_DRAIN_DBG", def = "(unset)",
-            doc = "Per-pool drain/pump debug trace for the given pool hex address (no 0x or with).";
-        dump_call_trace [bool] = true, env = "APEXBOT_DUMP_CALL_TRACE", def = "true",
-            doc = "Dump simulator call traces (default ON; `0` disables).";
-        dump_tick_maps [bool] = false, env = "APEXBOT_DUMP_TICK_MAPS", def = "false",
-            doc = "Dump assembled tick maps for offline comparison (UO3JM4 re-assembly aid).";
-        trace_liquidity [bool] = false, env = "APEXBOT_TRACE_LIQUIDITY", def = "false",
-            doc = "Global liquidity-events trace for EVERY V3/V4 liquidity mutation across all pools.";
-        trace_register_seed [bool] = false, env = "APEXBOT_TRACE_REGISTER_SEED", def = "false",
-            doc = "Trace pool registration seeding progress.";
-        trace_tick [opt i32] = None, env = "APEXBOT_TRACE_TICK", def = "(unset)",
-            doc = "Watch one known-divergent tick (signed decimal) across mutations in the pin/drain probes.";
-        ws_trace [bool] = false, env = "APEXBOT_WS_TRACE", def = "false",
-            doc = "Catch-all WS-log trace (one line per relevant log; high volume by design).";
-        gate_trace [bool] = false, env = "APEXBOT_GATE_TRACE", def = "false",
-        doc = "T5 profit-envelope compose tracing gate (profit_envelope TRACE).";
-        v2_calc_trace [bool] = true, env = "APEXBOT_V2_CALC_TRACE", def = "true",
-            doc = "V2-calc slot-8 read probe in the arbitrage dispatcher (KAHU5W: added during the env migration — previously an undeclared key parsed by a generic presence/flag helper at the site; conservative default ON, falsey opts out).";
         hotpath [bool] = false, env = "APEXBOT_HOTPATH", def = "false",
             doc = "Construct the hotpath profiling guard (default OFF; build must enable the profiling feature too).";
     }
@@ -288,6 +274,10 @@ crate::config_schema! {
             doc = "Clean-window hysteresis (ms) required before cordon exits (design doc §6: 10 s of clean windows).";
         cordon_sim_intake_floor [opt usize] = None, env = "APEXBOT_FLEET_CORDON_SIM_INTAKE_FLOOR", def = "(unset; half the slot cap)",
             doc = "SimDriver new-lease cap while cordoned; in-flight sims are never cancelled (default: half the slot cap).";
+        intake_backstop_ms [ms] = 250, env = "APEXBOT_FLEET_INTAKE_BACKSTOP_MS", def = "250",
+            doc = "Backstop recv-timeout (ms) armed iff a host intake backlog is non-empty; on timeout the host re-runs the grant pump, so a posture lift with no further message still drains held units (TB4QGX T2). Clamped to >= 1 ms at the site so a garbage value cannot collapse into a busy-spin.";
+        intake_no_progress_ticks [usize] = 8, env = "APEXBOT_FLEET_INTAKE_NO_PROGRESS_TICKS", def = "8",
+            doc = "Consecutive admitted-but-no-progress host intake passes (backlog non-empty, admission admits, yet no dequeue and no grant) before the host fails LOUDLY (TB4QGX T4). Legitimate WaitCap/WaitPosture holds never count, and only real progress resets the counter. Clamped to >= 1 at the site so a garbage value cannot trip on the first pass.";
     }
 
     capture CaptureConfig {
@@ -312,21 +302,15 @@ crate::config_schema! {
     }
 
     verify VerifyConfig {
-        verify_dbg [bool] = true, env = "APEXBOT_VERIFY_DBG", def = "true",
-            doc = "Structural visibility probes diagnosing liquidity-map verification misses (default ON; `0` disables).";
         verify_spotcheck_permyriad [u64] = 0, env = "APEXBOT_VERIFY_SPOTCHECK_PERMYRIAD", def = "0",
             doc = "Per-myriad (1/10_000) sampling rate for verify spot-checks (0 = off).";
     }
 
     simulation SimulationConfig {
-        sim_divergence_log [bool] = false, env = "APEXBOT_SIM_DIVERGENCE_LOG", def = "false",
-            doc = "Log engine-vs-RPC divergence probes on failed sims (`1` enables).";
         sim_execute_gas [opt u64] = None, env = "APEXBOT_SIM_EXECUTE_GAS", def = "(unset; EIP-7825 TX_GAS_LIMIT_CAP)",
             doc = "Override the execute() gas limit (decimal u64; garbage/0 falls back at the site while migrating).";
         sim_exit_on_fail [bool] = false, env = "APEXBOT_SIM_EXIT_ON_FAIL", def = "false",
             doc = "Abort the process when a sim fails (the live trap used to capture V3-hop fixtures).";
-        sim_log_reverted_swaps [bool] = true, env = "APEXBOT_SIM_LOG_REVERTED_SWAPS", def = "true",
-            doc = "Log reverted-swap pools during sims (default ON; `0` disables).";
         sim_serve_engine_state [bool] = false, env = "APEXBOT_SIM_SERVE_ENGINE_STATE", def = "false",
             doc = "Serve engine state to the sim/evm layer (`1` enables; behavior change, default off).";
         probe_fixture [opt path] = None, env = "APEXBOT_PROBE_FIXTURE", def = "(unset)",
@@ -337,11 +321,16 @@ crate::config_schema! {
             doc = "Passes per arm for the offline executor A/B probe.";
     }
 
+    // 4IOEVT: discovery delivery batching. The startup discovery sweep's
+    // async wrapper delivers paths in batches (one event-loop hop per batch)
+    // instead of one hop per path; this typed key makes the batch size
+    // operator-settable without a code change.
+    pathfinding PathfindingConfig {
+        discovery_batch_size [usize] = 1000, env = "APEXBOT_DISCOVERY_BATCH_SIZE", def = "1000",
+            doc = "Discovery-sweep delivery batch size (paths per async batch): the worker thread collects this many paths before the async consumer yields them and gives the event loop one turn. A value <= 1 falls back to the legacy per-path delivery.";
+    }
+
     aave AaveConfig {
-        aave_evtrace [bool] = false, env = "APEXBOT_AAVE_EVTRACE", def = "false",
-            doc = "Trace Aave transaction-processor events (`1` enables).";
-        aave_tx_trace [bool] = false, env = "APEXBOT_AAVE_TX_TRACE", def = "false",
-            doc = "Trace Aave updater transaction application (`1` enables).";
         bridge_probe [bool] = false, env = "APEXBOT_BRIDGE_PROBE", def = "false",
             doc = "In-tree bridge-probe observation surface in the arbitrage simulator (presence gates).";
     }
@@ -370,8 +359,6 @@ crate::config_schema! {
             doc = "Allocation-tracking gate for the math/pools bench suites (`1` enables).";
         self_abort_test [bool] = false, env = "APEXBOT_SELF_ABORT_TEST", def = "false",
             doc = "Block-pump self-abort hatch (presence gates in tests).";
-        no_progress_abort_test [bool] = false, env = "APEXBOT_NO_PROGRESS_ABORT_TEST", def = "false",
-            doc = "No-progress abort hatch gate (test scaffolding; `1` enables).";
         unused_test_flag [bool] = true, env = "APEXBOT_UNUSED_TEST_FLAG", def = "true",
             doc = "Default-ON flag-parse probe (asserted by the bot-core unit tests).";
     }
@@ -461,6 +448,16 @@ mod tests {
             !SCHEMA.iter().any(|k| k.env == "APEXBOT_FLEET"),
             "APEXBOT_FLEET must be retired from the schema"
         );
+    }
+
+    #[test]
+    fn pathfinding_discovery_batch_size_is_declared_with_default_1000() {
+        let key = SCHEMA
+            .iter()
+            .find(|k| k.toml_path == "pathfinding.discovery_batch_size");
+        assert!(key.is_some(), "4IOEVT key must be declared exactly once");
+        assert_eq!(key.map(|k| k.env), Some("APEXBOT_DISCOVERY_BATCH_SIZE"));
+        assert_eq!(BotConfig::default().pathfinding.discovery_batch_size, 1000);
     }
 
     #[test]

@@ -11,8 +11,8 @@ across future Rust reshuffles, and lets the Rust crate structure
 
 The functions are thin PyO3 wrappers over the pure-Rust ``apexbot-concentrated-liquidity-math``
 core crate. The CL math is shared across Uniswap V3 and V4, so this companion
-lives at ``apexbot.uniswap.math`` (variant-neutral), not under
-``v3_libraries``.
+lives at ``apexbot.uniswap.math`` (variant-neutral), shared by the V3 and V4
+families.
 """
 
 from apexbot._ffi.concentrated_liquidity_math import (
