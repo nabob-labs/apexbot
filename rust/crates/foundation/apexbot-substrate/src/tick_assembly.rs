@@ -1,0 +1,653 @@
+//! Tick-map assembly: the one `Db → Chain` precedence for concentrated liquidity pools.
+//!
+//! [`resolve_tick_map_arm`] is the single precedence decision — the Db read
+//! first, then (on a Db miss) the Chain transport — shared by every caller:
+//! the sync `assemble_v3_tick_map` / `assemble_v4_tick_map` wrappers, the
+//! async-native `pool_builder` registration arms, and the per-frame
+//! `pool_ingress`. Db conversion via [`liquidity_map_to_tick_info`],
+//! Tracked-empty handling, coverage tagging, and the forensic dump live only
+//! here, and both arms mint their
+//! [`TickMapSeed`] through [`TickMapArm::into_seed`], so no transport can
+//! drift the semantics.
+//!
+//! The Chain transport deliberately keeps two adapters: the sync
+//! [`TickWordSource`] trait object (used by the sync wrappers and the
+//! per-frame ingress) and the builder's async-native `ConstructionIo`
+//! bootstrap. The builder runs on the async registration runtime and cannot
+//! `block_on` the sync helper (the nested-`block_on` deadlock class), so the
+//! transport forks while the precedence does not. The former `Store` arm was
+//! retired (the in-memory `SnapshotStore` is replaced by a WAL held read
+//! transaction so every per-pool read during `build_paths` shares one frozen
+//! DB cut).
+//!
+//! # Chain arm coverage semantics
+//!
+//! A Chain hit seeds only the **one** tick-bitmap word containing the pool's
+//! current `tick`, so coverage is [`PoolTickCoverage::Sparse`] (NOT `Tracked`
+//! — the live-pump miss-detection must still backfill neighbouring words via
+//! `TickWordSource` during swap simulation). A Chain arm returning `None`
+//! (all-zero bitmap) means the pool genuinely has no initialized ticks within
+//! the current word — the caller registers with `tick_data=None,
+//! coverage="sparse"` (mirrors Python Branch 3 when `bitmap_at_word == 0`).
+//!
+//! //! # Lock protocol (must-read before editing)
+//!
+//! The Db arm reads through `Option<&dyn TickMapDb>` (a handle to a
+//! *separate* `Mutex<Connection>` — the `SnapshotDb` held-tx or a per-call
+//! `ApexbotDb`), decoupled from `BotState`. The Chain arm is an RPC trait
+//! object, also with no `BotState` guard. The former `Store` arm's closure
+//! (which briefly held a `BotState` read guard) is retired — the
+//! per-pool `fetch_liquidity_map` reads the DB directly with no `BotState`
+//! guard held across an `SQLite` read or an RPC `eth_call`. During
+//! `build_paths` the live pump holds `state.write()` on the same `BotState`
+//! (`resume()` precedes `build_paths`), so NO `BotState` guard may be held
+//! across either the Db or Chain read. The Chain arm holds the same
+//! invariant: RPC I/O runs with NO `BotState` guard (the lock protocol holds
+//! end-to-end).
+//!
+//! # Db error handling (Decision 8 (A) — behavior change)
+//!
+//! Today the Python builder wraps the Db snapshot read in
+//! `contextlib.suppress(Exception)`: a transient `database is locked` under
+//! the concurrent updater process is swallowed and the builder silently falls
+//! through to sparse RPC. This helper **propagates** `DbError` instead — the
+//! `PyO3` wrapper raises `RuntimeError`. The trade-off is
+//! deliberate: loud failure on Db problems beats silent degradation to a
+//! solver-unsafe sparse state. Do NOT "restore" the swallow — if a transient Db
+//! error now aborts registration where it previously degraded, that is the
+//! intended behavior and must be fixed at the Db layer (e.g. longer
+//! `busy_timeout`), not papered over here.
+//!
+//! # Chain error handling (Decision 8 (A) — extended to the Chain arm)
+//!
+//! A [`TickWordFetchError`] from the Chain arm is **propagated** as
+//! [`TickMapAssemblyError::Chain`] — same loud-failure posture as the Db arm.
+//! A transient RPC failure (timeout, transport, revert) surfaces as
+//! [`TickWordFetchError::FetchFailed`]; a malformed return as
+//! [`TickWordFetchError::InvalidReturn`]. Neither is swallowed: the caller
+//! raises a typed exception rather than silently degrading to a solver-unsafe
+//! empty state. If a retry-only-on-RPC-errors policy is later needed, match on
+//! the variant at the `PyO3` boundary.
+
+use hashbrown::HashMap;
+
+use alloy::primitives::{Address, U256};
+
+use apexbot_db::error::DbError;
+use apexbot_db::snapshot::{LiquidityAtTick, LiquidityMap};
+use apexbot_decoders::v4_swap_decoder::V4PoolId;
+// `PoolTickCoverage` + `TickInfo` live in `apexbot_pools` but aren't at its
+// crate root; `bot_core::mod` re-exports them via `pub use v3_state::…` +
+// `pub use ::apexbot_pools::TickInfo`. Use those re-exports to avoid coupling
+// this submodule to `apexbot_pools::v3_state`'s private path.
+use apexbot_pools::sim::tick_fetch::{TickWordFetchError, TickWordKey, TickWordSource};
+
+use crate::planning::{TickMapPoolIdentity, TickMapSeed};
+use crate::{PoolTickCoverage, TickInfo};
+
+/// The helper's error envelope: a `DbError` from the Db arm OR a
+/// [`TickWordFetchError`] from the Chain arm. Both are propagated loudly
+/// (Decision 8 (A)) — never swallowed. The `PyO3` wrapper maps each variant to
+/// the appropriate Python exception (`RuntimeError` for Db, a typed RPC error
+/// for Chain).
+#[derive(Debug, thiserror::Error)]
+pub enum TickMapAssemblyError {
+    /// A Db read failure from the Db arm (Decision 8 (A) — propagated, not
+    /// swallowed).
+    #[error(transparent)]
+    Db(#[from] DbError),
+    /// A Chain-arm RPC failure (transport/timeout/revert or malformed return).
+    /// Same loud-failure posture as the Db arm — the caller surfaces it as a
+    /// typed exception rather than silently degrading.
+    #[error(transparent)]
+    Chain(#[from] TickWordFetchError),
+    /// A Tracked snapshot reached the registration gate with no chain transport
+    /// wired, so the on-chain word reconciliation could not run. The gate fails
+    /// loudly rather than registering an unverified complete map — a silent
+    /// pass would claim chain truth it never established.
+    #[error(
+        "Tracked tick map intake requires a chain transport for on-chain word reconciliation, but none is wired"
+    )]
+    ChainUnavailable,
+    /// The snapshot's tick rows disagree with the word bitmaps FETCHED FROM
+    /// CHAIN at the snapshot block: a `liquidity_gross > 0` row has no chain
+    /// bit, or a chain bit has no `liquidity_gross > 0` row. Registration is
+    /// rejected AT INTAKE. `tick` is the conflicting position (`i32::MIN`
+    /// marks an out-of-range corrupted word position).
+    #[error(
+        "Tracked tick map inconsistent at intake: word {word} bit {bit} (tick {tick}) — bitmap_bit = {bitmap_bit}, row_gross_positive = {row_gross_positive}"
+    )]
+    InconsistentTickMap {
+        word: i64,
+        bit: u32,
+        tick: i32,
+        bitmap_bit: bool,
+        row_gross_positive: bool,
+    },
+}
+
+/// The helper's return shape: an optional hit (`Some((ticks, coverage))` on
+/// Db or Chain success) or a miss (`None`), with
+/// [`TickMapAssemblyError`] propagated from the Db + Chain arms. A type alias
+/// keeps the four call sites readable and silences `clippy::type_complexity`.
+pub type TickMapAssemblyResult =
+    Result<Option<(HashMap<i32, TickInfo>, PoolTickCoverage)>, TickMapAssemblyError>;
+
+/// Compact serialize of a `HashMap<i32, TickInfo>` (ascending tick) into
+/// `tick:gross,net;...`, for the snapshot-seed dump (ADR-021
+/// re-assembly aid).
+fn serialize_tick_info_map(ticks: &HashMap<i32, TickInfo>) -> String {
+    let mut keys: Vec<&i32> = ticks.keys().collect();
+    keys.sort_unstable();
+    keys.iter()
+        .map(|t| {
+            let ti = &ticks[*t];
+            format!("{t}:{},{}", ti.liquidity_gross, ti.liquidity_net)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Emit the snapshot-seed tick map (Db snapshot + backfill) at TRACE on
+/// `state`, so it can be compared against the map that later went into the
+/// verifier (ADR-021 re-assembly aid). Forensic: silent unless the sink
+/// enables `apexbot=trace`.
+pub(crate) fn dump_tick_map_seed(
+    pool_ident: &str,
+    seed: &(HashMap<i32, TickInfo>, PoolTickCoverage),
+) {
+    apexbot_core::diag_trace!(domain = state, pool = %pool_ident,
+        seed_origin = "db-snapshot",
+        coverage = ?seed.1,
+        tick_count = seed.0.len(),
+        seed_map = %serialize_tick_info_map(&seed.0),
+        "tick-map snapshot-seed (ADR-021 re-assembly aid)"
+    );
+}
+
+/// Which arm supplied a resolved concentrated liquidity tick map — the precedence decision before
+/// the seed vocabulary stamps provenance.
+pub enum TickMapArm {
+    /// A Db hit: the complete map, or a legitimately-empty `Tracked` pool.
+    Db(HashMap<i32, TickInfo>, PoolTickCoverage),
+    /// A Chain hit: the single tick word the transport returned, always
+    /// `Sparse`.
+    Chain(HashMap<i32, TickInfo>),
+    /// The Chain transport ran and returned no word (all-zero bitmap), or no
+    /// Chain transport is wired.
+    ChainMiss,
+}
+
+impl TickMapArm {
+    /// Stamp this arm into the single seed vocabulary. The one mint for BOTH
+    /// arms: Db provenance, Chain provenance, and the `ChainMiss` → empty
+    /// `Sparse` semantics cannot drift between transports.
+    #[must_use]
+    pub fn into_seed(self, block: u64, identity: TickMapPoolIdentity) -> TickMapSeed {
+        match self {
+            Self::Db(ticks, coverage) => {
+                TickMapSeed::db(ticks, coverage, block, Some(block), identity)
+            }
+            Self::Chain(ticks) => {
+                TickMapSeed::chain(ticks, PoolTickCoverage::Sparse, block, identity)
+            }
+            Self::ChainMiss => {
+                TickMapSeed::chain(HashMap::new(), PoolTickCoverage::Sparse, block, identity)
+            }
+        }
+    }
+
+    /// Project this arm onto the historical sync `assemble_*_tick_map`
+    /// contract, which reports a Chain miss as `None`.
+    #[must_use]
+    fn into_sync_hit(self) -> Option<(HashMap<i32, TickInfo>, PoolTickCoverage)> {
+        match self {
+            Self::Db(ticks, coverage) => Some((ticks, coverage)),
+            Self::Chain(ticks) => Some((ticks, PoolTickCoverage::Sparse)),
+            Self::ChainMiss => None,
+        }
+    }
+}
+
+/// The one `Db → Chain` precedence decision for concentrated liquidity tick maps.
+///
+/// The Db read is always attempted first, and its outcome alone decides
+/// whether the Chain transport runs. `Ok(Some(seed))` means the Db arm is
+/// authoritative — a complete map, or a Db-registered pool with no mapped
+/// liquidity ("legitimately-empty `Tracked`", never degraded to `Sparse`).
+/// `Ok(None)` means the pool is absent from the Db, so the caller runs its
+/// Chain transport and mints through [`TickMapArm::into_seed`].
+///
+/// Db conversion ([`liquidity_map_to_tick_info`]), coverage tagging, the
+/// forensic dump, and the loud error posture all live here, so every
+/// transport shares identical semantics. The
+/// Chain transport stays outside because it keeps two adapters — the sync
+/// [`TickWordSource`] trait object and the builder's async-native
+/// `ConstructionIo`, which cannot `block_on` the sync helper (the
+/// nested-`block_on` deadlock class; see the module doc). Both mint through
+/// [`TickMapArm::into_seed`].
+///
+/// # Errors
+///
+/// Propagates the caller's Db read error, mapped through `E`. The on-chain
+/// reconciliation that replaces the retired snapshot-internal check runs at
+/// the registration wrappers, not here (the shared arm is transport-free).
+pub fn resolve_tick_map_arm<E, FDb>(
+    pool_ident: &str,
+    identity: TickMapPoolIdentity,
+    _tick_spacing: i32,
+    block: u64,
+    db_read: FDb,
+) -> Result<Option<TickMapSeed>, E>
+where
+    E: From<TickMapAssemblyError>,
+    FDb: FnOnce() -> Result<Option<LiquidityMap>, E>,
+{
+    // 1. Db arm — held `SnapshotDb` tx (or per-call `ApexbotDb`), no BotState
+    // guard.
+    let Some(map) = db_read()? else {
+        return Ok(None); // pool not in Db -> caller runs the Chain transport
+    };
+    // Pool IS in the Db: a non-empty map -> Tracked + populated; an empty map
+    // -> legitimately-empty Tracked (authoritative — it came from the Db).
+    let arm = match liquidity_map_to_tick_info(map, block) {
+        Some(hit) => {
+            dump_tick_map_seed(pool_ident, &hit);
+            TickMapArm::Db(hit.0, hit.1)
+        }
+        None => TickMapArm::Db(HashMap::new(), PoolTickCoverage::Tracked),
+    };
+    Ok(Some(arm.into_seed(block, identity)))
+}
+
+/// Mint the Chain arm from a transport's raw hit: `Some(ticks)` is a `Sparse`
+/// word, `None` is a miss (all-zero bitmap, or no transport wired). The shared
+/// chain-side mint for both transports.
+#[must_use]
+pub fn chain_arm(ticks: Option<HashMap<i32, TickInfo>>) -> TickMapArm {
+    match ticks {
+        Some(ticks) => TickMapArm::Chain(ticks),
+        None => TickMapArm::ChainMiss,
+    }
+}
+
+/// Assemble a V3 pool's tick map with `Db → Chain` precedence.
+///
+/// Tries the Db snapshot arm first (through [`resolve_tick_map_arm`]); on a Db
+/// miss, falls back to the sync [`TickWordSource`] Chain transport and mints
+/// a `Sparse` seed. A Chain miss (all-zero bitmap / no transport) is reported
+/// as `None`, the historical sync contract.
+///
+/// # Errors
+///
+/// Propagates [`TickMapAssemblyError::Db`] from the Db arm and
+/// [`TickMapAssemblyError::Chain`] from the Chain arm — neither is swallowed
+/// (Decision 8 (A)).
+pub fn assemble_v3_tick_map(
+    db: Option<&dyn apexbot_db::snapshot::TickMapDb>,
+    address: Address,
+    tick: i32,
+    tick_spacing: i32,
+    block: u64,
+    chain: Option<&dyn TickWordSource>,
+) -> TickMapAssemblyResult {
+    let db_arm = resolve_tick_map_arm::<TickMapAssemblyError, _>(
+        &format!("{address}"),
+        TickMapPoolIdentity::V3(address),
+        tick_spacing,
+        block,
+        || match db {
+            Some(db) => db
+                .fetch_liquidity_map(address)
+                .map_err(TickMapAssemblyError::Db),
+            None => Ok(None),
+        },
+    )?;
+    if let Some(seed) = db_arm {
+        reconcile_db_seed_v3(&seed, address, tick_spacing, block, chain)?;
+        return Ok(Some((seed.ticks, seed.coverage)));
+    }
+    // 2. Chain arm — RPC trait object, no BotState guard. `chain=None`
+    // short-circuits (no RPC bootstrap wired).
+    let (word, _) =
+        apexbot_math::concentrated_liquidity::liquidity_mapping::get_tick_word_and_bit_position(
+            tick,
+            tick_spacing,
+        );
+    let key = TickWordKey::V3 {
+        address,
+        tick_spacing,
+    };
+    let chain_hit = match chain {
+        Some(chain) => chain
+            .fetch_tick_word(&key, word, block)
+            .map_err(TickMapAssemblyError::Chain)?
+            .map(|hit| hit.ticks),
+        None => None,
+    };
+    Ok(match chain_hit {
+        Some(ticks) => chain_arm(Some(ticks)).into_sync_hit(),
+        None => None,
+    })
+}
+
+/// Assemble a V4 pool's tick map with `Db → Chain` precedence.
+///
+/// V4 twin of [`assemble_v3_tick_map`]: the Db arm calls
+/// `db.fetch_liquidity_map_v4(pool_manager, pool_id_hash)`, and the Chain arm
+/// calls [`TickWordSource::fetch_tick_word`] with `(state_view,
+/// pool_id)` — `state_view` is the V4 `StateView` contract address (the
+/// contract exposing `getTickBitmap`/`getTickLiquidity`, NOT the
+/// `PoolManager`). Identical hit/miss/error semantics; both arms share
+/// [`resolve_tick_map_arm`] and [`TickMapArm::into_seed`].
+///
+/// # Errors
+///
+/// Propagates [`TickMapAssemblyError::Db`] from `fetch_liquidity_map_v4` and
+/// [`TickMapAssemblyError::Chain`] from `fetch_tick_word`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "precedence helper composes 2 arms; a params struct would obscure it"
+)]
+pub fn assemble_v4_tick_map(
+    db: Option<&dyn apexbot_db::snapshot::TickMapDb>,
+    pool_manager: Address,
+    state_view: Address,
+    pool_id: V4PoolId,
+    tick: i32,
+    tick_spacing: i32,
+    block: u64,
+    chain: Option<&dyn TickWordSource>,
+) -> TickMapAssemblyResult {
+    // `fetch_liquidity_map_v4` takes a `B256`; `V4PoolId` is `[u8; 32]` and
+    // `B256` is `FixedBytes<32>` — same layout, so the conversion is
+    // infallible.
+    let pool_id_hash = alloy::primitives::B256::from(pool_id);
+    let db_arm = resolve_tick_map_arm::<TickMapAssemblyError, _>(
+        &alloy::hex::encode_prefixed(pool_id),
+        TickMapPoolIdentity::V4 {
+            manager: pool_manager,
+            pool_id: pool_id_hash,
+        },
+        tick_spacing,
+        block,
+        || match db {
+            Some(db) => db
+                .fetch_liquidity_map_v4(pool_manager, pool_id_hash)
+                .map_err(TickMapAssemblyError::Db),
+            None => Ok(None),
+        },
+    )?;
+    if let Some(seed) = db_arm {
+        reconcile_db_seed_v4(&seed, state_view, pool_id, tick_spacing, block, chain)?;
+        return Ok(Some((seed.ticks, seed.coverage)));
+    }
+    // 2. Chain arm.
+    let (word, _) =
+        apexbot_math::concentrated_liquidity::liquidity_mapping::get_tick_word_and_bit_position(
+            tick,
+            tick_spacing,
+        );
+    let key = TickWordKey::V4 {
+        state_view,
+        pool_id,
+        tick_spacing,
+    };
+    let chain_hit = match chain {
+        Some(chain) => chain
+            .fetch_tick_word(&key, word, block)
+            .map_err(TickMapAssemblyError::Chain)?
+            .map(|hit| hit.ticks),
+        None => None,
+    };
+    Ok(match chain_hit {
+        Some(ticks) => chain_arm(Some(ticks)).into_sync_hit(),
+        None => None,
+    })
+}
+
+/// Reconcile a V3 Db seed against the chain word bitmaps read at `block`.
+///
+/// A `Tracked`, non-empty seed without a chain transport is refused
+/// ([`TickMapAssemblyError::ChainUnavailable`]) rather than registered
+/// unverified; `Sparse`/empty seeds carry no complete-map claim to reconcile.
+fn reconcile_db_seed_v3(
+    seed: &TickMapSeed,
+    address: Address,
+    tick_spacing: i32,
+    block: u64,
+    chain: Option<&dyn TickWordSource>,
+) -> Result<(), TickMapAssemblyError> {
+    if seed.coverage != PoolTickCoverage::Tracked || seed.ticks.is_empty() {
+        return Ok(());
+    }
+    let Some(chain) = chain else {
+        return Err(TickMapAssemblyError::ChainUnavailable);
+    };
+    let key = TickWordKey::V3 {
+        address,
+        tick_spacing,
+    };
+    reconcile_tracked_seed_with_chain(seed, tick_spacing, |word| {
+        let word = i32::try_from(word)
+            .map_err(|_| TickMapAssemblyError::Chain(TickWordFetchError::OutOfRange))?;
+        chain
+            .fetch_tick_word(&key, word, block)
+            .map_err(TickMapAssemblyError::Chain)
+            .map(|hit| hit.map_or(U256::ZERO, |hit| hit.bitmap.unwrap_or(U256::ZERO)))
+    })
+}
+
+/// V4 twin of [`reconcile_db_seed_v3`], keyed by the `StateView` contract.
+fn reconcile_db_seed_v4(
+    seed: &TickMapSeed,
+    state_view: Address,
+    pool_id: V4PoolId,
+    tick_spacing: i32,
+    block: u64,
+    chain: Option<&dyn TickWordSource>,
+) -> Result<(), TickMapAssemblyError> {
+    if seed.coverage != PoolTickCoverage::Tracked || seed.ticks.is_empty() {
+        return Ok(());
+    }
+    let Some(chain) = chain else {
+        return Err(TickMapAssemblyError::ChainUnavailable);
+    };
+    let key = TickWordKey::V4 {
+        state_view,
+        pool_id,
+        tick_spacing,
+    };
+    reconcile_tracked_seed_with_chain(seed, tick_spacing, |word| {
+        let word = i32::try_from(word)
+            .map_err(|_| TickMapAssemblyError::Chain(TickWordFetchError::OutOfRange))?;
+        chain
+            .fetch_tick_word(&key, word, block)
+            .map_err(TickMapAssemblyError::Chain)
+            .map(|hit| hit.map_or(U256::ZERO, |hit| hit.bitmap.unwrap_or(U256::ZERO)))
+    })
+}
+
+/// Convert a Db `LiquidityMap` into the helper's hit/miss shape.
+///
+/// Mirrors Python's `if not liq_positions: return ..., False` heuristic: a map
+/// with empty `tick_data` is treated as a miss (`None`) — the historical
+/// `init_maps` half of that guard is retired with the dropped word-value table.
+/// A non-empty map converts to `Tracked` coverage; the per-tick `block`
+/// is the Db arm's sync block `S` — the bulk-sync block. The Db stores no
+/// per-tick block, so the bulk-sync block is the real value in scope; `0` is a
+/// legal stamp and is never used as a sentinel.
+pub(crate) fn liquidity_map_to_tick_info(
+    map: LiquidityMap,
+    block: u64,
+) -> Option<(HashMap<i32, TickInfo>, PoolTickCoverage)> {
+    if map.tick_data.is_empty() {
+        return None;
+    }
+    let ticks = convert_liquidity_at_tick(map.tick_data, block);
+    Some((ticks, PoolTickCoverage::Tracked))
+}
+
+/// Chain-truth intake reconciliation: the snapshot's tick rows are compared
+/// against the word bitmaps READ FROM CHAIN at the snapshot block. A row with
+/// `liquidity_gross > 0` must have its bit set in the chain word that holds
+/// it (row side); every set bit of a chain word must have a gross>0 row at
+/// that position's grid tick (bitmap side). A row whose word was not fetched
+/// is skipped. `chain_words` carries one entry per word the snapshot's rows
+/// occupy; a chain word absent from the map was not fetched.
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub(crate) fn verify_tracked_tick_map(
+    chain_words: &HashMap<i64, U256>,
+    tick_data: &HashMap<i32, TickInfo>,
+    tick_spacing: i32,
+) -> Result<(), TickMapAssemblyError> {
+    let spacing = tick_spacing.max(1);
+    // Row side: a gross>0 snapshot row must have its bit set in the CHAIN word.
+    for (&tick, row) in tick_data {
+        if row.liquidity_gross.is_zero() {
+            continue;
+        }
+        let compressed = tick.div_euclid(spacing);
+        let word = i64::from(compressed >> 8);
+        let Some(bitmap) = chain_words.get(&word) else {
+            continue;
+        };
+        let bit = compressed.rem_euclid(256) as usize;
+        if !bitmap.bit(bit) {
+            return Err(TickMapAssemblyError::InconsistentTickMap {
+                word,
+                bit: bit as u32,
+                tick,
+                bitmap_bit: false,
+                row_gross_positive: true,
+            });
+        }
+    }
+    // Bitmap side: every set bit of a CHAIN word needs a gross>0 snapshot row
+    // at that position's grid tick.
+    for (&word, bitmap) in chain_words {
+        for bit in 0..256usize {
+            if !bitmap.bit(bit) {
+                continue;
+            }
+            let compressed = word * 256 + bit as i64; // bit < 256 (covered by fn-level expect)
+            let Some(tick) = (compressed * i64::from(spacing)).try_into().ok() else {
+                return Err(TickMapAssemblyError::InconsistentTickMap {
+                    word,
+                    bit: bit as u32,
+                    tick: i32::MIN,
+                    bitmap_bit: true,
+                    row_gross_positive: false,
+                });
+            };
+            let row_gross_positive = tick_data
+                .get(&tick)
+                .is_some_and(|r| !r.liquidity_gross.is_zero());
+            if !row_gross_positive {
+                return Err(TickMapAssemblyError::InconsistentTickMap {
+                    word,
+                    bit: bit as u32,
+                    tick,
+                    bitmap_bit: true,
+                    row_gross_positive: false,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The words the snapshot's rows occupy, ascending and de-duplicated.
+fn row_words(rows: &HashMap<i32, TickInfo>, tick_spacing: i32) -> Vec<i64> {
+    let spacing = tick_spacing.max(1);
+    let mut words: Vec<i64> = rows
+        .keys()
+        .map(|&tick| i64::from(tick.div_euclid(spacing) >> 8))
+        .collect();
+    words.sort_unstable();
+    words.dedup();
+    words
+}
+
+/// Fetch the CHAIN word bitmap for every word the snapshot's rows occupy,
+/// through `fetch`. The transport drives `fetch`; its errors propagate.
+fn fetch_chain_words_for_rows(
+    rows: &HashMap<i32, TickInfo>,
+    tick_spacing: i32,
+    mut fetch: impl FnMut(i64) -> Result<U256, TickMapAssemblyError>,
+) -> Result<HashMap<i64, U256>, TickMapAssemblyError> {
+    let words = row_words(rows, tick_spacing);
+    let mut chain_words = HashMap::with_capacity(words.len());
+    for word in words {
+        chain_words.insert(word, fetch(word)?);
+    }
+    Ok(chain_words)
+}
+
+/// Reconcile a `Tracked` seed's rows against the chain words obtained through
+/// `fetch`. Non-`Tracked` seeds are indeterminate by construction and never
+/// checked; an empty `Tracked` seed has no word to reconcile.
+fn reconcile_tracked_seed_with_chain(
+    seed: &TickMapSeed,
+    tick_spacing: i32,
+    fetch: impl FnMut(i64) -> Result<U256, TickMapAssemblyError>,
+) -> Result<(), TickMapAssemblyError> {
+    if seed.coverage != PoolTickCoverage::Tracked || seed.ticks.is_empty() {
+        return Ok(());
+    }
+    let chain_words = fetch_chain_words_for_rows(&seed.ticks, tick_spacing, fetch)?;
+    verify_tracked_tick_map(&chain_words, &seed.ticks, tick_spacing)
+}
+
+/// The word-key set a `Tracked` seed's rows occupy (ascending, de-duplicated).
+/// Exposed for registration gates that fetch each word through their own
+/// transport before reconciling.
+#[must_use]
+pub fn seed_row_words(seed: &TickMapSeed, tick_spacing: i32) -> Vec<i64> {
+    row_words(&seed.ticks, tick_spacing)
+}
+
+/// Chain-truth reconciliation over caller-fetched chain words (the snapshot's
+/// rows must agree with the word bitmaps read from chain). Public entry for
+/// registration gates that own their transport.
+///
+/// # Errors
+///
+/// [`TickMapAssemblyError::InconsistentTickMap`] on a row/word disagreement.
+pub fn reconcile_tracked_rows(
+    chain_words: &HashMap<i64, U256>,
+    rows: &HashMap<i32, TickInfo>,
+    tick_spacing: i32,
+) -> Result<(), TickMapAssemblyError> {
+    verify_tracked_tick_map(chain_words, rows, tick_spacing)
+}
+
+/// Convert `HashMap<i32, LiquidityAtTick>` → `HashMap<i32, TickInfo>`.
+///
+/// The Db stores `liquidity_gross` as `U256` (decimal `VARCHAR(78)`); valid
+/// on-chain gross liquidity always fits in `U128` (Uniswap's
+/// `type(uint128).max` cap on `liquidity_gross`). The narrowing uses
+/// `U256::to::<U128>()` which silently truncates out-of-range values —
+/// identical to `convert_tick_map` in `bot_core::mod.rs`; a `gross > U128::MAX`
+/// row would be corrupt on-chain data, not a parse failure.
+fn convert_liquidity_at_tick(
+    tick_data: HashMap<i32, LiquidityAtTick>,
+    block: u64,
+) -> HashMap<i32, TickInfo> {
+    tick_data
+        .into_iter()
+        .map(|(tick, lat)| {
+            (
+                tick,
+                TickInfo {
+                    liquidity_gross: lat.liquidity_gross.to::<alloy::primitives::U128>(),
+                    liquidity_net: lat.liquidity_net,
+                    block,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests;

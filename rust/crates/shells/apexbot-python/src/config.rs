@@ -1,0 +1,1346 @@
+//! The resolved configuration verdict the Python driver reads.
+//!
+//! `apexbot-config` owns the operator file, the environment, and the
+//! resolution order end to end; the loader is the only environment reader and
+//! the FFI module init installs the process-wide typed config it produced.
+//! What crosses the seam is ONE object — [`ResolvedConfig`] — built from that
+//! one load and installed once at module init.
+//!
+//! The verdict answers three kinds of question, and the difference matters:
+//! a `#[getter]` for a value that is settled when the load lands (the file,
+//! the declared keys, the layer each key came from), a schema-driven
+//! [`ResolvedConfig::values`] projection for every declared key, and a
+//! `#[pymethods]` entry for a resolution that takes an argument or can refuse
+//! (which chain's endpoint, the activation gate). A getter that could refuse
+//! would make the verdict unconstructible in exactly the processes that need
+//! it most, and an argument-taking resolution is not a value the load settled.
+//!
+//! The projection is what keeps the seam from growing with the schema: it
+//! walks `apexbot_config::SCHEMA` through the generated `BotConfig::value`
+//! reader, so declaring a key is the only edit a new key needs anywhere in
+//! the workspace.
+
+use crate::prelude::*;
+
+/// The verification-retry policy as it crosses the FFI seam — ONE value type
+/// from the driver shell to the core-owned retry dance.
+///
+/// The constructor validates through the core `RetryPolicy::validate` and
+/// raises `ValueError` with the core's message, so the driver shell cannot
+/// carry bounds the core would reject. Unset knobs default to the core's
+/// `verification_default`, so there is one home for the numbers.
+#[pyclass(frozen, get_all, module = "apexbot._ffi")]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base_delay: f64,
+    pub max_delay: f64,
+    pub jitter: f64,
+}
+
+impl RetryPolicy {
+    /// The core policy this seam value carries.
+    pub(crate) fn to_core(&self) -> ::apexbot_core::retry::RetryPolicy {
+        ::apexbot_core::retry::RetryPolicy {
+            max_attempts: self.max_attempts,
+            base_delay: self.base_delay,
+            max_delay: self.max_delay,
+            jitter: self.jitter,
+        }
+    }
+}
+
+#[pymethods]
+impl RetryPolicy {
+    #[new]
+    #[pyo3(signature = (max_attempts=None, base_delay=None, max_delay=None, jitter=None))]
+    fn new(
+        max_attempts: Option<u32>,
+        base_delay: Option<f64>,
+        max_delay: Option<f64>,
+        jitter: Option<f64>,
+    ) -> PyResult<Self> {
+        let core = ::apexbot_core::retry::RetryPolicy::verification_default();
+        let policy = Self {
+            max_attempts: max_attempts.unwrap_or(core.max_attempts),
+            base_delay: base_delay.unwrap_or(core.base_delay),
+            max_delay: max_delay.unwrap_or(core.max_delay),
+            jitter: jitter.unwrap_or(core.jitter),
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Validate the policy's field bounds against the core's rules.
+    ///
+    /// # Errors
+    ///
+    /// `ValueError` carrying the core validator's message.
+    fn validate(&self) -> PyResult<()> {
+        self.to_core()
+            .validate()
+            .map_err(::pyo3::exceptions::PyValueError::new_err)
+    }
+}
+
+/// The resolved strategy readiness, exposed as a self-describing Python
+/// view: the settlement and two per-ecosystem backrun arms with their settled
+/// endpoint posture.
+///
+/// Built from the same typed config the verdict holds, through the SAME
+/// `strategy_readiness` authority the operators' `apexbot strategy` verbs
+/// and the backrun driver boot use, so the Python driver shell cannot disagree
+/// with the console about what "settled" means.
+#[pyclass(frozen, module = "apexbot._ffi")]
+pub struct StrategyReadinessView {
+    #[pyo3(get)]
+    pub settlement_active: bool,
+    #[pyo3(get)]
+    pub settlement_endpoints: Vec<String>,
+    #[pyo3(get)]
+    pub mevblocker_backrun_active: bool,
+    #[pyo3(get)]
+    pub mevblocker_backrun_endpoints: Vec<String>,
+    #[pyo3(get)]
+    pub txpool_backrun_active: bool,
+    #[pyo3(get)]
+    pub txpool_backrun_endpoints: Vec<String>,
+    /// The active backrun arms' facet names, in canonical order. The driver's
+    /// hosted-enable set is this read, so Python never restates the host's
+    /// admission vocabulary.
+    #[pyo3(get)]
+    pub active_backrun_facets: Vec<String>,
+}
+
+impl StrategyReadinessView {
+    /// Build from the resolved arms (activity + resolved URLs).
+    fn from_readiness(readiness: &::apexbot_config::StrategyReadiness) -> Self {
+        fn arm(arm: &::apexbot_config::StrategyArm) -> (bool, Vec<String>) {
+            match arm {
+                ::apexbot_config::StrategyArm::Inactive => (false, Vec::new()),
+                ::apexbot_config::StrategyArm::Active(urls) => (true, urls.clone()),
+            }
+        }
+        let (settlement_active, settlement_endpoints) = arm(&readiness.settlement);
+        let (mevblocker_backrun_active, mevblocker_backrun_endpoints) =
+            arm(&readiness.mevblocker_backrun);
+        let (txpool_backrun_active, txpool_backrun_endpoints) = arm(&readiness.txpool_backrun);
+        // The facet-name spelling's one home is `StrategyName::as_str`
+        // (apexbot-strategy/src/strategy_plane.rs), the host's registration
+        // vocabulary. apexbot-strategy is an optional `submission`-gated
+        // dependency, and this view module is unconditional (it compiles
+        // without that feature), so the names are restated here rather than
+        // reached through the crate.
+        let mut active_backrun_facets = Vec::new();
+        if mevblocker_backrun_active {
+            active_backrun_facets.push(String::from("mevblocker_backrun"));
+        }
+        if txpool_backrun_active {
+            active_backrun_facets.push(String::from("txpool_backrun"));
+        }
+        Self {
+            settlement_active,
+            settlement_endpoints,
+            mevblocker_backrun_active,
+            mevblocker_backrun_endpoints,
+            txpool_backrun_active,
+            txpool_backrun_endpoints,
+            active_backrun_facets,
+        }
+    }
+}
+
+// =============================================================================
+// Driver-domain resolution (ADR-062 D7/D10): thin readers of the layers the
+// boot load published, so the Python driver resolves a value through the same
+// cascade as the console instead of owning a second config model.
+// =============================================================================
+
+/// The layers behind the installed typed config: the standard operator file
+/// the loader selected over the process environment, plus the per-key and
+/// per-entry provenance the driver-domain resolvers tag a winner with.
+///
+/// Published at module init from the SAME load the typed-config holder
+/// received, so the typed getters above and the resolvers below cannot
+/// disagree about what this process configured.
+static LOADED: ::std::sync::RwLock<Option<&'static ::apexbot_config::LoadedConfig>> =
+    ::std::sync::RwLock::new(None);
+
+/// The layers [`publish_loaded`] recorded.
+///
+/// Before any owner published (a construction that never booted a driver), the
+/// floor stands: the installed typed config with no provenance recorded, so
+/// every value reports the file layer — the bottom of the cascade — rather
+/// than inventing a winner.
+pub(crate) fn loaded() -> &'static ::apexbot_config::LoadedConfig {
+    if let Some(loaded) = read_layers() {
+        return loaded;
+    }
+    let mut slot = LOADED
+        .write()
+        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+    if let Some(loaded) = *slot {
+        return loaded;
+    }
+    let leaked: &'static ::apexbot_config::LoadedConfig = Box::leak(Box::new(floor_loaded()));
+    *slot = Some(leaked);
+    leaked
+}
+
+/// Read the published layers, ignoring a poisoned writer.
+fn read_layers() -> Option<&'static ::apexbot_config::LoadedConfig> {
+    let guard = LOADED
+        .read()
+        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+    *guard
+}
+
+/// The installed typed config carrying no provenance: the shape a config
+/// installed without a layered load has (the typed accessors above read the
+/// holder directly, so the values agree).
+fn floor_loaded() -> ::apexbot_config::LoadedConfig {
+    ::apexbot_config::LoadedConfig {
+        config: ::apexbot_config::holder::config().clone(),
+        provenance: ::std::collections::BTreeMap::new(),
+        entry_provenance: ::std::collections::BTreeMap::new(),
+    }
+}
+
+/// Publish the layers a boot load produced, next to the holder install it fed.
+///
+/// `installed` is the holder's first-wins verdict: when another owner
+/// installed a config before this module loaded one, the resolvers must read
+/// THAT config, so the published layers carry it — with no provenance, which
+/// the resolvers already read as the floor layer.
+pub(crate) fn publish_loaded(loaded: ::apexbot_config::LoadedConfig, installed: bool) {
+    let mut slot = LOADED
+        .write()
+        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+    if (*slot).is_none() {
+        *slot = Some(Box::leak(Box::new(if installed {
+            loaded
+        } else {
+            floor_loaded()
+        })));
+    }
+}
+
+/// TEST SEAM: force-replace the published layers with a fresh load and rebuild
+/// the verdict, so the Python-facing verdict follows a holder reinstall.
+///
+/// Unlike [`publish_loaded`] (first-wins), this OVERWRITES — it is the other
+/// half of `apexbot_config::holder::reinstall_for_tests`, and only the
+/// sanctioned test seam calls it.
+pub(crate) fn republish_loaded(loaded: ::apexbot_config::LoadedConfig) {
+    {
+        let mut slot = LOADED
+            .write()
+            .unwrap_or_else(::std::sync::PoisonError::into_inner);
+        *slot = Some(Box::leak(Box::new(loaded)));
+    }
+    reset_verdict();
+    install_verdict();
+}
+
+/// A node endpoint with the layer that supplied it, as the Python driver reads
+/// it: two named fields, so a driver cannot mis-assign the pair the way a
+/// positional tuple would.
+#[pyclass(frozen, get_all, module = "apexbot._ffi")]
+pub struct ResolvedNodeUri {
+    /// The effective endpoint.
+    pub uri: String,
+
+    /// Which layer supplied it: `default`, `file`, `env`, or `cli`.
+    pub source: String,
+}
+
+/// A session chain id with the layer that supplied it.
+#[pyclass(frozen, get_all, module = "apexbot._ffi")]
+pub struct ResolvedChainId {
+    /// The effective chain id.
+    pub chain_id: u64,
+
+    /// Which layer supplied it: `default`, `file`, `env`, or `cli`.
+    pub source: String,
+}
+
+/// A database path with the layer that supplied it.
+#[pyclass(frozen, get_all, module = "apexbot._ffi")]
+pub struct ResolvedDatabasePath {
+    /// The effective path, with `~` and the state home already expanded.
+    pub path: String,
+
+    /// Which layer supplied it: `default`, `file`, `env`, or `cli`.
+    pub source: String,
+}
+
+/// A config-layer refusal as `ValueError`: the loaders and resolvers fail
+/// closed, and a Python driver sees the same refusal a console command prints.
+fn refusal(error: &::apexbot_config::ConfigError) -> ::pyo3::PyErr {
+    ::pyo3::exceptions::PyValueError::new_err(error.to_string())
+}
+
+/// The one load's layers plus the file it read.
+struct Verdict {
+    layers: &'static ::apexbot_config::LoadedConfig,
+    file: Option<String>,
+}
+
+static VERDICT: ::std::sync::RwLock<Option<&'static Verdict>> = ::std::sync::RwLock::new(None);
+
+/// The installed verdict, built from the layers [`publish_loaded`] recorded.
+///
+/// Both slots resolve to the same load whichever is read first, so the verdict
+/// is a value rather than a race: the eager install only makes the module-init
+/// ordering a property instead of a coincidence. [`republish_loaded`] drops
+/// and rebuilds it alongside a holder reinstall, so the two never disagree.
+fn verdict() -> &'static Verdict {
+    if let Some(verdict) = read_verdict() {
+        return verdict;
+    }
+    let layers = loaded();
+    let file =
+        ::apexbot_config::standard_file_path().map(|path| path.to_string_lossy().into_owned());
+    let mut slot = VERDICT
+        .write()
+        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+    if let Some(verdict) = *slot {
+        return verdict;
+    }
+    let leaked: &'static Verdict = Box::leak(Box::new(Verdict { layers, file }));
+    *slot = Some(leaked);
+    leaked
+}
+
+/// Read the installed verdict, ignoring a poisoned writer.
+fn read_verdict() -> Option<&'static Verdict> {
+    let guard = VERDICT
+        .read()
+        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+    *guard
+}
+
+/// Drop the installed verdict so the next [`verdict`] rebuilds from the
+/// current layers. [`republish_loaded`] calls this after replacing them.
+fn reset_verdict() {
+    let mut slot = VERDICT
+        .write()
+        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+    *slot = None;
+}
+
+/// Build and install the verdict. Module init calls this right after
+/// publishing the layers, so the verdict cannot be built from a load the
+/// holder never received.
+pub(crate) fn install_verdict() {
+    let _ = verdict();
+}
+
+/// The installed verdict's typed tree, for the executor construction seam:
+/// `build_batch_executor_py` converts the SAME load the Python verdict
+/// projects, so the executor's policy values cannot disagree with
+/// `resolved_config().values`.
+pub(crate) fn installed_bot_config() -> &'static ::apexbot_config::BotConfig {
+    &verdict().layers.config
+}
+
+/// The winning layer per DECLARED key, keyed by its dotted TOML path.
+///
+/// The projection is schema-driven so the vocabulary a caller reads is the
+/// operator's rather than the loader's internal env names. A key no layer
+/// supplied is ABSENT, and a layer recorded against a name no key declares has
+/// no dotted path to appear under. Both absences are the answer, because
+/// filling them in with the floor layer is how an `env` winner gets reported
+/// as a `file` — the divergence a cross-language oracle exists to catch.
+fn provenance_by_path(
+    layers: &::apexbot_config::LoadedConfig,
+) -> ::std::collections::BTreeMap<String, String> {
+    ::apexbot_config::SCHEMA
+        .iter()
+        .filter_map(|key| {
+            layers
+                .source_of(key.env)
+                .map(|source| (key.toml_path.to_string(), source.to_string()))
+        })
+        .collect()
+}
+
+/// Per-ENTRY provenance for the table-shaped keys, keyed by the key's env name
+/// (the family prefix) and then by the operator-chosen entry — a per-chain
+/// endpoint table is overridden one entry at a time, so the key-level map
+/// cannot describe it.
+fn entry_provenance_by_env(
+    layers: &::apexbot_config::LoadedConfig,
+) -> ::std::collections::BTreeMap<String, ::std::collections::BTreeMap<String, String>> {
+    layers
+        .entry_provenance
+        .iter()
+        .map(|(env, entries)| {
+            (
+                (*env).to_string(),
+                entries
+                    .iter()
+                    .map(|(entry, source)| (entry.clone(), source.to_string()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// One declared value as the Python object its kind names. An unset optional
+/// key is `None`, never its declared default: "the operator said nothing" and
+/// "the operator chose this" are different facts and a caller must be able to
+/// tell them apart.
+fn value_into_py<'py>(
+    py: ::pyo3::Python<'py>,
+    value: Option<&::apexbot_config::ConfigValue<'_>>,
+) -> ::pyo3::PyResult<::pyo3::prelude::Bound<'py, ::pyo3::PyAny>> {
+    use ::apexbot_config::ConfigValue as V;
+    Ok(match value {
+        None => py.None().into_bound(py),
+        Some(V::Bool(inner)) => (*inner).into_pyobject(py)?.to_owned().into_any(),
+        Some(V::Text(inner) | V::Enum(inner)) => inner.as_ref().into_pyobject(py)?.into_any(),
+        Some(V::Path(inner)) => inner
+            .to_string_lossy()
+            .into_owned()
+            .into_pyobject(py)?
+            .into_any(),
+        Some(V::Uint(inner)) => (*inner).into_pyobject(py)?.into_any(),
+        Some(V::Int(inner)) => (*inner).into_pyobject(py)?.into_any(),
+        Some(V::Float(inner)) => (*inner).into_pyobject(py)?.into_any(),
+        Some(V::Map(entries)) => {
+            let table = ::pyo3::types::PyDict::new(py);
+            for (key, entry) in entries {
+                table.set_item(key, entry)?;
+            }
+            table.into_any()
+        }
+    })
+}
+
+/// The typed seam projection over ONE resolved config: named-property access
+/// to every declared key — `values.dispatch.min_profit_margin_bps`,
+/// `values.session.chain_id` — the surface the Python driver reads instead of
+/// dotted-path strings.
+///
+/// A generic two-level view over `config_schema!`'s emitted tables
+/// (`VALUES_PROJECTION` names every declared (section path, field) pair;
+/// `SECTION_PATHS` includes the keyless facet namespaces), so the wrapper
+/// carries no per-key code: a key declared in `config_schema!` is readable
+/// here the moment it is declared, and a name outside the declaration raises
+/// `AttributeError` rather than projecting a default.
+#[pyclass(frozen, module = "apexbot._ffi")]
+pub struct ConfigValues {
+    config: ::std::sync::Arc<::apexbot_config::BotConfig>,
+}
+
+impl ConfigValues {
+    /// Project one resolved config.
+    pub(crate) fn of(config: ::std::sync::Arc<::apexbot_config::BotConfig>) -> Self {
+        Self { config }
+    }
+
+    /// The typed tree behind the projection (the executor-policy conversion
+    /// face reads it so the policy and the values share one verdict).
+    pub(crate) fn bot_config(&self) -> &::apexbot_config::BotConfig {
+        &self.config
+    }
+}
+
+#[pymethods]
+impl ConfigValues {
+    /// One declared section (or facet namespace) by name.
+    fn __getattr__(&self, section: &str) -> ::pyo3::PyResult<ConfigSectionValues> {
+        let declared = ::apexbot_config::SECTION_PATHS.iter().any(|path| {
+            *path == section
+                || path
+                    .strip_prefix(section)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        });
+        if declared {
+            Ok(ConfigSectionValues {
+                config: ::std::sync::Arc::clone(&self.config),
+                path: section.to_string(),
+            })
+        } else {
+            Err(::pyo3::exceptions::PyAttributeError::new_err(format!(
+                "no declared config section {section:?}"
+            )))
+        }
+    }
+}
+
+/// One declared section path's named keys and nested facet namespaces.
+#[pyclass(frozen, module = "apexbot._ffi")]
+pub struct ConfigSectionValues {
+    config: ::std::sync::Arc<::apexbot_config::BotConfig>,
+    path: String,
+}
+
+#[pymethods]
+impl ConfigSectionValues {
+    /// A declared key's typed value, or a nested facet namespace's view. An
+    /// unset-able key the operator left alone projects as `None`: "the
+    /// operator said nothing" and "the operator chose this" stay distinct.
+    fn __getattr__<'py>(
+        &self,
+        py: ::pyo3::Python<'py>,
+        name: &str,
+    ) -> ::pyo3::PyResult<::pyo3::prelude::Bound<'py, ::pyo3::PyAny>> {
+        if ::apexbot_config::VALUES_PROJECTION
+            .iter()
+            .any(|(section, field)| section == &self.path && *field == name)
+        {
+            return value_into_py(py, self.config.value(&self.path, name).as_ref());
+        }
+        let nested = format!("{}.{}", self.path, name);
+        if ::apexbot_config::SECTION_PATHS
+            .iter()
+            .any(|path| *path == nested)
+        {
+            let view = ::pyo3::Py::new(
+                py,
+                ConfigSectionValues {
+                    config: ::std::sync::Arc::clone(&self.config),
+                    path: nested,
+                },
+            )?;
+            return Ok(view.into_bound(py).into_any());
+        }
+        Err(::pyo3::exceptions::PyAttributeError::new_err(format!(
+            "no declared config key {:?}.{:?}",
+            self.path, name
+        )))
+    }
+}
+
+/// The whole resolved configuration for this process: the values, the layer
+/// each came from, and the resolutions that need a capability or an override.
+///
+/// Frozen, so a Python driver cannot edit a verdict the console also read, and
+/// constructed only from the load published at module init — one process, one
+/// cascade, one answer.
+#[pyclass(frozen, module = "apexbot._ffi")]
+pub struct ResolvedConfig {
+    verdict: &'static Verdict,
+}
+
+impl ResolvedConfig {
+    /// The installed verdict.
+    #[must_use]
+    pub fn installed() -> Self {
+        Self { verdict: verdict() }
+    }
+}
+
+#[pymethods]
+impl ResolvedConfig {
+    /// The operator file the loader selected: the `APEXBOT_CONFIG` override
+    /// when set, else the XDG/HOME config file when it exists, else `None` (an
+    /// absent user file is contractually defaults).
+    ///
+    /// A raw-table reader (the deployment registry, the failure-policy table)
+    /// resolves the SAME file the typed load read instead of re-deriving the
+    /// discovery rule.
+    #[getter]
+    fn config_file_path(&self) -> Option<String> {
+        self.verdict.file.clone()
+    }
+
+    /// The database path through the full cascade, with `~` and the state home
+    /// expanded by the resolver.
+    #[getter]
+    fn database_path(&self) -> ResolvedDatabasePath {
+        database_path_in(self.verdict.layers, None)
+    }
+
+    /// The DECLARED `database.path` key — the value the operator wrote, with no
+    /// cascade and no `~` expansion.
+    ///
+    /// A caller that wants the path a session will actually open reads
+    /// [`Self::database_path`]; this is the declared key behind it, for the
+    /// readers that need to know what the config said rather than what won.
+    #[getter]
+    fn declared_database_path(&self) -> String {
+        declared_database_path_of(&self.verdict.layers.config)
+    }
+
+    /// The database path through the full cascade, with an explicit override
+    /// in the same slot a `--database` flag occupies.
+    #[pyo3(signature = (database=None))]
+    fn resolve_database_path(&self, database: Option<&str>) -> ResolvedDatabasePath {
+        database_path_in(self.verdict.layers, database)
+    }
+
+    /// The core's fee-history percentile pair (`p10`, `p50`) the settlement
+    /// driver polls `eth_feeHistory` for, riding the verdict: the driver reads
+    /// the pair off the config object it already holds instead of through a
+    /// module-function side door, and the core table stays the one owner of
+    /// the numbers.
+    #[getter]
+    #[expect(
+        clippy::unused_self,
+        reason = "a pyo3 getter reads the verdict by definition; the pair is core-owned, not verdict state"
+    )]
+    fn fee_percentiles(&self) -> (u64, u64) {
+        (
+            ::apexbot_core::fee_percentiles::PRIORITY_FEE_PERCENTILES
+                [::apexbot_core::fee_percentiles::P10_INDEX],
+            ::apexbot_core::fee_percentiles::PRIORITY_FEE_PERCENTILES
+                [::apexbot_core::fee_percentiles::P50_INDEX],
+        )
+    }
+
+    /// Every declared key's typed value, as named properties:
+    /// `values.dispatch.min_profit_margin_bps`, `values.session.chain_id`, ...
+    ///
+    /// The typed seam projection over this verdict, walked out of
+    /// `config_schema!`'s emitted `VALUES_PROJECTION`/`SECTION_PATHS` tables
+    /// through the generated `BotConfig::value` reader — the same declaration
+    /// that produced the typed tree, so a key declared there is readable here
+    /// with no FFI edit and no dotted-path string in the consumer.
+    #[getter]
+    fn values(&self) -> ConfigValues {
+        ConfigValues::of(::std::sync::Arc::new(self.verdict.layers.config.clone()))
+    }
+
+    /// The layer that supplied each declared key, keyed by its dotted TOML path
+    /// (`default`, `file`, `env`, or `cli`).
+    ///
+    /// A key no layer supplied is absent rather than reported as the floor, so
+    /// an unrecorded provenance map is visible as an unrecorded one.
+    #[getter]
+    fn provenance(&self) -> ::std::collections::BTreeMap<String, String> {
+        provenance_by_path(self.verdict.layers)
+    }
+
+    /// Per-entry layers for the table-shaped keys, keyed by the key's env name
+    /// and then by the operator-chosen entry (a chain id for `[nodes.*]`).
+    #[getter]
+    fn entry_provenance(
+        &self,
+    ) -> ::std::collections::BTreeMap<String, ::std::collections::BTreeMap<String, String>> {
+        entry_provenance_by_env(self.verdict.layers)
+    }
+
+    /// The node endpoint a consumer with `scope` capability resolves for
+    /// `chain_id`, through the layers `apexbot-config` owns.
+    ///
+    /// `node` is the explicit-override layer: one endpoint, classified by its
+    /// own value the way the console's `--node` is, so a driver passes a URL
+    /// and the transport is not a second thing to get right. A method rather
+    /// than a getter because the chain and the capability are the CALLER's,
+    /// not facts this load settled.
+    ///
+    /// # Errors
+    ///
+    /// `ValueError` when `scope` is not a capability, when `node` names no
+    /// transport, or when no layer supplied an endpoint for the chain (the
+    /// refusal names the scope, the transports, and the layers each was read
+    /// through).
+    #[pyo3(signature = (chain_id, scope, node=None))]
+    fn node_uri(
+        &self,
+        chain_id: u64,
+        scope: &str,
+        node: Option<&str>,
+    ) -> PyResult<ResolvedNodeUri> {
+        node_uri_in(self.verdict.layers, chain_id, scope, node)
+    }
+
+    /// The session chain id: the explicit override when given, else the layers
+    /// `apexbot-config` owns.
+    ///
+    /// # Errors
+    ///
+    /// `ValueError` when no layer named a chain, or when the explicit value is
+    /// not an integer.
+    #[pyo3(signature = (chain_id=None))]
+    fn resolve_chain_id(&self, chain_id: Option<&str>) -> PyResult<ResolvedChainId> {
+        chain_id_in(self.verdict.layers, chain_id)
+    }
+
+    /// The resolved strategy readiness of this process's config.
+    ///
+    /// # Errors
+    ///
+    /// `ValueError` carrying the typed refusal's remediation message (e.g. the
+    /// activation/endpoint remedies from the console verbs) — a live boot that
+    /// cannot settle STRATEGY endpoints, or that has no active facet at all,
+    /// refuses instead of degrading to the public mempool.
+    fn strategy_readiness(&self) -> PyResult<StrategyReadinessView> {
+        ::apexbot_config::validate_hosted_strategy_readiness(&self.verdict.layers.config)
+            .map(|readiness| StrategyReadinessView::from_readiness(&readiness))
+            .map_err(|error| ::pyo3::exceptions::PyValueError::new_err(error.to_string()))
+    }
+
+    /// The resolved settlement broadcast endpoints (this process's settlement
+    /// arm).
+    ///
+    /// The endpoints are the settlement arm's settled list from
+    /// `apexbot-config`'s readiness resolution — the one splitter and
+    /// allowlist gate. The settlement strategy composition keeps its role for
+    /// the strategy plane; this driver path does not re-derive the list
+    /// through it.
+    ///
+    /// # Errors
+    ///
+    /// `ValueError` when the settlement facet is not active, or when its
+    /// endpoint set is unsettled or refused by the readiness gate — a hosted
+    /// runner is the settlement arm, so its broadcast posture is never
+    /// optional.
+    fn settlement_broadcast_endpoints(&self) -> PyResult<Vec<String>> {
+        settlement_broadcast_endpoints_in(&self.verdict.layers.config)
+    }
+}
+
+/// [`ResolvedConfig::settlement_broadcast_endpoints`] over an explicit typed
+/// config: the settlement readiness arm's settled URLs, which the one readiness
+/// resolution already split and allowlist-validated.
+fn settlement_broadcast_endpoints_in(
+    config: &::apexbot_config::BotConfig,
+) -> PyResult<Vec<String>> {
+    let readiness = ::apexbot_config::strategy_readiness(config)
+        .map_err(|error| ::pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+    match readiness.settlement {
+        ::apexbot_config::StrategyArm::Active(urls) => Ok(urls),
+        ::apexbot_config::StrategyArm::Inactive => Err(::pyo3::exceptions::PyValueError::new_err(
+            "strategy settlement is not active: this hosted runner IS the settlement arm; \
+             activate it first (apexbot strategy activate settlement --endpoints-default)",
+        )),
+    }
+}
+
+/// The installed verdict, as the Python driver reads it.
+///
+/// # Errors
+///
+/// `PyErr` when the interpreter refuses the allocation. The verdict itself
+/// cannot fail: a process that named no chain or refused an endpoint still has
+/// a configuration to report.
+#[pyfunction]
+pub fn resolved_config(py: ::pyo3::Python<'_>) -> PyResult<::pyo3::Py<ResolvedConfig>> {
+    ::pyo3::Py::new(py, ResolvedConfig::installed())
+}
+
+// =============================================================================
+// Hypothetical resolution (ADR-013 private seam): a pure function of a
+// captured environment and an operator file. It installs NOTHING and is
+// reachable only from the raw FFI, never from `apexbot.config`, so a caller
+// that asks HOW the cascade resolves an input cannot be reading the answer
+// this process happened to install.
+// =============================================================================
+
+/// The layered load a hypothetical resolution reads: the captured environment
+/// (never the process environment) over the named file (or the standard file
+/// the CAPTURED env selects when `file` is `None`).
+///
+/// A pure function of its inputs: it reads no `OnceLock`, publishes nothing,
+/// and a refusal is the loader's own typed [`::apexbot_config::ConfigError`]
+/// rather than a process exit.
+pub(crate) fn hypothetical_layers(
+    env: ::std::collections::BTreeMap<String, String>,
+    file: Option<&str>,
+) -> Result<::apexbot_config::LoadedConfig, ::apexbot_config::ConfigError> {
+    let captured = ::apexbot_config::MapEnv::new(env);
+    let selected = match file.filter(|path| !path.is_empty()) {
+        Some(path) => Some(::std::path::PathBuf::from(path)),
+        None => ::apexbot_config::standard_file_path_with(&captured),
+    };
+    let mut loader = ::apexbot_config::BotConfigLoader::new().with_env(Box::new(captured));
+    if let Some(path) = selected {
+        loader = loader.with_config_path(path);
+    }
+    loader.load()
+}
+
+/// The verdict a hypothetical load produces, as the Python driver reads it:
+/// the same three schema-driven projections [`ResolvedConfig`] exposes, with
+/// no install and no `&'static` borrow.
+///
+/// A `ResolvedConfig` CANNOT be built here — it holds `&'static Verdict` from
+/// the process-wide `OnceLock` — so a hypothetical is its own value type. The
+/// name carries the warning: this object answers what a cascade WOULD resolve
+/// for the inputs given, never what this process installed.
+#[pyclass(frozen, module = "apexbot._ffi")]
+pub struct HypotheticalConfig {
+    layers: ::apexbot_config::LoadedConfig,
+}
+
+#[pymethods]
+impl HypotheticalConfig {
+    /// Every declared key's typed value, as named properties — the same typed
+    /// seam projection the installed verdict exposes.
+    #[getter]
+    fn values(&self) -> ConfigValues {
+        ConfigValues::of(::std::sync::Arc::new(self.layers.config.clone()))
+    }
+
+    /// The layer that supplied each declared key, keyed by its dotted TOML path.
+    #[getter]
+    fn provenance(&self) -> ::std::collections::BTreeMap<String, String> {
+        provenance_by_path(&self.layers)
+    }
+
+    /// Per-entry layers for the table-shaped keys.
+    #[getter]
+    fn entry_provenance(
+        &self,
+    ) -> ::std::collections::BTreeMap<String, ::std::collections::BTreeMap<String, String>> {
+        entry_provenance_by_env(&self.layers)
+    }
+}
+
+/// The whole resolved configuration a cascade WOULD produce for `env` + `file`,
+/// installing nothing and reachable only through the raw FFI (ADR-013).
+///
+/// The comparison door for claims about HOW the cascade resolves inputs; the
+/// installed [`ResolvedConfig`] is the door for claims about WHAT this process
+/// installed. Using the wrong one is a tautology, so the name says
+/// "hypothetical" and the Python home (`apexbot.config`) deliberately does not
+/// re-export it.
+///
+/// # Errors
+///
+/// `ValueError` carrying the loader's aggregated refusal — the typed error the
+/// module-init boot path turns into an exit(2) wrapper.
+#[pyfunction]
+#[pyo3(signature = (env, file=None))]
+pub fn resolve_hypothetical(
+    py: ::pyo3::Python<'_>,
+    env: ::std::collections::BTreeMap<String, String>,
+    file: Option<&str>,
+) -> PyResult<::pyo3::Py<HypotheticalConfig>> {
+    let layers = hypothetical_layers(env, file).map_err(|error| refusal(&error))?;
+    ::pyo3::Py::new(py, HypotheticalConfig { layers })
+}
+
+/// [`ResolvedConfig::node_uri`] over a hypothetical load: the standalone
+/// sibling for the argument-taking cascade method (envy's `from_env` /
+/// `from_iter` split). Installs nothing.
+///
+/// # Errors
+///
+/// `ValueError` on a load refusal or the resolution's own refusal.
+#[pyfunction]
+#[pyo3(signature = (env, file, chain_id, scope, node=None))]
+pub fn resolve_hypothetical_node_uri(
+    env: ::std::collections::BTreeMap<String, String>,
+    file: Option<&str>,
+    chain_id: u64,
+    scope: &str,
+    node: Option<&str>,
+) -> PyResult<ResolvedNodeUri> {
+    let layers = hypothetical_layers(env, file).map_err(|error| refusal(&error))?;
+    node_uri_in(&layers, chain_id, scope, node)
+}
+
+/// [`ResolvedConfig::resolve_chain_id`] over a hypothetical load. Installs
+/// nothing.
+///
+/// # Errors
+///
+/// `ValueError` on a load refusal or the resolution's own refusal.
+#[pyfunction]
+#[pyo3(signature = (env, file, chain_id=None))]
+pub fn resolve_hypothetical_chain_id(
+    env: ::std::collections::BTreeMap<String, String>,
+    file: Option<&str>,
+    chain_id: Option<&str>,
+) -> PyResult<ResolvedChainId> {
+    let layers = hypothetical_layers(env, file).map_err(|error| refusal(&error))?;
+    chain_id_in(&layers, chain_id)
+}
+
+/// [`ResolvedConfig::resolve_database_path`] over a hypothetical load.
+/// Installs nothing.
+///
+/// # Errors
+///
+/// `ValueError` on a load refusal; the resolution itself is fallible by
+/// contract but cannot refuse today.
+#[pyfunction]
+#[pyo3(signature = (env, file, database=None))]
+pub fn resolve_hypothetical_database_path(
+    env: ::std::collections::BTreeMap<String, String>,
+    file: Option<&str>,
+    database: Option<&str>,
+) -> PyResult<ResolvedDatabasePath> {
+    let layers = hypothetical_layers(env, file).map_err(|error| refusal(&error))?;
+    Ok(database_path_in(&layers, database))
+}
+
+/// [`ResolvedConfig::node_uri`] over an explicit set of layers (the shape a
+/// caller outside the process boot, or a test, resolves against).
+fn node_uri_in(
+    cfg: &::apexbot_config::LoadedConfig,
+    chain_id: u64,
+    scope: &str,
+    node: Option<&str>,
+) -> PyResult<ResolvedNodeUri> {
+    let scope = scope
+        .parse::<::apexbot_config::NodeScope>()
+        .map_err(|error| refusal(&error))?;
+    let overrides = match node.filter(|value| !value.is_empty()) {
+        Some(uri) => {
+            let transport = ::apexbot_config::NodeTransport::classify(uri).ok_or_else(|| {
+                let forms: Vec<String> = ::apexbot_config::NodeTransport::ALL
+                    .iter()
+                    .map(|transport| format!("{} — {}", transport.key_path(), transport.expected()))
+                    .collect();
+                ::pyo3::exceptions::PyValueError::new_err(format!(
+                    "{uri:?} names no node transport; accepted forms: {}",
+                    forms.join("; ")
+                ))
+            })?;
+            ::apexbot_config::NodeOverrides::new().with_transport(transport, uri)
+        }
+        None => ::apexbot_config::NodeOverrides::new(),
+    };
+    let resolved = ::apexbot_config::resolve_node_uri(cfg, chain_id, scope, &overrides)
+        .map_err(|error| refusal(&error))?;
+    Ok(ResolvedNodeUri {
+        uri: resolved.value,
+        source: resolved.source.to_string(),
+    })
+}
+
+/// [`ResolvedConfig::resolve_chain_id`] over an explicit set of layers.
+fn chain_id_in(
+    cfg: &::apexbot_config::LoadedConfig,
+    chain_id: Option<&str>,
+) -> PyResult<ResolvedChainId> {
+    let resolved =
+        ::apexbot_config::resolve_chain_id(cfg, chain_id).map_err(|error| refusal(&error))?;
+    Ok(ResolvedChainId {
+        chain_id: resolved.value,
+        source: resolved.source.to_string(),
+    })
+}
+
+/// [`ResolvedConfig::database_path`] over an explicit set of layers.
+fn database_path_in(
+    cfg: &::apexbot_config::LoadedConfig,
+    database: Option<&str>,
+) -> ResolvedDatabasePath {
+    let resolved = ::apexbot_config::resolve_database_path(cfg, database);
+    ResolvedDatabasePath {
+        path: resolved.value.to_string_lossy().into_owned(),
+        source: resolved.source.to_string(),
+    }
+}
+
+/// The declared `database.path` key over an explicit typed config.
+fn declared_database_path_of(cfg: &::apexbot_config::BotConfig) -> String {
+    cfg.database.path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test assertions fail loudly")]
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ::apexbot_config::{
+        BotConfig, BotConfigLoader, MapEnv, NodeScope, Source, StrategyArm, StrategyReadiness,
+    };
+    use ::apexbot_strategy::Settlement;
+
+    use super::{
+        chain_id_in, database_path_in, declared_database_path_of, entry_provenance_by_env,
+        node_uri_in, provenance_by_path, settlement_broadcast_endpoints_in, ResolvedConfig,
+        StrategyReadinessView,
+    };
+
+    /// The layers a `MapEnv` supplies, with no file layer and no process
+    /// environment, so every case names its own winning layer.
+    fn loaded(pairs: &[(&str, &str)]) -> ::apexbot_config::LoadedConfig {
+        BotConfigLoader::new()
+            .with_env(Box::new(MapEnv::new(
+                pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect::<BTreeMap<_, _>>(),
+            )))
+            .load()
+            .expect("a map env carries no unreadable file layer")
+    }
+
+    /// The winning layer travels with the value: a driver that reports where an
+    /// endpoint came from would otherwise have to re-derive the cascade.
+    #[test]
+    fn node_uri_reports_the_layer_that_won() {
+        let cfg = loaded(&[("APEXBOT_RPC_WS_CHAINID_1", "wss://node.example/ws")]);
+        let resolved = node_uri_in(&cfg, 1, NodeScope::Request.as_str(), None)
+            .expect("the env layer names a request endpoint");
+        assert_eq!(resolved.uri, "wss://node.example/ws");
+        assert_eq!(resolved.source, Source::Env.to_string());
+    }
+
+    /// An explicit endpoint is classified by its own value and outranks every
+    /// layer, so a driver that passes `node=` cannot be overruled by an
+    /// exported endpoint for another transport.
+    #[test]
+    fn explicit_node_override_outranks_the_exported_endpoint() {
+        let cfg = loaded(&[("APEXBOT_RPC_WS_CHAINID_1", "wss://node.example/ws")]);
+        let resolved = node_uri_in(
+            &cfg,
+            1,
+            NodeScope::Request.as_str(),
+            Some("ipc:///tmp/geth.ipc"),
+        )
+        .expect("an ipc endpoint serves a request");
+        assert_eq!(resolved.uri, "ipc:///tmp/geth.ipc");
+        assert_eq!(resolved.source, Source::Cli.to_string());
+    }
+
+    /// A value that names no transport is refused with the accepted forms, not
+    /// guessed into a slot.
+    #[test]
+    fn node_override_naming_no_transport_is_refused() {
+        let cfg = loaded(&[("APEXBOT_RPC_WS_CHAINID_1", "wss://node.example/ws")]);
+        let error = node_uri_in(&cfg, 1, NodeScope::Request.as_str(), Some("node.example"))
+            .err()
+            .expect("a bare host is not an endpoint");
+        let message = error.to_string();
+        for transport in ::apexbot_config::NodeTransport::ALL {
+            assert!(
+                message.contains(transport.key_path()),
+                "the refusal must name {}, got: {message}",
+                transport.key_path()
+            );
+        }
+    }
+
+    /// The scope is the caller's capability, so a scope the driver cannot
+    /// resolve refuses here rather than degrading to another transport.
+    #[test]
+    fn unknown_scope_is_refused() {
+        let cfg = loaded(&[("APEXBOT_RPC_WS_CHAINID_1", "wss://node.example/ws")]);
+        assert!(node_uri_in(&cfg, 1, "polling", None).is_err());
+    }
+
+    /// The chain id resolves through the same layers, and an unparsable
+    /// explicit value is a refusal that names the layer that supplied it.
+    #[test]
+    fn chain_id_resolves_and_refuses_with_the_layer_named() {
+        let cfg = loaded(&[("APEXBOT_DEFAULT_CHAIN_ID", "8453")]);
+        let resolved = chain_id_in(&cfg, None).expect("the env layer names a chain");
+        assert_eq!(resolved.chain_id, 8453);
+        assert_eq!(resolved.source, Source::Env.to_string());
+
+        let error = chain_id_in(&cfg, Some("mainnet"))
+            .err()
+            .expect("a name is not a chain id");
+        assert!(
+            error.to_string().contains("--chain-id"),
+            "the refusal must name the layer that refused, got: {error}"
+        );
+    }
+
+    /// The declared key and the resolved path are different questions: the
+    /// first reads the installed typed config, the second runs the cascade.
+    #[test]
+    fn declared_database_path_is_the_installed_key_not_the_cascade() {
+        let cfg = loaded(&[("APEXBOT_DB_PATH", "/var/lib/apexbot.db")]);
+        assert_eq!(
+            declared_database_path_of(&cfg.config),
+            "/var/lib/apexbot.db"
+        );
+        assert_eq!(database_path_in(&cfg, None).path, "/var/lib/apexbot.db");
+        assert_eq!(
+            database_path_in(&cfg, Some("/tmp/session.db")).path,
+            "/tmp/session.db"
+        );
+    }
+
+    /// The seam projection and `SCHEMA` agree one-to-one: every declared key
+    /// is name-addressable and the projection names nothing else — a key
+    /// declared in `config_schema!` reaches Python with no FFI edit, and a
+    /// name outside the declaration cannot appear.
+    #[test]
+    fn values_projection_is_the_schema_one_to_one() {
+        let projected: BTreeSet<(&str, &str)> = ::apexbot_config::VALUES_PROJECTION
+            .iter()
+            .copied()
+            .collect();
+        let declared: BTreeSet<(&str, &str)> = ::apexbot_config::SCHEMA
+            .iter()
+            .map(|key| (key.section, key.field))
+            .collect();
+        assert_eq!(
+            projected, declared,
+            "the projection is emitted from the same arms as SCHEMA, so a key \
+             declared without reaching it means the emitter drifted"
+        );
+    }
+
+    /// A loaded key names the layer that supplied it, in the operator's dotted
+    /// path vocabulary rather than the loader's internal env names.
+    #[test]
+    fn provenance_names_a_layer_for_every_key_the_load_recorded() {
+        let cfg = loaded(&[("APEXBOT_DEFAULT_CHAIN_ID", "8453")]);
+        let provenance = provenance_by_path(&cfg);
+        assert_eq!(
+            provenance.get("session.chain_id").map(String::as_str),
+            Some("env")
+        );
+        assert_eq!(
+            provenance.get("telemetry.otel").map(String::as_str),
+            Some("default"),
+            "an untouched key still names the layer that won it"
+        );
+        let declared: BTreeSet<&str> = ::apexbot_config::SCHEMA
+            .iter()
+            .map(|key| key.toml_path)
+            .collect();
+        assert_eq!(
+            provenance
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            declared
+        );
+    }
+
+    /// A load that recorded no layer reports NO layer. Filling the gap with
+    /// the floor would report an `env` winner as a `file` winner, which is
+    /// exactly the divergence a cross-language oracle exists to catch.
+    #[test]
+    fn an_unrecorded_layer_is_absent_rather_than_the_floor() {
+        let mut cfg = loaded(&[("APEXBOT_DEFAULT_CHAIN_ID", "8453")]);
+        cfg.provenance.clear();
+        assert!(
+            provenance_by_path(&cfg).is_empty(),
+            "a map with no recorded layer must project to no layers at all"
+        );
+    }
+
+    /// A layer recorded against a name no key declares has no dotted path to
+    /// appear under, so it cannot masquerade as a declared key's layer.
+    #[test]
+    fn a_foreign_layer_name_never_becomes_a_declared_key() {
+        // Named without the `APEXBOT_` prefix on purpose: a prefixed
+        // literal here would enter the schema-inventory sweep, which is a
+        // different gate answering a different question.
+        let mut cfg = loaded(&[]);
+        cfg.provenance.insert("NOT_A_DECLARED_KEY", Source::Env);
+        let provenance = provenance_by_path(&cfg);
+        assert!(
+            provenance.keys().all(|path| ::apexbot_config::SCHEMA
+                .iter()
+                .any(|k| k.toml_path == path)),
+            "every projected path must be a declared key"
+        );
+    }
+
+    /// A per-chain endpoint table is overridden one entry at a time, so the
+    /// per-entry layers are carried beside the key-level one.
+    #[test]
+    fn entry_provenance_reports_the_layer_of_each_table_entry() {
+        let cfg = loaded(&[("APEXBOT_RPC_WS_CHAINID_1", "wss://node.example/ws")]);
+        let entries = entry_provenance_by_env(&cfg);
+        assert_eq!(
+            entries
+                .get("APEXBOT_RPC_WS_CHAINID_")
+                .and_then(|table| table.get("1"))
+                .map(String::as_str),
+            Some("env")
+        );
+    }
+
+    /// The verdict Python receives is the installed one, and its value
+    /// projection is built under the GIL from that same load — the two halves
+    /// of the interface cannot describe different configurations.
+    #[test]
+    fn the_installed_verdict_projects_the_installed_load() {
+        ::pyo3::Python::attach(|py| {
+            use ::pyo3::types::PyAnyMethods as _;
+
+            let verdict = ResolvedConfig::installed();
+
+            // The named projection answers every read with the declared kind:
+            // an unsigned floor reads as an int, and a nested facet namespace
+            // walks through the section view.
+            let values = verdict.values();
+            let dispatch = values
+                .__getattr__("dispatch")
+                .expect("dispatch is a declared section");
+            let margin = dispatch
+                .__getattr__(py, "min_profit_margin_bps")
+                .expect("the floor is a declared key");
+            assert_eq!(
+                margin.extract::<u64>().expect("the floor is an int"),
+                0,
+                "the default floor is the schema's, not a Python twin"
+            );
+            let strategy = values
+                .__getattr__("strategy")
+                .expect("strategy is a declared section");
+            let facet = strategy
+                .__getattr__(py, "mevblocker_backrun")
+                .expect("the facet namespace is walkable");
+            let bid_mode = facet
+                .getattr("bid_mode")
+                .expect("the facet key is a declared key");
+            assert!(!bid_mode.extract::<bool>().expect("a flag is a bool"));
+
+            // A name outside the declaration is an AttributeError, not a
+            // projected default: the projection is closed.
+            let foreign = values
+                .__getattr__("dispatch")
+                .and_then(|dispatch| dispatch.__getattr__(py, "not_a_key"));
+            assert!(
+                foreign.err().is_some_and(
+                    |error| error.is_instance_of::<::pyo3::exceptions::PyAttributeError>(py)
+                ),
+                "an undeclared name must refuse"
+            );
+
+            // This binary never runs the module init that publishes a load, so
+            // the verdict stands on the floor: every declared key is still
+            // recorded, and no key claims a layer nobody recorded.
+            assert!(
+                verdict.provenance().keys().all(|path| {
+                    ::apexbot_config::SCHEMA
+                        .iter()
+                        .any(|key| key.toml_path == path)
+                }),
+                "every projected layer must belong to a declared key"
+            );
+        });
+    }
+
+    /// The readiness resolution's settled settlement URLs, or `None` when the
+    /// resolution refuses or the arm is inactive.
+    fn readiness_settlement_endpoints(cfg: &BotConfig) -> Option<Vec<String>> {
+        match ::apexbot_config::strategy_readiness(cfg) {
+            Ok(readiness) => match readiness.settlement {
+                StrategyArm::Active(urls) => Some(urls),
+                StrategyArm::Inactive => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Precondition for returning the readiness arm directly: for every
+    /// representative settlement config the readiness arm's settled URLs equal
+    /// the composition's, so the lift cannot change the returned list. A blank
+    /// or whitespace-only set is the refusal shape both splitters agree on:
+    /// the composition settles to empty, and the readiness resolution refuses
+    /// it outright because an active facet may not carry an unsettled set.
+    #[test]
+    fn readiness_and_composition_settle_the_same_settlement_endpoints() {
+        let explicit = {
+            let mut cfg = BotConfig::default();
+            cfg.strategy.settlement.active = true;
+            cfg.strategy.settlement.endpoints = Some(String::from(
+                "https://rpc.mevblocker.io/noreverts, https://rpc.flashbots.net?hint=hash",
+            ));
+            cfg
+        };
+        let default_stamped = {
+            let mut cfg = BotConfig::default();
+            cfg.strategy.settlement.active = true;
+            cfg.strategy.settlement.endpoints =
+                Some(::apexbot_config::SETTLEMENT_DEFAULT_ENDPOINTS.join(","));
+            cfg
+        };
+        for cfg in [&explicit, &default_stamped] {
+            let readiness = readiness_settlement_endpoints(cfg)
+                .expect("the settlement arm is active with an allowlisted set");
+            assert_eq!(
+                readiness,
+                Settlement::from_config(cfg).into_config().endpoints,
+                "the readiness arm and the composition must settle one list"
+            );
+        }
+        for raw in ["", "   ", " , , "] {
+            let mut cfg = BotConfig::default();
+            cfg.strategy.settlement.active = true;
+            cfg.strategy.settlement.endpoints = Some(String::from(raw));
+            assert!(
+                ::apexbot_config::strategy_readiness(&cfg).is_err(),
+                "an active settlement facet with a blank set must refuse"
+            );
+            assert!(
+                Settlement::from_config(&cfg)
+                    .into_config()
+                    .endpoints
+                    .is_empty(),
+                "the composition's split of a blank set is empty, matching the refusal"
+            );
+        }
+    }
+
+    /// The returned list is pinned here in Rust: the Python relay-posture pins
+    /// monkeypatch the wrapper, so the lift's return home needs a lower-level
+    /// pin. Splitting, trimming, and order come from the readiness resolution.
+    #[test]
+    fn settlement_broadcast_endpoints_returns_the_readiness_arm_list() {
+        let mut cfg = BotConfig::default();
+        cfg.strategy.settlement.active = true;
+        cfg.strategy.settlement.endpoints = Some(String::from(
+            " https://rpc.mevblocker.io/noreverts , https://rpc.flashbots.net?hint=hash ",
+        ));
+        assert_eq!(
+            settlement_broadcast_endpoints_in(&cfg).expect("the settlement arm is active"),
+            vec![
+                String::from("https://rpc.mevblocker.io/noreverts"),
+                String::from("https://rpc.flashbots.net?hint=hash"),
+            ]
+        );
+    }
+
+    /// An inactive settlement facet refuses with the settlement-arm message,
+    /// not an empty list.
+    #[test]
+    fn settlement_broadcast_endpoints_refuses_an_inactive_facet() {
+        let error = settlement_broadcast_endpoints_in(&BotConfig::default())
+            .expect_err("an inactive settlement arm refuses");
+        assert!(
+            error
+                .to_string()
+                .contains("this hosted runner IS the settlement arm"),
+            "the refusal must name the settlement-arm remedy, got: {error}"
+        );
+    }
+
+    /// The view projects the active backrun arms' facet names as data: the
+    /// driver's enable set is a read, never a Python restatement of the host's
+    /// admission vocabulary.
+    #[test]
+    fn active_backrun_facets_project_in_canonical_order() {
+        fn active(url: &str) -> StrategyArm {
+            StrategyArm::Active(vec![url.to_string()])
+        }
+        let facets = |mevblocker: StrategyArm, txpool: StrategyArm| {
+            StrategyReadinessView::from_readiness(&StrategyReadiness {
+                settlement: StrategyArm::Inactive,
+                mevblocker_backrun: mevblocker,
+                txpool_backrun: txpool,
+            })
+            .active_backrun_facets
+        };
+
+        assert_eq!(
+            facets(active("ws://mevblocker"), active("http://txpool")),
+            vec![
+                String::from("mevblocker_backrun"),
+                String::from("txpool_backrun")
+            ],
+            "both active arms project in canonical order"
+        );
+        assert_eq!(
+            facets(active("ws://mevblocker"), StrategyArm::Inactive),
+            vec![String::from("mevblocker_backrun")],
+        );
+        assert_eq!(
+            facets(StrategyArm::Inactive, active("http://txpool")),
+            vec![String::from("txpool_backrun")],
+        );
+        assert!(
+            facets(StrategyArm::Inactive, StrategyArm::Inactive).is_empty(),
+            "no active arm projects no facet"
+        );
+    }
+}

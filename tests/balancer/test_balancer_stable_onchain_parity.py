@@ -2,9 +2,9 @@
 
 Golden conversion of the exact-equality parity tests in
 ``tests/balancer/test_stable_pool_class.py``: the MetaStable pools
-(``wsteth_weth``, ``cbeth_wsteth`` — no BPT token, near-static rates) and the
-ComposableStable pools (``tusd_bsp``, ``bb_s_usd`` — BPT token + time-varying
-rate providers). Each asserts the Python
+(``wsteth_weth``, ``cbeth_wsteth``, ``ankreth_weth``, ``reth_weth`` — no BPT
+token, near-static rates) and the ComposableStable pools (``tusd_bsp``,
+``bb_s_usd`` — BPT token + time-varying rate providers). Each asserts the Python
 ``calculate_tokens_out_from_tokens_in`` / ``calculate_tokens_in_from_tokens_out``
 exactly equals the on-chain ``BalancerQueries.querySwap`` (GIVEN_IN +
 GIVEN_OUT) over all non-BPT swap directions and the amount-multiplier grid.
@@ -28,7 +28,7 @@ resolve to at the pinned block (cached-if-valid, fresh-if-expired) — and a
 non-static :class:`_CapturedRateProvider` injects them so the pool's
 ``requires_io_at_calculation_time`` path (which the StaleRateResult guard
 mandates for Composable pools) returns the same rates querySwap used. Verified
-offline: 216/216 exact matches (4 pools x all non-BPT directions x multipliers).
+offline: 288/288 exact matches (6 pools x all non-BPT directions x multipliers).
 
 - **Replay mode** (default, CI): reads recorded ints; the deferred
   ``contract=`` callable is never invoked, so no fork is created. Offline.
@@ -36,7 +36,7 @@ offline: 216/216 exact matches (4 pools x all non-BPT directions x multipliers).
   mainnet at the pinned block is shared across the whole loop.
 
 Pinned to Ethereum mainnet block 24,407,242, served by a local archive node
-(URI configurable via ``tests.env``; see ``ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
+(URI configurable via ``tests.env``; see ``TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
 """
 
 from __future__ import annotations
@@ -58,10 +58,15 @@ from apexbot.balancer.stable_pools import INVARIANT_V1, INVARIANT_V2
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.exceptions import ContractLogicError
 from apexbot.exceptions.pool import EVMRevertError
-from apexbot.fork import AnvilFork
+from apexbot.fork import AnvilFork, ForkLaunchConfig
 from apexbot.utils.bytes import to_bytes
-from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.conftest import TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.balancer_pool_factory import make_balancer_stable_pool
+from tests.helpers.balancer_queries_abi import BALANCERQUERIES_ABI
 from tests.helpers.contract_compat import ContractCompat
 from tests.helpers.erc20_factory import make_erc20
 
@@ -76,6 +81,8 @@ _STABLE_CASSETTES = {
     "cbeth_wsteth": _CASSETTE_DIR / "balancer_stable_cbeth_wsteth.json",
     "tusd_bsp": _CASSETTE_DIR / "balancer_stable_tusd_bsp.json",
     "bb_s_usd": _CASSETTE_DIR / "balancer_stable_bb_s_usd.json",
+    "ankreth_weth": _CASSETTE_DIR / "balancer_stable_ankreth_weth.json",
+    "reth_weth": _CASSETTE_DIR / "balancer_stable_reth_weth.json",
 }
 
 VITALIK_ADDRESS = get_checksum_address("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
@@ -93,42 +100,6 @@ _AMOUNT_MULTIPLIERS = (
 )
 _SWAP_KIND_GIVEN_IN = 0
 _SWAP_KIND_GIVEN_OUT = 1
-
-# Minimal ABI for the deferred on-chain oracle call (record mode only).
-_BALANCERQUERIES_ABI: list[dict[str, Any]] = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"name": "poolId", "type": "bytes32"},
-                    {"name": "kind", "type": "uint8"},
-                    {"name": "assetIn", "type": "address"},
-                    {"name": "assetOut", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                    {"name": "userData", "type": "bytes"},
-                ],
-                "internalType": "struct IVault.SingleSwap",
-                "name": "singleSwap",
-                "type": "tuple",
-            },
-            {
-                "components": [
-                    {"name": "sender", "type": "address"},
-                    {"name": "fromInternalBalance", "type": "bool"},
-                    {"name": "recipient", "type": "address"},
-                    {"name": "toInternalBalance", "type": "bool"},
-                ],
-                "internalType": "struct IVault.FundManagement",
-                "name": "funds",
-                "type": "tuple",
-            },
-        ],
-        "name": "querySwap",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-]
 
 
 class _CapturedRateProvider:
@@ -214,10 +185,12 @@ class _RecordFork(AbstractContextManager):
     def __enter__(self) -> Self:
         if self._recording:
             self.fork = AnvilFork(
-                fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+                fork_url=TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI,
                 fork_block=BALANCER_PARITY_BLOCK,
-                storage_caching=True,
-                anvil_opts=["--accounts=0"],
+                launch=ForkLaunchConfig(
+                    storage_caching=True,
+                    anvil_opts=["--accounts=0"],
+                ),
             )
         return self
 
@@ -240,7 +213,7 @@ def _query_swap_callable(
         assert fork.fork is not None
         query_contract = ContractCompat(
             BALANCERQUERIES_CONTRACT_ADDRESS,
-            _BALANCERQUERIES_ABI,
+            BALANCERQUERIES_ABI,
             fork.fork.provider,
         )
         return query_contract.functions.querySwap(
@@ -294,21 +267,31 @@ def _run_stable_parity(
                     ),
                 )
                 if oracle.reverted:
+                    # On-chain reverted — the helper must revert too, or the
+                    # revert reason is an on-chain-only check (like
+                    # SWAPS_DISABLED) and the case is skipped — never silently
+                    # accepted. Mirrors test_pools_expanded's ContractLogicError
+                    # branch.
                     try:
                         if given_out:
-                            lp.calculate_tokens_in_from_tokens_out(
+                            result = lp.calculate_tokens_in_from_tokens_out(
                                 token_in=lp.tokens[token_in_idx],
                                 token_out=lp.tokens[token_out_idx],
                                 token_out_quantity=amount,
                             )
                         else:
-                            lp.calculate_tokens_out_from_tokens_in(
+                            result = lp.calculate_tokens_out_from_tokens_in(
                                 token_in=lp.tokens[token_in_idx],
                                 token_in_quantity=amount,
                                 token_out=lp.tokens[token_out_idx],
                             )
                     except (EVMRevertError, ContractLogicError):
-                        pass
+                        pass  # both reverted — OK
+                    else:
+                        pytest.skip(
+                            f"On-chain reverted but Python returned {result} "
+                            f"(likely on-chain-only check like SWAPS_DISABLED)",
+                        )
                     continue
                 if given_out:
                     calc = lp.calculate_tokens_in_from_tokens_out(
@@ -334,9 +317,10 @@ def test_balancer_v2_stable_query_swap_given_in(
 ) -> None:
     """Balancer V2 stable pool: GIVEN_IN == golden(querySwap).
 
-    Covers MetaStable pools (wstETH/WETH, cbETH/wstETH — near-static rates, no
-    BPT) and ComposableStable pools (TUSD BSP, bb-s-USD — BPT token +
-    time-varying rate providers with cache-aware rate resolution).
+    Covers MetaStable pools (wstETH/WETH, cbETH/wstETH, ankrETH/WETH,
+    rETH/WETH — near-static rates, no BPT) and ComposableStable pools
+    (TUSD BSP, bb-s-USD — BPT token + time-varying rate providers with
+    cache-aware rate resolution).
     """
     _run_stable_parity(
         golden_factory,
@@ -358,3 +342,50 @@ def test_balancer_v2_stable_query_swap_given_out(
         cassette_path=_STABLE_CASSETTES[pool_key],
         given_out=True,
     )
+
+
+def _stable_golden_keys(cassette: dict[str, Any], *, given_out: bool) -> set[str]:
+    """The oracle keys one stable-pool parity run drives: all non-BPT swap
+    directions over the multiplier grid (GIVEN_IN scales the amount from the
+    token-in balance, GIVEN_OUT from the token-out balance)."""
+    address = cassette["address"]
+    bpt_idx = cassette["bpt_idx"]
+    balances = cassette["balances"]
+    label = "GIVEN_OUT" if given_out else "GIVEN_IN"
+    keys: set[str] = set()
+    for token_in_idx, token_out_idx in itertools.permutations(range(len(balances)), 2):
+        if token_in_idx == bpt_idx or token_out_idx == bpt_idx:
+            continue  # skip BPT swaps
+        reserve = balances[token_out_idx] if given_out else balances[token_in_idx]
+        for mult in _AMOUNT_MULTIPLIERS:
+            amount = int(mult * reserve)
+            if amount == 0:
+                continue
+            keys.add(f"{address}|querySwap|{label}|i={token_in_idx}|j={token_out_idx}|{amount}")
+    return keys
+
+
+@pytest.mark.parametrize(
+    ("test_name", "given_out"),
+    [
+        ("test_balancer_v2_stable_query_swap_given_in", False),
+        ("test_balancer_v2_stable_query_swap_given_out", True),
+    ],
+)
+def test_golden_keys_exactly_match_the_oracle_surface(
+    request: pytest.FixtureRequest,
+    test_name: str,
+    *,
+    given_out: bool,
+) -> None:
+    """The golden files hold exactly the keys this module's replay drives.
+
+    Each golden file aggregates the whole pool parametrization, so the
+    expected surface is the union over the four cassettes. Replay fails loud
+    on a missing key but stays silent on a stale extra one — nothing looks it
+    up. Set-equality against the recorded file closes that drift: a shrunken
+    case list cannot leave orphaned oracle entries behind."""
+    expected: set[str] = set()
+    for cassette_path in _STABLE_CASSETTES.values():
+        expected |= _stable_golden_keys(_load_cassette(cassette_path), given_out=given_out)
+    assert_golden_keys_exact(request, test_name, expected)

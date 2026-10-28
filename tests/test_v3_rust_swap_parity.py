@@ -1,6 +1,6 @@
 """ADR-005 sparse-map parity — Rust sparse+fetch vs dense-Rust oracle.
 
-After the §4.3 oracle retirement (the Python ``_v3_swap`` simulator +
+After the oracle retirement (the Python ``_v3_swap`` simulator +
 ``_calculate_swap`` are deleted), the durable regression set for the Rust
 V3 sim is: the Rust ``#[cfg(test)]`` corpus (``tick_bitmap.rs`` gen_ticks
 clamping incl. the MIN/MAX strand-prevention assertions) + the on-chain-quoter
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from apexbot._ffi import Bot
+from apexbot._ffi import Bot, SwapRefused
 from apexbot.uniswap.concentrated.types import LiquidityAtTick
 from apexbot.uniswap.math import MIN_SQRT_RATIO
 from tests.helpers.erc20_factory import make_erc20
@@ -91,6 +91,38 @@ def _build_v3_pool(
     )
 
 
+def _unsigned_swap(handle, *, zero_for_one: bool, amount_in: int, block: int = 0):
+    """Run the Rust ``simulate`` seam and return the legacy unsigned 5-tuple.
+
+    ``None`` mirrors the retired bare-``None`` not-computable contract.
+    """
+    try:
+        read = handle.simulate(
+            zero_for_one=zero_for_one,
+            amount_specified=-amount_in,
+            block=block,
+        )
+    except SwapRefused:
+        return None
+    amount0_delta = int(read.amount0_delta)
+    amount1_delta = int(read.amount1_delta)
+    if zero_for_one:
+        return (
+            amount0_delta,
+            -amount1_delta,
+            int(read.sqrt_price_x96),
+            int(read.liquidity),
+            int(read.tick),
+        )
+    return (
+        -amount0_delta,
+        amount1_delta,
+        int(read.sqrt_price_x96),
+        int(read.liquidity),
+        int(read.tick),
+    )
+
+
 def test_sparse_mainline_swap_routed_to_rust_matches_dense_oracle():
     """Sparse pool's mainline swap → Rust fetch+retry == dense-Rust oracle.
 
@@ -110,7 +142,7 @@ def test_sparse_mainline_swap_routed_to_rust_matches_dense_oracle():
 
     # Sparse pool: identical scalars + position, but NO tick_data seeded.
     # The pool's sparse-word fetcher is the RUST-stored callback the routing
-    # invokes on a miss (T2 FBJTUM: the companion-side fetcher is retired).
+    # invokes on a miss (the companion-side fetcher is retired).
     # The starting tick 0 lives in word 0; the zfo walk descends to tick -60
     # which lives in word -1 (tick_spacing 60).
     fetched_words: list[int] = []
@@ -191,7 +223,8 @@ def test_sparse_fetch_reaches_min_tick_via_empty_words():
     # via the Rust seam. gen_ticks (now clamped at MIN_TICK) drives the walk
     # to the price limit; the dense path never exercises sparse+fetch, so it
     # is a valid reference for the sparse fetch+retry path below.
-    oracle_outcome = dense._py_pool.simulate_swap_with_fetch(
+    oracle_outcome = _unsigned_swap(
+        dense._py_pool,
         zero_for_one=True,  # zfo (token0 in → token1 out, descending → MIN)
         amount_in=amount_in,
         block=0,
@@ -227,7 +260,8 @@ def test_sparse_fetch_reaches_min_tick_via_empty_words():
     )
     assert sparse.sparse_liquidity_map, "no tick_data ⇒ sparse companion"
 
-    result = sparse._py_pool.simulate_swap_with_fetch(
+    result = _unsigned_swap(
+        sparse._py_pool,
         zero_for_one=True,
         amount_in=amount_in,
         block=0,

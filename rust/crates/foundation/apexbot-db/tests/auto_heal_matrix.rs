@@ -1,0 +1,246 @@
+//! Heal-at-open matrix (ADR-052 D1): one case pair per committed fixture
+//! revision under `tests/fixtures/alembic_revs`.
+//!
+//! Opening never mutates: the plain `open*` constructors run `auto_heal =
+//! false`. Healing is EXPLICIT (`open_with` with `auto_heal = true`), so each
+//! case states its intent as data.
+//!
+//! 1. **Explicit heal** — the legacy marker is replaced by the Rust stamp
+//!    table, every head table lands, seeded rows survive, retired tables drop,
+//!    and the pre-heal file survives as `.bak` at the released revision.
+//! 2. **The default posture** (`open`) — the pre-D1 posture persists:
+//!    `LegacyAlembic`, read-only, no `.bak`, and the file on disk is
+//!    untouched.
+//!
+//! Every case copies its committed fixture into a temp dir first — the
+//! committed files are never mutated.
+
+#![expect(clippy::unwrap_used, clippy::panic)]
+
+use std::path::{Path, PathBuf};
+
+use rusqlite::{Connection, OpenFlags};
+use tempfile::TempDir;
+
+use apexbot_db::schema::RUST_SCHEMA_VERSION;
+use apexbot_db::{ApexbotDb, SchemaState};
+
+/// Committed fixture directory (never mutated — every case copies out first).
+const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/alembic_revs");
+
+/// The private Rust-owned stamp table (not re-exported as a constant).
+const RUST_STAMP_TABLE: &str = "_apexbot_db_schema_version";
+
+/// Every content table the Rust head schema (`SCHEMA_HEAD`) defines. The
+/// healed DB must carry all of them (the D5 "expected table set present").
+const HEAD_TABLES: &[&str] = &[
+    "aave_gho_tokens",
+    "aave_v3_asset_configs",
+    "aave_v3_assets",
+    "aave_v3_collateral_positions",
+    "aave_v3_contracts",
+    "aave_v3_debt_positions",
+    "aave_v3_emode_categories",
+    "aave_v3_markets",
+    "aave_v3_user_collateral_configs",
+    "aave_v3_users",
+    "aerodrome_v2_pools",
+    "aerodrome_v3_pools",
+    "camelot_v2_pools",
+    "erc20_tokens",
+    "exchanges",
+    "lfj_pools",
+    "liquidity_positions",
+    "managed_pool_liquidity_positions",
+    "managed_pools",
+    "pancakeswap_v2_pools",
+    "pancakeswap_v3_pools",
+    "pool_managers",
+    "pools",
+    "sushiswap_v2_pools",
+    "sushiswap_v3_pools",
+    "swapbased_v2_pools",
+    "uniswap_v2_pools",
+    "uniswap_v3_pools",
+    "uniswap_v4_pools",
+];
+
+/// The synthetic seed every fixture carries (table, row count). These are
+/// tables whose head shape is unchanged from the initial revision, so the row
+/// transport is the thing under test, not a column-mapping edge.
+const SEEDED: &[(&str, i64)] = &[("erc20_tokens", 2), ("liquidity_positions", 2)];
+
+/// The word-bitmap value tables retired by the RW3 deletion wave: a pre-existing
+/// fixture still carries them (seeded), and the healed DB must NOT — the head
+/// schema no longer defines them and the out-of-place heal rebuilds to head,
+/// dropping them without a panic.
+const RETIRED_TABLES: &[&str] = &["initialization_maps", "managed_pool_initialization_maps"];
+
+fn fixture_path(rev: &str) -> PathBuf {
+    Path::new(FIXTURE_DIR).join(format!("{rev}.db"))
+}
+
+fn bak_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap().to_owned();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Copy a committed fixture into a fresh temp dir. Returns the dir so it stays
+/// alive for the test's duration.
+fn copy_fixture(rev: &str) -> (TempDir, PathBuf) {
+    let src = fixture_path(rev);
+    assert!(
+        src.exists(),
+        "{rev}: committed fixture missing at {}",
+        src.display()
+    );
+    let dir = TempDir::new().unwrap();
+    let dst = dir.path().join(src.file_name().unwrap());
+    std::fs::copy(&src, &dst).unwrap();
+    (dir, dst)
+}
+
+fn has_table(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![name],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap()
+        == 1
+}
+
+fn count(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn open_readonly(path: &Path) -> Connection {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+}
+
+fn stamped_rev(conn: &Connection) -> String {
+    conn.query_row("SELECT version_num FROM alembic_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// One fixture, both halves of the D5 promise.
+fn run_fixture(rev: &str) {
+    // ── 1. Explicit heal-at-open (open_with auto_heal = true). ────────────────
+    {
+        let (_dir, path) = copy_fixture(rev);
+
+        let (db, state) = ApexbotDb::open_with(&path, true, true)
+            .unwrap_or_else(|e| panic!("{rev}: explicit heal open failed: {e}"));
+        match state {
+            SchemaState::RustOwned { schema_version } => assert_eq!(
+                schema_version, RUST_SCHEMA_VERSION,
+                "{rev}: healed DB must be at the current Rust schema version",
+            ),
+            other => panic!("{rev}: expected RustOwned after auto-heal, got {other:?}"),
+        }
+
+        {
+            let conn = db.lock();
+            // The Alembic stamp is gone; the Rust stamp table is written.
+            assert!(
+                !has_table(&conn, "alembic_version"),
+                "{rev}: alembic_version must be dropped after heal",
+            );
+            assert!(
+                has_table(&conn, RUST_STAMP_TABLE),
+                "{rev}: Rust stamp table must be present after heal",
+            );
+            let stamp: i64 = conn
+                .query_row(
+                    &format!("SELECT schema_version FROM {RUST_STAMP_TABLE}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamp, i64::from(RUST_SCHEMA_VERSION), "{rev}: stamp");
+
+            for t in HEAD_TABLES {
+                assert!(
+                    has_table(&conn, t),
+                    "{rev}: healed DB is missing head table {t}",
+                );
+            }
+            for (t, n) in SEEDED {
+                assert_eq!(count(&conn, t), *n, "{rev}: seeded row count for {t}");
+            }
+
+            // An old DB still carrying the retired word-value tables heals
+            // cleanly: the tables are gone, and NO panic fired merely because
+            // they existed (the heal copies only head-schema tables).
+            for t in RETIRED_TABLES {
+                assert!(
+                    !has_table(&conn, t),
+                    "{rev}: healed DB must not carry the retired table {t}",
+                );
+            }
+        }
+
+        // The pre-heal file survives as `.bak`, still stamped at the released
+        // revision (the recoverable snapshot ADR-011 promises).
+        let bak = bak_path(&path);
+        assert!(bak.exists(), "{rev}: .bak must exist after heal");
+        let bak_conn = open_readonly(&bak);
+        assert_eq!(stamped_rev(&bak_conn), rev, "{rev}: .bak stamp");
+        assert!(
+            !has_table(&bak_conn, RUST_STAMP_TABLE),
+            "{rev}: .bak must be the pre-heal Alembic file",
+        );
+    }
+
+    // ── 2. The default posture: open never mutates. ──────────────────
+    {
+        let (_dir, path) = copy_fixture(rev);
+
+        // Legacy marker present → opens LegacyAlembic read-only, writes
+        // nothing. The revision is never inspected (ADR-052 D6).
+        let (db, state) =
+            ApexbotDb::open(&path).unwrap_or_else(|e| panic!("{rev}: default open failed: {e}"));
+        assert_eq!(
+            state,
+            SchemaState::LegacyAlembic,
+            "{rev}: must open LegacyAlembic under the default posture",
+        );
+        let conn = db.lock();
+        assert!(has_table(&conn, "alembic_version"));
+        assert!(!has_table(&conn, RUST_STAMP_TABLE));
+        drop(conn);
+
+        assert!(
+            !bak_path(&path).exists(),
+            "{rev}: default posture must never take a .bak (no heal ran)",
+        );
+        // The fixture on disk is untouched: still stamped at the revision.
+        let conn = open_readonly(&path);
+        assert_eq!(
+            stamped_rev(&conn),
+            rev,
+            "{rev}: default open left the DB unchanged"
+        );
+    }
+}
+
+/// Generate one `#[test]` per fixture so a failure names the revision.
+macro_rules! fixture_case {
+    ($name:ident, $rev:literal) => {
+        #[test]
+        fn $name() {
+            run_fixture($rev);
+        }
+    };
+}
+
+fixture_case!(rev_9347bbfcd47a, "9347bbfcd47a");
+fixture_case!(rev_756fba1f75f4, "756fba1f75f4");
+fixture_case!(rev_9c411aeeb15e, "9c411aeeb15e");
+fixture_case!(rev_b0b9e84d5527, "b0b9e84d5527");
+fixture_case!(rev_e0aaad8ad486, "e0aaad8ad486");
+fixture_case!(rev_2606a6c7f5ee, "2606a6c7f5ee");

@@ -1,4 +1,4 @@
-"""Red→Green tests for the dual-await consumer (epic 6W35AI).
+"""Tests for the dual-await consumer.
 
 `consume_result_batches` must derive its block clock from the forwarded
 `newHeads` block stream (`engine.block_stream()`), NOT from
@@ -17,10 +17,14 @@ from __future__ import annotations
 
 from typing import Any
 
+import asyncio
+
 import pytest
 
 from apexbot.dispatch import Dispatcher
 from apexbot.runner._consume import consume_result_batches
+from tests.fakes.runner_pipelines import StubPipeline
+from tests.helpers.identity_env import identity_env
 
 
 class _Eth:
@@ -30,7 +34,7 @@ class _Eth:
         self._nonce = nonce
         self.fee_history_blocks: list[int] = []
 
-    # PAGQCK: the dispatch hot loop now routes ``eth_feeHistory`` via
+    # The dispatch hot loop now routes ``eth_feeHistory`` via
     # ``make_request`` (raw JSON shape with hex-string rewards) instead of
     # ``async_w3.eth.fee_history(block_count=, newest_block=, ...)``. The
     # fake records the requested ``newest_block`` from the make_request params
@@ -45,7 +49,7 @@ class _Eth:
 
 
 class _FakeW3:
-    """Fake ``AsyncAlloyProvider`` for the dispatch-path tests (PAGQCK).
+    """Fake ``AsyncAlloyProvider`` for the dispatch-path tests.
 
     The dispatch hot loop was routed off raw ``AsyncWeb3`` onto
     ``AsyncAlloyProvider`` — this fake exposes the SAME flat surface
@@ -81,7 +85,7 @@ class _FakeW3:
         # the adapter to drive the Rust `fetch_fee_history_py` leaf. The test
         # fake has no alloy backend — returning ``None`` makes `_apply_block_
         # if_ready` skip the fee-history leaf (the RPC parity is now exercised
-        # by the Rust `fetch_fee_history` tests per §4.3, not this Python
+        # by the Rust `fetch_fee_history` tests (the fee oracle), not this Python
         # mock).
         return None
 
@@ -156,81 +160,89 @@ async def _run(
 ) -> tuple[Dispatcher, _FakeW3, list[int]]:
     dispatcher = dispatcher or Dispatcher.for_block(0)
     w3 = _FakeW3()
-    # Monkeypatch the consumer's binding of ``_dispatch_profitable`` so a
-    # non-empty batch records the ``current_block`` it was dispatched with,
-    # proving it keys off the block stream (not solve_block).
     dispatched: list[int] = []
 
-    def _fake_dispatch(session: Any, results: Any, **kwargs: Any):
-        dispatched.append(session.dispatcher.current_block)
-
-        async def _n() -> None:
-            pass
-
-        return _n()
-
-    from apexbot.runner import _consume as _runner_consume
     from apexbot.runner.bot_runner import _SessionState
-    from apexbot.runner.config import ArbitrageConfig
+    from apexbot.runner.config import ArbitrageConfig, RpcCascadeOverrides
 
-    orig = _runner_consume._dispatch_profitable
-    orig_pipe = _runner_consume.SimSubmitPipeline
-    _runner_consume._dispatch_profitable = _fake_dispatch  # type: ignore[assignment]
-
-    # SIMPIPE option A: the default consumer path routes batches through the
-    # pipeline; the fake pipeline records the dispatch clock the same way the
-    # serial-leaf fake above does (both seams share the session owner).
-    class _StubPipeline:
-        def __init__(self, session: Any, **kwargs: Any) -> None:
-            self._session = session
-
-        async def enqueue(
-            self,
-            results: Any,
-            *,
-            block_timestamp: int,
-            base_fee_next: int,
-            payloads: dict[int, dict] | None = None,
-        ) -> None:
-            dispatched.append(self._session.dispatcher.current_block)
-
-        def raise_if_failed(self) -> None:
-            return None
-
-        async def stop(self) -> None:
-            return None
-
-    _runner_consume.SimSubmitPipeline = _StubPipeline  # type: ignore[misc-assignment]
+    # SIMPIPE option A: the consumer routes batches through the pipeline; the
+    # session's pipeline factory supplies the shared void stub, which records
+    # the dispatch clock at enqueue. That clock is what `dispatched` proves —
+    # the stub stands in for the serial leaf's own dispatch clock capture.
+    StubPipeline.instances.clear()
+    with identity_env({
+        "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
+        "OPERATOR_PRIVATE_KEY": "0x" + "11" * 32,
+        "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
+    }):
+        cfg = ArbitrageConfig.build(
+            live=False,
+            permutation=None,
+            rpc=RpcCascadeOverrides(node="ws://localhost:8546"),
+        )
     owner = _SessionState(
         engine_registry=object(),  # type: ignore[arg-type] — not read (streams injected)
         async_w3=w3,  # type: ignore[arg-type]
         sim_ctx=None,
         dispatcher=dispatcher,
-        cfg=ArbitrageConfig.from_env(
-            {
-                "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
-                "OPERATOR_PRIVATE_KEY": "0x"
-                + "11" * 32,  # valid secp256k1 scalar, cosmetic (leaf stubbed)
-                "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
-                "INJECT_EXECUTOR_CODE": "0",
-            },
+        cfg=cfg,
+        current_block=dispatcher.current_block,
+        pipeline_factory=StubPipeline,
+    )
+    await consume_result_batches(
+        owner,
+        block_stream=_Blocks(blocks),
+        result_iter=_Results(batches),
+        allow_quiet_end=allow_quiet_end,
+    )
+    for stub in StubPipeline.instances:
+        dispatched.extend(stub.enqueue_clock)
+    return dispatcher, w3, dispatched
+
+
+async def _run_with_pipeline_factory(
+    factory: Any,
+    *,
+    blocks: list[dict[str, int]],
+    batches: list[dict[str, Any]],
+    allow_quiet_end: bool = True,
+) -> tuple[Dispatcher, _FakeW3, list[int]]:
+    """Drive the consumer with an injected pipeline factory (drain tests)."""
+    dispatcher = Dispatcher.for_block(0)
+    w3 = _FakeW3()
+    dispatched: list[int] = []
+
+    from apexbot.runner.bot_runner import _SessionState
+    from apexbot.runner.config import ArbitrageConfig, RpcCascadeOverrides
+
+    StubPipeline.instances.clear()
+    with identity_env({
+        "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
+        "OPERATOR_PRIVATE_KEY": "0x" + "11" * 32,
+        "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
+    }):
+        cfg = ArbitrageConfig.build(
             live=False,
             permutation=None,
-            cli_http="http://localhost:8545",
-            cli_ws="ws://localhost:8546",
-        ),
-        current_block=dispatcher.current_block,
-    )
-    try:
-        await consume_result_batches(
-            owner,
-            block_stream=_Blocks(blocks),
-            result_iter=_Results(batches),
-            allow_quiet_end=allow_quiet_end,
+            rpc=RpcCascadeOverrides(node="ws://localhost:8546"),
         )
-    finally:
-        _runner_consume._dispatch_profitable = orig  # type: ignore[assignment]
-        _runner_consume.SimSubmitPipeline = orig_pipe  # type: ignore[assignment]
+    owner = _SessionState(
+        engine_registry=object(),  # type: ignore[arg-type] — not read (streams injected)
+        async_w3=w3,  # type: ignore[arg-type]
+        sim_ctx=None,
+        dispatcher=dispatcher,
+        cfg=cfg,
+        current_block=dispatcher.current_block,
+        pipeline_factory=factory,
+    )
+    await consume_result_batches(
+        owner,
+        block_stream=_Blocks(blocks),
+        result_iter=_Results(batches),
+        allow_quiet_end=allow_quiet_end,
+    )
+    for stub in StubPipeline.instances:
+        dispatched.extend(getattr(stub, "enqueue_clock", []))
     return dispatcher, w3, dispatched
 
 
@@ -247,11 +259,11 @@ class TestBlockClockFromStream:
         )
 
     async def test_fee_history_keys_off_block_stream_numbers(self) -> None:
-        # 7UIYJ6: the fee-history RPC + record-priority-fees now run in the
+        # The fee-history RPC + record-priority-fees now run in the
         # Rust submit leaf (`fetch_fee_history_py`), keyed off the block-stream
         # number passed by `_apply_block_if_ready`. The RPC-parity (that the
         # leaf queries the block-stream number's reward percentiles) is
-        # exercised by the Rust `fetch_fee_history` tests per §4.3 — this Python
+        # exercised by the Rust `fetch_fee_history` tests — this Python
         # test now verifies only that the per-block advance drives the clock
         # + records block-time pairs (the latency-baseline ring the leaf feeds).
         dispatcher, _w3, _dispatched = await _run(
@@ -276,7 +288,7 @@ class TestBlockClockFromStream:
         batch = dict(_empty_batch(999))
         batch["fresh"] = [
             (1, 100, 50, (1, 2), (3,), (0,))
-        ]  # one profitable result (state_nonces=(0,) — AV42C7)
+        ]  # one profitable result (state_nonces=(0,))
         _dispatcher, _w3, dispatched = await _run(
             blocks=[_block(301), _block(302)],
             batches=[batch],
@@ -315,3 +327,56 @@ class TestPumpDeathVisible:
             allow_quiet_end=True,
         )
         assert dispatcher.current_block == 101
+
+
+class _AbsorbingDrainPipeline:
+    """A pipeline whose outcome stream absorbs the drain task's cancellation."""
+
+    def __init__(self, session: object, **kwargs: object) -> None:
+        self.session = session
+        StubPipeline.instances.append(self)
+
+    def enqueue(self, work: object) -> None:
+        return None
+
+    def raise_if_failed(self) -> None:
+        return None
+
+    async def next_outcome(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return None  # the swallow the drain reap must catch
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
+class _LoudAbortPipeline(_AbsorbingDrainPipeline):
+    """A pipeline whose outcome stream dies with the loud-abort failure."""
+
+    async def next_outcome(self) -> None:
+        msg = "loud abort from the submit lane"
+
+        raise RuntimeError(msg)
+
+
+class TestDrainReapDiscipline:
+    """The outcome-drain teardown at consumer stream end.
+
+    The drain's lifetime is the consumer loop's: at stream end the loop
+    cancels + reaps it, and the reap must OBSERVE the cancellation (a drain
+    that absorbed its cancel cannot pass silently) while a drain that
+    already died with the loud-abort failure still surfaces it.
+    """
+
+    async def test_stream_end_observes_drain_cancellation(self) -> None:
+        with pytest.raises(AssertionError, match="cancellation"):
+            await _run_with_pipeline_factory(_AbsorbingDrainPipeline, blocks=[], batches=[])
+
+    async def test_ended_drain_still_surfaces_loud_abort(self) -> None:
+        with pytest.raises(RuntimeError, match="loud abort"):
+            await _run_with_pipeline_factory(_LoudAbortPipeline, blocks=[], batches=[])

@@ -13,7 +13,7 @@ prior to this ADR that version lived in **two unrelated, unsynchronized places**
 
 - `pyproject.toml` — `version = "0.6.0a3"` hardcoded under `[project]`.
 - every Rust crate — `version = "0.0.0"` as a literal in each `Cargo.toml`,
-  with the PyO3 binding crate (`apexbot_rs` in `crates/apexbot-python/`) carrying
+  with the PyO3 binding crate (`apexbot_rs` in `crates/shells/apexbot-python/`) carrying
   **no `version` field at all** (defaulting to `0.0.0`).
 
 A release therefore touched `pyproject.toml` for the wheel and left the Rust
@@ -39,10 +39,10 @@ naming the shared defaults every member crate inherits:
 [workspace.package]
 version = "0.6.0-alpha.3"
 edition = "2021"
-license = "Apache-2.0 license"
+license = "MIT"
 publish = false
 repository = "https://github.com/nabob-labs/apexbot"
-authors = ["nabob-labs"]
+authors = ["nabob-labs <astralmoonhalo@gmail.com.com>"]
 ```
 
 Every member crate's `[package]` table then writes the inherited fields as
@@ -60,7 +60,7 @@ repository.workspace = true
 authors.workspace = true
 ```
 
-The binding crate `crates/apexbot-python/` (package name `apexbot_rs`, the
+The binding crate `crates/shells/apexbot-python/` (package name `apexbot_rs`, the
 cdylib maturin builds) **also** inherits `version.workspace = true` — *that*
 is the version the published wheel ends up with.
 
@@ -81,7 +81,7 @@ dynamic = ["version"]
 ```
 
 maturin (the build backend, already configured via
-`[tool.maturin] manifest-path = "rust/crates/apexbot-python/Cargo.toml"`)
+`[tool.maturin] manifest-path = "rust/crates/shells/apexbot-python/Cargo.toml"`)
 supplies the wheel version at build time by reading the `[package].version` of
 the crate it builds — that is `apexbot_rs`'s version, which is itself
 inherited from `[workspace.package]`. The `[tool.maturin]` block is unchanged;
@@ -164,11 +164,24 @@ for verification at any point in a release.
   `cargo add apexbot-core` ships, that crate may pin its own semver while
   the binding crate follows the workspace.
 
+## Amendments
+
+- **2026-10-14 — the build receipt stamp retires; freshness is build-on-run.**
+  The per-build receipt stamp (a stamp a Python run checked before exercising
+  the built extension) is gone. Its guarantee — *a Python run always exercises
+  the current extension* — is now structural instead of checked: every
+  entrypoint that executes Python through the extension depends on `dev`, and
+  `dev` runs `scripts/build_extension.sh develop` first, unconditionally.
+  Freshness is a property of the entrypoints, not a claim about an artifact.
+  The stamp table's one remaining job is extension discovery (DEG-37), which
+  `apexbot.cli doctor` automates (DEG-39). There is no stale extension to
+  detect, because no entrypoint runs one.
+
 ## Related
 
 - **ADR-005** (Polars-inspired three-layer architecture) — establishes the
   crate-split topology this ADR versions. The workspace-virtual-manifest +
-  `crates/apexbot-python` peer layout is ADR-005's; this ADR adds the
+  `crates/shells/apexbot-python` peer layout is ADR-005's; this ADR adds the
   versioning half of the same Polars model (Polars itself uses
   `[workspace.package]` + `version.workspace = true` across `polars-core`/
   `-plan`/`-python`/etc., with `dynamic = ["version"]` in `pyproject.toml`).

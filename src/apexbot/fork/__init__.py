@@ -2,12 +2,12 @@
 
 A thin companion shell (ADR-005 three-layer Python layer) over the rust core
 `apexbot._ffi.AnvilFork` PyO3 seam (`apexbot_fork::AnvilFork`). The rust
-core (added in epic `NXYVYU` FF2/FF3) owns the spawned anvil subprocess
+core owns the spawned anvil subprocess
 (via `alloy::node_bindings::Anvil`) + a connected alloy `DynProvider`
 (over IPC) + the 12 anvil dev-RPC methods. This Python shell:
 
-- preserves the legacy Python-facing constructor config surface (so
-  existing callsites don't need to change which kwargs they pass);
+- carries the anvil launch configuration in :class:`ForkLaunchConfig`
+  (the fork target stays a direct ``fork_url`` / ``fork_block`` argument);
 - re-uses rust-driven dev-method invocations (`mine` / `reset` /
   `set_snapshot` / `return_to_snapshot` / `set_balance` / ...);
 - re-exposes general RPC against the forked node as
@@ -21,18 +21,21 @@ The breaking change vs the pre-0.7 Python `AnvilFork` is `self.w3` →
 `self.provider` (and the dropped capture-file / middlewares / free-port
 management).
 
-`PyAnvilFork` exposes the IPC path the rust core resolved for the spawned
+`_FFIAnvilFork` exposes the IPC path the rust core resolved for the spawned
 anvil process. Former callers using `fork.w3.eth.X` are migrated to
-`fork.provider.X` (FF5 / `ECKJE2`, done) — the legacy attribute is gone.
+`fork.provider.X` — the legacy attribute is gone.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Self, TypedDict
 
 from pydantic import validate_call
 
-from apexbot._ffi.fork import AnvilFork as PyAnvilFork
+from apexbot._ffi.fork import AnvilFork as _FFIAnvilFork
+from apexbot._ffi.provider import is_local_rpc_url
+from apexbot.config import resolved_config
 from apexbot.exceptions.base import ApexbotValueError
 from apexbot.exceptions.infrastructure import AnvilError
 from apexbot.logging import logger
@@ -44,7 +47,7 @@ from apexbot.validation.evm_values import (
 
 if TYPE_CHECKING:
     import pathlib
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from apexbot.types.chain import HexAddress, HexStr
 
@@ -77,20 +80,104 @@ def _coerce_storage_value_to_int(value: HexStr | bytes | int) -> int:
     return int(value, 16) if value.startswith("0x") else int(value)
 
 
+def _default_fork_compute_units_per_second(fork_url: str | None) -> int | None:
+    """Return the upstream fetch cap a fork target needs, absent an explicit one.
+
+    A fork child fetches its genesis state from the upstream before anvil
+    reports readiness, so an UNCAPPED hosted endpoint answers with HTTP 429 and
+    anvil exits at once — a spawn failure, not a slow spawn. A local node has no
+    per-IP budget, and uncapped fetches are what keep its lanes fast.
+
+    Which endpoints count as local is the Rust core's call
+    (:func:`apexbot._ffi.provider.is_local_rpc_url`): the same predicate the
+    provider throttles by, so the fork lane and the throttle lane cannot
+    disagree about it, and the hostname list has one home.
+
+    Returns:
+        The configured cap for a hosted endpoint (``None`` when
+        ``nodes.anvil_fork_compute_units_per_second`` is unset), and ``None``
+        for a local endpoint or an in-memory node.
+
+    """
+    if fork_url is None or is_local_rpc_url(fork_url):
+        return None
+    return resolved_config().values.nodes.anvil_fork_compute_units_per_second
+
+
+@dataclass(frozen=True, slots=True)
+class ForkLaunchConfig:
+    """Non-target launch knobs for the rust-owned anvil subprocess.
+
+    The fork target (``fork_url`` / ``fork_block``) stays a direct
+    :class:`AnvilFork` argument because nearly every caller names it; this
+    carrier groups the anvil-CLI, mining, and post-spawn state-override
+    families that most callers leave at their defaults. Values forward to the
+    rust core unchanged (``localhost`` becomes its ``host`` key; ``ipc_path``
+    is stringified).
+    """
+
+    localhost: str = "127.0.0.1"
+    fork_transaction_hash: str | None = None
+    mining_mode: Literal["auto", "interval", "none"] = "auto"
+    mining_interval: int | None = None
+    storage_caching: bool = True
+    base_fee: int | None = None
+    ipc_path: pathlib.Path | None = None
+    # Default mnemonic used by Brownie for Ganache forks
+    mnemonic: str = "patient rude simple dog close planet oval animal hunt sketch suspect slim"
+    chain_id: int | None = None
+    balance_overrides: Iterable[tuple[HexAddress, int]] | None = None
+    bytecode_overrides: Iterable[tuple[HexAddress, bytes]] | None = None
+    nonce_overrides: Iterable[tuple[HexAddress, int]] | None = None
+    storage_overrides: Iterable[tuple[HexAddress | bytes, int, HexStr | bytes | int]] | None = None
+    coinbase: HexAddress | None = None
+    anvil_opts: list[str] | None = None
+    # Cap on the fork upstream's request rate (anvil's
+    # ``--compute-units-per-second``). ``None`` derives the cap from the fork
+    # target: ``nodes.anvil_fork_compute_units_per_second`` for a hosted
+    # endpoint, ``--no-rate-limit`` for a local one (see
+    # :func:`_default_fork_compute_units_per_second`).
+    fork_compute_units_per_second: int | None = None
+
+
+class _AnvilForkSpawnKwargs(TypedDict):
+    """Keyword surface of the `apexbot._ffi.AnvilFork` constructor.
+
+    Every key :meth:`AnvilFork._spawn_kwargs` produces, typed as the PyO3
+    signature types it, so the `**` spread at the constructor call is checked
+    against that signature. A plain ``dict[str, object]`` leaves the spread
+    untyped and every value an ``object``.
+    """
+
+    host: str
+    fork_url: str | None
+    fork_block: int | None
+    fork_transaction_hash: str | None
+    mining_mode: str
+    mining_interval: int | None
+    storage_caching: bool
+    base_fee: int | None
+    ipc_path: str | None
+    mnemonic: str
+    chain_id: int | None
+    anvil_opts: Sequence[str] | None
+    fork_compute_units_per_second: int | None
+
+
 class AnvilFork:
     """A rust-owned Anvil fork subprocess + IPC `DynProvider` + dev-RPC surface.
 
     Companion shell (ADR-005 Python layer) over `apexbot._ffi.AnvilFork`
     (the PyO3 seam on `apexbot_fork::AnvilFork`). The rust core owns the
     subprocess lifecycle (drop = kill) + an alloy `DynProvider` (IPC
-    transport) + the 12 anvil dev-RPC methods. The shell preserves the
-    legacy Python-facing constructor config surface + dev-method names,
-    raises the legacy `AnvilError` exception subclass on rust-side
-    RPC failures, and exposes general RPC through the `AlloyProvider`
-    pyclass at :attr:`provider` (replacing the legacy `self.w3` Web3 handle
+    transport) + the 12 anvil dev-RPC methods. The shell carries the
+    legacy constructor knobs in :class:`ForkLaunchConfig`, preserves the
+    legacy dev-method names, raises the legacy `AnvilError` exception
+    subclass on rust-side RPC failures, and exposes general RPC through
+    the `AlloyProvider` pyclass at :attr:`provider` (replacing the legacy
+    `self.w3` Web3 handle
     — that handle is gone; all callers now use
-    ``fork.provider.get_block_number()`` etc.; the migration shipped in
-    task `ECKJE2`).
+    ``fork.provider.get_block_number()`` etc.).
 
     The rust core (`apexbot_fork::AnvilFork`) owns:
 
@@ -103,7 +190,8 @@ class AnvilFork:
 
     The Python shell keeps:
 
-    - the legacy constructor kwargs + the multi-override queueing
+    - the legacy constructor knobs (grouped in :class:`ForkLaunchConfig`)
+      + the multi-override queueing
       (``balance_overrides`` / ``bytecode_overrides`` / ``nonce_overrides``
       / ``storage_overrides`` / ``coinbase``) — applied post-spawn via the
       dev-method delegations;
@@ -124,7 +212,7 @@ class AnvilFork:
     Dropped (no longer needed now that subprocess lifecycle is rust-owned):
     the `--auto-impersonate` CLI arg list construction, the
     `_setup_process` / `_setup_w3` / `_close_ipc_socket` block, the
-    `socket`-based free-port allocation, the `tenacity` spawn retry,
+    `socket`-based free-port allocation, the retry-with-backoff spawn loop,
     the `subprocess.Popen` capture-file management
     (`capture_path` / `preserve_capture` / `*_capture_filename` properties),
     the `web3.IPCProvider` client + `middleware_onion.inject(middleware)`
@@ -141,28 +229,9 @@ class AnvilFork:
     def __init__(
         self,
         *,
-        localhost: str = "127.0.0.1",
         fork_url: str | None = None,
         fork_block: BlockNumber | None = None,
-        fork_transaction_hash: str | None = None,
-        mining_mode: Literal["auto", "interval", "none"] = "auto",
-        mining_interval: int | None = None,
-        storage_caching: bool = True,
-        base_fee: int | None = None,
-        ipc_path: pathlib.Path | None = None,
-        # Default mnemonic used by Brownie for Ganache forks
-        mnemonic: str = (
-            "patient rude simple dog close planet oval animal hunt sketch suspect slim"
-        ),
-        chain_id: int | None = None,
-        balance_overrides: Iterable[tuple[HexAddress, int]] | None = None,
-        bytecode_overrides: Iterable[tuple[HexAddress, bytes]] | None = None,
-        nonce_overrides: Iterable[tuple[HexAddress, int]] | None = None,
-        storage_overrides: (
-            Iterable[tuple[HexAddress | bytes, int, HexStr | bytes | int]] | None
-        ) = None,
-        coinbase: HexAddress | None = None,
-        anvil_opts: list[str] | None = None,
+        launch: ForkLaunchConfig | None = None,
     ) -> None:
         """Initialize the instance.
 
@@ -178,27 +247,20 @@ class AnvilFork:
         # `reset(transaction_hash=...)` can recreate the subprocess with
         # ALL the original params (the legacy Python `AnvilFork.reset`
         # supported re-spawning to a new fork URL + block + txn hash).
-        self._init_kwargs: dict[str, object] = {
-            "host": localhost,
-            "fork_url": fork_url,
-            "fork_block": fork_block,
-            "fork_transaction_hash": fork_transaction_hash,
-            "mining_mode": mining_mode,
-            "mining_interval": mining_interval,
-            "storage_caching": storage_caching,
-            "base_fee": base_fee,
-            "ipc_path": str(ipc_path) if ipc_path is not None else None,
-            "mnemonic": mnemonic,
-            "chain_id": chain_id,
-            "anvil_opts": tuple(anvil_opts) if anvil_opts else None,
-        }
-
+        config = launch or ForkLaunchConfig()
+        self._launch = config
         self._fork_url = fork_url
         # Spawn the rust core. The rust core raises `RuntimeError` /
         # `ValueError` on failure — let those propagate unchanged
         # (`ValueError` for the `mining_mode` parse; `RuntimeError` for
         # the spawn / IPC connect).
-        self._fork: PyAnvilFork | None = PyAnvilFork(**self._init_kwargs)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+        self._fork: _FFIAnvilFork | None = _FFIAnvilFork(
+            **self._spawn_kwargs(
+                fork_url=fork_url,
+                fork_block=fork_block,
+                fork_transaction_hash=self._launch.fork_transaction_hash,
+            )
+        )
 
         # General-RPC `AlloyProvider` over the fork's HTTP endpoint. The
         # rust core's dev-RPC (`mine`/`reset`/`anvil_*`) runs over its own
@@ -217,22 +279,62 @@ class AnvilFork:
         # Post-spawn state overrides — applied via the registered dev
         # methods so the rust `AnvilApi` calls go through the same
         # IPC-bound `DynProvider`. Matches the legacy Python semantics.
-        if balance_overrides is not None:
-            for account, balance in balance_overrides:
+        if config.balance_overrides is not None:
+            for account, balance in config.balance_overrides:
                 self.set_balance(account, balance)
-        if bytecode_overrides is not None:
-            for account, bytecode in bytecode_overrides:
+        if config.bytecode_overrides is not None:
+            for account, bytecode in config.bytecode_overrides:
                 self.set_code(account, bytecode)
-        if nonce_overrides is not None:
-            for account, nonce in nonce_overrides:
+        if config.nonce_overrides is not None:
+            for account, nonce in config.nonce_overrides:
                 self.set_nonce(account, nonce)
-        if storage_overrides is not None:
-            for address, position, value in storage_overrides:
+        if config.storage_overrides is not None:
+            for address, position, value in config.storage_overrides:
                 self.set_storage(address=address, position=position, value=value)
-        if coinbase is not None:
-            self.set_coinbase(coinbase)
-        if mining_interval is not None and mining_mode == "interval":
-            self.set_block_timestamp_interval(mining_interval)
+        if config.coinbase is not None:
+            self.set_coinbase(config.coinbase)
+        if config.mining_interval is not None and config.mining_mode == "interval":
+            self.set_block_timestamp_interval(config.mining_interval)
+
+    def _spawn_kwargs(
+        self,
+        *,
+        fork_url: str | None,
+        fork_block: BlockNumber | None,
+        fork_transaction_hash: str | None,
+    ) -> _AnvilForkSpawnKwargs:
+        """Build the FFI constructor kwargs for one anvil subprocess.
+
+        The fork target is a parameter, not a captured field, because
+        ``reset(fork_url=...)`` respawns against a different upstream: the
+        upstream cap is derived from the target being spawned, so a reset from
+        a local node to a hosted endpoint gains the cap instead of inheriting
+        the local node's ``--no-rate-limit``.
+
+        Returns:
+            Keyword arguments for ``apexbot._ffi.AnvilFork``.
+
+        """
+        launch = self._launch
+        return {
+            "host": launch.localhost,
+            "fork_url": fork_url,
+            "fork_block": fork_block,
+            "fork_transaction_hash": fork_transaction_hash,
+            "mining_mode": launch.mining_mode,
+            "mining_interval": launch.mining_interval,
+            "storage_caching": launch.storage_caching,
+            "base_fee": launch.base_fee,
+            "ipc_path": str(launch.ipc_path) if launch.ipc_path is not None else None,
+            "mnemonic": launch.mnemonic,
+            "chain_id": launch.chain_id,
+            "anvil_opts": tuple(launch.anvil_opts) if launch.anvil_opts else None,
+            "fork_compute_units_per_second": (
+                launch.fork_compute_units_per_second
+                if launch.fork_compute_units_per_second is not None
+                else _default_fork_compute_units_per_second(fork_url)
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Properties
@@ -315,7 +417,7 @@ class AnvilFork:
         """Drop the rust-owned subprocess + IPC handle.
 
         The rust core (`apexbot_fork::AnvilFork`) owns the subprocess via
-        alloy's `AnvilInstance`; dropping the `PyAnvilFork` pyclass handle
+        alloy's `AnvilInstance`; dropping the `_FFIAnvilFork` pyclass handle
         terminates the anvil process + closes the IPC transport. This
         method just clears the Python-side reference so the GC finalizes
         the rust handle — there is no separate IPC-socket cleanup needed
@@ -335,25 +437,43 @@ class AnvilFork:
         # `AnvilError` via the `ipc_path` getter / dev-method calls.
         self._fork = None
 
+    def __enter__(self) -> Self:
+        """Enter the context manager.
+
+        Teardown parity with the rust core's ``Drop``: the block exit closes
+        the fork even when the body raised, so a failed assertion cannot leak
+        the anvil subprocess. The sibling handles (Bot, SyncProvider, the
+        snapshot readers) all carry the same pair.
+
+        Returns:
+            This fork, so callers can bind it: ``with AnvilFork(...) as fork:``.
+
+        """
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Close on block exit, failure or not."""
+        self.close()
+
     def __del__(self) -> None:
         """Drop the rust core handle on instance finalization (best-effort).
 
         The rust-side `Drop` (`AnvilInstance::drop`) kills the spawned
-        anvil subprocess; Python's GC handles `PyAnvilFork` cleanup. The
+        anvil subprocess; Python's GC handles `_FFIAnvilFork` cleanup. The
         explicit :meth:`close` is the canonical lifecycle primitive —
         `__del__` factories no-defensive cleanup because alloy's
         `AnvilInstance` already implements `Drop` correctly.
         """
 
     # ------------------------------------------------------------------
-    # Dev-RPC methods (delegate to PyAnvilFork, translate exceptions)
+    # Dev-RPC methods (delegate to _FFIAnvilFork, translate exceptions)
     # ------------------------------------------------------------------
 
-    def _require_fork(self) -> PyAnvilFork:
-        """Return the open `PyAnvilFork` handle.
+    def _require_fork(self) -> _FFIAnvilFork:
+        """Return the open `_FFIAnvilFork` handle.
 
         Returns:
-            The open `PyAnvilFork` handle.
+            The open `_FFIAnvilFork` handle.
 
         Raises:
             AnvilError: If the fork was closed (the rust handle was dropped).
@@ -404,8 +524,6 @@ class AnvilFork:
                 "the rust subprocess is being recreated (legacy Python"
                 " `reset()` semantics).",
             )
-            new_kwargs = dict(self._init_kwargs)
-            new_kwargs["fork_url"] = fork_url or self._fork_url
             if block_number is not None and transaction_hash is not None:
                 logger.warning(
                     f"Forking from transaction hash {transaction_hash},"
@@ -414,8 +532,12 @@ class AnvilFork:
             # When a transaction_hash is requested, the block_number
             # must not be passed (anvil's `--fork-transaction-hash`
             # conflicts with `--fork-block-number`).
-            new_kwargs["fork_block"] = block_number if transaction_hash is None else None
-            new_kwargs["fork_transaction_hash"] = transaction_hash
+            new_fork_url = fork_url or self._fork_url
+            spawn_kwargs = self._spawn_kwargs(
+                fork_url=new_fork_url,
+                fork_block=block_number if transaction_hash is None else None,
+                fork_transaction_hash=transaction_hash,
+            )
 
             # Drop the old `AlloyProvider` (HTTP — no pubsub to leak) then
             # the old handle (kills the old subprocess) BEFORE spawning the
@@ -423,8 +545,8 @@ class AnvilFork:
             # listening on.
             self._provider = None
             self._fork = None
-            self._fork = PyAnvilFork(**new_kwargs)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
-            self._fork_url = new_kwargs["fork_url"]  # type: ignore[assignment]
+            self._fork = _FFIAnvilFork(**spawn_kwargs)
+            self._fork_url = new_fork_url
             # Replace the general-RPC provider over the new fork's HTTP
             # endpoint (HTTP: no IPC/WS pubsub, so consumers that borrow it
             # cannot keep a reconnect loop alive across fork teardown).

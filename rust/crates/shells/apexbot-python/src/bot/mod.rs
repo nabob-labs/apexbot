@@ -1,0 +1,4051 @@
+//! Per-domain binding-crate modules.
+//!
+//! `engine/` is the first inhabitant of the split binding layer; the
+//! other `bot` / `bot::pool` wrappers live alongside it.
+
+use apexbot_core::op_warn;
+pub mod build_flights;
+pub mod deployments;
+pub mod dex_identity;
+pub mod engine;
+mod errmap;
+pub mod intake;
+pub mod pool;
+pub mod pump;
+pub mod py_bot_io;
+pub(crate) mod registration_lifecycle;
+pub mod session_registry;
+#[cfg(feature = "auto-initialize")]
+pub mod test_gil;
+pub mod token;
+
+// === PyBot (moved from the former root `py_bot.rs`) ===
+//
+// `PyO3` wrappers for `BotState` — thin Python handle over Rust-owned state.
+// Implements the Polars-inspired three-layer topology (ADR-005): Rust [`BotState`]
+// core → `PyBot` `#[pyclass]` wrapper holding `Arc<parking_lot::RwLock<BotState>>`
+// → Python `BotState` session. `PyLiquidityPool`/`PyErc20Token` clone the same
+// `Arc` so many Python handles reference one Rust-owned `BotState`.
+// See: `docs/adr/ADR-005-polars-inspired-three-layer-architecture.md`.
+
+use crate::prelude::*;
+use std::sync::Arc;
+
+use alloy::primitives::Address;
+
+use crate::bot::engine::{hex_string_to_pool_id, SpecViolationError};
+use crate::bot::errmap::{
+    map_build_refusal, map_calc_tokens_in_err, map_calc_tokens_out_err, map_driver_err,
+    map_no_construction_io, map_refusal, map_register_v2_err,
+};
+
+/// Narrow a Python-supplied `U256` reserve to `U112` (the on-chain `uint112`
+/// width), raising `SpecViolationError` if bits ≥ 112 are set.
+fn narrow_reserve(
+    value: alloy::primitives::U256,
+    field: &'static str,
+) -> PyResult<alloy::primitives::aliases::U112> {
+    apexbot_pools::state::spec_bounds::narrow_v2_reserve(value, field)
+        .map_err(|sv| SpecViolationError::new_err(format!("{sv}")))
+}
+pub use crate::bot::pool::PyLiquidityPool;
+use crate::bot::pool::TickData;
+use crate::bot::token::PyErc20Token;
+use apexbot_bot::bot_core::pool_builder::construction_door::PoolConstruction;
+use apexbot_bot::bot_core::pool_builder::route::{self, BuiltIdentity};
+use apexbot_bot::bot_core::registration_ledger::RefusalKind;
+use apexbot_bot::bot_core::PoolTickCoverage;
+use apexbot_bot::bot_core::RegisteredPoolFamily;
+use apexbot_bot::bot_core::{
+    Bot, RegisterAerodromeV2PoolParams, RegisterBalancerStablePoolParams,
+    RegisterBalancerWeightedPoolParams, RegisterCurvePoolParams, RegisterV2PoolParams,
+    RegisterV3PoolParams, RegisterV4PoolParams, V4PoolKey,
+};
+use apexbot_pools::sim::registration_refusal::SpecRefusal;
+use apexbot_substrate::{PoolLookup, PoolRegistration};
+use apexbot_uniswap::dex_identity::DexVariant;
+use pyo3::types::{PyDict, PyList};
+use pyo3::Bound;
+
+/// Open the construction DB half for `attach_construction_io` (ADR-070: the
+/// write open lives in the shell, a writer-enabled crate — the engine crate
+/// never touches `open_for_writes`). `None` for the no-DB path, a write-capable
+/// held connection otherwise (the construction executor does reads AND the
+/// `update_erc20_token_metadata` write-back). A missing file (`SQLAlchemy`
+/// creates the DB lazily on first write) surfaces as `None` after the
+/// diagnostic — the DB methods then return the no-DB shape (matching the
+/// original `database_path` cold-start skip); a `Bot` restart after the file
+/// exists picks it up.
+fn open_construction_db(
+    database_path: Option<&str>,
+) -> Option<std::sync::Arc<apexbot_db::ApexbotDb>> {
+    let path = database_path?;
+    match apexbot_db::ApexbotDb::open_for_writes(std::path::Path::new(path)) {
+        Ok((db, _state)) => Some(std::sync::Arc::new(db)),
+        Err(e) => {
+            apexbot_core::diag!(
+                domain = state,
+                path = %path,
+                %e,
+                "Construction-I/O DB open failed; falling back to NoDb"
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyBot — owns the Bot orchestrator; hands out shared BotState Arcs
+// ---------------------------------------------------------------------------
+
+/// Python handle to the per-chain `Bot` orchestrator (ADR-006 D4).
+///
+/// Python constructs a `PyBot` (or receives a shared handle), registers
+/// pools/tokens, then reads results. `PyBot` owns a [`Bot`] via `Arc` and hands
+/// out clones of its shared `Arc<RwLock<BotState>>` (`state_arc`) so
+/// `PyLiquidityPool` / `PyErc20Token` / the engine wrapper all reach ONE
+/// Rust-owned `BotState`; `BlockPump` clones the same `Arc<Bot>` so its
+/// `dispatch_log` writes flow through to the engine's reads (N handles → one
+/// state — the Polars three-layer invariant, preserved + generalized by D4).
+#[pyclass(name = "Bot", module = "apexbot._ffi")]
+pub struct PyBot {
+    bot: Arc<Bot>,
+    /// ADR-006 D4 (T3): the pump lifecycle state, shared with the
+    /// `PyArbEngine` this bot owns. `None` until an engine is
+    /// constructed against this bot (the engine attaches its `Arc<PumpState>`
+    /// back here during `new()`). Once attached, the three pump methods —
+    /// `subscribe`, `backfill_from_snapshot`, `resume` — are drivable from
+    /// `PyBot` (the D4 owner) and read/write the SAME `EngineDriver` the
+    /// engine's snapshot/solve slices read.
+    pump: parking_lot::Mutex<Option<Arc<apexbot_bot::arb_engine::EngineDriver>>>,
+    /// Cached read-only `SnapshotDb` handle armed at `load_snapshot_from_db`
+    /// time (Decisions 5 (B) + 9 (A)). `None` for cold-start
+    /// (no DB) or before the snapshot load is attempted. The registration-path
+    /// `PyO3` functions clone this Arc to feed `&dyn TickMapDb` to the tick-map
+    /// assembly helper's Db arm (`bot_core::tick_assembly`).
+    ///
+    /// One connection, opened by `load_snapshot_from_db` with a held deferred
+    /// read transaction + **retained**. The snapshot load + the per-pool Db
+    /// probe share the SAME `Mutex<Connection>` + its open tx — every read
+    /// shares one frozen DB snapshot across `build_paths` (WAL MVCC).
+    /// `close_snapshot_tx()` commits the tx at end of `build_paths`.
+    db: parking_lot::Mutex<Option<Arc<apexbot_db::snapshot_db::SnapshotDb>>>,
+    /// PRG-1: the engine-internal single-flight build table —
+    /// claims collapsed into the Rust build path (was the `PoolBuildClaims`
+    /// FFI peer + the Python `(family, key)` claim driver).
+    flights: build_flights::BuildFlights,
+}
+
+/// Crate-internal Rust surface on `PyBot` (not Python-visible).
+impl PyBot {
+    /// Hand out a clone of the shared `Arc<Bot>` so `BlockPump` (and other
+    /// sibling consumers) drive the SAME `Bot`'s `dispatch_log` + state that
+    /// `PyBot` owns (ADR-006 D4: pump lifecycle relocation onto `Bot`).
+    #[must_use]
+    pub(crate) fn bot_arc(&self) -> Arc<Bot> {
+        Arc::clone(&self.bot)
+    }
+
+    /// The cached read-only `SnapshotDb` handle armed by
+    /// `load_snapshot_from_db` (Decision 5 (B)),
+    /// or `None` on the cold-start path (no DB configured, or the snapshot
+    /// load hasn't run, or `close_snapshot_tx()` dropped it). The registration-
+    /// path `PyO3` functions (`assemble_v3_tick_map` / `assemble_v4_tick_map`)
+    /// clone this Arc and pass `&*arc as &dyn TickMapDb` to
+    /// `bot_core::tick_assembly::assemble_*`'s `db` param. Returns a fresh
+    /// `Arc` clone — the caller owns the lifetime of the borrow; `PyBot`
+    /// retains its own Arc so subsequent callers still get `Some`.
+    #[must_use]
+    pub(crate) fn db_handle(&self) -> Option<Arc<apexbot_db::snapshot_db::SnapshotDb>> {
+        self.db.lock().clone()
+    }
+
+    // ===================== PRG-1 build-flight seam ==================
+
+    /// Re-raise a single-flight peer's published failure: the exception value
+    /// the leader raised, converted back into a `PyErr` under the caller's
+    /// GIL token.
+    fn py_err_from_exc(py: Python<'_>, exc: Py<pyo3::exceptions::PyBaseException>) -> pyo3::PyErr {
+        pyo3::PyErr::from_value(exc.into_bound(py).into_any())
+    }
+
+    /// Run one pool build under the engine-internal single flight (PRG-1):
+    /// `precheck` answers from the `BotState` registry of record, `lead` runs
+    /// the full build choreography (fetch → register) exactly once under the
+    /// `(family, chain_id, key)` claim, and concurrent peers park GIL-free on
+    /// the claim and wake with the published result (id or failure).
+    ///
+    /// Publication is strictly after the leader's `BotState` insertion, so a
+    /// `Built` wake never precedes the registry. A lead whose claim window
+    /// closed before it subscribed loops back through `precheck`; past a
+    /// defensive retry bound the call falls through to an unclaimed build
+    /// (the terminal registration refuses duplicates exactly as the legacy
+    /// path did).
+    fn run_flight<T>(
+        &self,
+        py: Python<'_>,
+        key: &build_flights::FlightKey,
+        mut precheck: impl FnMut() -> PyResult<Option<T>>,
+        lead: impl FnOnce() -> PyResult<(u64, T)>,
+    ) -> PyResult<T> {
+        let mut iterations: u32 = 0;
+        loop {
+            if let Some(payload) = precheck()? {
+                return Ok(payload);
+            }
+            match self.flights.enter(key) {
+                build_flights::FlightEnter::Lead(guard) => {
+                    let outcome = lead();
+                    match outcome {
+                        Ok((pool_id, payload)) => {
+                            guard.publish_built(pool_id);
+                            return Ok(payload);
+                        }
+                        Err(err) => {
+                            guard.publish_failed(py, &err);
+                            return Err(err);
+                        }
+                    }
+                }
+                build_flights::FlightEnter::Peer(slot) => {
+                    // Park GIL-free; `Built` re-answers through `precheck`, a
+                    // failure re-raises the leader's exact exception.
+                    if let build_flights::Parked::Failed(exc) = slot.wait(py) {
+                        return Err(Self::py_err_from_exc(py, exc));
+                    }
+                }
+            }
+            iterations += 1;
+            if iterations > 8 {
+                return lead().map(|(_, payload)| payload);
+            }
+        }
+    }
+
+    /// The address-keyed registry-of-record payload for a V2 build: identity
+    /// straight off the registered entry (parity with the builder's return
+    /// surface — token0/token1/address/variant — read from the SAME source).
+    /// The shaping is core-owned ([`Bot::registered_v2_payload`]); this
+    /// wrapper only releases the GIL across the read.
+    fn registered_v2_payload(
+        &self,
+        py: Python<'_>,
+        addr: &Address,
+    ) -> Option<(u64, String, String, String, String)> {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.registered_v2_payload(addr))
+    }
+
+    /// The V3 twin of [`Self::registered_v2_payload`] — family string
+    /// resolved from the registered `factory` exactly as the builder's
+    /// return surface does.
+    fn registered_v3_payload(
+        &self,
+        py: Python<'_>,
+        addr: &Address,
+        chain_id: u64,
+    ) -> Option<(u64, String, String, String, String)> {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.registered_v3_payload(addr, chain_id))
+    }
+
+    /// The family-guarded registry-of-record identity for the multi-token
+    /// families: `(pool_id, tokens)`.
+    fn registered_family_identity(
+        &self,
+        py: Python<'_>,
+        addr: &Address,
+        want: RegisteredPoolFamily,
+    ) -> Option<(u64, Vec<Address>)> {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.registered_family_identity(addr, want))
+    }
+
+    /// The V4 registry-of-record payload (`pool_manager`, `pool_id`)-keyed — the
+    /// already-registered fast path, EXTRACTED so the single-flight peer-wait
+    /// twin uses the same identity/fee/coverage surface as the original
+    /// inline block: identity from the core's immutable pool key,
+    /// protocol fee from the core's state machine, coverage as recorded.
+    fn registered_v4_echo(
+        &self,
+        py: Python<'_>,
+        pm: Address,
+        pid: &[u8; 32],
+    ) -> PyResult<Option<apexbot_bot::bot_core::registration::V4RegisteredEcho>> {
+        // PRG-2: the keyed registration gate refuses an immutable-admission
+        // pool (dynamic fee / fee-exceeds-encoder-limit) BEFORE any RPC work
+        // on the registration path, with the exact exception class the live
+        // registration refusal would have raised (map_refusal). The
+        // verdict consult + echo shaping are core-owned
+        // ([`Bot::registered_v4_echo`]); this wrapper only releases the
+        // GIL across the read and maps the typed refusal.
+        py.detach(|| self.bot.registered_v4_echo(pm, pid))
+            .map_err(map_refusal)
+    }
+
+    /// The `managed_v4` translation arm: `(pool_manager, pool_id)`-keyed, the
+    /// id validated at construction. The identity overrides fill the DB
+    /// two-step's gaps (all optional; the resolver prefers the DB row).
+    fn translate_v4_request<'a>(
+        request: &PyPoolConstructionRequest,
+        addr: Address,
+        db: Option<&'a dyn apexbot_db::snapshot::TickMapDb>,
+    ) -> PyResult<PoolConstruction<'a>> {
+        let pool_id_hex = request.pool_id.as_deref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "construct_pool: the managed_v4 family requires `pool_id`",
+            )
+        })?;
+        let pool_id = hex_string_to_pool_id(pool_id_hex)?;
+        let parse_opt = |s: Option<&String>, name: &str| -> PyResult<Option<Address>> {
+            s.map(|s| {
+                parse_address(s).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "construct_pool: malformed {name} {s:?}: {e}"
+                    ))
+                })
+            })
+            .transpose()
+        };
+        let tokens = request.tokens.as_deref();
+        let overrides = apexbot_bot::bot_core::pool_builder::builder::V4PoolBuildOverrides {
+            currency0: parse_opt(tokens.and_then(|t| t.first()), "currency0")?,
+            currency1: parse_opt(tokens.and_then(|t| t.get(1)), "currency1")?,
+            fee: request.fee,
+            tick_spacing: request.tick_spacing,
+            hook_address: parse_opt(request.hook_address.as_ref(), "hook_address")?,
+            state_view: parse_opt(request.state_view_address.as_ref(), "state_view_address")?,
+        };
+        Ok(PoolConstruction::V4 {
+            pool_manager: addr,
+            pool_id,
+            overrides,
+            db,
+        })
+    }
+
+    /// Shape the ONE construction echo from the door's verdict: the fresh
+    /// build's minted identity (the pair-keyed families echo their pair;
+    /// EVERY family answers its full token set), else the registry-GET race
+    /// answer (the same shaping the flight pre-check reads).
+    #[expect(clippy::too_many_arguments)]
+    fn shape_outcome_echo(
+        &self,
+        py: Python<'_>,
+        pool_id: u64,
+        built: Option<&BuiltIdentity>,
+        pair_echo: bool,
+        family: &str,
+        variant: Option<&str>,
+        addr: &Address,
+        pool_id_hex: Option<&str>,
+    ) -> PyResult<ConstructionEcho> {
+        match built {
+            Some(built) => {
+                let (token0, token1) = if pair_echo {
+                    let (t0, t1) = built.pair().unwrap_or_default();
+                    (t0.to_checksum(None), t1.to_checksum(None))
+                } else {
+                    (String::new(), String::new())
+                };
+                Ok(ConstructionEcho {
+                    pool_id,
+                    token0,
+                    token1,
+                    tokens: built.tokens.iter().map(|t| t.to_checksum(None)).collect(),
+                    variant: built.variant.clone(),
+                })
+            }
+            None => self
+                .registered_echo(py, family, variant, addr, pool_id_hex)?
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "construct_pool: registration answered pool id {pool_id} with no identity"
+                    ))
+                }),
+        }
+    }
+
+    /// The ONE translation: the family-tagged construction request -> the core
+    /// door's request. `pair_echo` is the seam's echo convention — the pair-keyed
+    /// families echo their identity pair, the multi-token ones echo empty token
+    /// strings (their list rides the handle).
+    fn translate_construction_request<'a>(
+        request: &PyPoolConstructionRequest,
+        addr: Address,
+        db: Option<&'a dyn apexbot_db::snapshot::TickMapDb>,
+    ) -> PyResult<(PoolConstruction<'a>, bool)> {
+        let variant = request.variant.as_deref();
+        let vault = request.vault.as_deref();
+        // An empty hint list is "the caller supplied none": the per-family arms
+        // read `Option` (absent = use the family's own default route).
+        let registries = (!request.registries.is_empty()).then(|| request.registries.clone());
+        match request.family.as_str() {
+            "constant_product" if variant == Some("aerodrome") => {
+                Ok((PoolConstruction::AerodromeV2 { address: addr }, false))
+            }
+            "constant_product" => Ok((PoolConstruction::V2 { address: addr }, true)),
+            // The fork storage layout is resolved CORE-side from the deployment
+            // table, so the driver never names a fork.
+            "concentrated_liquidity" => Ok((
+                PoolConstruction::V3 {
+                    address: addr,
+                    db,
+                    fetcher: None,
+                    slot_layout: None,
+                },
+                true,
+            )),
+            "weighted" => {
+                let vault = vault.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "construct_pool: the weighted family requires `vault`",
+                    )
+                })?;
+                Ok((
+                    PoolConstruction::BalancerWeighted {
+                        vault: parse_address(vault)?,
+                        address: addr,
+                    },
+                    false,
+                ))
+            }
+            "stableswap" if variant == Some("balancer_stable") => {
+                let vault = vault.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "construct_pool: the stableswap family requires `vault`",
+                    )
+                })?;
+                Ok((
+                    PoolConstruction::BalancerStable {
+                        vault: parse_address(vault)?,
+                        address: addr,
+                        invariant_version: request.invariant_version,
+                    },
+                    false,
+                ))
+            }
+            "managed_v4" => Ok((Self::translate_v4_request(request, addr, db)?, true)),
+            // Curve — the discovery-only stableswap family with no `factory()`.
+            // The driver supplies the registry/factory addresses the LP-token +
+            // metapool lookups consult (driver values, like the V3 route's factory
+            // rungs).
+            "stableswap" => {
+                let registries = registries.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "construct_pool: the Curve family requires `registries`",
+                    )
+                })?;
+                let registry = registries
+                    .iter()
+                    .map(|s| parse_address(s))
+                    .collect::<PyResult<Vec<Address>>>()?;
+                Ok((
+                    PoolConstruction::Curve {
+                        address: addr,
+                        registries: registry,
+                    },
+                    false,
+                ))
+            }
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "construct_pool: unsupported family {other:?}"
+            ))),
+        }
+    }
+
+    /// The single-flight key family for a construction request — the concurrency
+    /// class a build of this family+address takes part in.
+    fn flight_family_of(family: &str, variant: Option<&str>) -> u8 {
+        match family {
+            "constant_product" if variant == Some("aerodrome") => {
+                build_flights::flight_family::AERODROME
+            }
+            "constant_product" => build_flights::flight_family::V2,
+            "concentrated_liquidity" => build_flights::flight_family::V3,
+            "managed_v4" => build_flights::flight_family::V4,
+            "weighted" => build_flights::flight_family::BALANCER_WEIGHTED,
+            "stableswap" if variant == Some("balancer_stable") => {
+                build_flights::flight_family::BALANCER_STABLE
+            }
+            _ => build_flights::flight_family::CURVE,
+        }
+    }
+
+    /// The registry-of-record identity echo for an already-registered
+    /// address — the flight pre-check AND the door's registry-GET race
+    /// answer read the SAME shaping. The pair-keyed families echo their
+    /// registered identity (parity with the builder's return surface); the
+    /// multi-token ones echo the family's own spelling with empty token
+    /// strings (their list rides the handle).
+    /// The registry-of-record identity echo for an already-registered
+    /// address — the flight pre-check AND the door's registry-GET race
+    /// answer read the SAME shaping. The pair-keyed families echo their
+    /// registered pair (parity with the builder's return surface); every
+    /// family answers its FULL token set (`tokens`, ADR-085 D5). The V4
+    /// family reads its keyed echo (the PRG-2 gate consult rides it).
+    fn registered_echo(
+        &self,
+        py: Python<'_>,
+        family: &str,
+        variant: Option<&str>,
+        addr: &Address,
+        pool_id_hex: Option<&str>,
+    ) -> PyResult<Option<ConstructionEcho>> {
+        let keyed =
+            |pool_id: u64, token0: String, token1: String, tokens: Vec<String>, variant: &str| {
+                ConstructionEcho {
+                    pool_id,
+                    token0,
+                    token1,
+                    tokens,
+                    variant: variant.to_string(),
+                }
+            };
+        match family {
+            "managed_v4" => {
+                let Some(pid) = pool_id_hex.map(hex_string_to_pool_id).transpose()? else {
+                    return Ok(None);
+                };
+                Ok(self.registered_v4_echo(py, *addr, &pid)?.map(|echo| {
+                    let t0 = echo.1.clone();
+                    let t1 = echo.2.clone();
+                    keyed(echo.0, t0.clone(), t1.clone(), vec![t0, t1], "")
+                }))
+            }
+            "constant_product" if variant == Some("aerodrome") => Ok(self
+                .registered_family_identity(py, addr, RegisteredPoolFamily::AerodromeV2)
+                .map(|(pool_id, tokens)| {
+                    keyed(
+                        pool_id,
+                        String::new(),
+                        String::new(),
+                        tokens.iter().map(|t| t.to_checksum(None)).collect(),
+                        "aerodrome",
+                    )
+                })),
+            "constant_product" => {
+                Ok(self
+                    .registered_v2_payload(py, addr)
+                    .map(|(pool_id, t0, t1, _address, v)| {
+                        keyed(pool_id, t0.clone(), t1.clone(), vec![t0, t1], &v)
+                    }))
+            }
+            "concentrated_liquidity" => Ok(self
+                .registered_v3_payload(py, addr, self.bot.chain_id())
+                .map(|(pool_id, t0, t1, _address, v)| {
+                    keyed(pool_id, t0.clone(), t1.clone(), vec![t0, t1], &v)
+                })),
+            "weighted" => Ok(self
+                .registered_family_identity(py, addr, RegisteredPoolFamily::BalancerWeighted)
+                .map(|(pool_id, tokens)| {
+                    keyed(
+                        pool_id,
+                        String::new(),
+                        String::new(),
+                        tokens.iter().map(|t| t.to_checksum(None)).collect(),
+                        "balancer_weighted",
+                    )
+                })),
+            "stableswap" if variant == Some("balancer_stable") => Ok(self
+                .registered_family_identity(py, addr, RegisteredPoolFamily::BalancerStable)
+                .map(|(pool_id, tokens)| {
+                    keyed(
+                        pool_id,
+                        String::new(),
+                        String::new(),
+                        tokens.iter().map(|t| t.to_checksum(None)).collect(),
+                        "balancer_stable",
+                    )
+                })),
+            "stableswap" => Ok(self
+                .registered_family_identity(py, addr, RegisteredPoolFamily::Curve)
+                .map(|(pool_id, tokens)| {
+                    keyed(
+                        pool_id,
+                        String::new(),
+                        String::new(),
+                        tokens.iter().map(|t| t.to_checksum(None)).collect(),
+                        "stableswap",
+                    )
+                })),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn attach_pump_state(&self, driver: Arc<apexbot_bot::arb_engine::EngineDriver>) {
+        *self.pump.lock() = Some(driver);
+    }
+
+    /// Borrow the attached `EngineDriver`,
+    /// error if no engine was constructed against this bot.
+    pub(crate) fn pump_state(&self) -> PyResult<Arc<apexbot_bot::arb_engine::EngineDriver>> {
+        self.pump.lock().clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "No engine attached to this Bot. Construct an engine against it (py_bot=...) \
+                 before calling pump lifecycle methods on Bot.",
+            )
+        })
+    }
+}
+
+#[pymethods]
+impl PyBot {
+    #[new]
+    #[pyo3(signature = (chain_id = 0))]
+    #[must_use]
+    pub fn new(chain_id: u64) -> Self {
+        // The Python ``Bot`` facade is single-chain,
+        // so it passes its ``config.default_chain_id`` here. The ``chain_id = 0``
+        // default keeps the bare ``PyBot()`` lower-level test fixtures (which
+        // only exercise the Rust core) working without a chain invariant.
+        // `Arc<Bot>` so `BlockPump` clones the same orchestrator (ADR-006 D4).
+        Self {
+            bot: Arc::new(Bot::new(chain_id)),
+            pump: parking_lot::Mutex::new(None),
+            db: parking_lot::Mutex::new(None),
+            flights: build_flights::BuildFlights::default(),
+        }
+    }
+
+    /// PRG-3: whether the fleet hosts the registration intake (the
+    /// `fleet.stance=fleet` migration stance installed this process's
+    /// intake boot descriptor at engine construction). The Python driver
+    /// reads this ONCE at pipeline construction (stance like the executor
+    /// field — never re-read on the hot path).
+    pub fn registration_fleet_hosted(&self) -> bool {
+        apexbot_bot::fleet_intake::registration_boot_installed()
+    }
+
+    /// PRG-3: submit one intake unit (a pool-build callable) to the fleet
+    /// intake executor. Returns a receipt whose `.wait()` joins the unit.
+    /// Refuses loudly under the legacy stance — the driver must keep the
+    /// incumbent worker pool there.
+    ///
+    /// FF-T1: a refused fleet boot raises the TYPED `BootRefused`
+    /// (detected budget + floor + one operator hint) at this submit and at
+    /// every submit after it (the sticky materializer); the host process
+    /// survives — the library never aborts on the boot-refusal arm.
+    #[expect(
+        clippy::unused_self,
+        reason = "pymethod keeps its instance surface; the stance gate is process-global"
+    )]
+    fn submit_registration_unit(&self, fn_work: Py<PyAny>) -> PyResult<intake::PyIntakeReceipt> {
+        // The PRG-3 stance gate is core-owned (the typed refusal carries the
+        // historical message); the receipt itself stays pyo3-bound here.
+        apexbot_bot::bot_core::registration::ensure_registration_fleet_hosted()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        intake::submit(fn_work)
+    }
+
+    /// Return a fresh async iterator over `newHeads` block notifications —
+    /// the settlement bot's authoritative block clock .
+    ///
+    /// ADR-027 completion : the block-clock pipe is
+    /// coordinator-owned, so this method lives on `PyBot` (the pump-lifecycle
+    /// handle) — NOT on the engine wrapper, which is out of the block path
+    /// entirely. The receiver is born on the shared `PumpState` beside the
+    /// pipe's sender and is handed out exactly once.
+    ///
+    /// Each yielded item is a dict: `number`, `timestamp`,
+    /// `base_fee_per_gas` (int | None), `gas_used`, `gas_limit`.
+    ///
+    /// Can be called at most once (the receiver is moved into the iterator).
+    /// Subsequent calls raise `RuntimeError`. Raises `RuntimeError` too if
+    /// no engine was constructed against this bot (no pump state).
+    ///
+    /// # Errors
+    /// `RuntimeError` if no pump state is attached (no engine constructed
+    /// against this bot) or the receiver was already handed out.
+    pub fn block_stream(&self) -> PyResult<crate::bot::engine::BlockStream> {
+        use apexbot_bot::bot_core::bot::BlockStreamError;
+        // D4 state: the pump `Mutex<Option<Arc<EngineDriver>>>` is read here;
+        // the once-only receiver hand-off is the core `Bot::block_stream`.
+        let pump = self.pump.lock().clone();
+        let block_rx = Bot::block_stream(pump.as_deref()).map_err(|e| match e {
+            BlockStreamError::NoPumpState => pyo3::exceptions::PyRuntimeError::new_err(
+                "no pump state: construct an engine against this Bot first",
+            ),
+            BlockStreamError::AlreadyTaken => {
+                pyo3::exceptions::PyRuntimeError::new_err("block_stream() can only be called once")
+            }
+        })?;
+        Ok(crate::bot::engine::BlockStream::new(block_rx))
+    }
+
+    /// Load the V3 + V4 DB snapshot into the core `BotState` .
+    ///
+    /// Called at Python `Bot.__init__` time when a DB path is configured
+    /// (Shape 2: eager construction-time load). Opens a read-only
+    /// `ApexbotDb` handle from `db_path`, then calls the core
+    /// `Bot::load_snapshot_from_db` — the single Rust entry point that
+    /// `stream_liquidity_maps`-loads V3+V4 pools into the core `SnapshotStore`s
+    /// + records `S = min(fetch_newest_update_block(V3), V4)`. After this,
+    /// pool registration consumes the store via `take()` — the
+    /// Python builder passes `tick_data=None, coverage=Tracked` and lets the
+    /// store decide Tracked-vs-Sparse per pool.
+    ///
+    /// `None`/cold-start (no pools) is NOT an error — the pump anchors on
+    /// `first_observed_block` at resume. Idempotent across the two families,
+    /// but a second call after a successful load will `begin_load` a store
+    /// that's already loaded (panics) — call exactly once at construction.
+    ///
+    /// # Errors
+    /// `PyRuntimeError` on a DB open/read failure or a liquidity value
+    /// out of range.
+    #[pyo3(signature = (db_path, chain_id))]
+    fn load_snapshot_from_db(&self, py: Python<'_>, db_path: &str, chain_id: u64) -> PyResult<()> {
+        use apexbot_bot::bot_core::bot::SnapshotOpenError;
+        // The core opens the `SnapshotDb` — a read-only handle with a held
+        // deferred read transaction — and reads `S =
+        // min(fetch_newest_update_block(V3), V4)` INSIDE the held tx so `S`
+        // and every per-pool `fetch_liquidity_map` read share one frozen DB
+        // snapshot across `build_paths` (the consistency replacement for the
+        // retired `SnapshotStore`); the STILL-OPEN handle comes back for the
+        // shell to retain. `PyBot.close_snapshot_tx()` commits the tx at end
+        // of `build_paths` to release the WAL snapshot.
+        // GIL hygiene: the DB open + seed read run under this py.detach.
+        let snap = py
+            .detach(|| self.bot.load_snapshot_from_db_path(db_path, chain_id))
+            .map_err(|e| match e {
+                SnapshotOpenError::Open(e) => crate::db::db_err_to_py(&e),
+                SnapshotOpenError::Load(kind) => {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "load_snapshot_from_db failed: {}",
+                        kind.detail().unwrap_or_default()
+                    ))
+                }
+            })?;
+        // Retain the `SnapshotDb` as a long-lived `Arc` so the registration-
+        // path PyO3 functions (`assemble_v3_tick_map` etc.) clone it to feed
+        // `&dyn TickMapDb` to the tick-map assembly helper's Db arm. Stored
+        // AFTER the snapshot load succeeded, so a failure leaves `db` as
+        // `None` (cold-start).
+        *self.db.lock() = Some(Arc::new(snap));
+        Ok(())
+    }
+
+    /// Commit + drop the held snapshot read transaction.
+    /// Call after `build_paths` finishes so the WAL snapshot is released + the
+    /// updater's checkpoint can reclaim `-wal` space. After this, `db_handle()`
+    /// returns `None` (the `assemble_*` Db arm goes through the held tx — once
+    /// it's closed, there's no Db arm for late registrations; they'd need a
+    /// fresh handle). Idempotent on a not-loaded bot (no-op).
+    ///
+    /// # Errors
+    /// `PyRuntimeError` if the `COMMIT` fails.
+    fn close_snapshot_tx(&self, py: Python<'_>) -> PyResult<()> {
+        use apexbot_bot::bot_core::bot::CloseSnapshotTxError;
+        // Canary: capture S_snapshot (read inside the
+        // held tx) before committing, then re-read S_live after COMMIT on the
+        // same connection (now seeing the live DB). If S_live > S_snapshot the
+        // pool_updater committed concurrently with startup — a discipline
+        // violation. Correctness was already preserved by the held tx; the
+        // canary only surfaces it. That teardown — S capture, sole-Arc
+        // unwrap, COMMIT + canary re-read — is the core
+        // `Bot::close_snapshot_tx`; the shell maps the typed refusals and
+        // emits the operator warning.
+        // GIL hygiene: the teardown runs under this py.detach.
+        let snap = self.db.lock().take();
+        let report = py
+            .detach(|| self.bot.close_snapshot_tx(snap))
+            .map_err(|e| match e {
+                CloseSnapshotTxError::Close(e) => crate::db::db_err_to_py(&e),
+                CloseSnapshotTxError::ArcHeld => pyo3::exceptions::PyRuntimeError::new_err(
+                    "close_snapshot_tx: SnapshotDb Arc still held (clone leak — \
+                         a caller didn't drop its handle)",
+                ),
+            })?;
+        if let Some(report) = report {
+            if report.advanced {
+                op_warn!(
+                    domain = state,
+                    s_snapshot = report.s_snapshot.unwrap_or(0),
+                    s_live = report.s_live.unwrap_or(0),
+                    "DB advanced during startup — operator discipline violation"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach a construction-I/O handle built from a Python provider + an
+    /// optional `database_path` (architecture review 2025-07-18 / candidate 1).
+    /// The Python `Bot.__init__` calls this after constructing `PyBot` so the
+    /// 7 generic RPC + 12 DB atomic methods on `PyBotIo` can delegate through
+    /// the core trait objects. Alloy-only — a non-alloy provider raises
+    /// `RuntimeError` (Q6-narrow; the 27 choreography wrappers keep their
+    /// Python-delegation fallback this slice, deleted with the builder-
+    /// choreography port).
+    ///
+    /// `database_path = None` → the DB half is `NoDb` (every read returns
+    /// `None`/empty, the no-DB path). `Some(path)` → a held `ApexbotDb` is
+    /// opened (WAL permits the concurrent connection) + wrapped in
+    /// `ApexbotDbConstruction`; construction DB reads route through this held
+    /// connection (no per-call `ApexbotDb::open`).
+    #[pyo3(signature = (provider, database_path=None))]
+    #[expect(clippy::unnecessary_wraps, clippy::needless_pass_by_value)]
+    fn attach_construction_io(
+        &self,
+        py: Python<'_>,
+        provider: Bound<'_, PyAny>,
+        database_path: Option<&str>,
+    ) -> PyResult<()> {
+        use crate::bot::py_bot_io::extract_native_alloy;
+        use apexbot_bot::bot_core::construction_io::{
+            AlloyRpcConstruction, ConstructionIo, ApexbotDbConstruction, NoDb,
+        };
+
+        // Q6-narrow: the trait is alloy-only. A non-alloy provider (legacy
+        // test doubles that exercise the choreography fallback) yields `None`
+        // here — we skip attaching, leaving `construction_io = None`. The 7
+        // RPC + 12 DB methods on `PyBotIo` then fall back to the `self.alloy` /
+        // Python path (the `None` branch in each). This preserves the
+        // choreography-test path; a production driver MUST supply an alloy
+        // provider to get the trait delegation (the migration note documents
+        // this; the fallback is deleted with the builder-choreography port).
+        let Some(alloy) = extract_native_alloy(&provider) else {
+            return Ok(());
+        };
+        let rpc = std::sync::Arc::new(AlloyRpcConstruction::new((*alloy).clone()));
+
+        // The DB half — open (write-capable; the construction executor does
+        // reads AND the `update_erc20_token_metadata` write-back), with the
+        // missing-file cold-start fallback to `NoDb` so the DB methods
+        // return the no-DB shape (matching the original `database_path`
+        // cold-start skip; a `Bot` restart after the file exists picks it
+        // up) — is shell-owned ([`open_construction_db`], run under this
+        // py.detach).
+        let db: std::sync::Arc<
+            dyn apexbot_bot::bot_core::construction_io::DbConstruction + Send + Sync,
+        > = match py.detach(|| open_construction_db(database_path)) {
+            Some(db) => {
+                // Bind the session's position reader HERE, and only
+                // here: this is the one point in a bot boot where the
+                // session and the database handle its reads are sourced
+                // from are both in hand. The reader is a lending
+                // integration's, the session registry is the engine's,
+                // and neither may take the other's edge, so the boot
+                // that already owns both composes them. Nothing about
+                // the reading is decided at this site — which rows
+                // answer, how fresh they are, and which faults refuse
+                // are the observer's own (`apexbot_aave::positions`).
+                #[cfg(feature = "aave-updater")]
+                {
+                    let observer: std::sync::Arc<
+                        dyn apexbot_substrate::session_registry::PositionObserver,
+                    > = std::sync::Arc::new(apexbot_aave::AavePositionObserver::new(
+                        std::sync::Arc::clone(&db),
+                    ));
+                    // A refused second install is the registry's to
+                    // report: it already logs at ERROR and hands the
+                    // observer back, precisely because it cannot be the
+                    // site that installs one.
+                    let _ = self
+                        .bot
+                        .session_registry()
+                        .install_position_observer(observer);
+                }
+                std::sync::Arc::new(ApexbotDbConstruction::new(db))
+            }
+            None => std::sync::Arc::new(NoDb),
+        };
+
+        let io = ConstructionIo::new(db, rpc);
+        // Attach to the shared `Bot` (interior-mutable `construction_io` field);
+        // `Bot` is held as `Arc` by `PyBot`, so we mutate through the `RwLock`
+        // rather than adopting the `Arc` out.
+        self.bot.set_construction_io(io);
+        Ok(())
+    }
+
+    /// PRG-2: the Python driver records registration skips into
+    /// the Rust `apexbot.registration.skips` meter family; the former
+    /// Python `SkipGate` memo is retired — immutable V4 admission verdicts
+    /// are refused pre-RPC by the core registration gate. The label
+    /// collapse + meter write are core-owned; observation only.
+    #[pyo3(signature = (reason))]
+    fn record_registration_skip(&self, py: Python<'_>, reason: &str) {
+        // GIL hygiene: the skip-kind collapse + meter write run detached —
+        // both are core-owned ([`Bot::record_registration_skip`]); no state
+        // guard is involved.
+        py.detach(|| self.bot.record_registration_skip(reason));
+    }
+
+    /// The snapshot seed block `S` (or `None` when no DB snapshot was loaded —
+    /// the cold-start path). Python reads this in `engine_registry.start()`
+    /// to stash `_verify_snapshot_block` for the per-pool two-step verify.
+    #[getter]
+    fn snapshot_seed_block(&self, py: Python<'_>) -> Option<u64> {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.snapshot_seed_block())
+    }
+
+    /// Subscribe to the WS `newHeads` + logs streams (ADR-006 D4 T3).
+    ///
+    /// The Bot-owned pump entry point — delegates to the shared `PumpState`
+    /// attached when an engine wrapper was constructed against this bot.
+    /// Blocks (sync, via the shared tokio runtime) until the first block is
+    /// observed, then returns the first WS block number (the backfill target).
+    ///
+    /// # Errors
+    /// `PyRuntimeError` if no engine is attached, the pump is already
+    /// started/subscribed, or the WS subscribe fails.
+    #[pyo3(signature = (rpc_url))]
+    fn subscribe(&self, py: Python<'_>, rpc_url: &str) -> PyResult<u64> {
+        let driver = self.pump_state()?;
+        // GIL-release across the WS handshake block_on (the block_on lives in
+        // the core `Bot::subscribe`): the handshake future (WS subscribe +
+        // header polling) does NOT need the GIL to complete.
+        py.detach(|| Bot::subscribe(&driver, rpc_url))
+            .map_err(map_driver_err)
+    }
+
+    /// Resume the pump — begin normal WS processing (ADR-006 D4 T3).
+    ///
+    /// The snapshot→WS gap is closed automatically inside the core
+    /// `BlockPump::resume_from_subscribe`; the pyo3
+    /// `backfill_from_snapshot` method is retired. Delegates to the
+    /// shared `PumpState`.
+    fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        let driver = self.pump_state()?;
+        // GIL-release across the backfill block_on (the block_on lives in the
+        // core `Bot::resume`): the backfill (`eth_getLogs` + `BotState`
+        // mutation) is pure Rust async and does not need the GIL.
+        py.detach(|| Bot::resume(&driver)).map_err(map_driver_err)
+    }
+
+    /// Stop the pump and signal the Rust core to clean up (ADR-006 D4).
+    ///
+    /// The symmetric teardown half of the `subscribe` → `backfill_from_snapshot`
+    /// → `resume` lifecycle. Sets the shutdown flag and aborts the spawned
+    /// pump task so a Ctrl-C exits promptly (the pump loop otherwise blocks
+    /// up to 60s on a silent WS stream). Idempotent — safe to call from both
+    /// the `__aexit__` path and a signal handler. Delegates to the shared
+    /// `PumpState`.
+    fn stop(&self, _py: Python<'_>) -> PyResult<()> {
+        let driver = self.pump_state()?;
+        Bot::stop(&driver).map_err(map_driver_err)
+    }
+
+    /// Set the HTTP RPC URL used for verification (ADR-006 D4 T4).
+    /// Delegates to the shared `PumpState`.
+    #[pyo3(signature = (rpc_url))]
+    fn set_verify_rpc_url(&self, rpc_url: &str) {
+        // No engine attached → no-op (the swallowed pump_state error, now the
+        // core `None` arm).
+        let pump = self.pump_state().ok();
+        Bot::set_verify_rpc_url(pump.as_deref(), rpc_url);
+    }
+
+    /// Set the `StateView` contract address for V4 verification (ADR-006 D4 T4).
+    #[pyo3(signature = (state_view_address))]
+    fn set_verify_state_view(&self, state_view_address: &str) {
+        // No engine attached → no-op (the swallowed pump_state error, now the
+        // core `None` arm).
+        let pump = self.pump_state().ok();
+        Bot::set_verify_state_view(pump.as_deref(), state_view_address);
+    }
+
+    /// Register a V2 pool by contract address.
+    ///
+    /// Returns the auto-assigned pool ID.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (address, token0, token1, reserve0, reserve1, gamma_numer0, fee_denom0, gamma_numer1, fee_denom1, factory, update_block=0, variant="uniswap-v2", stable_swap=false, fee_denominator=None))]
+    fn register_v2_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        token0: &str,
+        token1: &str,
+        reserve0: &Bound<'_, PyAny>,
+        reserve1: &Bound<'_, PyAny>,
+        gamma_numer0: u64,
+        fee_denom0: u64,
+        gamma_numer1: u64,
+        fee_denom1: u64,
+        factory: &str,
+        update_block: u64,
+        variant: &str,
+        stable_swap: bool,
+        fee_denominator: Option<u64>,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let t0 = parse_address(token0)?;
+        let t1 = parse_address(token1)?;
+        let fac = parse_address(factory)?;
+        let r0 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve0)?,
+            "reserve0",
+        )?;
+        let r1 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve1)?,
+            "reserve1",
+        )?;
+        let variant_enum = DexVariant::try_from(variant)
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+
+        // ADR-078 D3 step 3: the kwargs translate into the ONE door request
+        // and dispatch through the engine verb ([`Bot::register`]); the
+        // get-or-register guard, the CREATE2 verify, and the derived
+        // deployer/init-hash completion are core-owned behind it. The write
+        // guard is acquired inside the core method; the GIL is released
+        // across this py.detach — never hold the GIL while parked on the
+        // BotState write.
+        let pool_id = py
+            .detach(|| {
+                self.bot
+                    .register(PoolRegistration::V2(Box::new(RegisterV2PoolParams {
+                        address: addr,
+                        token0: t0,
+                        token1: t1,
+                        reserve0: r0,
+                        reserve1: r1,
+                        fee_token0: (gamma_numer0, fee_denom0),
+                        fee_token1: (gamma_numer1, fee_denom1),
+                        factory: fac,
+                        // Derived identity (deployer/init-hash) is completed
+                        // core-side, inside the request interior.
+                        deployer: Address::default(),
+                        init_hash: alloy::primitives::B256::default(),
+                        update_block,
+                        variant: variant_enum,
+                        stable_swap,
+                        fee_denominator,
+                    })))
+            })
+            .map_err(map_refusal)?;
+        // Telemetry: one Jaeger node per V2 registration (the fresh-build
+        // twin lives at the construction door).
+        let _reg = tracing::info_span!(
+            "apexbot.pool.register",
+            pool.version = "v2",
+            pool.address = %addr,
+            token0 = %t0,
+            token1 = %t1,
+            pool.id = pool_id,
+        )
+        .entered();
+        Ok(pool_id)
+    }
+}
+
+/// The construction echo — the identity the seam registered, ONE shape
+/// shared by the flight pre-check, the GET-race arm, and the fresh build
+/// (ADR-085 D5). `token0`/`token1` stay the pair-keyed families' pair echo
+/// (the driver's identity guard reads them); `tokens` is the FULL token set
+/// every family answers — the companion loop iterates it.
+#[derive(Clone)]
+struct ConstructionEcho {
+    pool_id: u64,
+    token0: String,
+    token1: String,
+    tokens: Vec<String>,
+    variant: String,
+}
+
+/// The one construction answer (ADR-085 D3).
+///
+/// The registered handle plus the identity the seam registered, so a caller never
+/// re-reads the registry for the handle nor re-derives the echo the core already
+/// answered. Minted by [`PyBot::construct_pool`].
+#[pyclass(name = "ConstructionOutcome", module = "apexbot._ffi")]
+pub struct PyConstructionOutcome {
+    /// The registered pool handle (the registry's own object).
+    pool: Py<PyLiquidityPool>,
+    /// The auto-assigned pool id.
+    pool_id: u64,
+    /// The requested family tag.
+    family: String,
+    /// The normalized variant echo the core registered.
+    variant: String,
+    /// Token0 (empty for the multi-token families).
+    token0: String,
+    /// Token1 (empty for the multi-token families).
+    token1: String,
+    /// The FULL registered token set, canonical order — the companion
+    /// loop's iteration source (ADR-085 D5).
+    tokens: Vec<String>,
+}
+
+#[pymethods]
+impl PyConstructionOutcome {
+    /// The registered pool handle.
+    #[getter]
+    fn pool(&self, py: Python<'_>) -> Py<PyLiquidityPool> {
+        self.pool.clone_ref(py)
+    }
+
+    /// The auto-assigned pool id.
+    #[getter]
+    const fn pool_id(&self) -> u64 {
+        self.pool_id
+    }
+
+    /// The requested family tag.
+    #[getter]
+    fn family(&self) -> String {
+        self.family.clone()
+    }
+
+    /// The normalized variant echo the core registered.
+    #[getter]
+    fn variant(&self) -> String {
+        self.variant.clone()
+    }
+
+    /// Token0 (empty for the multi-token families).
+    #[getter]
+    fn token0(&self) -> String {
+        self.token0.clone()
+    }
+
+    /// Token1 (empty for the multi-token families).
+    #[getter]
+    fn token1(&self) -> String {
+        self.token1.clone()
+    }
+
+    /// The FULL registered token set, canonical order.
+    #[getter]
+    fn tokens(&self) -> Vec<String> {
+        self.tokens.clone()
+    }
+}
+
+/// The one construction request (ADR-085 D2).
+///
+/// The identity a caller resolved plus the per-family hints, carried as ONE value
+/// instead of a positional/string-kwarg protocol: the family is a field the core
+/// dispatches on, not the verb's name or its argument order.
+#[pyclass(name = "PoolConstructionRequest", module = "apexbot._ffi")]
+pub struct PyPoolConstructionRequest {
+    /// The pool address the request builds.
+    address: String,
+    /// The family tag the core dispatches on.
+    family: String,
+    /// The variant the resolver identified (within the family).
+    variant: Option<String>,
+    /// The snapshot block (`None` = chain head, resolved core-side).
+    block: Option<u64>,
+    /// Whether the DB tick-map arm may seed the construction.
+    db: bool,
+    /// V3 factory rungs for the address→identity derivation.
+    factories: Vec<String>,
+    /// Curve registry addresses for the LP-token/metapool lookups.
+    registries: Vec<String>,
+    /// Balancer V2 Vault address (the `weighted`/`balancer_stable` families).
+    vault: Option<String>,
+    /// The requested invariant version (family-specific).
+    invariant_version: Option<u8>,
+    /// The V4 on-chain pool id (normalized lowercase `0x`-prefixed 64-hex;
+    /// the `managed_v4` family, validated at construction).
+    pool_id: Option<String>,
+    /// V4 identity overrides (the DB two-step's fallback): the currency pair.
+    tokens: Option<Vec<String>>,
+    /// V4 identity overrides: the pool-key fee.
+    fee: Option<u32>,
+    /// V4 identity overrides: the tick spacing.
+    tick_spacing: Option<i32>,
+    /// V4 identity overrides: the hook contract address.
+    hook_address: Option<String>,
+    /// V4 identity overrides: the `StateView` contract address.
+    state_view_address: Option<String>,
+}
+
+impl PyPoolConstructionRequest {
+    /// Assemble a request (the per-family constructors are this type's only
+    /// Python entry points, so a family's required hints are checked where the
+    /// family is chosen rather than where the request is consumed).
+    #[expect(clippy::too_many_arguments)] // the assembler every constructor funnels through
+    fn make(
+        address: &str,
+        family: &str,
+        variant: Option<&str>,
+        block: Option<u64>,
+        db: bool,
+        factories: Option<Vec<String>>,
+        registries: Option<Vec<String>>,
+        vault: Option<String>,
+        invariant_version: Option<u8>,
+    ) -> Self {
+        Self {
+            address: String::from(address),
+            family: String::from(family),
+            variant: variant.map(str::to_string),
+            block,
+            db,
+            factories: factories.unwrap_or_default(),
+            registries: registries.unwrap_or_default(),
+            vault,
+            invariant_version,
+            pool_id: None,
+            tokens: None,
+            fee: None,
+            tick_spacing: None,
+            hook_address: None,
+            state_view_address: None,
+        }
+    }
+}
+
+#[pymethods]
+impl PyPoolConstructionRequest {
+    /// A Uniswap-style V2 constant-product pool.
+    #[staticmethod]
+    #[pyo3(signature = (address, *, block=None, db=true))]
+    fn v2(address: &str, block: Option<u64>, db: bool) -> Self {
+        Self::make(
+            address,
+            "constant_product",
+            None,
+            block,
+            db,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// An Aerodrome V2 (volatile/stable) pool.
+    #[staticmethod]
+    #[pyo3(signature = (address, *, block=None, db=true))]
+    fn aerodrome_v2(address: &str, block: Option<u64>, db: bool) -> Self {
+        Self::make(
+            address,
+            "constant_product",
+            Some("aerodrome"),
+            block,
+            db,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A positively identified pool whose shape no construction arm models —
+    /// a Balancer Vault pool that is neither weighted nor stable (a linear
+    /// pool, a boosted pool's linear constituent, a gyro/quant-amm shape).
+    /// The request exists so the refusal reaches the seam under THIS
+    /// identity's own name, never another family's builder failure.
+    #[staticmethod]
+    #[pyo3(signature = (address, *, block=None, db=true))]
+    fn unmodeled(address: &str, block: Option<u64>, db: bool) -> Self {
+        Self::make(
+            address,
+            "unmodeled",
+            None,
+            block,
+            db,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A Balancer V2 weighted pool — `vault` is required, so it cannot be
+    /// omitted at construction.
+    #[staticmethod]
+    #[pyo3(signature = (address, vault, *, block=None, db=true))]
+    fn weighted(address: &str, vault: &str, block: Option<u64>, db: bool) -> Self {
+        Self::make(
+            address,
+            "weighted",
+            Some("balancer_weighted"),
+            block,
+            db,
+            None,
+            None,
+            Some(vault.to_string()),
+            None,
+        )
+    }
+
+    /// A Balancer V2 stable pool — `vault` is required.
+    #[staticmethod]
+    #[pyo3(signature = (address, vault, *, block=None, db=true))]
+    fn balancer_stable(address: &str, vault: &str, block: Option<u64>, db: bool) -> Self {
+        Self::make(
+            address,
+            "stableswap",
+            Some("balancer_stable"),
+            block,
+            db,
+            None,
+            None,
+            Some(vault.to_string()),
+            None,
+        )
+    }
+
+    /// A Curve `StableSwap` pool — `registries` is required (the LP-token and
+    /// metapool lookups have no default).
+    #[staticmethod]
+    #[pyo3(signature = (address, registries, *, block=None, db=true))]
+    fn curve(address: &str, registries: Vec<String>, block: Option<u64>, db: bool) -> Self {
+        Self::make(
+            address,
+            "stableswap",
+            None,
+            block,
+            db,
+            None,
+            Some(registries),
+            None,
+            None,
+        )
+    }
+
+    /// A Uniswap V3 concentrated-liquidity pool.
+    #[staticmethod]
+    #[pyo3(signature = (address, *, factories=None, invariant_version=None, block=None, db=true))]
+    fn concentrated_liquidity(
+        address: &str,
+        factories: Option<Vec<String>>,
+        invariant_version: Option<u8>,
+        block: Option<u64>,
+        db: bool,
+    ) -> Self {
+        Self::make(
+            address,
+            "concentrated_liquidity",
+            None,
+            block,
+            db,
+            factories,
+            None,
+            None,
+            invariant_version,
+        )
+    }
+
+    /// A V4 managed pool keyed by its `PoolManager` + on-chain pool id —
+    /// `pool_id` is required and validated HERE (ADR-085 D3: a family's
+    /// required hint is an argument, not a runtime check at the verb). The
+    /// identity overrides fill the DB two-step's gaps for a pool not in the
+    /// database.
+    #[staticmethod]
+    #[pyo3(signature = (pool_manager, pool_id, *, tokens=None, fee=None, tick_spacing=None, hook_address=None, state_view_address=None, block=None, db=true))]
+    #[expect(clippy::too_many_arguments)]
+    fn managed_v4(
+        pool_manager: &str,
+        pool_id: &str,
+        tokens: Option<Vec<String>>,
+        fee: Option<u32>,
+        tick_spacing: Option<i32>,
+        hook_address: Option<String>,
+        state_view_address: Option<String>,
+        block: Option<u64>,
+        db: bool,
+    ) -> PyResult<Self> {
+        // Fail fast on a malformed id, and normalize so the single-flight
+        // key and the core's parse see ONE spelling.
+        let pid = hex_string_to_pool_id(pool_id)?;
+        let mut request = Self::make(
+            pool_manager,
+            "managed_v4",
+            None,
+            block,
+            db,
+            None,
+            None,
+            None,
+            None,
+        );
+        request.pool_id = Some(format!("0x{}", alloy::hex::encode(pid)));
+        request.tokens = tokens;
+        request.fee = fee;
+        request.tick_spacing = tick_spacing;
+        request.hook_address = hook_address;
+        request.state_view_address = state_view_address;
+        Ok(request)
+    }
+
+    /// The pool address the request builds.
+    #[getter]
+    fn address(&self) -> String {
+        self.address.clone()
+    }
+
+    /// The family tag the core dispatches on.
+    #[getter]
+    fn family(&self) -> String {
+        self.family.clone()
+    }
+
+    /// The variant the resolver identified.
+    #[getter]
+    fn variant(&self) -> Option<String> {
+        self.variant.clone()
+    }
+
+    /// The snapshot block (`None` = chain head, resolved core-side).
+    #[getter]
+    const fn block(&self) -> Option<u64> {
+        self.block
+    }
+
+    /// Whether the DB tick-map arm may seed the construction.
+    #[getter]
+    const fn db(&self) -> bool {
+        self.db
+    }
+
+    /// V3 factory rungs for the address→identity derivation.
+    #[getter]
+    fn factories(&self) -> Vec<String> {
+        self.factories.clone()
+    }
+
+    /// Curve registry addresses for the LP-token/metapool lookups.
+    #[getter]
+    fn registries(&self) -> Vec<String> {
+        self.registries.clone()
+    }
+
+    /// Balancer V2 Vault address (the `weighted`/`balancer_stable` families).
+    #[getter]
+    fn vault(&self) -> Option<String> {
+        self.vault.clone()
+    }
+
+    /// The requested invariant version (family-specific).
+    #[getter]
+    const fn invariant_version(&self) -> Option<u8> {
+        self.invariant_version
+    }
+
+    /// The V4 on-chain pool id (`None` off the `managed_v4` family).
+    #[getter]
+    fn pool_id(&self) -> Option<String> {
+        self.pool_id.clone()
+    }
+
+    /// V4 identity overrides: the currency pair.
+    #[getter]
+    fn tokens(&self) -> Option<Vec<String>> {
+        self.tokens.clone()
+    }
+
+    /// V4 identity overrides: the pool-key fee.
+    #[getter]
+    const fn fee(&self) -> Option<u32> {
+        self.fee
+    }
+
+    /// V4 identity overrides: the tick spacing.
+    #[getter]
+    const fn tick_spacing(&self) -> Option<i32> {
+        self.tick_spacing
+    }
+
+    /// V4 identity overrides: the hook contract address.
+    #[getter]
+    fn hook_address(&self) -> Option<String> {
+        self.hook_address.clone()
+    }
+
+    /// V4 identity overrides: the `StateView` contract address.
+    #[getter]
+    fn state_view_address(&self) -> Option<String> {
+        self.state_view_address.clone()
+    }
+}
+
+#[pymethods]
+impl PyBot {
+    /// Construct + register a pool of ANY family through ONE entry — the
+    /// construction switchboard's FFI face (ADR-059 D6: dispatch at the tier
+    /// boundary, then monomorphic). The Python driver resolves the pool's
+    /// `(family, variant)` identity (DB descriptor or on-chain probe) and
+    /// hands it here; this adapter dispatches to the already-shipped
+    /// per-family core builders so a NEW family is a new arm here — never a
+    /// new branch in the Python driver.
+    ///
+    /// Returns the one construction answer ([`PyConstructionOutcome`]): the
+    /// registered handle, its pool id, the registered family, and the identity
+    /// echo — so a caller never re-reads the registry for the handle nor
+    /// re-derives what the core already registered. `tokens` is the FULL
+    /// registered token set (the companion loop iterates it, ADR-085 D5);
+    /// `token0`/`token1` stay the pair-keyed families' pair echo.
+    ///
+    /// # Errors
+    ///
+    /// As the dispatched per-family builder; `ValueError` on an unknown family
+    /// or a missing required argument (Balancer's `vault`).
+    fn construct_pool(
+        &self,
+        py: Python<'_>,
+        request: &PyPoolConstructionRequest,
+    ) -> PyResult<PyConstructionOutcome> {
+        let echo = self.construct_pool_payload(py, request)?;
+        let pool = self.get_pool(py, echo.pool_id).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "construct_pool: registration answered pool id {} with no handle",
+                echo.pool_id
+            ))
+        })?;
+        Ok(PyConstructionOutcome {
+            pool: Py::new(py, pool)?,
+            pool_id: echo.pool_id,
+            family: request.family.clone(),
+            variant: echo.variant,
+            token0: echo.token0,
+            token1: echo.token1,
+            tokens: echo.tokens,
+        })
+    }
+}
+
+impl PyBot {
+    /// The construction switchboard's payload arm: the flat per-family dispatch
+    /// ([`Self::construct_pool`] wraps it into the one answer). Not a pymethod:
+    /// the seam presents one construction verb.
+    fn construct_pool_payload(
+        &self,
+        py: Python<'_>,
+        request: &PyPoolConstructionRequest,
+    ) -> PyResult<ConstructionEcho> {
+        let address = request.address.as_str();
+        let family = request.family.as_str();
+        let variant = request.variant.as_deref();
+        let block = request.block;
+        let db = request.db;
+        // An empty hint list is "the caller supplied none": the route plan
+        // reads `Option` (absent = the generic-only route).
+        let factories = (!request.factories.is_empty()).then(|| request.factories.clone());
+        // An identity the engine does not model: a positively probed Balancer
+        // Vault pool (`getPoolId()` answered) whose family probe did not, so
+        // neither weighted nor stable — a linear pool, a boosted pool's linear
+        // constituent, a gyro/quant-amm shape. There is no shape to build, so
+        // the refusal rides the ledger's spec taxonomy under the identity's
+        // own name. Routing it through any other family's builder instead
+        // reports that builder's failure for a pool the family never owned
+        // (the measured mislabel was the Curve arm's "curve required read
+        // reverted").
+        if family == "unmodeled" {
+            return Err(map_refusal(RefusalKind::unbuilt_spec_refusal(
+                SpecRefusal::BalancerUnmodeledFamily,
+            )));
+        }
+        let addr = parse_address(address)?;
+        // The DB tick-map handle (the V3 `Tracked` arm) lives as long as the
+        // request that borrows it.
+        let db_arc: Option<std::sync::Arc<apexbot_db::snapshot_db::SnapshotDb>> =
+            if family == "concentrated_liquidity" && db {
+                self.db_handle()
+            } else {
+                None
+            };
+        let db_ref: Option<&dyn apexbot_db::snapshot::TickMapDb> = db_arc
+            .as_deref()
+            .map(|d| d as &dyn apexbot_db::snapshot::TickMapDb);
+        let (construction, pair_echo) =
+            Self::translate_construction_request(request, addr, db_ref)?;
+        let family_tag = construction.family();
+        // The V4 family is `(pool_manager, pool_id)`-keyed — two pools on one
+        // manager are distinct single flights (the retired verb's key shape).
+        let flight_target = if family == "managed_v4" {
+            format!(
+                "{}:{}",
+                addr.to_checksum(None).to_lowercase(),
+                request
+                    .pool_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+            )
+        } else {
+            addr.to_checksum(None).to_lowercase()
+        };
+        let key = build_flights::FlightKey(
+            Self::flight_family_of(family, variant),
+            self.bot.chain_id(),
+            flight_target,
+        );
+        self.run_flight(
+            py,
+            &key,
+            // The registry-of-record pre-check: ONE shaping for every
+            // family (the V4 keyed read rides inside it, so the PRG-2
+            // admission-gate consult surfaces HERE, before any build work).
+            || self.registered_echo(py, family, variant, &addr, request.pool_id.as_deref()),
+            || {
+                // The io fetch is core-owned; the failure maps to the
+                // method-prefixed legacy `RuntimeError`.
+                let io = py
+                    .detach(|| self.bot.require_construction_io())
+                    .map_err(|_| map_no_construction_io("construct_pool"))?;
+                // The construction route (pool-construction card): the
+                // cockpit's resolved route (the ordered factory rungs) rides
+                // the call; an absent list is the generic-only route (the
+                // behavior-preserving default).
+                let plan = route::ConstructionRoute {
+                    factories: factories
+                        .clone()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|f| parse_address(f).ok())
+                        .collect(),
+                    generic: true,
+                };
+                // The get-or-register + route order + build + register
+                // choreography is core-owned ([`Bot::construct_pool`]); the
+                // GIL is released across the whole scope.
+                let constructed = py
+                    .detach(|| {
+                        apexbot_core::runtime::get_runtime().block_on(self.bot.construct_pool(
+                            &plan,
+                            construction,
+                            &io,
+                            block,
+                        ))
+                    })
+                    .into_result()
+                    .map_err(|refusal| {
+                        map_build_refusal(
+                            "construct_pool",
+                            RefusalKind::from_construction_refusal(&refusal, Some(family_tag)),
+                        )
+                    })?;
+                let pool_id = constructed.pool_id;
+                let echo = self.shape_outcome_echo(
+                    py,
+                    pool_id,
+                    constructed.built.as_ref(),
+                    pair_echo,
+                    family,
+                    variant,
+                    &addr,
+                    request.pool_id.as_deref(),
+                )?;
+                Ok((pool_id, echo))
+            },
+        )
+    }
+}
+
+// (The `resolve_v4_identity` / `build_v4_pool` pymethod pair retired with
+// the V4 fold: ONE `construct_pool` request carries the identity overrides,
+// the core door resolves + builds + registers, and the registered handle is
+// self-describing — no two-call choreography, no caller-supplied-identity
+// echo to guard.)
+#[pymethods]
+impl PyBot {
+    /// Prototype test-only V2 registration that bypasses CREATE2 verification.
+    /// Wire to a new method on Python so tests can build a synthetic V2 pool.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn register_v2_pool_test_only(
+        &self,
+        address: &str,
+        token0: &str,
+        token1: &str,
+        reserve0: &Bound<'_, PyAny>,
+        reserve1: &Bound<'_, PyAny>,
+        gamma_numer0: u64,
+        fee_denom0: u64,
+        gamma_numer1: u64,
+        fee_denom1: u64,
+        factory: &str,
+        update_block: u64,
+        variant: &str,
+        stable_swap: bool,
+        fee_denominator: Option<u64>,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let t0 = parse_address(token0)?;
+        let t1 = parse_address(token1)?;
+        let fac = parse_address(factory)?;
+        let r0 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve0)?,
+            "reserve0",
+        )?;
+        let r1 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve1)?,
+            "reserve1",
+        )?;
+        let variant_enum = DexVariant::try_from(variant)
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        // T1-scan-exempt: test-only seam (pure-Rust test callers, no GIL held).
+        self.bot
+            .state_arc()
+            .write_at(apexbot_substrate::state_lock::LockSite::Python)
+            .register_v2_pool(&RegisterV2PoolParams {
+                address: addr,
+                token0: t0,
+                token1: t1,
+                reserve0: r0,
+                reserve1: r1,
+                fee_token0: (gamma_numer0, fee_denom0),
+                fee_token1: (gamma_numer1, fee_denom1),
+                factory: fac,
+                deployer: fac,
+                init_hash: alloy::primitives::B256::default(),
+                update_block,
+                variant: variant_enum,
+                stable_swap,
+                fee_denominator,
+            })
+            .map_err(|err| map_register_v2_err(&err))
+    }
+
+    /// Update a V2 pool's reserves from a Sync event.
+    #[pyo3(signature = (address, reserve0, reserve1, block_number))]
+    fn update_v2_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        reserve0: &Bound<'_, PyAny>,
+        reserve1: &Bound<'_, PyAny>,
+        block_number: u64,
+    ) -> PyResult<()> {
+        let addr = parse_address(address)?;
+        let r0 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve0)?,
+            "reserve0",
+        )?;
+        let r1 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve1)?,
+            "reserve1",
+        )?;
+
+        // The write guard is core-owned ([`Bot::update_v2_pool`],
+        // LockSite::Core) under this py.detach (inversion class).
+        py.detach(|| self.bot.update_v2_pool(addr, r0, r1, block_number));
+        Ok(())
+    }
+
+    /// Calculate the output token amount for a given input amount.
+    ///
+    /// Raises `ValueError` when the swap math overflows a `uint256` intermediate
+    /// (mirrors on-chain `getAmountOut` `SafeMath` revert — cdbc03bb). A V3/V4
+    /// sparse-map miss is still mapped to 0; callers needing the miss surfaced
+    /// use `calculate_tokens_out_with_fetch` on the pool handle.
+    #[pyo3(signature = (pool_id, zero_for_one, amount_in))]
+    fn calculate_tokens_out(
+        &self,
+        py: Python<'_>,
+        pool_id: u64,
+        zero_for_one: bool,
+        amount_in: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let amount = crate::conversion::alloy::extract_python_u256(amount_in)?;
+        // The request assembly (sign convention), the write guard (the
+        // sparse-miss recovery fills words), the SwapRead classification, and
+        // the legacy 0-on-miss contract are core-owned
+        // ([`Bot::calculate_tokens_out`]); the GIL is released across it
+        // (inversion class).
+        let out = py
+            .detach(|| self.bot.calculate_tokens_out(pool_id, zero_for_one, amount))
+            .map_err(|e| map_calc_tokens_out_err(&e))?;
+        let bound = crate::conversion::alloy::u256_to_py(py, &out)?;
+        Ok(bound.unbind())
+    }
+
+    /// Calculate the raw stableswap `get_dy` for a Curve pool (Rust-owned).
+    /// Backs the companion `CurveStableswapPool
+    /// .get_dy` so no Python provider / cache / calculator is on the path.
+    ///
+    /// Args:
+    ///     `pool_id`: The pool ID returned by `register_curve_pool`.
+    ///     `i`/`j`: Coin indices.
+    ///     `dx`: Input amount (Python int).
+    ///     `block_number`: Block to resolve against.
+    ///     `override_balances`: Optional `list[int]` to use as the balance
+    ///         source instead of the pool's current balances.
+    ///
+    /// Returns:
+    ///     The raw `dy` output amount as a Python int.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (pool_id, i, j, dx, block_number, override_balances=None))]
+    fn curve_get_dy(
+        &self,
+        py: Python<'_>,
+        pool_id: u64,
+        i: usize,
+        j: usize,
+        dx: &Bound<'_, PyAny>,
+        block_number: u64,
+        override_balances: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let amount = crate::conversion::alloy::extract_python_u256(dx)?;
+        let overrides = match override_balances {
+            Some(list) => {
+                let cast = list.cast::<PyList>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err("override_balances must be a list[int]")
+                })?;
+                Some(extract_u256_list(cast)?)
+            }
+            None => None,
+        };
+        // The read guard is core-owned ([`Bot::curve_get_dy`],
+        // LockSite::Core); the typed error passes through so the shell's
+        // `Debug`-format `ValueError` surface is unchanged.
+        let out = py
+            .detach(|| {
+                self.bot
+                    .curve_get_dy(pool_id, i, j, amount, block_number, overrides.as_deref())
+            })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:?}")))?;
+        let bound = crate::conversion::alloy::u256_to_py(py, &out)?;
+        Ok(bound.unbind())
+    }
+
+    /// Calculate the required input token amount for a given output amount.
+    ///
+    /// Args:
+    ///     `pool_id`: The pool ID returned by `register_v2_pool`.
+    ///     `zero_for_one`: True for token0→token1, False for token1→token0.
+    ///     `amount_out`: Desired output token amount (Python int).
+    ///
+    /// Returns:
+    ///     The required input token amount as a Python int.
+    #[pyo3(signature = (pool_id, zero_for_one, amount_out))]
+    fn calculate_tokens_in(
+        &self,
+        py: Python<'_>,
+        pool_id: u64,
+        zero_for_one: bool,
+        amount_out: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let amount = crate::conversion::alloy::extract_python_u256(amount_out)?;
+        // ADR-037: the exact-output request assembly (positive
+        // user-perspective; the required input rides back as the consumed
+        // magnitude), the write guard, and the SwapRead→result classification
+        // (legacy 0-on-miss, typed family gap) are core-owned
+        // ([`Bot::calculate_tokens_in`]); the GIL is released across it
+        // (inversion class).
+        let result = py
+            .detach(|| self.bot.calculate_tokens_in(pool_id, zero_for_one, amount))
+            .map_err(|e| map_calc_tokens_in_err(&e))?;
+        let bound = crate::conversion::alloy::u256_to_py(py, &result)?;
+        Ok(bound.unbind())
+    }
+
+    /// Number of registered pools.
+    fn pool_count(&self, py: Python<'_>) -> usize {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.pool_count())
+    }
+
+    /// The chain this `PyBot` orchestrates (ADR-006 D4). Wired from the
+    /// single-chain Python `Bot` facade's ``config.default_chain_id``; `0` on
+    /// the bare-test-fixture path (see `PyBot::new`).
+    #[getter]
+    fn chain_id(&self) -> u64 {
+        self.bot.chain_id()
+    }
+
+    /// Drive a raw REORGED (`removed: true`) WS log through the reorg path.
+    ///
+    /// The WS twin of [`PyBot::dispatch_log`] and the Python-facing mirror of
+    /// the `BlockPump`'s removed-log branch: the log is decoded (the same
+    /// `LogDispatcher` decode half, `Bot::try_decode_log`) to resolve its
+    /// `pool_id` WITHOUT applying it forward, then the production
+    /// `ReorgCoordinator` restores that pool's state to just before the log's
+    /// block from its reorg journal and records the pool into the epoch
+    /// `EpochDelta` ledger.
+    ///
+    /// A separate door rather than a `removed=` flag on `dispatch_log` because
+    /// the two production call sites differ in more than the flag: forward
+    /// dispatch has no verdict, while a reorg restore returns an action AND
+    /// can fail hard (a too-deep reorg). The shell keeps that split.
+    ///
+    /// Args:
+    ///     `address`: Emitter contract address (hex string, `0x` optional).
+    ///     `topics`: Log topics (hex strings, `0x` optional).
+    ///     `data`: ABI-encoded log data (hex string, `0x` optional).
+    ///     `block_number`: Block number the reorged log belonged to; the
+    ///         journal restores to its pre-block state.
+    ///
+    /// Returns:
+    ///     `"restored"` when journal deltas were popped and the live state
+    ///     changed, `"noop"` otherwise (an idempotent replay whose newest
+    ///     delta is already before the target, or a log the registry does not
+    ///     decode / a pool it does not know — the forward-dispatch no-op).
+    ///
+    /// Raises:
+    ///     `ValueError`: If the log fields do not parse, or the target is at
+    ///         or below the journal's earliest delta (a too-deep reorg —
+    ///         production shuts the pump down on it; a driver gets the raise).
+    #[pyo3(signature = (address, topics, data, block_number=0))]
+    fn dispatch_reorg_log(
+        &self,
+        address: &str,
+        topics: Vec<String>,
+        data: &str,
+        block_number: u64,
+    ) -> PyResult<&'static str> {
+        let mut log = apexbot_bot::bot_core::build_rpc_log(address, topics, data, block_number)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        // `removed` is the ONE field a reorg log differs by: the decoders read
+        // topics/data/block, and the coordinator consumes only the block +
+        // pool identity.
+        log.removed = true;
+        let coordinator = apexbot_bot::bot_core::reorg_coordinator::ReorgCoordinator::new(
+            std::sync::Arc::clone(&self.bot),
+        );
+        match coordinator.dispatch_reorg_log(&log, None) {
+            Ok(apexbot_bot::bot_core::reorg_coordinator::ReorgOutcome::Restored) => Ok("restored"),
+            Ok(apexbot_bot::bot_core::reorg_coordinator::ReorgOutcome::IdempotentNoop) => {
+                Ok("noop")
+            }
+            Err(e) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dispatch_reorg_log: {e:?}"
+            ))),
+        }
+    }
+
+    /// Drive a raw WS log through the event bus (ADR-006 D4).
+    ///
+    /// This is the Python-facing mirror of the `BlockPump`'s per-log call to
+    /// `Bot::dispatch_log`: decode via the registered `LogDecoder`s, apply the
+    /// decoded event to the shared `BotState` under a write guard, release it,
+    /// then record the touched pool into the `EpochDelta` ledger so
+    /// the next solve reads fresh keys.
+    ///
+    /// Reconstructs an `alloy::rpc::types::Log` from the WS-log shape Python
+    /// passes — `(address, topics, data, block_number)` — so an offline test
+    /// can drive the full pump→dispatch→solve loop without a live node.
+    /// No-op if no decoder recognizes the log or the pool isn't registered.
+    ///
+    /// Args:
+    ///     `address`: Emitter contract address (hex string, `0x` optional).
+    ///     `topics`: Log topics (hex strings, `0x` optional). `topics[0]` is
+    ///         the event signature hash the decoders match against.
+    ///     `data`: ABI-encoded log data (hex string, `0x` optional).
+    ///     `block_number`: Block number the synthetic log belongs to.
+    #[pyo3(signature = (address, topics, data, block_number=0))]
+    fn dispatch_log(
+        &self,
+        address: &str,
+        topics: Vec<String>,
+        data: &str,
+        block_number: u64,
+    ) -> PyResult<()> {
+        let log = apexbot_bot::bot_core::build_rpc_log(address, topics, data, block_number)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        self.bot.dispatch_log(&log);
+        Ok(())
+    }
+
+    /// Get a thin `PyLiquidityPool` handle for the given pool ID.
+    ///
+    /// Args:
+    ///     `pool_id`: The pool ID returned by `register_v2_pool`.
+    ///
+    /// Returns:
+    ///     A `PyLiquidityPool` handle, or `None` if the pool ID is not registered.
+    fn get_pool(&self, py: Python<'_>, pool_id: u64) -> Option<PyLiquidityPool> {
+        // GIL hygiene: the has_pool read runs under this py.detach via the core.
+        if py.detach(|| self.bot.has_pool(pool_id)) {
+            Some(PyLiquidityPool::new(
+                self.bot.state_arc(),
+                pool_id,
+                self.bot.chain_id(),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Unregister a V2/V3 pool by its contract address.
+    ///
+    /// ADR-007 U3. Drops the `PoolEntry`, its reorg journal, its index entry,
+    /// and any buffered V3 liquidity events for the address so a re-register
+    /// does not replay stale Mint/Burn onto the fresh pool. `next_pool_id` is
+    /// not reused — removed ids are retired to prevent stale `PyLiquidityPool`
+    /// handles aliasing to a different pool on recreate.
+    ///
+    /// V2/V3 path only — `PyBot` exposes `register_v2/v3_pool` (no V4;
+    /// V4 registration lives on the engine wrapper, and its symmetric
+    /// unregister belongs there too — see ADR-007 Consequences).
+    ///
+    /// Returns `True` if a pool was found and removed; `False` if the address
+    /// was never registered (silent no-op, mirroring Python `PoolRegistry.remove`).
+    /// Register stays refusal-on-panic for duplicates (ADR-007 U2) — the
+    /// asymmetry reflects the asymmetry in the operations' invariants.
+    ///
+    /// Args:
+    ///     `address`: The V2/V3 pool contract address (checksum or 0x-hex).
+    ///     `pool_id`: Reserved — must be `None` on `PyBot`. (V4 tuple-key
+    ///         unregister is engine-side; kept in the signature for parity
+    ///         with `BotState::unregister_pool`.)
+    ///
+    /// Raises:
+    ///     `ValueError`: If `address` cannot be parsed.
+    #[pyo3(signature = (address, pool_id=None))]
+    #[expect(clippy::needless_pass_by_value)] // PyO3 binding idiom for optional bytes
+    fn unregister_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        pool_id: Option<Vec<u8>>,
+    ) -> PyResult<bool> {
+        let addr = parse_address(address)?;
+        // V4 on PyBot is intentionally not exposed: registration for V4 lives
+        // on the engine wrapper (bot::engine), so the symmetric V4 unregister
+        // belongs there too (ADR-007 Consequences / Deferred). A `Some` here
+        // would be a caller bug — surface it rather than silently no-op.
+        if pool_id.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Bot.unregister_pool does not handle V4 (pool_id set); \
+                 V4 unregister is engine-side — use the engine’s unregister path.",
+            ));
+        }
+        // The write guard is acquired inside the core method under this
+        // py.detach — the GIL is released while parked on the BotState
+        // write.
+        Ok(py.detach(|| self.bot.unregister_pool(PoolLookup::from_address(addr))))
+    }
+
+    /// Assemble a V3 pool's tick map from the stored DB snapshot (`Store → Db`
+    /// precedence — Decision 6 (B)). Returns
+    /// `(tick_data, coverage)` on a hit, `None` on a miss (caller runs Branch 3
+    /// sparse RPC and registers inline). Raises `RuntimeError` on a Db read
+    /// failure — Decision 8 (A): loud error over silent degrade.
+    ///
+    /// `tick_data` has the same `{tick: (liquidity_gross, liquidity_net, block)}`
+    /// shape as `register_v3_pool`'s `tick_data` arg, so the builder can pass
+    /// the returned dict straight back into `register_v3_pool`. Coverage is
+    /// `"tracked"` on a hit (Store or Db).
+    ///
+    /// **Two-phase lock protocol**: `BotState`'s read guard is held only for
+    /// the `SnapshotStore::take` (brief `Mutex` lock); the Db read inside the
+    /// core helper runs with NO `BotState` lock held (the live pump's
+    /// `state.write()` is not blocked). The GIL is released across the Db read.
+    ///
+    /// Args:
+    ///   address: the V3 pool's contract address (checksummed or lowercase hex).
+    ///   tick: the pool's current tick (drives the Chain arm's word computation).
+    ///   `tick_spacing`: the pool's tick spacing (drives active-tick computation).
+    ///   block: the snapshot block for the Chain arm's RPC reads.
+    ///   io: optional `PyBotIo` whose native alloy provider backs the Chain arm.
+    ///     `None` (or a non-alloy provider) → no Chain arm (Store + Db only).
+    #[pyo3(signature = (address, tick=0, tick_spacing=0, block=0, io=None))]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "PyO3 passes the pyclass Bound by value; borrow is internal"
+    )]
+    fn assemble_v3_tick_map<'py>(
+        &self,
+        py: Python<'py>,
+        address: &str,
+        tick: i64,
+        tick_spacing: i64,
+        block: u64,
+        io: Option<pyo3::Bound<'_, crate::bot::py_bot_io::PyBotIo>>,
+    ) -> PyResult<Option<(Bound<'py, PyDict>, String)>> {
+        let addr = parse_address(address)?;
+        let tick_i32 = i32::try_from(tick)
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("tick out of int24 range"))?;
+        let spacing_i32 = i32::try_from(tick_spacing)
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("tick_spacing out of range"))?;
+        let db = self.db_handle();
+        // extract the native alloy provider from `io` + construct an
+        // `AlloyTickWordSource` (Option B — pure-Rust choreography, no GIL
+        // re-entry per RPC). `None` when `io=None` or the provider isn't
+        // alloy-backed → Chain arm short-circuits (current behavior).
+        let chain: Option<std::sync::Arc<dyn apexbot_pools::sim::tick_fetch::TickWordSource>> =
+            io.as_ref().and_then(|io_bound| {
+                io_bound
+                    .try_borrow()
+                    .ok()
+                    .and_then(|borrowed| crate::bot::pool::make_tick_bootstrap_rpc(&borrowed))
+            });
+        let result = py.detach(|| {
+            Bot::assemble_v3_tick_map(
+                db.as_deref()
+                    .map(|d| d as &dyn apexbot_db::snapshot::TickMapDb),
+                addr,
+                tick_i32,
+                spacing_i32,
+                block,
+                chain.as_deref(),
+            )
+        });
+        let Some((rows, coverage)) = result.map_err(|e| crate::db::assembly_err_to_py(&e))? else {
+            return Ok(None);
+        };
+        let dict = build_tick_rows_py(py, &rows)?;
+        let cov_str = match coverage {
+            apexbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
+            apexbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
+        };
+        Ok(Some((dict, cov_str.to_string())))
+    }
+
+    /// Assemble a V4 pool's tick map from the stored DB snapshot — V4 twin of
+    /// [`Self::assemble_v3_tick_map`]. Same precedence, miss, and error
+    /// semantics; returns `(tick_data, coverage)` on a hit, `None` on miss,
+    /// `RuntimeError` on Db error.
+    ///
+    /// Args:
+    ///   `pool_manager`: the V4 `PoolManager` contract address (Db key).
+    ///   `pool_id`: the V4 pool id as a 32-byte hex `str` (`0x...`) or `bytes`.
+    ///   `state_view`: the V4 `StateView` contract address (Chain-arm RPC target).
+    ///   `tick`/`tick_spacing`/`block`/`io`: see [`Self::assemble_v3_tick_map`].
+    #[pyo3(signature = (pool_manager, pool_id, state_view, tick=0, tick_spacing=0, block=0, io=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::needless_pass_by_value,
+        reason = "PyO3 wrapper over the precedence helper; signature mirrors Python surface"
+    )]
+    fn assemble_v4_tick_map<'py>(
+        &self,
+        py: Python<'py>,
+        pool_manager: &str,
+        pool_id: &Bound<'_, PyAny>,
+        state_view: &str,
+        tick: i64,
+        tick_spacing: i64,
+        block: u64,
+        io: Option<pyo3::Bound<'_, crate::bot::py_bot_io::PyBotIo>>,
+    ) -> PyResult<Option<(Bound<'py, PyDict>, String)>> {
+        let mgr = parse_address(pool_manager)?;
+        let state_view_addr = parse_address(state_view)?;
+        let tick_i32 = i32::try_from(tick)
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("tick out of int24 range"))?;
+        let spacing_i32 = i32::try_from(tick_spacing)
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("tick_spacing out of range"))?;
+        // V4 pool id is `B256` ([u8; 32]); accept either a 0x-hex str or 32
+        // bytes (mirror `db/snapshot.rs::get_liquidity_map_v4`'s arg accept).
+        let pool_id_hash = if let Ok(s) = pool_id.extract::<String>() {
+            <alloy::primitives::B256 as std::str::FromStr>::from_str(&s)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad pool_id: {e}")))?
+        } else if let Ok(bytes) = pool_id.extract::<&[u8]>() {
+            if bytes.len() != 32 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "V4 pool_id bytes must be exactly 32 long, got {}",
+                    bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            alloy::primitives::B256::from(arr)
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "pool_id must be a 0x-hex str or 32-byte bytes",
+            ));
+        };
+        let db = self.db_handle();
+        let pool_id_inner: apexbot_decoders::v4_swap_decoder::V4PoolId = pool_id_hash.0; // B256 = FixedBytes<32>; .0 is [u8; 32]
+        let chain: Option<std::sync::Arc<dyn apexbot_pools::sim::tick_fetch::TickWordSource>> =
+            io.as_ref().and_then(|io_bound| {
+                io_bound
+                    .try_borrow()
+                    .ok()
+                    .and_then(|borrowed| crate::bot::pool::make_tick_bootstrap_rpc(&borrowed))
+            });
+        let result = py.detach(|| {
+            Bot::assemble_v4_tick_map(
+                db.as_deref()
+                    .map(|d| d as &dyn apexbot_db::snapshot::TickMapDb),
+                mgr,
+                state_view_addr,
+                pool_id_inner,
+                tick_i32,
+                spacing_i32,
+                block,
+                chain.as_deref(),
+            )
+        });
+        let Some((rows, coverage)) = result.map_err(|e| crate::db::assembly_err_to_py(&e))? else {
+            return Ok(None);
+        };
+        let dict = build_tick_rows_py(py, &rows)?;
+        let cov_str = match coverage {
+            apexbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
+            apexbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
+        };
+        Ok(Some((dict, cov_str.to_string())))
+    }
+
+    /// Register a V3 pool by contract address.
+    ///
+    /// Returns the auto-assigned pool ID.
+    #[expect(clippy::too_many_arguments)]
+    /// Register a V3 pool, optionally seeding `tick_data` inline.
+    ///
+    /// ADR-006 rolling-start race closure: the builder previously registered
+    /// with an empty `tick_data` THEN seeded the snapshot through a separate
+    /// pool write. Because ``resume()`` runs before ``build_paths``, a pump
+    /// Mint/Burn landing between register and seed was applied to the empty
+    /// `tick_data` then CLOBBERED by the seed overwrite — a lost update the
+    /// on-chain ``verify_liquidity_maps`` reproduces. Folding the seed into
+    /// ``register_v3_pool`` (one ``BotState`` write lock) closes the window:
+    /// the pool is never visible to the pump in an unseeded state, so pump
+    /// events always land on top of the seed and are never overwritten.
+    ///
+    /// `tick_data` is ``{tick: (liquidity_gross, liquidity_net, block)}``
+    /// (symmetric with ``PyLiquidityPool.tick_data_snapshot``).
+    /// `coverage` is ``"tracked"`` (complete DB snapshot) or ``"sparse"``
+    /// (RPC-fetched active word only / no snapshot).
+    ///
+    /// `known_bitmap_words` are the tick-bitmap WORD positions the caller
+    /// looked up on-chain and found EMPTY. They are seeded INLINE (same write
+    /// lock as the `tick_data` seed), so a checked word is never re-fetched —
+    /// no post-register seed call is needed. Any iterable of word ints (a
+    /// `list`/`set`/`tuple`, or a `dict` whose keys are the words) works.
+    /// Sparse pools record them; Tracked pools ignore them (a complete bitmap
+    /// has no miss to prevent).
+    #[pyo3(signature = (address, token0, token1, fee, tick_spacing, factory, sqrt_price_x96, liquidity, tick, tick_data=None, update_block=0, coverage="sparse", tick_data_fetcher=None, tick_data_block=None, slot_layout=None, known_bitmap_words=None))]
+    fn register_v3_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        token0: &str,
+        token1: &str,
+        fee: u32,
+        tick_spacing: i32,
+        factory: &str,
+        sqrt_price_x96: &Bound<'_, PyAny>,
+        liquidity: &Bound<'_, PyAny>,
+        tick: i32,
+        tick_data: Option<Bound<'_, PyDict>>,
+        update_block: u64,
+        coverage: &str,
+        tick_data_fetcher: Option<Bound<'_, PyAny>>,
+        tick_data_block: Option<u64>,
+        slot_layout: Option<&str>,
+        known_bitmap_words: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let t0 = parse_address(token0)?;
+        let t1 = parse_address(token1)?;
+        let fac = parse_address(factory)?;
+        let spx = crate::conversion::alloy::extract_python_u256(sqrt_price_x96)?;
+        // liquidity is uint128 — extracted as U256 then narrowed.
+        let liq = crate::conversion::alloy::extract_python_u256(liquidity)?.to::<u128>();
+
+        // The seed boundary owns the wire shape; `None` means no seed.
+        let rust_tick_data = TickData::from_py_optional(tick_data)?;
+        let cov = match coverage {
+            "tracked" => PoolTickCoverage::Tracked,
+            "sparse" => PoolTickCoverage::Sparse,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "register_v3_pool: coverage must be 'tracked' or 'sparse', got {other:?}",
+                )));
+            }
+        };
+
+        // concentrated liquidity slot layout : an explicit "pancakeswap" override forces the
+        // PancakeV3 layout (the Python driver knows the pool class for
+        // non-JSON deployments); "uniswap"/None defer to the deployment
+        // table, resolved inside the core method. Validated BEFORE any
+        // RPC-adjacent work (cheap string check first — no malformed
+        // argument behind a CREATE2 verify).
+        let slot_override = match slot_layout {
+            Some("pancakeswap") => {
+                Some(apexbot_pools::state::v3_state::ConcentratedLiquiditySlotLayout::PancakeV3)
+            }
+            Some("uniswap") | None => None,
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "register_v3_pool: slot_layout must be 'uniswap' or 'pancakeswap', got {other:?}"
+                )));
+            }
+        };
+
+        // The CREATE2 verify (Fork A), deployer/init-hash resolution, and the
+        // write-lock acquisition live inside the door's V3 request interior.
+        // The seed fetcher is wrapped here (GIL held) — a Python callback
+        // cannot cross into the core closure — and the remaining params are
+        // all `Send`; the error is mapped to a `PyErr` OUTSIDE the detach
+        // (GIL-held) since `PyErr` construction needs the interpreter.
+        let fetcher = tick_data_fetcher
+            .filter(|f| !f.is_none())
+            .map(|f| crate::bot::pool::make_tick_fetcher(f.clone().unbind()));
+        let checked_words = extract_checked_bitmap_words(known_bitmap_words, "register_v3_pool")?;
+        py.detach(|| {
+            let slot_layout = self.bot.v3_slot_layout_for(fac, slot_override);
+            self.bot
+                .register(PoolRegistration::V3(Box::new(RegisterV3PoolParams {
+                    address: addr,
+                    token0: t0,
+                    token1: t1,
+                    fee,
+                    tick_spacing,
+                    factory: fac,
+                    sqrt_price_x96: spx,
+                    liquidity: liq,
+                    tick,
+                    tick_data: rust_tick_data,
+                    update_block,
+                    tick_data_block,
+                    coverage: cov,
+                    fetcher,
+                    slot_layout,
+                    known_bitmap_words: checked_words,
+                    ..Default::default()
+                })))
+                .map_err(map_refusal)
+        })
+    }
+
+    /// Register a V4 pool by `(pool_manager, pool_id)`.
+    ///
+    /// Returns the auto-assigned pool ID. The dynamic-fee admission floor
+    /// lives in `BotState::register_v4_pool`: pools with
+    /// dynamic fees (`fee == 0x100000`) or static fees exceeding the
+    /// executor's 2-byte encoding limit (`fee > 65535`) are rejected here,
+    /// surfacing as typed Python exceptions
+    /// (`DynamicFeePoolRejectedError` / `HighFeePoolRejectedError`) so Python
+    /// classifies by type, not string matching. Since ADR-037
+    /// amount-modifying hooked pools are ADMITTED (the ADR-037 guards use the
+    /// registered hook address at hop projection / simulation-caveat time),
+    /// and the `HookedPoolRejectedError` raise site is reserved (no longer
+    /// fires). The FULL `hook_address` rides into the registered pool key so
+    /// the identity round-trips `keccak(abi.encode(pool_key))`.
+    ///
+    /// ADR-006 rolling-start race closure: the snapshot `tick_data` is seeded
+    /// INLINE in `register_v4_pool` (one `BotState` write lock) so the pool is
+    /// never visible to the live pump (resumed before `build_paths`) in an
+    /// unseeded state. Previously the builder registered with empty `tick_data`
+    /// then seeded through a separate pool write — a pump `ModifyLiquidity`
+    /// landing between register and seed was applied then CLOBBERED by the seed
+    /// overwrite (lost update → V4 tick-map desync → `verify_liquidity_maps`
+    /// mismatch). Mirrors the V3 closure.
+    ///
+    /// Raises:
+    ///     `DynamicFeePoolRejectedError`: If `fee == 0x100000`.
+    ///     `HighFeePoolRejectedError`: If `fee > 65535` (executor can't encode).
+    ///     `ValueError`: If `addresses/pool_id` are malformed or already
+    ///         registered.
+    #[expect(clippy::too_many_arguments)]
+    /// `known_bitmap_words`: V4 twin of the V3 argument — the checked
+    /// (on-chain-empty) tick-bitmap WORD positions, seeded INLINE in the
+    /// registration (Sparse pools only; Tracked pools ignore them).
+    #[pyo3(signature = (pool_manager, pool_id_hex, currency0, currency1, fee, tick_spacing, hook_address, sqrt_price_x96, liquidity, tick, block, tick_data=None, coverage="sparse", tick_data_fetcher=None, protocol_fee=0, tick_data_block=None, known_bitmap_words=None, state_view=None))]
+    fn register_v4_pool(
+        &self,
+        py: Python<'_>,
+        pool_manager: &str,
+        pool_id_hex: &str,
+        currency0: &str,
+        currency1: &str,
+        fee: u32,
+        tick_spacing: i32,
+        // The REAL hook contract address (None/empty = no hook). Registered
+        // in the pool key in full so the identity round-trips
+        // keccak(abi.encode(pool_key)) (pool-ID mismatch regression);
+        // the derived 16-bit mask rides along in params.hook_flags.
+        hook_address: Option<&str>,
+        sqrt_price_x96: &Bound<'_, PyAny>,
+        liquidity: u128,
+        tick: i32,
+        block: u64,
+        tick_data: Option<Bound<'_, pyo3::types::PyDict>>,
+        coverage: &str,
+        tick_data_fetcher: Option<Bound<'_, PyAny>>,
+        protocol_fee: u32,
+        tick_data_block: Option<u64>,
+        known_bitmap_words: Option<&Bound<'_, PyAny>>,
+        // The V4 `StateView` contract for the pool's tick-word reads (NOT
+        // the `PoolManager`). `None` when the registering path does not know
+        // one — such pools never build a chain read key (their stored source
+        // ignores the key).
+        state_view: Option<&str>,
+    ) -> PyResult<u64> {
+        let state_view_addr = state_view
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<Address>().map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid state_view address: {e}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let pm = pool_manager.parse::<Address>().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid pool_manager address: {e}"))
+        })?;
+        let pool_id = hex_string_to_pool_id(pool_id_hex)?;
+        let c0 = currency0.parse::<Address>().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid currency0 address: {e}"))
+        })?;
+        let c1 = currency1.parse::<Address>().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid currency1 address: {e}"))
+        })?;
+        let sp = crate::conversion::alloy::extract_python_u256(sqrt_price_x96)?;
+        // Seed inline so the pool is never visible to the live pump unseeded
+        // (rolling-start race closure, ADR-006).
+        let rust_tick_data = TickData::from_py_optional(tick_data)?;
+        let cov = match coverage {
+            "tracked" => PoolTickCoverage::Tracked,
+            "sparse" => PoolTickCoverage::Sparse,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "register_v4_pool: coverage must be 'tracked' or 'sparse', got {other:?}",
+                )));
+            }
+        };
+        let hook_addr = hook_address
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<Address>().map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid hook_address: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let checked_words = extract_checked_bitmap_words(known_bitmap_words, "register_v4_pool")?;
+        let params = RegisterV4PoolParams {
+            pool_manager: pm,
+            pool_id,
+            pool_key: V4PoolKey {
+                currency0: c0,
+                currency1: c1,
+                fee,
+                tick_spacing,
+                // The REAL hook address — the identity must round-trip
+                // keccak(abi.encode(pool_key)) (pool-ID mismatch).
+                hooks: hook_addr,
+            },
+            state_view: state_view_addr,
+            hook_flags: apexbot_bot::bot_core::pool_builder::builder::derive_hook_flags(hook_addr),
+            protocol_fee,
+            sqrt_price_x96: sp,
+            liquidity,
+            tick,
+            tick_data: rust_tick_data,
+            update_block: block,
+            tick_data_block,
+            coverage: cov,
+            fetcher: tick_data_fetcher
+                .filter(|f| !f.is_none())
+                .map(|f| crate::bot::pool::make_tick_fetcher(f.clone().unbind())),
+            known_bitmap_words: checked_words,
+        };
+        // ADR-078 D3 step 3: the params ride the ONE door request and
+        // dispatch through the engine verb ([`Bot::register`]); the
+        // get-or-register key guard and the admission floor (which records
+        // the PRG-2 keyed verdicts) are core-owned behind it. The GIL is
+        // released across the verb (see `register_token`);
+        // `RegisterV4PoolParams` is `Send`, and the refusal is mapped to a
+        // `PyErr` OUTSIDE the closure via the one refusal mapper
+        // (`map_refusal`).
+        py.detach(|| self.bot.register(PoolRegistration::V4(Box::new(params))))
+            .map_err(map_refusal)
+    }
+
+    /// Register a Curve `StableSwap` pool by contract address.
+    ///
+    /// Returns the auto-assigned pool ID. The `tokens` / `rate_multipliers` /
+    /// `balances` lists must all have the same length `N` (the coin count).
+    ///
+    /// Raises:
+    ///     `ValueError`: If the pool address is malformed or already
+    ///         registered, or the list lengths mismatch.
+    #[expect(clippy::too_many_arguments)]
+    // `y_variant` / `yd_variant` mirror the public Python kwargs and the
+    // `resolve_y_variant` / `resolve_yd_variant` vocabulary in
+    // `apexbot.curve._variant_groups`; they are intentional domain terms,
+    // not a naming slip, so the `similar_names` nudge does not apply here.
+    #[expect(clippy::similar_names)]
+    #[pyo3(signature = (
+        address,
+        tokens,
+        a_coefficient,
+        a_precision,
+        fee,
+        admin_fee,
+        rate_multipliers,
+        balances,
+        update_block,
+        swap_style=0,
+        lending_rate_style=0,
+        d_variant=0,
+        y_variant=0,
+        yd_variant=0,
+        base_pool=None,
+        initial_a_coefficient=None,
+        future_a_coefficient=None,
+        initial_a_coefficient_time=None,
+        future_a_coefficient_time=None,
+        create_timestamp=None,
+        fee_gamma=None,
+        mid_fee=None,
+        offpeg_fee_multiplier=None,
+        out_fee=None,
+        gamma=None,
+        lp_token=None,
+        use_lending=None,
+        precision_multipliers=None,
+        tokens_underlying=None,
+        metapool_rate_style=1,
+        metapool_underlying_style=1,
+        data_provider=None
+    ))]
+    fn register_curve_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        tokens: &Bound<'_, PyList>,
+        a_coefficient: u128,
+        a_precision: u128,
+        fee: u64,
+        admin_fee: u64,
+        rate_multipliers: &Bound<'_, PyList>,
+        balances: &Bound<'_, PyList>,
+        update_block: u64,
+        swap_style: u8,
+        lending_rate_style: u8,
+        d_variant: u8,
+        y_variant: u8,
+        yd_variant: u8,
+        base_pool: Option<&str>,
+        initial_a_coefficient: Option<u128>,
+        future_a_coefficient: Option<u128>,
+        initial_a_coefficient_time: Option<u64>,
+        future_a_coefficient_time: Option<u64>,
+        create_timestamp: Option<u64>,
+        fee_gamma: Option<u64>,
+        mid_fee: Option<u64>,
+        offpeg_fee_multiplier: Option<u64>,
+        out_fee: Option<u64>,
+        gamma: Option<u64>,
+        lp_token: Option<&str>,
+        use_lending: Option<&Bound<'_, PyList>>,
+        precision_multipliers: Option<&Bound<'_, PyList>>,
+        tokens_underlying: Option<&Bound<'_, PyList>>,
+        metapool_rate_style: u8,
+        metapool_underlying_style: u8,
+        data_provider: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let token_addrs = parse_address_list(tokens)?;
+        let rate_mults = extract_u256_list(rate_multipliers)?;
+        let bal_vals = extract_u256_list(balances)?;
+        let base = match base_pool {
+            Some(s) => Some(parse_address(s)?),
+            None => None,
+        };
+        let lp = match lp_token {
+            Some(s) => Some(parse_address(s)?),
+            None => None,
+        };
+        let use_lend: Vec<bool> = match use_lending {
+            Some(l) => l.extract()?,
+            None => Vec::new(),
+        };
+        let prec_mults: Vec<alloy::primitives::U256> = match precision_multipliers {
+            Some(l) => extract_u256_list(l)?,
+            None => Vec::new(),
+        };
+        let tokens_under = match tokens_underlying {
+            Some(l) => Some(parse_address_list(l)?),
+            None => None,
+        };
+        let p = RegisterCurvePoolParams {
+            address: addr,
+            tokens: token_addrs,
+            a_coefficient,
+            a_precision,
+            fee,
+            admin_fee,
+            rate_multipliers: rate_mults,
+            balances: bal_vals,
+            update_block,
+            swap_style,
+            lending_rate_style,
+            d_variant,
+            y_variant,
+            yd_variant,
+            base_pool: base,
+            initial_a_coefficient,
+            future_a_coefficient,
+            initial_a_coefficient_time,
+            future_a_coefficient_time,
+            create_timestamp,
+            fee_gamma,
+            mid_fee,
+            offpeg_fee_multiplier,
+            out_fee,
+            gamma,
+            lp_token: lp,
+            use_lending: use_lend,
+            precision_multipliers: prec_mults,
+            tokens_underlying: tokens_under,
+            metapool_rate_style,
+            metapool_underlying_style,
+            data_provider: data_provider
+                .map(|b| crate::bot::pool::make_curve_data_provider(b.unbind())),
+        };
+        // ADR-078 D3 step 3: the params ride the ONE door request and
+        // dispatch through the engine verb ([`Bot::register`]) — the
+        // get-or-register reuse guard and the door's typed duplicate
+        // refusal (previously the state insert's loud panic) are core-owned
+        // behind it. The GIL is released while parked on the BotState
+        // write.
+        py.detach(|| self.bot.register(PoolRegistration::Curve(Box::new(p))))
+            .map_err(map_refusal)
+    }
+
+    /// Build + register a Curve `StableSwap` pool through the Rust `PoolBuilder`
+    /// — the Curve twin of [`Self::build_v2_pool`].
+    /// The core `builder::build_curve_pool` runs the full detection
+    /// choreography (coins + balances, `A`/`fee`/`admin_fee`, A-ramping,
+    /// lending, crypto params, `lp_token`, metapool base + underlying coins,
+    /// ERC20 decimals) and constructs a Rust `RpcCurveDataProvider` —
+    /// so the pool is registered with a **Rust-native** on-chain data
+    /// provider, not a Python `CurveDataProviderImpl`. Returns the `pool_id`
+    /// (`get_pool(id)` after this). `registry_addresses` is the list of
+    /// Curve registry/factory contract addresses consulted for the `lp_token`
+    /// / metapool lookups.
+    ///
+    /// `block` defaults to the current chain head.
+    ///
+    /// Raises:
+    ///     `RuntimeError`: No `ConstructionIo` attached (requires an alloy
+    ///         provider).
+    ///     `PoolBuildRpcError`: A builder read failed — the pool's state was
+    ///         never read, so the refusal is retryable.
+    ///     `PoolBuildDecodeError`: A builder read answered a value no pool can
+    ///         hold (permanent for the observed state).
+    #[pyo3(signature = (address, registry_addresses, block=None))]
+    fn build_curve_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        registry_addresses: &Bound<'_, PyList>,
+        block: Option<u64>,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let registry = parse_address_list(registry_addresses)?;
+        // The fetch/detect/register choreography is core-owned
+        // ([`Bot::build_and_register_curve_pool`]); the GIL is released
+        // across the whole scope.
+        py.detach(|| {
+            self.bot
+                .build_and_register_curve_pool(addr, &registry, block)
+        })
+        .map_err(|kind| map_build_refusal("build_curve_pool", kind))
+    }
+
+    /// Register a Balancer V2 weighted pool.
+    ///
+    /// Stores immutable pool config (`pool_id`, vault, tokens, weights,
+    /// `scaling_factors`, `swap_fee`, `pow_version`) + registration balances + a
+    /// genesis reorg journal delta. The Python `BalancerV2Pool` companion is
+    /// constructed over the returned `PyLiquidityPool` handle (call
+    /// `get_pool(id)` after this).
+    ///
+    /// Returns the auto-assigned numeric pool ID. `tokens` / `weights` /
+    /// `scaling_factors` / `balances` lists MUST all have length `N`.
+    ///
+    /// Raises:
+    ///     `ValueError`: If an address is malformed, the pool is already
+    ///         registered, the list lengths mismatch, or `pool_id_hex` is not
+    ///         a 32-byte hex string.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        address,
+        vault,
+        pool_id_hex,
+        tokens,
+        weights,
+        scaling_factors,
+        swap_fee,
+        pow_version,
+        balances,
+        update_block
+    ))]
+    fn register_balancer_weighted_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        vault: &str,
+        pool_id_hex: &str,
+        tokens: &Bound<'_, PyList>,
+        weights: &Bound<'_, PyList>,
+        scaling_factors: &Bound<'_, PyList>,
+        swap_fee: u128,
+        pow_version: u8,
+        balances: &Bound<'_, PyList>,
+        update_block: u64,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let vault_addr = parse_address(vault)?;
+        let pool_id_bytes = hex_string_to_pool_id(pool_id_hex)?;
+        let token_addrs = parse_address_list(tokens)?;
+        let weight_vals = extract_u256_list(weights)?;
+        let scaling_vals = extract_u256_list(scaling_factors)?;
+        let bal_vals = extract_u256_list(balances)?;
+        let p = RegisterBalancerWeightedPoolParams {
+            address: addr,
+            vault: vault_addr,
+            pool_id: pool_id_bytes,
+            tokens: token_addrs,
+            weights: weight_vals,
+            scaling_factors: scaling_vals,
+            swap_fee,
+            pow_version,
+            balances: bal_vals,
+            update_block,
+        };
+        // ADR-078 D3 step 3: the params ride the ONE door request and
+        // dispatch through the engine verb ([`Bot::register`]) — see
+        // `register_curve_pool`. The GIL is released across this py.detach —
+        // never hold the GIL while parked on the BotState write.
+        py.detach(|| {
+            self.bot
+                .register(PoolRegistration::BalancerWeighted(Box::new(p)))
+        })
+        .map_err(map_refusal)
+    }
+
+    /// Register a Balancer V2 stable pool.
+    ///
+    /// Stores immutable pool config (`pool_id`, vault, tokens, amp,
+    /// `scaling_factors`, `swap_fee`, `bpt_idx`, `invariant_version`) +
+    /// registration balances + a genesis reorg journal delta. The Python
+    /// `BalancerV2StablePool` companion is constructed over the returned
+    /// `PyLiquidityPool` handle (call `get_pool(id)` after this).
+    ///
+    /// Returns the auto-assigned numeric pool ID. `tokens` / `scaling_factors`
+    /// / `balances` lists MUST all have length `N`. `bpt_idx` is `None` for
+    /// `MetaStablePools` and `Some(i)` (`i < N`) for `ComposableStablePools`.
+    ///
+    /// Raises:
+    ///     `ValueError`: If an address is malformed, the pool is already
+    ///         registered, the list lengths mismatch, `bpt_idx` is
+    ///         out-of-range, or `pool_id_hex` is not a 32-byte hex string.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        address,
+        vault,
+        pool_id_hex,
+        tokens,
+        amp,
+        scaling_factors,
+        swap_fee,
+        bpt_idx,
+        invariant_version,
+        balances,
+        update_block,
+        rate_provider=None
+    ))]
+    fn register_balancer_stable_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        vault: &str,
+        pool_id_hex: &str,
+        tokens: &Bound<'_, PyList>,
+        amp: u128,
+        scaling_factors: &Bound<'_, PyList>,
+        swap_fee: u128,
+        bpt_idx: Option<usize>,
+        invariant_version: u8,
+        balances: &Bound<'_, PyList>,
+        update_block: u64,
+        rate_provider: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let vault_addr = parse_address(vault)?;
+        let pool_id_bytes = hex_string_to_pool_id(pool_id_hex)?;
+        let token_addrs = parse_address_list(tokens)?;
+        let scaling_vals = extract_u256_list(scaling_factors)?;
+        let bal_vals = extract_u256_list(balances)?;
+        let provider =
+            rate_provider.map(|b| crate::bot::pool::make_balancer_rate_provider(b.unbind()));
+        let params = RegisterBalancerStablePoolParams {
+            address: addr,
+            vault: vault_addr,
+            pool_id: pool_id_bytes,
+            tokens: token_addrs,
+            amp,
+            scaling_factors: scaling_vals,
+            swap_fee,
+            bpt_idx,
+            invariant_version,
+            balances: bal_vals,
+            update_block,
+            rate_provider: provider,
+        };
+        // ADR-078 D3 step 3: the params ride the ONE door request and
+        // dispatch through the engine verb ([`Bot::register`]) — see
+        // `register_curve_pool`. No GIL while parked on the BotState write
+        // (see `unregister_pool`).
+        py.detach(|| {
+            self.bot
+                .register(PoolRegistration::BalancerStable(Box::new(params)))
+        })
+        .map_err(map_refusal)
+    }
+
+    /// Register an Aerodrome V2 pool by contract address (ADR-005 Aerodrome
+    /// state port).
+    ///
+    /// Stores immutable identity (address, tokens, factory, variant, stable
+    /// flag, unidirectional fee) + the registration reserves + a genesis
+    /// reorg-journal anchor (mirror of V2's discipline). Returns the
+    /// auto-assigned pool ID. Call `get_pool(id)` after this to obtain the
+    /// `PyLiquidityPool` handle.
+    ///
+    /// Raises:
+    ///     `PoolAlreadyRegisteredError`: If a pool at this address is
+    ///         already registered (a `PoolRegistrationError`/`ValueError`
+    ///         subclass — the typed twin of the V2/V3 duplicate rejection).
+    ///     `ValueError`: If an address is malformed or `variant` is not a
+    ///         recognized Aerodrome variant.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (address, token0, token1, factory, variant, stable, fee_numer, fee_denom, token0_decimals, token1_decimals, reserve0, reserve1, update_block=0))]
+    fn register_aerodrome_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        token0: &str,
+        token1: &str,
+        factory: &str,
+        variant: &str,
+        stable: bool,
+        fee_numer: u64,
+        fee_denom: u64,
+        token0_decimals: u8,
+        token1_decimals: u8,
+        reserve0: &Bound<'_, PyAny>,
+        reserve1: &Bound<'_, PyAny>,
+        update_block: u64,
+    ) -> PyResult<u64> {
+        let addr = parse_address(address)?;
+        let t0 = parse_address(token0)?;
+        let t1 = parse_address(token1)?;
+        let fac = parse_address(factory)?;
+        let r0 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve0)?,
+            "reserve0",
+        )?;
+        let r1 = narrow_reserve(
+            crate::conversion::alloy::extract_python_u256(reserve1)?,
+            "reserve1",
+        )?;
+        let variant_enum = DexVariant::try_from(variant)
+            .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+
+        // ADR-078 D3 step 3: the params ride the ONE door request and
+        // dispatch through the engine verb ([`Bot::register`]); the EIP-1167
+        // verify (skipped for non-JSON (chain, factory) rows) is core-owned
+        // behind it. The GIL is released across this py.detach — never hold
+        // the GIL while parked on the BotState write.
+        py.detach(|| {
+            self.bot.register(PoolRegistration::AerodromeV2(Box::new(
+                RegisterAerodromeV2PoolParams {
+                    address: addr,
+                    token0: t0,
+                    token1: t1,
+                    factory: fac,
+                    variant: variant_enum,
+                    stable,
+                    fee: (fee_numer, fee_denom),
+                    token0_decimals,
+                    token1_decimals,
+                    reserve0: r0,
+                    reserve1: r1,
+                    update_block,
+                },
+            )))
+        })
+        .map_err(map_refusal)
+    }
+
+    /// Update a V3 pool's state from a Swap event.
+    ///
+    /// No-op if the pool is not registered.
+    #[pyo3(signature = (address, sqrt_price_x96, liquidity, tick, block_number))]
+    fn update_v3_pool(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        sqrt_price_x96: &Bound<'_, PyAny>,
+        liquidity: &Bound<'_, PyAny>,
+        tick: i32,
+        block_number: u64,
+    ) -> PyResult<()> {
+        let addr = parse_address(address)?;
+        let spx = crate::conversion::alloy::extract_python_u256(sqrt_price_x96)?;
+        let liq = crate::conversion::alloy::extract_python_u256(liquidity)?.to::<u128>();
+
+        // The write guard is core-owned ([`Bot::update_v3_pool`],
+        // LockSite::Core) under this py.detach (inversion class).
+        py.detach(|| self.bot.update_pool(addr, spx, liq, tick, block_number));
+        Ok(())
+    }
+
+    /// Get the number of deltas in the reorg journal for a V3 pool.
+    ///
+    /// Returns 0 if the pool ID is not registered or is not a V3 pool.
+    fn v3_journal_len(&self, py: Python<'_>, pool_id: u64) -> usize {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.v3_journal_len(pool_id))
+    }
+
+    /// Register a token.
+    ///
+    /// Args:
+    ///     `address`: Token contract address (hex string).
+    ///     `name`: Token name.
+    ///     `symbol`: Token symbol.
+    ///     `decimals`: Token decimals.
+    ///     `chain_id`: Chain ID.
+    #[pyo3(signature = (address, name, symbol, decimals, chain_id))]
+    fn register_token(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        name: &str,
+        symbol: &str,
+        decimals: u8,
+        chain_id: u64,
+    ) -> PyResult<PyErc20Token> {
+        let addr = parse_address(address)?;
+        let name = name.to_string();
+        let symbol = symbol.to_string();
+        // release the GIL across the BotState write-lock acquisition +
+        // insert so the live pump (tokio) + the asyncio loop keep making GIL
+        // progress while the main thread awaits `core.write()`. Pre-fix no
+        // registration seam released the GIL, so a parked `core.write()` /
+        // `engine.lock()` carried the GIL with it — the startup-stall enabler
+        // (the asyncio loop froze for the whole park; the pump's GIL-requiring
+        // notify/log path could not progress). The lock + insertion live
+        // inside the core method ([`Bot::register_token`]) under this
+        // py.detach; the `PyErc20Token` handle is built afterward from the
+        // parsed `addr`.
+        py.detach(|| {
+            self.bot
+                .register_token(addr, name, symbol, decimals, chain_id);
+        });
+        Ok(PyErc20Token::new(self.bot.state_arc(), addr))
+    }
+
+    /// Get a thin `PyErc20Token` handle for the given address.
+    ///
+    /// Args:
+    ///     `address`: Token contract address (hex string).
+    ///
+    /// Returns:
+    ///     A `PyErc20Token` handle, or `None` if the address is not registered.
+    fn get_token(&self, py: Python<'_>, address: &str) -> PyResult<Option<PyErc20Token>> {
+        let addr = parse_address(address)?;
+        // GIL hygiene: the has_token read runs under this py.detach via the core.
+        if py.detach(|| self.bot.has_token(&addr)) {
+            Ok(Some(PyErc20Token::new(self.bot.state_arc(), addr)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Build + register an ERC-20 token, resolving metadata DB-first, then
+    /// on-chain (the core twin of `Erc20Builder.build`).
+    ///
+    /// `builder::build_erc20_metadata` resolves `name`/`symbol`/`decimals`
+    /// (DB row → on-chain batched read → alternate-prototype fallback →
+    /// UNKNOWN sentinels, with a DB write-back), then this adapter registers
+    /// the token into `BotState.tokens` (ADR-006) exactly like
+    /// [`Self::register_token`], and returns a thin [`PyErc20Token`] handle.
+    ///
+    /// Args:
+    ///     `address`: token contract address (hex string).
+    ///     `chain_id`: chain ID.
+    ///     `block`: optional block to read on-chain at (None = head).
+    #[pyo3(signature = (address, chain_id, block=None))]
+    fn build_erc20_token(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        chain_id: u64,
+        block: Option<u64>,
+    ) -> PyResult<PyErc20Token> {
+        let addr = parse_address(address)?;
+        // The metadata resolution and token registration are core-owned
+        // ([`Bot::build_and_register_erc20_token`]); the GIL is released
+        // across the whole scope.
+        let _registered = py
+            .detach(|| {
+                self.bot
+                    .build_and_register_erc20_token(chain_id, addr, block)
+            })
+            .map_err(|kind| map_build_refusal("build_erc20_token", kind))?;
+        Ok(PyErc20Token::new(self.bot.state_arc(), addr))
+    }
+
+    /// Encode a V2 swap call, returning `(to_address_hex, calldata_hex, value)`.
+    ///
+    /// Args:
+    ///     `pool_id`: The pool ID returned by `register_v2_pool`.
+    ///     `zero_for_one`: True for token0→token1, False for token1→token0.
+    ///     `amount_out`: Output token amount (Python int).
+    ///     `recipient`: Address to receive output tokens (hex string).
+    ///
+    /// Returns:
+    ///     A tuple `(to_hex, calldata_hex, value)` or `None` if pool not found.
+    #[pyo3(signature = (pool_id, zero_for_one, amount_out, recipient))]
+    fn encode_swap(
+        &self,
+        py: Python<'_>,
+        pool_id: u64,
+        zero_for_one: bool,
+        amount_out: &Bound<'_, PyAny>,
+        recipient: &str,
+    ) -> PyResult<Option<(String, String, u64)>> {
+        let amount = crate::conversion::alloy::extract_python_u256(amount_out)?;
+        let recip = parse_address(recipient)?;
+
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.encode_swap(pool_id, zero_for_one, amount, recip))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("encode_swap: {e}")))
+    }
+
+    /// Get the number of deltas in the reorg journal for a V2 pool.
+    ///
+    /// Returns 0 if the pool ID is not registered.
+    fn v2_journal_len(&self, py: Python<'_>, pool_id: u64) -> usize {
+        // GIL hygiene: the read guard is acquired inside the core method,
+        // which runs under this py.detach (inversion class).
+        py.detach(|| self.bot.v2_journal_len(pool_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Parse one address string, raising the historical `ValueError`. The
+/// `Invalid address '<input>': <source>` vocabulary is core-owned
+/// ([`apexbot_bot::bot_core::registration::parse_address_str`]); this
+/// adapter only crosses the error into Python.
+/// Extract checked tick-bitmap WORD positions from a Python iterable (a
+/// `list`/`set`/`tuple` of word ints, or a `dict` whose keys are the words) —
+/// the shape `register_v3_pool`'s `known_bitmap_words` argument accepts. `None`
+/// (or `None` passed as the value) means "no words checked at registration".
+fn extract_checked_bitmap_words(
+    words: Option<&Bound<'_, PyAny>>,
+    door: &str,
+) -> PyResult<Vec<i32>> {
+    let Some(words) = words.filter(|w| !w.is_none()) else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<i32> = Vec::new();
+    for item in words.try_iter().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "{door}: known_bitmap_words must be an iterable of word ints"
+        ))
+    })? {
+        out.push(item?.extract::<i32>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{door}: known_bitmap_words entries must be ints"
+            ))
+        })?);
+    }
+    Ok(out)
+}
+
+fn parse_address(s: &str) -> PyResult<Address> {
+    apexbot_bot::bot_core::registration::parse_address_str(s).map_err(|kind| {
+        pyo3::exceptions::PyValueError::new_err(kind.detail().unwrap_or_default().to_string())
+    })
+}
+
+/// Serialize the core-normalized rows
+/// ([`apexbot_bot::bot_core::registration::tick_rows`] owns the `TickInfo`
+/// narrowing half) to the tick-data wire shape via [`TickData::to_py`], so the
+/// builder can pass the returned dict straight back into
+/// `register_*_pool(tick_data=..., ...)` without reshaping.
+fn build_tick_rows_py<'py>(
+    py: Python<'py>,
+    rows: &[(i32, u128, i128, u64)],
+) -> PyResult<Bound<'py, PyDict>> {
+    TickData::to_py(py, rows.iter().copied())
+}
+
+/// Parse a Python list of address strings into `Vec<Address>`. The per-item
+/// extract error (and its precedence over parse errors) stays here; the
+/// string→address parse with the historical `Invalid address` message
+/// vocabulary is core-owned
+/// ([`apexbot_bot::bot_core::registration::parse_address_str`]).
+fn parse_address_list(list: &Bound<'_, PyList>) -> PyResult<Vec<Address>> {
+    list.iter()
+        .map(|item| {
+            let s: String = item.extract().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("token address must be a str: {e}"))
+            })?;
+            apexbot_bot::bot_core::registration::parse_address_str(&s).map_err(|kind| {
+                pyo3::exceptions::PyValueError::new_err(
+                    kind.detail().unwrap_or_default().to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Extract a Python list of ints (or int-like) into `Vec<U256>`.
+pub(crate) fn extract_u256_list(
+    list: &Bound<'_, PyList>,
+) -> PyResult<Vec<alloy::primitives::U256>> {
+    list.iter()
+        .map(|item| crate::conversion::alloy::extract_python_u256(&item))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
+    use super::*;
+
+    /// PRG-1 registry unification: `construct_pool` answers an
+    /// address that is already registered in `BotState` (the registry of
+    /// record) WITHOUT replaying the RPC choreography — proven by giving it
+    /// NO `ConstructionIo` at all: the legacy path raised
+    /// "no `ConstructionIo` attached" here; the pre-check answers identity
+    /// straight off the registered entry instead.
+    #[test]
+    fn construct_pool_answers_registered_address_from_the_registry_of_record() {
+        pyo3::Python::attach(|py| {
+            let bot = PyBot::new(1);
+            let addr = "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa";
+            let t0 = "0x1111111111111111111111111111111111111111";
+            let t1 = "0x2222222222222222222222222222222222222222";
+            let factory = "0x3333333333333333333333333333333333333333";
+            let r0 = pyo3::types::PyInt::new(py, 1000i64);
+            let r1 = pyo3::types::PyInt::new(py, 2000i64);
+            let pool_id = bot
+                .register_v2_pool(
+                    py,
+                    addr,
+                    t0,
+                    t1,
+                    r0.as_any(),
+                    r1.as_any(),
+                    997,
+                    1000,
+                    997,
+                    1000,
+                    factory,
+                    5,
+                    "uniswap-v2",
+                    false,
+                    None,
+                )
+                .expect("test setup: V2 registration");
+
+            // No ConstructionIo attached — the registry-of-record pre-check
+            // must answer before the io fetch.
+            let outcome = bot
+                .construct_pool(py, &PyPoolConstructionRequest::v2(addr, Some(5), true))
+                .expect("registered address answers from the registry of record");
+            assert_eq!(outcome.pool_id, pool_id);
+            assert_eq!(outcome.token0.to_lowercase(), t0);
+            assert_eq!(outcome.token1.to_lowercase(), t1);
+            assert_eq!(outcome.variant, "uniswap-v2");
+
+            // And the single-flight twin: the peer path (claim window
+            // closed) re-answers through the same pre-check.
+            let outcome2 = bot
+                .construct_pool(py, &PyPoolConstructionRequest::v2(addr, None, true))
+                .expect("second build answers from the registry of record");
+            assert_eq!(
+                outcome2.pool_id, pool_id,
+                "same registered pool id — no duplicate build"
+            );
+        });
+    }
+
+    /// PRG-1: an UNREGISTERED address without an attached `ConstructionIo`
+    /// still raises the legacy `RuntimeError` (the pre-check only answers
+    /// registry hits; a fresh build still requires the choreography io).
+    #[test]
+    fn construct_pool_unregistered_address_requires_construction_io() {
+        pyo3::Python::attach(|py| {
+            let bot = PyBot::new(1);
+            let err = bot
+                .construct_pool(
+                    py,
+                    &PyPoolConstructionRequest::v2(
+                        "0xbBbBbBbbBbbbBbbBbbBBbbbBbBbbBBBbbBBBbbbb",
+                        None,
+                        true,
+                    ),
+                )
+                .err()
+                .expect("no ConstructionIo attached");
+            assert!(
+                err.to_string().contains("no ConstructionIo attached"),
+                "legacy io requirement preserved for fresh builds: {err}"
+            );
+        });
+    }
+
+    /// Lowercase hex encode (no `0x` prefix) — for `OfflineProvider` call keys.
+    fn hex_encode(bytes: &[u8]) -> String {
+        const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            s.push(HEX_CHARS[(b >> 4) as usize] as char);
+            s.push(HEX_CHARS[(b & 0x0f) as usize] as char);
+        }
+        s
+    }
+
+    /// 32-byte big-endian `uint256` word (hex, no `0x`).
+    fn word_u256(v: &alloy::primitives::U256) -> String {
+        let mut buf = [0u8; 32];
+        v.to_be_bytes::<32>()
+            .iter()
+            .enumerate()
+            .for_each(|(i, &b)| {
+                buf[i] = b;
+            });
+        hex_encode(&buf)
+    }
+
+    /// 32-byte right-aligned `uint128` word (hex).
+    fn word_u128(v: u128) -> String {
+        let mut buf = [0u8; 32];
+        buf[16..].copy_from_slice(&v.to_be_bytes());
+        hex_encode(&buf)
+    }
+
+    /// 32-byte sign-extended `int128` word (hex).
+    fn word_i128(v: i128) -> String {
+        let mut buf = [0u8; 32];
+        let be = v.to_be_bytes();
+        if v < 0 {
+            buf[..16].fill(0xff);
+        }
+        buf[16..].copy_from_slice(&be);
+        hex_encode(&buf)
+    }
+
+    /// Build an `io`-bound offline V3 chain transport: `tickBitmap(0)` answers
+    /// `bitmap`, and each set bit's `ticks(tick)` call answers the matching
+    /// `rows` entry. Lets a shell test drive the chain-truth intake gate.
+    fn offline_v3_tick_word_io<'py>(
+        py: pyo3::Python<'py>,
+        pool: alloy::primitives::Address,
+        bitmap: alloy::primitives::U256,
+        rows: &[(i32, u128, i128)],
+    ) -> pyo3::Bound<'py, crate::bot::py_bot_io::PyBotIo> {
+        use apexbot_rpc::offline::OfflineProvider;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let addr_lower = pool.to_checksum(None).to_lowercase();
+        let mut calls: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        let bitmap_calldata = apexbot_rpc::abi::encode_tick_bitmap(0);
+        calls.insert(
+            format!("{}:0x{}", addr_lower, hex_encode(&bitmap_calldata)),
+            Some(word_u256(&bitmap)),
+        );
+        for &(tick, gross, net) in rows {
+            let td_calldata = apexbot_rpc::abi::encode_tick_data(tick);
+            let mut response = String::new();
+            response.push_str(&word_u128(gross));
+            response.push_str(&word_i128(net));
+            calls.insert(
+                format!("{}:0x{}", addr_lower, hex_encode(&td_calldata)),
+                Some(response),
+            );
+        }
+
+        // The recorded block must be the block the intake gate calls at
+        // (`assemble_*`'s `block` arg = 0 in these tests).
+        let json_str = json!({
+            "chain_id": 1u64,
+            "block_number": 0u64,
+            "timestamp": 0u64,
+            "calls": calls,
+            "code": {},
+        })
+        .to_string();
+        let alloy = OfflineProvider::from_json_str(&json_str)
+            .expect("valid offline JSON")
+            .as_alloy_provider();
+        let pyalloy = pyo3::Bound::new(
+            py,
+            crate::rpc::provider::PyAlloyProvider {
+                provider: Arc::new(alloy),
+                max_blocks_per_request: 5000,
+            },
+        )
+        .expect("PyAlloyProvider construction");
+        let provider_any: pyo3::Py<pyo3::PyAny> = pyalloy.into_any().unbind();
+        let io_struct = crate::bot::py_bot_io::PyBotIo::new(py, provider_any, None);
+        pyo3::Bound::new(py, io_struct).expect("wrap PyBotIo as Bound")
+    }
+
+    /// The parity fixture DB (shared with `apexbot-bot`'s
+    /// `load_snapshot_from_db_populates_store_and_seed_block` test).
+    fn parity_fixture() -> Option<std::path::PathBuf> {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../foundation/apexbot-db/tests/fixtures/parity.db");
+        if p.exists() {
+            // The plain opens never heal, so this read cannot rewrite the
+            // committed fixture.
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// A fresh `PyBot` has `db_handle() == None` (cold-start path — no
+    /// `load_snapshot_from_db` call yet). Acceptance criterion: "Cold-start
+    /// path (no `load_snapshot_from_db` call) leaves `db` as None".
+    #[test]
+    fn cold_start_pybot_has_no_db_handle() {
+        let py_bot = PyBot::new(1);
+        assert!(
+            py_bot.db_handle().is_none(),
+            "a fresh PyBot must not hold a ApexbotDb handle (cold-start)"
+        );
+    }
+
+    /// `assemble_v3_tick_map` on a fresh `PyBot` (cold-start, no DB loaded, empty
+    /// store) returns `Ok(None)` — the miss path. The AC: "Returns None on
+    /// miss".
+    #[test]
+    fn assemble_v3_tick_map_cold_start_returns_none() {
+        pyo3::Python::attach(|py| {
+            let py_bot = PyBot::new(1);
+            let result = py_bot
+                .assemble_v3_tick_map(
+                    py,
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    0,
+                    10,
+                    0,
+                    None,
+                )
+                .expect("cold-start assemble should not error");
+            assert!(result.is_none(), "cold-start (no store, no Db) → miss");
+        });
+    }
+
+    /// `assemble_v4_tick_map` cold-start miss — V4 twin of the V3 cold-start test.
+    #[test]
+    fn assemble_v4_tick_map_cold_start_returns_none() {
+        pyo3::Python::attach(|py| {
+            let py_bot = PyBot::new(1);
+            // 32-byte V4 pool id as 0x-hex (64 hex chars + 0x prefix).
+            let pool_id_py = ("0x".to_string() + &"cc".repeat(32))
+                .into_pyobject(py)
+                .expect("str into pyobject")
+                .into_any();
+            let result = py_bot
+                .assemble_v4_tick_map(
+                    py,
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    &pool_id_py,
+                    "0x7fffffffffffffffffffffffffffffffffffffff", // StateView address (dummy)
+                    0,
+                    10,
+                    0,
+                    None,
+                )
+                .expect("cold-start assemble should not error");
+            assert!(result.is_none(), "cold-start (no store, no Db) → miss");
+        });
+    }
+
+    /// Chain-arm end-to-end — a cold-start `PyBot` (empty Store, no Db)
+    /// with an `io=Some(PyBotIo)` backed by an `OfflineProvider`-recorded alloy
+    /// provider routes through the Chain arm + returns `Some((ticks, "sparse"))`
+    /// with the recorded tick liquidity. Verifies wiring: `io=Some` → Chain arm
+    /// fires → `AlloyTickWordSource` choreography runs pure-Rust under
+    /// `py.detach`.
+    #[test]
+    fn assemble_v3_tick_map_chain_arm_fires_with_offline_io() {
+        use alloy::primitives::U256;
+        use apexbot_rpc::offline::OfflineProvider;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        pyo3::Python::attach(|py| {
+            // 1. Build an `OfflineProvider` recording the V3 tick-bitmap +
+            //    tick-data responses for a known word + 2 active ticks.
+            //    tick=10, tick_spacing=1 → word=0, bit_pos=10.
+            //    Set bits 10 + 20 → bitmap = (1<<10) | (1<<20).
+            let pool_addr = alloy::primitives::Address::from([0xaa; 20]);
+            let bitmap = U256::from(1u128 << 10) | U256::from(1u128 << 20);
+            let addr_lower = pool_addr.to_checksum(None).to_lowercase();
+
+            let mut calls: std::collections::HashMap<String, Option<String>> =
+                std::collections::HashMap::new();
+
+            // tickBitmap(int16) → uint256
+            let bitmap_calldata = apexbot_rpc::abi::encode_tick_bitmap(0);
+            calls.insert(
+                format!("{}:0x{}", addr_lower, hex_encode(&bitmap_calldata)),
+                Some(word_u256(&bitmap)),
+            );
+            // ticks(int24) → (uint128 gross, int128 net)
+            for &(tick, gross, net) in &[(10_i32, 1_000u128, -500i128), (20, 2_000, 750)] {
+                let td_calldata = apexbot_rpc::abi::encode_tick_data(tick);
+                let mut response = String::new();
+                response.push_str(&word_u128(gross));
+                response.push_str(&word_i128(net));
+                calls.insert(
+                    format!("{}:0x{}", addr_lower, hex_encode(&td_calldata)),
+                    Some(response),
+                );
+            }
+
+            let json_str = json!({
+                "chain_id": 1u64,
+                "block_number": 100u64,
+                "timestamp": 0u64,
+                "calls": calls,
+                "code": {},
+            })
+            .to_string();
+            let alloy = OfflineProvider::from_json_str(&json_str)
+                .expect("valid offline JSON")
+                .as_alloy_provider();
+
+            // 2. Wrap the alloy provider in a `PyAlloyProvider` + `PyBotIo`.
+            let pyalloy = pyo3::Bound::new(
+                py,
+                crate::rpc::provider::PyAlloyProvider {
+                    provider: Arc::new(alloy),
+                    max_blocks_per_request: 5000,
+                },
+            )
+            .expect("PyAlloyProvider construction");
+            let provider_any: pyo3::Py<pyo3::PyAny> = pyalloy.into_any().unbind();
+            let io_struct = crate::bot::py_bot_io::PyBotIo::new(py, provider_any, None);
+            let io_bound = pyo3::Bound::new(py, io_struct).expect("wrap PyBotIo as Bound");
+
+            // 3. Cold-start PyBot + assemble_v3_tick_map with `io=Some`.
+            let py_bot = PyBot::new(1);
+            let assembled = py_bot
+                .assemble_v3_tick_map(py, &pool_addr.to_checksum(None), 10, 1, 100, Some(io_bound))
+                .expect("Chain arm must not error")
+                .expect("Chain hit → Some((ticks, sparse))");
+            let (ticks, coverage) = assembled;
+            assert_eq!(coverage, "sparse", "Chain-arm hit → Sparse coverage");
+            assert_eq!(ticks.len(), 2, "both active ticks seeded");
+
+            let tick_10 = ticks
+                .get_item(10)
+                .expect("get_item Ref")
+                .expect("tick 10 present");
+            let (gross10_val, _net10, _block10): (u128, i128, u64) =
+                tick_10.extract().expect("tick 10 as (u128,i128,u64)");
+            assert_eq!(gross10_val, 1_000);
+
+            let tick_20 = ticks
+                .get_item(20)
+                .expect("get_item Ref")
+                .expect("tick 20 present");
+            let (gross20_val, _net20, _block20): (u128, i128, u64) =
+                tick_20.extract().expect("tick 20 as (u128,i128,u64)");
+            assert_eq!(gross20_val, 2_000);
+        });
+    }
+
+    /// snapshot via `load_snapshot_from_db`, then `assemble_v3_tick_map(addr)`
+    /// must return the seeded ticks with coverage `"tracked"`.
+    #[test]
+    fn assemble_v3_tick_map_returns_tracked_after_snapshot_load() {
+        use alloy::primitives::{address, aliases::U128, Address, I256, U256};
+        use apexbot_db::discovery::V3PoolRowInput;
+        use apexbot_db::ApplyLiquidityAtTick;
+        use hashbrown::HashMap;
+
+        // Create a temp-file path for the test DB (unique via PID + counter).
+        let temp_path = std::env::temp_dir().join(format!(
+            "apexbot_assemble_test_{}_{:x}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        // (Scope-guarded cleanup below; assert at end.)
+
+        // 1. Open writable, seed exchange + V3 pool + init-map + liquidity-pos.
+        {
+            let (db, _state) = apexbot_db::connection::ApexbotDb::open_for_writes(&temp_path)
+                .expect("open_for_writes on temp");
+            let factory = address!("0x1F98431c8aD98523631AE4a59f267346ea31F984");
+            db.upsert_exchange(1, "uniswap_v3", factory, None).unwrap();
+            let pool_address = Address::from([0xaa; 20]);
+            db.upsert_v3_pools(
+                1,
+                "uniswap_v3",
+                1,
+                1_000_000,
+                &[V3PoolRowInput {
+                    address: pool_address,
+                    token0_address: Address::from([0x11; 20]),
+                    token1_address: Address::from([0x22; 20]),
+                    fee: 0,
+                    tick_spacing: 10,
+                }],
+            )
+            .unwrap();
+            let pool_id: i64 = db
+                .lock()
+                .query_row(
+                    "SELECT id FROM pools WHERE address = ?1 LIMIT 1",
+                    [&pool_address.to_checksum(None)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut tick_data: HashMap<i32, ApplyLiquidityAtTick> = HashMap::new();
+            tick_data.insert(
+                10,
+                ApplyLiquidityAtTick {
+                    liquidity_gross: U128::from(1_000_000u64),
+                    liquidity_net: I256::try_from(500i128).unwrap(),
+                    block: 0,
+                },
+            );
+            db.upsert_v3_liquidity_positions(pool_id, &tick_data)
+                .unwrap();
+        }
+        // The writable connection is dropped here; the file persists.
+
+        // 2. Construct PyBot + load the snapshot from the temp file.
+        pyo3::Python::attach(|py| {
+            let py_bot = PyBot::new(1);
+            py_bot
+                .load_snapshot_from_db(py, &temp_path.to_string_lossy(), 1)
+                .expect("snapshot load must succeed against the seeded temp DB");
+
+            // 3. assemble against the seeded pool — expect a hit. The Db arm's
+            //    non-empty Tracked map reconciles against CHAIN truth (word 0
+            //    bit 1 = the seeded row at tick 10), so an `io` is required;
+            //    without one the intake gate refuses (never a silent pass).
+            let io_bound = offline_v3_tick_word_io(
+                py,
+                Address::from([0xaa; 20]),
+                U256::from(1u64) << 1,
+                &[(10, 1_000_000, 500)],
+            );
+            let (ticks, coverage) = py_bot
+                .assemble_v3_tick_map(
+                    py,
+                    "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa",
+                    0,
+                    10,
+                    0,
+                    Some(io_bound),
+                )
+                .expect("assemble hit must not error")
+                .expect("store hit against the seeded V3 pool must return Some");
+            assert_eq!(coverage, "tracked");
+            assert_eq!(ticks.len(), 1, "one tick seeded at index 10");
+            let val = ticks
+                .get_item(10)
+                .expect("get_item must not error")
+                .expect("tick 10 must be present");
+            let (gross, _net, _block) = val
+                .extract::<(u128, i128, u64)>()
+                .expect("tick value is (gross, net, block)");
+            assert_eq!(gross, 1_000_000);
+        });
+
+        // 4. Cleanup.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    /// T3, rewired to CHAIN truth: a Tracked snapshot's rows are reconciled
+    /// against the word bitmaps read from chain. With no chain transport the
+    /// gate refuses with a typed `RuntimeError` (never a silent pass); a chain
+    /// transport that disagrees refuses with a typed `ValueError`; and a chain
+    /// word that agrees with the rows is admitted. The DB stores no word
+    /// bitmap (BW3 dropped the value tables), so the retired snapshot-internal
+    /// bit<->row check would be a tautology over rows alone — chain truth owns
+    /// the reconciliation.
+    #[expect(clippy::too_many_lines)]
+    #[test]
+    fn assemble_v3_tick_map_chain_truth_gate() {
+        use alloy::primitives::{address, aliases::U128, Address, I256, U256};
+        use apexbot_db::discovery::V3PoolRowInput;
+        use apexbot_db::ApplyLiquidityAtTick;
+        use hashbrown::HashMap;
+
+        let temp_path = std::env::temp_dir().join(format!(
+            "apexbot_assemble_inconsistent_{}_{:x}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        {
+            let (db, _state) = apexbot_db::connection::ApexbotDb::open_for_writes(&temp_path)
+                .expect("open_for_writes on temp");
+            let factory = address!("0x1F98431c8aD98523631AE4a59f267346ea31F984");
+            db.upsert_exchange(1, "uniswap_v3", factory, None).unwrap();
+            let pool_address = Address::from([0xaa; 20]);
+            db.upsert_v3_pools(
+                1,
+                "uniswap_v3",
+                1,
+                1_000_000,
+                &[V3PoolRowInput {
+                    address: pool_address,
+                    token0_address: Address::from([0x11; 20]),
+                    token1_address: Address::from([0x22; 20]),
+                    fee: 0,
+                    tick_spacing: 10,
+                }],
+            )
+            .unwrap();
+            let pool_id: i64 = db
+                .lock()
+                .query_row(
+                    "SELECT id FROM pools WHERE address = ?1 LIMIT 1",
+                    [&pool_address.to_checksum(None)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut tick_data: HashMap<i32, ApplyLiquidityAtTick> = HashMap::new();
+            tick_data.insert(
+                10,
+                ApplyLiquidityAtTick {
+                    liquidity_gross: U128::from(1_000_000u64),
+                    liquidity_net: I256::try_from(500i128).unwrap(),
+                    block: 0,
+                },
+            );
+            db.upsert_v3_liquidity_positions(pool_id, &tick_data)
+                .unwrap();
+        }
+        pyo3::Python::attach(|py| {
+            let py_bot = PyBot::new(1);
+            py_bot
+                .load_snapshot_from_db(py, &temp_path.to_string_lossy(), 1)
+                .expect("snapshot load must succeed against the seeded temp DB");
+            // (1) No chain transport wired → typed RuntimeError, never a
+            //     silent pass and never a ValueError claiming a snapshot
+            //     contradiction.
+            let err = py_bot
+                .assemble_v3_tick_map(
+                    py,
+                    "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa",
+                    0,
+                    10,
+                    0,
+                    None,
+                )
+                .expect_err("a Tracked snapshot with no chain transport must be refused");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py),
+                "a missing chain transport surfaces as a RuntimeError: {err}"
+            );
+            assert!(
+                err.to_string().contains("chain transport"),
+                "the refusal must name the missing chain transport: {err}"
+            );
+
+            // (2) A chain word that disagrees (empty word 0 vs the gross>0 row
+            //     at tick 10) → typed ValueError naming the conflicting tick.
+            let disagreeing =
+                offline_v3_tick_word_io(py, Address::from([0xaa; 20]), U256::ZERO, &[]);
+            let err = py_bot
+                .assemble_v3_tick_map(
+                    py,
+                    "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa",
+                    0,
+                    10,
+                    0,
+                    Some(disagreeing),
+                )
+                .expect_err("a chain/snapshot disagreement must be refused at intake");
+            assert!(
+                err.is_instance_of::<pyo3::exceptions::PyValueError>(py),
+                "the chain-truth rejection surfaces as a ValueError: {err}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("Tracked tick map inconsistent at intake"),
+                "the refusal must carry the intake message: {message}"
+            );
+            assert!(
+                message.contains("(tick 10)"),
+                "the row without a chain bit must be named: {message}"
+            );
+
+            // (3) A chain word that agrees with the rows (bit 1 = tick 10) is
+            //     admitted — the retired snapshot-internal bit<->row tautology
+            //     no longer rejects it.
+            let agreeing = offline_v3_tick_word_io(
+                py,
+                Address::from([0xaa; 20]),
+                U256::from(1u64) << 1,
+                &[(10, 1_000_000, 500)],
+            );
+            let (tick_data, coverage) = py_bot
+                .assemble_v3_tick_map(
+                    py,
+                    "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa",
+                    0,
+                    10,
+                    0,
+                    Some(agreeing),
+                )
+                .expect("a chain-agreeing snapshot must not error")
+                .expect("a chain-agreeing Tracked snapshot must return Some");
+            assert_eq!(coverage, "tracked");
+            assert_eq!(tick_data.len(), 1);
+            let row = tick_data.get_item(10).expect("get_item must not error");
+            assert!(row.is_some(), "the row at tick 10 survives admission");
+        });
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    /// Calling `load_snapshot_from_db` against a missing DB fails cleanly and
+    /// leaves `db_handle() == None` (the snapshot load failed → the cached
+    /// handle is NOT armed). Acceptance criterion: "On failure, `self.db`
+    /// stays `None`".
+    #[test]
+    fn snapshot_load_failure_leaves_db_handle_none() {
+        pyo3::Python::attach(|py| {
+            let py_bot = PyBot::new(1);
+            let result = py_bot.load_snapshot_from_db(py, "/nonexistent/path/to/db.sqlite", 1);
+            assert!(
+                result.is_err(),
+                "opening a nonexistent DB path must surface a PyRuntimeError"
+            );
+            assert!(
+                py_bot.db_handle().is_none(),
+                "on snapshot-load failure the cached handle must stay None"
+            );
+        });
+    }
+
+    /// A successful `load_snapshot_from_db` arms `db_handle()` with the
+    /// read-only `ApexbotDb` used for the snapshot stream. Acceptance
+    /// criterion: "After successful load, `db_handle()` returns `Some`."
+    /// Skipped if the parity fixture isn't reachable from this crate layout.
+    #[test]
+    fn snapshot_load_success_arms_db_handle() {
+        let Some(fixture) = parity_fixture() else {
+            eprintln!("skipping: parity fixture not reachable");
+            return;
+        };
+        pyo3::Python::attach(|py| {
+            let py_bot = PyBot::new(8453);
+            let path_str = fixture.to_string_lossy().to_string();
+            py_bot
+                .load_snapshot_from_db(py, &path_str, 8453)
+                .expect("snapshot load against the parity fixture must succeed");
+            let handle = py_bot
+                .db_handle()
+                .expect("a successful snapshot load must arm the cached ApexbotDb handle");
+            // Sanity: the cached handle is usable for a read — the snapshot
+            // seed block computed at load time is readable via the cached
+            // connection (proving the `Mutex<Connection>` isn't dropped).
+            assert!(
+                py_bot.snapshot_seed_block(py).is_some(),
+                "parity fixture must record a non-cold-start snapshot seed block"
+            );
+            // Two clones don't interfere — PyBot retains its own Arc.
+            let _second = py_bot.db_handle();
+            assert!(py_bot.db_handle().is_some());
+            drop(handle);
+        });
+    }
+
+    // ── the position seam's production wiring ────────────────────────────
+    //
+    // `attach_construction_io` is the method Python's `Bot.__init__` calls
+    // with the resolved provider and the session's database path
+    // (`src/apexbot/bot/_bot.py`), and it is the only point in a bot boot
+    // holding both the session and the database handle a position read is
+    // sourced from. The tests below therefore boot the way a real bot boots
+    // and install nothing: the position reader they find is the one the boot
+    // bound. Every other position test in the workspace installs its own
+    // observer, so deleting the boot's install turns ONLY these red.
+
+    /// A supplied-and-borrowed position in one Aave market, observed at
+    /// [`POSITION_OBSERVED_AT`].
+    #[cfg(feature = "aave-updater")]
+    const POSITION_OBSERVED_AT: u64 = 21_000_000;
+
+    #[cfg(feature = "aave-updater")]
+    fn position_market() -> Address {
+        Address::from([0x7bu8; 20])
+    }
+
+    #[cfg(feature = "aave-updater")]
+    fn position_account() -> Address {
+        Address::from([0x8bu8; 20])
+    }
+
+    /// A throwaway database path, unique per call so a parallel test run
+    /// cannot read another test's rows.
+    #[cfg(feature = "aave-updater")]
+    fn position_db_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "apexbot_{tag}_{}_{:x}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    /// Write the rows an Aave updater would have left after advancing this
+    /// market to [`POSITION_OBSERVED_AT`]: one market, one supplied-and-
+    /// borrowed account. Seeded through the raw connection so the fixture
+    /// depends on no crate the test target does not already name.
+    #[cfg(feature = "aave-updater")]
+    fn seed_aave_position(path: &std::path::Path) {
+        let (db, _state) =
+            apexbot_db::connection::ApexbotDb::open_for_writes(path).expect("open a temp DB");
+        let user = position_account().to_checksum(None);
+        db.lock()
+            .execute_batch(&format!(
+                "INSERT INTO aave_v3_markets (id, chain_id, name, active, last_update_block) \
+                 VALUES (1, 1, 'Aave Ethereum Market', 1, {POSITION_OBSERVED_AT}); \
+                 INSERT INTO erc20_tokens (id, chain, address) \
+                 VALUES (1, 1, '0x0000000000000000000000000000000000000001'); \
+                 INSERT INTO aave_v3_assets \
+                 (id, market_id, underlying_asset_id, a_token_id, a_token_revision, \
+                  v_token_id, v_token_revision, liquidity_index, liquidity_rate, \
+                  borrow_index, borrow_rate) \
+                 VALUES (1, 1, 1, 1, 1, 1, 1, '1000000000000000000000000000', '0', \
+                 '1000000000000000000000000000', '0'); \
+                 INSERT INTO aave_v3_asset_configs (id, asset_id, ltv, liquidation_threshold, \
+                      liquidation_bonus, borrowing_enabled, stable_borrowing_enabled, \
+                      flash_loan_enabled, isolation_mode, borrowable_in_isolation) \
+                 VALUES (1, 1, 8000, 8500, 10500, 1, 1, 1, 0, 0); \
+                 INSERT INTO aave_v3_users (id, market_id, address, e_mode, gho_discount, \
+                  isolation_mode_debt) VALUES (1, 1, '{user}', 0, 0, '0'); \
+                 INSERT INTO aave_v3_collateral_positions (id, user_id, asset_id, balance) \
+                 VALUES (1, 1, 1, '1000000000000000000000'); \
+                 INSERT INTO aave_v3_debt_positions (id, user_id, asset_id, balance) \
+                 VALUES (1, 1, 1, '1000000000000000000000');"
+            ))
+            .expect("seed the Aave market and position rows");
+        db.lock()
+            .execute(
+                "INSERT INTO aave_v3_contracts (id, market_id, name, address, revision) \
+                 VALUES (1, 1, 'POOL', ?1, 1)",
+                [position_market().to_checksum(None)],
+            )
+            .expect("seed the market's pool contract");
+    }
+
+    /// The production boot's provider argument: a `PyAlloyProvider` over an
+    /// offline transport, which is the shape `extract_native_alloy` accepts
+    /// and the shape a configured session resolves to.
+    #[cfg(feature = "aave-updater")]
+    fn boot_provider(py: pyo3::Python<'_>) -> pyo3::Bound<'_, pyo3::PyAny> {
+        use apexbot_rpc::offline::OfflineProvider;
+        use serde_json::json;
+
+        let offline = OfflineProvider::from_json_str(
+            &json!({
+                "chain_id": 1u64,
+                "block_number": POSITION_OBSERVED_AT,
+                "timestamp": 0u64,
+                "calls": {},
+                "code": {},
+            })
+            .to_string(),
+        )
+        .expect("valid offline JSON")
+        .as_alloy_provider();
+        pyo3::Bound::new(
+            py,
+            crate::rpc::provider::PyAlloyProvider {
+                provider: Arc::new(offline),
+                max_blocks_per_request: 5000,
+            },
+        )
+        .expect("PyAlloyProvider construction")
+        .into_any()
+    }
+
+    /// A session booted exactly as `apexbot.bot.Bot.__init__` boots it, with
+    /// the given database as the session's own.
+    #[cfg(feature = "aave-updater")]
+    fn booted_session(py: pyo3::Python<'_>, db_path: &std::path::Path) -> PyBot {
+        let bot = PyBot::new(1);
+        bot.attach_construction_io(
+            py,
+            boot_provider(py),
+            Some(db_path.to_string_lossy().as_ref()),
+        )
+        .expect("the production boot attaches its construction I/O");
+        bot
+    }
+
+    /// The regression that keeps the wiring: a session booted by the real
+    /// production path, with no observer installed by this test, reads a
+    /// position the updater stored. Delete the install in
+    /// `attach_construction_io` and the first assertion fails here while
+    /// every hand-installing position test in the workspace stays green.
+    #[cfg(feature = "aave-updater")]
+    #[test]
+    fn a_booted_session_reads_a_position_no_test_installed_an_observer_for() {
+        use apexbot_substrate::session_registry::Freshness;
+
+        let db_path = position_db_path("position_boot_wiring");
+        seed_aave_position(&db_path);
+
+        pyo3::Python::attach(|py| {
+            let bot = booted_session(py, &db_path);
+            let registry = bot.bot.session_registry();
+
+            assert!(
+                registry.has_position_observer(),
+                "a booted session reaches positions through the reader the boot bound"
+            );
+
+            let identity = registry.position_identity(position_market(), position_account());
+            let read = registry.read_position(
+                &identity,
+                &Freshness::AtOrAfter {
+                    block: POSITION_OBSERVED_AT,
+                },
+            );
+            assert!(
+                read.is_ok(),
+                "a booted session reads the position its updater stored; refused {:?}",
+                read.as_ref().err()
+            );
+            let reading = read.unwrap();
+            assert_eq!(reading.identity(), &identity);
+            assert_eq!(reading.observed_block(), POSITION_OBSERVED_AT);
+        });
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// The bound reader is the boot's LIVE handle, not a snapshot taken at
+    /// boot: the updater advancing the market after the boot is visible to the
+    /// next read. A boot that handed the observer a stale copy, or a registry
+    /// that cached a reading, would fail the second read's freshness floor.
+    #[cfg(feature = "aave-updater")]
+    #[test]
+    fn a_read_through_the_boot_bound_observer_sees_a_later_updater_commit() {
+        use apexbot_substrate::session_registry::Freshness;
+
+        let db_path = position_db_path("position_boot_live");
+        seed_aave_position(&db_path);
+
+        pyo3::Python::attach(|py| {
+            let bot = booted_session(py, &db_path);
+            let registry = bot.bot.session_registry();
+
+            // The updater advances the market, on its own connection, while
+            // the session is already booted and reading.
+            {
+                let (updater_db, _state) =
+                    apexbot_db::connection::ApexbotDb::open_for_writes(&db_path)
+                        .expect("the updater opens its own write connection");
+                updater_db
+                    .lock()
+                    .execute(
+                        "UPDATE aave_v3_markets SET last_update_block = ?1 WHERE id = 1",
+                        [i64::try_from(POSITION_OBSERVED_AT + 5).expect("block fits i64")],
+                    )
+                    .expect("the updater commits a later block");
+            }
+
+            let identity = registry.position_identity(position_market(), position_account());
+            let read = registry.read_position(
+                &identity,
+                &Freshness::AtOrAfter {
+                    block: POSITION_OBSERVED_AT + 5,
+                },
+            );
+            assert!(
+                read.is_ok(),
+                "the boot-bound reader sees the updater's later commit; refused {:?}",
+                read.as_ref().err()
+            );
+            assert_eq!(read.unwrap().observed_block(), POSITION_OBSERVED_AT + 5);
+        });
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// The cross-strategy acceptance claim, resting on production wiring
+    /// rather than on a hand-install: the settlement arm and the
+    /// txpool-backrun arm each ask ONE booted session for the same position,
+    /// agree on one canonical identity, and each receives its own fresh
+    /// reading. Neither arm's configuration reaches the reading.
+    #[cfg(all(feature = "aave-updater", feature = "submission"))]
+    #[test]
+    fn the_settlement_and_backrun_arms_share_one_position_through_the_real_boot() {
+        use apexbot_config::BotConfig;
+        use apexbot_strategy::{Settlement, Strategy, StrategyName, TxpoolBackrun};
+        use apexbot_substrate::session_registry::Freshness;
+
+        let db_path = position_db_path("position_cross_strategy");
+        seed_aave_position(&db_path);
+
+        let mut cfg = BotConfig::default();
+        cfg.strategy.settlement.active = true;
+        cfg.strategy.settlement.endpoints = Some(String::from("https://a.local,https://b.local"));
+        cfg.strategy.txpool_backrun.bid_mode = true;
+        cfg.strategy.txpool_backrun.budget_wei = 1_000_000_000_000_000_000u128;
+        cfg.strategy.txpool_backrun.endpoints = Some(String::from("https://rpc.local"));
+
+        pyo3::Python::attach(|py| {
+            let bot = booted_session(py, &db_path);
+            let registry = bot.bot.session_registry();
+            let settlement = Settlement::from_config(&cfg);
+            let backrun = TxpoolBackrun::from_config(&cfg, String::from("http://node.invalid"));
+            assert_eq!(settlement.name(), StrategyName::Settlement);
+            assert_eq!(
+                <TxpoolBackrun as Strategy>::NAME,
+                StrategyName::TxpoolBackrun
+            );
+
+            let identity = registry.position_identity(position_market(), position_account());
+            let floor = Freshness::AtOrAfter {
+                block: POSITION_OBSERVED_AT,
+            };
+            let from_settlement = registry.read_position(&identity, &floor);
+            let from_backrun = registry.read_position(&identity, &floor);
+            assert!(
+                from_settlement.is_ok() && from_backrun.is_ok(),
+                "both arms read through the one booted session; settlement refused {:?}, backrun refused {:?}",
+                from_settlement.as_ref().err(),
+                from_backrun.as_ref().err()
+            );
+            let from_settlement = from_settlement.unwrap();
+            let from_backrun = from_backrun.unwrap();
+
+            // One canonical identity, reached from either arm.
+            assert_eq!(from_settlement.identity(), from_backrun.identity());
+            assert_eq!(from_settlement.identity().market(), position_market());
+            assert_eq!(from_settlement.identity().account(), position_account());
+            assert_eq!(from_settlement.identity().chain_id(), 1);
+            // Neither arm's policy reaches the reading: the same risk report
+            // both arms act on, not a per-arm projection.
+            assert_eq!(
+                from_settlement.health_factor(),
+                from_backrun.health_factor()
+            );
+            let rendered = format!("{from_settlement:?}");
+            assert!(!rendered.contains("a.local"));
+            assert!(!rendered.contains("rpc.local"));
+            assert!(!format!("{settlement:?}{backrun:?}").contains(&rendered));
+        });
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+}

@@ -1,0 +1,388 @@
+//! `PyO3` seam for the pool discovery writers — (split out of the discovery writers).
+//!
+//! Wraps `apexbot-db`'s `discovery` substrate
+//! ([`apexbot_db::ApexbotDb::upsert_v2_pools`] / [`upsert_v3_pools`] /
+//! [`upsert_v4_pools`] / [`set_exchange_last_update_block`]) as module-level
+//! `#[pyfunction]`s taking a `database_path` (same pattern as the discovery
+//! `db_apply_v3/v4_liquidity_updates` seam). The Python
+//! `cli/pool_updater_configs.py::update_v2/v3/v4_pools` shells decode the raw
+//! `PoolCreated` `LogReceipt`s (topics/data → addresses/fee/tick-spacing) + do
+//! the RPC fee lookup, then build [`PyV2PoolRowInput`] / [`PyV3PoolRowInput`]
+//! / [`PyV4PoolRowInput`] lists + delegate here — the `Rust` core owns the
+//! `erc20_tokens` get-or-create escalate + the polymorphic pool-row insert +
+//! the `ExchangeTable.last_update_block` stamp.
+//!
+//! `py.detach()` wraps the DB I/O (no `GIL` held during the upsert loop).
+
+use std::path::PathBuf;
+
+use alloy::primitives::Address;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+
+use crate::address_utils::parse_address;
+use crate::db::db_err_to_py;
+use crate::db::pool_read::{PyExchangeRow, PyPoolManagerRow};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Python row-input pyclasses (the arg-extraction boundary)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One V2 pool-row to upsert — the Python constructor surface over
+/// [`apexbot_db::V2PoolRowInput`]: the `(address, token0_address,
+/// token1_address, fee_token0, fee_token1, stable)` tuple. The Python
+/// `update_v2_pools` shell decodes the `PoolCreated` event + builds these
+/// records; the `Rust` core get-or-create's the tokens + inserts the
+/// polymorphic base `pools` row + the subclass detail row. `stable` is `None`
+/// for all V2 families except `Aerodrome` (the sole V2 subclass with a
+/// `stable` column).
+///
+/// The pyclass IS the core row (a newtype over it), so the core struct is the
+/// one place the field list is declared and this seam cannot drift from it.
+/// The constructor is the only place a Python hex string becomes an [`Address`]
+/// ([`parse_address`] rejects a malformed address AT CONSTRUCTION with
+/// `ValueError`, instead of per-field at upsert time).
+#[pyclass(name = "V2PoolRowInput", module = "apexbot._ffi.db")]
+pub struct PyV2PoolRowInput(apexbot_db::V2PoolRowInput);
+
+impl PyV2PoolRowInput {
+    /// Copy the carried core row out — the writer takes `&[V2PoolRowInput]` and
+    /// each batch owns its rows.
+    fn to_core(&self) -> apexbot_db::V2PoolRowInput {
+        self.0.clone()
+    }
+}
+
+#[pymethods]
+impl PyV2PoolRowInput {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "PyO3 constructor boundary takes ownership; FFI signature is fixed"
+    )]
+    #[new]
+    #[pyo3(signature = (address, token0_address, token1_address, fee_token0, fee_token1, stable=None))]
+    fn new(
+        address: String,
+        token0_address: String,
+        token1_address: String,
+        fee_token0: i64,
+        fee_token1: i64,
+        stable: Option<bool>,
+    ) -> PyResult<Self> {
+        Ok(Self(apexbot_db::V2PoolRowInput {
+            address: parse_address(&address)?,
+            token0_address: parse_address(&token0_address)?,
+            token1_address: parse_address(&token1_address)?,
+            fee_token0,
+            fee_token1,
+            stable,
+        }))
+    }
+}
+
+/// One V3 pool-row to upsert — the Python constructor surface over
+/// [`apexbot_db::V3PoolRowInput`], same newtype shape as
+/// [`PyV2PoolRowInput`].
+#[pyclass(name = "V3PoolRowInput", module = "apexbot._ffi.db")]
+pub struct PyV3PoolRowInput(apexbot_db::V3PoolRowInput);
+
+impl PyV3PoolRowInput {
+    /// Copy the carried core row out (see [`PyV2PoolRowInput::to_core`]).
+    fn to_core(&self) -> apexbot_db::V3PoolRowInput {
+        self.0.clone()
+    }
+}
+
+#[pymethods]
+impl PyV3PoolRowInput {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "PyO3 constructor boundary takes ownership; FFI signature is fixed"
+    )]
+    #[new]
+    fn new(
+        address: String,
+        token0_address: String,
+        token1_address: String,
+        fee: i64,
+        tick_spacing: i64,
+    ) -> PyResult<Self> {
+        Ok(Self(apexbot_db::V3PoolRowInput {
+            address: parse_address(&address)?,
+            token0_address: parse_address(&token0_address)?,
+            token1_address: parse_address(&token1_address)?,
+            fee,
+            tick_spacing,
+        }))
+    }
+}
+
+/// One V4 pool-row to upsert — the Python constructor surface over
+/// [`apexbot_db::V4PoolRowInput`], same newtype shape as
+/// [`PyV2PoolRowInput`]. `pool_hash` stays the core's `0x`-prefixed hex
+/// `String`: the `uniswap_v4_pools.pool_hash` column is a hex `VARCHAR`, not a
+/// blob, and the graph's V4 lookup hands the same string to `PathStep.hash`.
+/// The `pool_id` / `manager_id` is resolved inside the `Rust` core from the
+/// passed `pool_manager_address` (one `SELECT` per batch).
+#[pyclass(name = "V4PoolRowInput", module = "apexbot._ffi.db")]
+pub struct PyV4PoolRowInput(apexbot_db::V4PoolRowInput);
+
+impl PyV4PoolRowInput {
+    /// Copy the carried core row out (see [`PyV2PoolRowInput::to_core`]).
+    fn to_core(&self) -> apexbot_db::V4PoolRowInput {
+        self.0.clone()
+    }
+}
+
+#[pymethods]
+impl PyV4PoolRowInput {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "PyO3 constructor boundary takes ownership; FFI signature is fixed"
+    )]
+    #[new]
+    fn new(
+        pool_hash: String,
+        hooks: String,
+        currency0_address: String,
+        currency1_address: String,
+        fee: i64,
+        tick_spacing: i64,
+    ) -> PyResult<Self> {
+        Ok(Self(apexbot_db::V4PoolRowInput {
+            pool_hash,
+            hooks: parse_address(&hooks)?,
+            currency0_address: parse_address(&currency0_address)?,
+            currency1_address: parse_address(&currency1_address)?,
+            fee,
+            tick_spacing,
+        }))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PyO3 wrapper functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `apexbot._ffi.db.db_upsert_v2_pools(database_path, chain_id, kind, exchange_id,
+/// fee_denominator, rows) -> None`
+///
+/// Insert a batch of V2 pool rows. The `Rust` core get-or-create's the two
+/// `erc20_tokens` per row + inserts the polymorphic base `pools` row (kind) +
+/// the subclass detail row (`fee_token0`/`fee_token1`/`fee_denominator`, +
+/// `stable` for `aerodrome_v2`). Raises `ValueError` if `kind` is not a known
+/// V2 family discriminator (mirrors the Python
+/// `config.database_type` dispatch). The address uniqueness constraint raises
+/// `ValueError` (`SQLITE_CONSTRAINT`) on a duplicate `(address, chain)`,
+/// matching the Python `session.add` `IntegrityError` trajectory.
+#[pyfunction]
+pub(crate) fn db_upsert_v2_pools(
+    py: Python<'_>,
+    database_path: &str,
+    chain_id: i64,
+    kind: &str,
+    exchange_id: i64,
+    fee_denominator: i64,
+    rows: Vec<Py<PyV2PoolRowInput>>,
+) -> PyResult<()> {
+    let path = PathBuf::from(database_path);
+    let rust_rows: Vec<apexbot_db::V2PoolRowInput> =
+        rows.into_iter().map(|r| r.borrow(py).to_core()).collect();
+    py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.upsert_v2_pools(chain_id, kind, exchange_id, fee_denominator, &rust_rows)
+            .map_err(|e| db_err_to_py(&e))
+    })
+}
+
+/// `apexbot._ffi.db.db_upsert_v3_pools(database_path, chain_id, kind, exchange_id,
+/// fee_denominator, rows) -> None`
+///
+/// Insert a batch of V3 pool rows. Same shape as [`db_upsert_v2_pools`];
+/// subclass detail row carries `tick_spacing` + the fee columns
+/// (`liquidity_update_block`/`log_index` left `NULL` until the liquidity
+/// updater stamps them). Raises `ValueError` if `kind` is not a V3 family.
+#[pyfunction]
+pub(crate) fn db_upsert_v3_pools(
+    py: Python<'_>,
+    database_path: &str,
+    chain_id: i64,
+    kind: &str,
+    exchange_id: i64,
+    fee_denominator: i64,
+    rows: Vec<Py<PyV3PoolRowInput>>,
+) -> PyResult<()> {
+    let path = PathBuf::from(database_path);
+    let rust_rows: Vec<apexbot_db::V3PoolRowInput> =
+        rows.into_iter().map(|r| r.borrow(py).to_core()).collect();
+    py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.upsert_v3_pools(chain_id, kind, exchange_id, fee_denominator, &rust_rows)
+            .map_err(|e| db_err_to_py(&e))
+    })
+}
+
+/// `apexbot._ffi.db.db_upsert_v4_pools(database_path, chain_id, pool_manager_address,
+/// fee_denominator, rows) -> None`
+///
+/// Insert a batch of V4 pool rows. The `Rust` core resolves the
+/// `PoolManagerTable` id from `(chain_id, pool_manager_address)` (one
+/// `SELECT`), then per row: get-or-create the two currency tokens + insert
+/// the `managed_pools` polymorphic base (`kind='uniswap_v4', manager_id`) +
+/// the `uniswap_v4_pools` detail row. Raises `ValueError` if no
+/// `PoolManager` row matches (mirrors the Python
+/// `assert manager_in_db is not None`).
+#[pyfunction]
+pub(crate) fn db_upsert_v4_pools(
+    py: Python<'_>,
+    database_path: &str,
+    chain_id: i64,
+    pool_manager_address: &str,
+    fee_denominator: i64,
+    rows: Vec<Py<PyV4PoolRowInput>>,
+) -> PyResult<()> {
+    let path = PathBuf::from(database_path);
+    let rust_rows: Vec<apexbot_db::V4PoolRowInput> =
+        rows.into_iter().map(|r| r.borrow(py).to_core()).collect();
+    py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.upsert_v4_pools(chain_id, pool_manager_address, fee_denominator, &rust_rows)
+            .map_err(|e| db_err_to_py(&e))
+    })
+}
+
+/// `apexbot._ffi.db.db_set_exchange_last_update_block(database_path, chain_id,
+/// exchange_id, block) -> None`
+///
+/// Stamp an `ExchangeTable.last_update_block`. Port of the
+/// `exchange.last_update_block = working_end_block` trajectory in
+/// `cli/pool.py::pool_update` (the discovery-writer close-out stamp).
+#[pyfunction]
+pub(crate) fn db_set_exchange_last_update_block(
+    py: Python<'_>,
+    database_path: &str,
+    chain_id: i64,
+    exchange_id: i64,
+    block: i64,
+) -> PyResult<()> {
+    let path = PathBuf::from(database_path);
+    py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.set_exchange_last_update_block(chain_id, exchange_id, block)
+            .map_err(|e| db_err_to_py(&e))
+    })
+}
+
+/// `apexbot._ffi.db.db_upsert_exchange(database_path, chain_id, name, factory,
+/// deployer) -> ExchangeRow`
+///
+/// Resolve an `exchanges` row by `(chain_id, name)`, inserting a new
+/// `active=False`, `last_update_block=None` row if none exists (the substrate
+/// the `exchange activate/deactivate` CLI delegates to for the get-or-create
+/// step). If a row already exists it is returned UNCHANGED — `active` is NOT
+/// touched here (flipping active is a separate concern, see
+/// [`db_set_exchange_active`]). `exchanges` has no unique index on
+/// `(chain_id, name)` so this uses the explicit SELECT-then-INSERT dedup the
+/// Python `cli/exchange.py` trajectory uses (no Alembic migration forced). The
+/// `factory` / `deployer` are stored EIP-55-checksummed. Raises `ValueError`
+/// on a parse or DB failure.
+#[pyfunction]
+pub(crate) fn db_upsert_exchange(
+    py: Python<'_>,
+    database_path: &str,
+    chain_id: i64,
+    name: &str,
+    factory: &str,
+    deployer: Option<&str>,
+) -> PyResult<Py<PyExchangeRow>> {
+    let path = PathBuf::from(database_path);
+    let factory = Address::parse_checksummed(factory, None)
+        .map_err(|e| PyValueError::new_err(format!("bad factory address: {e}")))?;
+    let deployer = deployer
+        .map(|d| {
+            Address::parse_checksummed(d, None)
+                .map_err(|e| PyValueError::new_err(format!("bad deployer address: {e}")))
+        })
+        .transpose()?;
+    let row = py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.upsert_exchange(chain_id, name, factory, deployer)
+            .map_err(|e| db_err_to_py(&e))
+    })?;
+    Py::new(py, PyExchangeRow::from(row))
+}
+
+/// `apexbot._ffi.db.db_set_exchange_active(database_path, exchange_id, active)
+/// -> None`
+///
+/// Flip an `exchanges` row's `active` flag by id — the activate/deactivate
+/// primitive the `exchange activate` / `exchange deactivate` CLI commands
+/// delegate to (the Python trajectory's `exchange.active = True/False;
+/// session.commit()`). Raises `ValueError` (a not-found error surfaced from
+/// [`apexbot_db::DbError::MissingRow`]) if no row matches `exchange_id`.
+#[pyfunction]
+pub(crate) fn db_set_exchange_active(
+    py: Python<'_>,
+    database_path: &str,
+    exchange_id: i64,
+    active: bool,
+) -> PyResult<()> {
+    let path = PathBuf::from(database_path);
+    py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.set_exchange_active(exchange_id, active)
+            .map_err(|e| db_err_to_py(&e))
+    })
+}
+
+/// `apexbot._ffi.db.db_upsert_pool_manager(database_path, address, chain, kind,
+/// state_view, exchange_id) -> PoolManagerRow`
+///
+/// Upsert a `pool_managers` row by `(address, chain)` (the get-or-create
+/// substrate for the V4 manager row the `exchange activate uniswap_v4` CLI
+/// creates). `pool_managers` HAS the unique index on `(address, chain)` so this
+/// uses `INSERT … ON CONFLICT … RETURNING` — idempotent: re-calling with a
+/// changed `state_view` updates the row in place (same id), re-calling
+/// identical leaves it unchanged. `address` / `state_view` are stored
+/// EIP-55-checksummed. Raises `ValueError` on a parse or DB failure.
+#[pyfunction]
+pub(crate) fn db_upsert_pool_manager(
+    py: Python<'_>,
+    database_path: &str,
+    address: &str,
+    chain: i64,
+    kind: &str,
+    state_view: Option<&str>,
+    exchange_id: i64,
+) -> PyResult<Py<PyPoolManagerRow>> {
+    let path = PathBuf::from(database_path);
+    let address = Address::parse_checksummed(address, None)
+        .map_err(|e| PyValueError::new_err(format!("bad pool manager address: {e}")))?;
+    let state_view = state_view
+        .map(|sv| {
+            Address::parse_checksummed(sv, None)
+                .map_err(|e| PyValueError::new_err(format!("bad state_view address: {e}")))
+        })
+        .transpose()?;
+    let row = py.detach(|| {
+        let (db, _state) =
+            apexbot_db::ApexbotDb::open_for_writes(&path).map_err(|e| db_err_to_py(&e))?;
+        db.upsert_pool_manager(address, chain, kind, state_view, exchange_id)
+            .map_err(|e| db_err_to_py(&e))
+    })?;
+    Py::new(py, PyPoolManagerRow::from(row))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Module registration
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The discovery seam members (the upsert/write pyfunctions + the pool-row
+// input builders) are exported declaratively from the `db` `#[pymodule]` in
+// the parent `mod.rs`.

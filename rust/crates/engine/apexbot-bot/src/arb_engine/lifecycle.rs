@@ -1,0 +1,273 @@
+//! Path registration, buffer management, and engine accessors.
+//!
+//! The inherent `impl ArbitrageEngine` block was dissolved. Every
+//! member is now a machine-direct free function over `&ArbitrageEngine` /
+//! `&mut ArbitrageEngine`; the stage surface (`EngineStages`) and the in-crate
+//! tests both call these directly, so no delegating inherent engine method
+//! remains outside `arb_engine/mod.rs` (the one-impl-block structural gate).
+
+use super::{ArbitrageEngine, HashMap};
+use ::apexbot_pools::solve::{PoolHop, SolvePathResult};
+/// the solve tree's runtime stance is INSTANCE-SCOPED — built
+/// fresh per engine from the typed config and passed down; no `OnceLock`.
+#[must_use]
+pub(crate) fn solve_runtime_config_from_cfg(
+    cfg: &::apexbot_config::BotConfig,
+) -> ::apexbot_pools::solve::runtime::SolveRuntimeConfig {
+    ::apexbot_pools::solve::runtime::SolveRuntimeConfig {
+        event_solver_legacy: cfg.solve.walk_event_solver_legacy,
+        walk_event_census: cfg.solve.walk_event_census,
+        anchor_sweep: match cfg.solve.walk_anchor_sweep {
+            ::apexbot_config::AnchorSweep::Off => {
+                ::apexbot_pools::solve::runtime::AnchorSweep::Off
+            }
+            ::apexbot_config::AnchorSweep::CenterOnly => {
+                ::apexbot_pools::solve::runtime::AnchorSweep::CenterOnly
+            }
+            ::apexbot_config::AnchorSweep::Full => {
+                ::apexbot_pools::solve::runtime::AnchorSweep::Full
+            }
+        },
+        max_tangent_lines: cfg.solve.envelope_max_tangent_lines,
+        sampled_compose_lines: cfg.solve.envelope_sampled_compose_lines,
+        memo_on: cfg.solve.solver_walk_memo,
+        memo_stats: cfg.solve.solver_walk_memo_stats,
+        // Loop-19/20/21 experiment stances — schema keys pending in
+        // apexbot-config; the engine pins the measured defaults for now.
+        refine_model_anchor: false,
+        tangent_sample_by_mass: false,
+        envelope_pruned_refine: true,
+    }
+}
+/// T4: the ONE config parse point for the engine's runtime stances —
+/// called at engine construction with the typed `BotConfig`; hot paths read
+/// the parsed statics. The crate performs ZERO environment reads: every stance
+/// is a schema key (env or TOML loads into it via the apexbot-config loader).
+/// The solver-runtime stance is NOT installed globally anymore — the engine
+/// holds an instance value built by [`solve_runtime_config_from_cfg`] and
+/// threads it down.
+///
+/// the boots installed here are the CONSTRUCTION-STAMPED values —
+/// the engine derived its own `FleetBoot` from THIS caller cfg and stamped it
+/// (`BootStamp`: engine id + deterministic cfg hash); the per-role fleet
+/// executors courier the identified stamp to the single fleet
+/// materialization, and a divergent-cfg rider is ledgered
+/// (`boot_stamp::record_ride`) instead of silently winning the fleet.
+pub(crate) fn install_engine_stances(
+    cfg: &::apexbot_config::BotConfig,
+    boot_stamp: &crate::arb_engine::boot_stamp::BootStamp,
+) {
+    // LW-T9 (no stance, no migration flag): the solve bins ALWAYS ride the
+    // fleet-hosted executor; the typed boot descriptor (quota + overrides +
+    // posture) is parsed here once.
+    // the engine's OWN construction boot, stamped — each role's
+    // install records the identified ride (first-fleet-wins per role).
+    crate::arb_engine::fleet_solve_executor::install_boot(boot_stamp.clone());
+    // candidate 4: the two POOLED roles install through the ONE
+    // registry. Sim installs BEFORE registration, so the registry's
+    // first-wins canonical process boot is sim's (same descriptor value as
+    // registration's — the boot is shared). ADR-042 F4: the SimDriver seat
+    // pool shares the boot descriptor; PRG-3: registration shares it too
+    // (duty-counted PoolStateUpdater slots, Deferrable cordon class).
+    let registry = crate::arb_engine::fleet_boot::FleetBootRegistry::process();
+    registry.install_boot(
+        crate::arb_engine::boot_stamp::BootRole::Sim,
+        boot_stamp.clone(),
+    );
+    registry.install_boot(
+        crate::arb_engine::boot_stamp::BootRole::Registration,
+        boot_stamp.clone(),
+    );
+    // C2: the cycle's stance values are ENGINE instance values now
+    // (`SolveCycle::min_profit_floor` / `::inline_sim_enabled`, packed at
+    // construction) — no process statics remain for the solve cycle.
+    apexbot_substrate::resolve::install_projection_memo_stance(
+        cfg.solve.concentrated_liquidity_projection_cache,
+    );
+    // the chunked parallel resolve stance is an ENGINE
+    // instance value now — packed per construction from
+    // cfg.solve.solve_resolve_par (the construction-stance
+    // trajectory); no installer store remains here.
+}
+/// PRG-4: `PathRegistrationError` moved to
+/// [`super::path_registry`] (ADR-045); re-exported here at its old
+/// path so the `PyO3` mapper (`apexbot-python`) and white-box tests compile
+/// unchanged.
+pub use super::path_registry::PathRegistrationError;
+
+/// Register a mixed path and return its ID (machine-direct free-function route).
+///
+/// Each hop's family is derived from the associated `BotState`'s `PoolEntry`
+/// variant; a `pool_id` not registered in the `BotState` is rejected with a
+/// clear error (ADR-006 D3). The path is resolved immediately. If all pool
+/// states are available, the path is marked valid and will be solved on the
+/// next dirty cycle or `solve_all_paths` call.
+///
+/// # Errors
+///
+/// Returns `Err` if any `pool_id` is not registered in the associated
+/// `BotState`.
+pub(crate) fn register_path(
+    engine: &mut ArbitrageEngine,
+    hops: Vec<PoolHop>,
+) -> Result<u64, PathRegistrationError> {
+    engine
+        .cycle
+        .register_path(hops, &mut engine.registry)
+        .map(|r| r.path_id)
+}
+/// Register a path and eagerly solve it (machine-direct free-function route).
+///
+/// Like `register_path`, but also solves the path immediately and appends the
+/// result to `engine.cycle.results`. The `pending_new_paths` set tracks the
+/// path so the next dirty-cycle merge doesn't discard it.
+///
+/// # Errors
+///
+/// Returns `Err` if any `pool_id` is not registered in the associated
+/// `BotState` (see [`register_path`]).
+pub(crate) fn register_and_solve_path(
+    engine: &mut ArbitrageEngine,
+    hops: Vec<PoolHop>,
+) -> Result<u64, PathRegistrationError> {
+    engine
+        .cycle
+        .register_and_solve_path(hops, &mut engine.registry)
+        .map(|r| r.path_id)
+}
+/// Set the maximum age for buffered events in the V3/V4 buffers (ADR-003:
+/// both live on `BotState`).
+///
+/// Caches the stance ON the engine - with `None` the expiry is a
+/// provable no-op and `expire_buffered_events` skips the core write (each
+/// write bought a ~2.9s writer-queue slot under the block-apply stream).
+pub(crate) fn set_event_buffer_max_age(engine: &mut ArbitrageEngine, max_age: Option<u64>) {
+    engine.event_buffer_expiry_enabled = max_age.is_some();
+    engine
+        .core
+        .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .concentrated_liquidity_mut()
+        .set_v3_buffer_max_age(max_age);
+    engine
+        .core
+        .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .concentrated_liquidity_mut()
+        .set_v4_buffer_max_age(max_age);
+}
+/// Flush all buffered events in the V3/V4 buffers on `BotState` (ADR-003).
+pub(crate) fn flush_event_buffer(engine: &mut ArbitrageEngine) {
+    engine
+        .core
+        .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .concentrated_liquidity_mut()
+        .flush_v3_buffer();
+    engine
+        .core
+        .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .concentrated_liquidity_mut()
+        .flush_v4_buffer();
+}
+/// Read the last solved results and block number.
+///
+/// Engine-shard T1: snaps a snapshot of the `DashMap`
+/// shards into an owned `HashMap` so the caller never holds a lock into the
+/// engine. `O(n_results)` — typically <50 entries (profitable solves only)
+/// per drain.
+#[must_use]
+pub(crate) fn latest_results(engine: &ArbitrageEngine) -> (HashMap<u64, SolvePathResult>, u64) {
+    (
+        engine
+            .cycle
+            .results
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect(),
+        engine.cycle.cursor.coordinates().results_block,
+    )
+}
+/// Return the last block number processed by `process_block`.
+/// Returns `None` if no block has been processed yet.
+#[must_use]
+pub(crate) fn last_processed_block(engine: &ArbitrageEngine) -> Option<u64> {
+    engine.cycle.cursor.coordinates().last_processed_block
+}
+/// Set the last processed block manually (machine-direct cursor poke).
+///
+/// Called by Python after backfill completes, so the Rust pump knows not to
+/// re-process the backfilled range. A monotone advance on the block
+/// cursor — a lower value cannot pull the processed boundary backwards.
+pub(crate) fn set_last_processed_block(engine: &mut ArbitrageEngine, block: u64) {
+    engine.cycle.cursor.advance_processed(block);
+}
+/// install the deferred-path re-record hook (the ledger carry). The
+/// `EngineStages` constructor is the production installer — it captures the
+/// shared `EpochDelta` and re-records a deferred path's hop-pool keys at the
+/// cycle's solve block. Direct engine drives (unit tests, the cold-start
+/// `solve_all`) leave it unset, and the deferral falls back to today's
+/// dropped behavior.
+pub(crate) fn set_deferred_re_record(
+    engine: &mut ArbitrageEngine,
+    hook: super::DeferredReRecordHook,
+) {
+    engine.cycle.deferred_re_record = Some(hook);
+}
+/// Resolve and solve all registered paths (machine-direct cycle route).
+/// **Solve-only — does NOT dispatch a batch** (matches the cycle's contract;
+/// dispatch is the pump's job via `compute_diff_and_send`, driven by the
+/// debounce timer).
+///
+/// Cold-start / test synchronization entry point. Populates
+/// `engine.cycle.results` and advances
+/// `results_block`; leaves `delivered` untouched (Python has not yet
+/// received anything). Callers read results via `latest_results`.
+#[tracing::instrument(name = "apexbot.arb.solve_all", skip(engine), fields(block_number, path_count = engine.registry.len()))]
+pub(crate) fn solve_all_paths(engine: &mut ArbitrageEngine, block_number: u64) {
+    engine.cycle.solve_all_paths(block_number, &engine.registry);
+}
+/// Number of registered pools the V2 solve lane ADMITS — the reserve-pair
+/// family's volatile designs (V2 + Aerodrome volatile; ADR-059 D6, one
+/// dispatch row, two entry arms). A Camelot `stable_swap` V2 entry and a
+/// stable Aerodrome entry are the `SolidlyStable` lane's designs that this
+/// lane refuses; they are not counted here.
+#[must_use]
+pub(crate) fn reserve_pair_pool_count(engine: &ArbitrageEngine) -> usize {
+    engine
+        .core
+        .read_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .reserve_pair_pool_count()
+}
+/// Number of registered V3 pools (state lives in `BotState` under ADR-003).
+#[must_use]
+pub(crate) fn v3_pool_count(engine: &ArbitrageEngine) -> usize {
+    engine
+        .core
+        .read_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .pool_count_of::<apexbot_pools::state::v3_state::V3PoolState>()
+}
+/// Number of registered V4 pools (state lives in `BotState` under ADR-003).
+#[must_use]
+pub(crate) fn v4_pool_count(engine: &ArbitrageEngine) -> usize {
+    engine
+        .core
+        .read_at(apexbot_substrate::state_lock::LockSite::Solver)
+        .concentrated_liquidity()
+        .registered_pool_count()
+}
+/// Number of registered mixed paths.
+#[must_use]
+pub(crate) fn path_count(engine: &ArbitrageEngine) -> usize {
+    engine.registry.len()
+}
+/// PRG-4: the engine path registry owns the registered-path cap (was
+/// the Python `MAX_REGISTERED_PATHS` counter). `None` = unlimited. The
+/// `PyO3` driver sets it once at boot from the typed config value.
+pub(crate) fn set_path_cap(engine: &mut ArbitrageEngine, cap: Option<usize>) {
+    engine.registry.set_cap(cap);
+}
+/// PRG-4: dedup hits counted engine-side — a duplicate registration returns
+/// the existing id and never surfaces to the driver as a skip, so the `dup`
+/// telemetry needs this witness.
+#[must_use]
+pub(crate) fn path_dedups(engine: &ArbitrageEngine) -> u64 {
+    engine.registry.dedups()
+}

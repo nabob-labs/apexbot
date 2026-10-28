@@ -1,10 +1,11 @@
 """apexbot: Ethereum DEX helper library."""
 
 # FIRST import (ADR-043 §6): `logging` attaches the console handler that owns
-# this process's console. The Rust extension below emits its boot-time records
-# during ITS module init, and the Rust→Python bridge forwards them to the
-# `apexbot` logger — so the handler must already exist or those early records
-# hit stdlib `lastResort` (WARNING+, no handler) and are dropped.
+# this process's console. The Rust side emits boot-time records during the
+# explicit driver boot (`apexbot._ffi.driver_boot()`, triggered by Bot
+# construction), and the Rust→Python bridge forwards them to the `apexbot`
+# logger — so the handler must already exist or those early records hit
+# stdlib `lastResort` (WARNING+, no handler) and are dropped.
 from .logging import logger
 
 # isort: split
@@ -18,6 +19,7 @@ from .abi import decode_single as abi_decode_single
 from .abi import encode as abi_encode
 from .bot import Bot
 from .checksum_cache import get_checksum_address
+from .discovery import PoolRef
 from .runtime_status import runtime_status
 from .version import __version__
 
@@ -29,10 +31,8 @@ from . import (
 from .aerodrome import (
     AerodromeV2Pool,
     AerodromeV2PoolState,
-    AerodromeV2PoolTracker,
     AerodromeV3Pool,
     AerodromeV3PoolState,
-    AerodromeV3PoolTracker,
 )
 from .chainlink import ChainlinkPriceContract
 from .curve import (
@@ -42,10 +42,7 @@ from .curve import (
 )
 from .erc20 import Erc20Token, EtherPlaceholder
 from .fork import AnvilFork
-from .pancakeswap import (
-    PancakeswapV3Pool,
-    PancakeswapV3PoolTracker,
-)
+from .pancakeswap import PancakeswapV3Pool
 from .registry import (
     ManagedPoolRegistry,
     PoolRegistry,
@@ -66,21 +63,16 @@ from .registry.deployment_loader import (
 from .registry.deployment_loader import (
     register_from_deployments as _register_from_deployments,
 )
-from .sushiswap import (
-    SushiswapV3PoolTracker,
-)
 from .uniswap import (
     UniswapV2Pool,
     UniswapV2PoolExternalUpdate,
     UniswapV2PoolSimulationResult,
     UniswapV2PoolState,
-    UniswapV2PoolTracker,
     UniswapV3LiquiditySnapshot,
     UniswapV3Pool,
     UniswapV3PoolExternalUpdate,
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
-    UniswapV3PoolTracker,
     UniswapV4LiquiditySnapshot,
     UniswapV4Pool,
     UniswapV4PoolExternalUpdate,
@@ -94,10 +86,8 @@ __all__ = (
     "AbiEncodeError",
     "AerodromeV2Pool",
     "AerodromeV2PoolState",
-    "AerodromeV2PoolTracker",
     "AerodromeV3Pool",
     "AerodromeV3PoolState",
-    "AerodromeV3PoolTracker",
     "AnvilFork",
     "Bot",
     "ChainlinkPriceContract",
@@ -108,22 +98,19 @@ __all__ = (
     "EtherPlaceholder",
     "ManagedPoolRegistry",
     "PancakeswapV3Pool",
-    "PancakeswapV3PoolTracker",
+    "PoolRef",
     "PoolRegistry",
     "PoolTypeRegistry",
-    "SushiswapV3PoolTracker",
     "TokenRegistry",
     "UniswapV2Pool",
     "UniswapV2PoolExternalUpdate",
     "UniswapV2PoolSimulationResult",
     "UniswapV2PoolState",
-    "UniswapV2PoolTracker",
     "UniswapV3LiquiditySnapshot",
     "UniswapV3Pool",
     "UniswapV3PoolExternalUpdate",
     "UniswapV3PoolSimulationResult",
     "UniswapV3PoolState",
-    "UniswapV3PoolTracker",
     "UniswapV4LiquiditySnapshot",
     "UniswapV4Pool",
     "UniswapV4PoolExternalUpdate",

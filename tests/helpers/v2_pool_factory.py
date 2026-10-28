@@ -1,15 +1,18 @@
 """Factory helpers for I/O-free V2 pool construction in tests.
 
-Mirrors ``tests/helpers/erc20_factory.py`` (slice 3): every direct
+Mirrors ``tests/helpers/erc20_factory.py``: every direct
 ``UniswapV2Pool(...)`` / V2-subclass construction in the test suite routes
-through ``make_v2_pool`` so the ``LiquidityPool`` handle is wired through
+through ``make_v2_pool`` so the ``Pool`` handle is wired through
 ``Bot::register_v2_pool`` → ``get_pool`` → companion, matching the
 ``Bot.build_pool()`` flow.
 
-Each call creates its own short-lived ``Bot`` (the returned handle holds an
-``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``) — so
-each test pool is fully isolated (no shared mutable state across tests, which
-matters because pools are mutable, unlike slice-3's tokens).
+Each call mints a FRESH ``Bot`` (via ``new_pool_bot``) so every built pool is
+isolated. The register entry is get-or-register — a same address + same
+family + same identity build answers the EXISTING handle (read-only re-builds
+are idempotent) — while a genuine conflict (a different family, or a
+mismatched identity = wire drift) still refuses loudly. Pools are MUTABLE, so
+isolation is the default; a caller that WANTS to share one bot (a read-only
+parity build, or the engine's shared core) passes ``py_bot=`` explicitly.
 """
 
 from __future__ import annotations
@@ -17,14 +20,15 @@ from __future__ import annotations
 from fractions import Fraction
 from typing import TYPE_CHECKING
 
-from apexbot._ffi import Bot
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.uniswap.v2_liquidity_pool import UniswapV2Pool
+from tests.helpers.pool_bot import new_pool_bot
 
 if TYPE_CHECKING:
+    from apexbot._ffi import Bot
     from apexbot._ffi.dex_identity import DexIdentity
     from apexbot.erc20 import Erc20Token
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.aliases import ChainId
 
 
@@ -33,7 +37,7 @@ def _gamma_complement(fee: Fraction) -> tuple[int, int]:
 
     Rust's ``Bot::register_v2_pool`` and the Möbius ``IntHopState`` interpret
     ``gamma_numer`` as the post-fee RETAINED fraction (e.g. 997 for a 0.3% fee,
-    where ``fee_denom=1000`` and ``gamma_numer=1000-3=997`` — the slice-4
+    where ``fee_denom=1000`` and ``gamma_numer=1000-3=997`` — the
     parity tests confirm this). Source data from Python is the FEE ``Fraction``
     (e.g. ``Fraction(3, 1000)``), so we convert to the retained-fraction form.
     """
@@ -61,15 +65,15 @@ def make_v2_pool(
     stable_swap: bool = False,
     fee_denominator: int | None = None,
 ) -> UniswapV2Pool:
-    """Construct an I/O-free V2-style pool companion over a fresh ``LiquidityPool`` handle.
+    """Construct an I/O-free V2-style pool companion over a fresh ``Pool`` handle.
 
-    Each call creates its own short-lived ``Bot`` (the returned handle holds
-    an ``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``)
-    — so each test pool is fully isolated (no shared mutable state across
-    tests, which matters because pools are mutable, unlike slice-3's tokens).
-    The token companions passed in may live in a different ``Bot`` (their own
-    ``make_erc20`` ``Bot``); that's fine — the pool reads reserves from its
-    own ``Bot`` and token metadata from the token's handle, independently.
+    Mints a fresh ``Bot`` unless ``py_bot`` is injected, so each pool is
+    isolated. Registration is get-or-register (a same-identity re-build
+    answers the EXISTING handle); a caller that wants to share one bot passes
+    ``py_bot=``. The token companions passed in may live in a different
+    ``Bot`` (their own ``make_erc20`` ``Bot``); that's fine — the pool reads
+    reserves from its own ``Bot`` and token metadata from the token's handle,
+    independently.
 
     ``Bot.build_pool()`` is the production path (registers in the session's
     shared ``_py_bot``); this helper is the test-only equivalent.
@@ -77,14 +81,14 @@ def make_v2_pool(
     ``pool_class`` defaults to ``UniswapV2Pool``; subclasses like
     ``SushiswapV2Pool`` inherit the companion ``__init__``.
 
-    ``dex`` (ADR-005 slice 7 step 3): the canonical DexIdentity preset. When
+    ``dex``: the canonical DexIdentity preset. When
     provided, fills in ``factory``/``fee_token0``/``fee_token1``/``init_hash``
     from the preset when those explicit params are ``None``. Also threaded
     through to ``UniswapV2Pool(dex=...)``. Explicit params always take
     precedence (non-breaking for callers that pass everything explicitly).
     """
     address = get_checksum_address(address)
-    # chain_id is recovered off the handle by _from_py_pool (token0.chain_id).
+    # chain_id is recovered off the handle by from_handle (token0.chain_id).
     if dex is not None:
         if factory is None:
             factory = dex.factory
@@ -116,13 +120,13 @@ def make_v2_pool(
         gamma_numer0, fee_denom0 = _gamma_complement(fee_token0)
         gamma_numer1, fee_denom1 = _gamma_complement(fee_token1)
 
-    py_bot = py_bot if py_bot is not None else Bot()
+    py_bot = py_bot if py_bot is not None else new_pool_bot()
 
-    # Descriptor params (ADR-005 / FMO2GE): ``variant`` defaults from the dex
+    # Descriptor params (ADR-005): ``variant`` defaults from the dex
     # preset (if provided) or "uniswap-v2". ``stable_swap``/``fee_denominator``
     # default to False/None — callers building a Camelot stable pool pass them
     # explicitly. These flow into Rust as a ``V2PoolDescriptor`` on the
-    # ``LiquidityPool`` handle.
+    # ``Pool`` handle.
     resolved_variant = (
         variant if variant is not None else (dex.variant if dex is not None else "uniswap-v2")
     )
@@ -143,8 +147,8 @@ def make_v2_pool(
         stable_swap=stable_swap,
         fee_denominator=fee_denominator,
     )
-    # ADR-006 (OGTTCS D1): the pool's tokens must live in the SAME Bot as
-    # the pool — ``_from_py_pool`` recovers them via ``py_pool.get_token0``/
+    # ADR-006: the pool's tokens must live in the SAME Bot as
+    # the pool — ``from_handle`` recovers them via ``py_pool.get_token0``/
     # ``get_token1``, which look up ``token0_address``/``token1_address`` in
     # the pool's own ``BotState``. The token companions passed in may have been
     # built against a different ``Bot``; re-register their metadata here so
@@ -154,7 +158,7 @@ def make_v2_pool(
         if py_bot.get_token(tok.address) is None:
             py_bot.register_token(tok.address, tok.name, tok.symbol, tok.decimals, tok.chain_id)
 
-    py_pool: LiquidityPool | None = py_bot.get_pool(pool_id)
+    py_pool: Pool | None = py_bot.get_pool(pool_id)
     assert py_pool is not None, "register_v2_pool returned a pool_id with no handle"
 
-    return pool_class._from_py_pool(py_pool)
+    return pool_class.from_handle(py_pool)

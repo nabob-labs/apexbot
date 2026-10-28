@@ -1,0 +1,418 @@
+"""Bot pool-admission exceptions through the Python seam.
+
+Companion to ``test_v4_admission_exceptions.py`` (which pins the class
+hierarchy shape) — this file exercises the *actual* PyO3 seam so a typed
+``PoolRegistrationError`` subclass surfaces when a caller registers an
+out-of-spec or duplicate pool via ``Bot.register_v{2,3,4}_pool``.
+
+The admission epic made every
+``register_vx_pool`` a typed ``Result<u64, RegisterVxPoolError>`` and gave
+every variant set a ``SpecViolation`` that wraps the shared
+``spec_bounds::SpecViolation { field, value, bound }``. It promoted the
+stop-gap ``PyValueError`` mappers to a typed ``PoolRegistrationError``
+hierarchy shared across V2/V3/V4:
+
+    ValueError
+    └─ PoolRegistrationError
+       ├─ HookedPoolRejectedError       (V4 admission — amount-modifying hook)
+       ├─ DynamicFeePoolRejectedError    (V4 admission — dynamic fee)
+       ├─ HighFeePoolRejectedError      (V4 admission — static fee > 65535)
+       ├─ PoolAlreadyRegisteredError     (V2/V3/V4 duplicate at registration)
+       └─ SpecViolationError            (V2/V3/V4 out-of-spec field)
+
+So Python callers can now ``except PoolRegistrationError:`` to scope just
+admission refusals (a broad ``except ValueError:`` still catches them — backward
+compatible with ``build_paths``'s existing skip-one-rejection-at-a-time net).
+
+Cross-checked V2/V3 registration vectors (``UNISWAP_V2_FACTORY`` /
+``V2_DAI_WETH_ADDR`` etc.) come from ``tests/registry/test_registration_verify``
+so the CREATE2-verify step upstream of `register_vx_pool` passes — the spec
+validator in the Rust core is what gets to fire. V4 admission doesn't do
+CREATE2 verify (pool_manager + pool_id + pool_key tuple), so its vectors are
+arbitrary.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+import apexbot.exceptions
+from apexbot._ffi import Bot
+from apexbot.exceptions import (
+    DynamicFeePoolRejectedError,
+    HighFeePoolRejectedError,
+    HookedPoolRejectedError,
+    PoolAlreadyRegisteredError,
+    PoolRegistrationError,
+    SpecViolationError,
+)
+
+# Cross-checked mainnet V2/V3 vectors (see tests/registry/test_registration_verify).
+UNISWAP_V2_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+UNISWAP_V3_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+DAI = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+USDC = "0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48"
+V2_DAI_WETH_ADDR = "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11"
+V3_UNI_USDC_WETH_500_ADDR = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"
+# In-spec V3 sqrt price at the 1:1 tick (`1 << 96`); the previously-sloppy
+# `sqrt_price_x96 = 1` was below MIN_SQRT_RATIO and is now rejected.
+V3_SQRT_1_TO_1 = 1 << 96
+
+# `uint112(-1)` — the V2 on-chain reserve bound (`UniswapV2Pair._update` asserts
+# `balance <= uint112(-1)`). `1 << 112` is one above it.
+UINT112_MAX = (1 << 112) - 1
+V2_RESERVE_OVER_112BIT = 1 << 112
+
+
+# -----------------------------------------------------------------------
+# Hierarchy shape — pins the class tree + the reparenting of the
+# V4-specific names under the new shared base.
+# -----------------------------------------------------------------------
+
+
+def test_pool_registration_error_is_exposed_and_is_value_error() -> None:
+    assert hasattr(apexbot.exceptions, "PoolRegistrationError")
+    assert issubclass(PoolRegistrationError, ValueError)
+
+
+def test_spec_violation_error_and_already_registered_are_exposed() -> None:
+    assert hasattr(apexbot.exceptions, "SpecViolationError")
+    assert hasattr(apexbot.exceptions, "PoolAlreadyRegisteredError")
+    assert issubclass(SpecViolationError, PoolRegistrationError)
+    assert issubclass(PoolAlreadyRegisteredError, PoolRegistrationError)
+
+
+def test_v4_admission_errors_reparented_under_pool_registration_error() -> None:
+    """The V4-specific names are reparented under `PoolRegistrationError`.
+
+    A broad `except PoolRegistrationError:` must now catch V4 admission
+    rejections too, not just the new V2/V3 spec/dup variants.
+    """
+    assert issubclass(HookedPoolRejectedError, PoolRegistrationError)
+    assert issubclass(DynamicFeePoolRejectedError, PoolRegistrationError)
+
+
+@pytest.mark.parametrize(
+    "exc_name",
+    [
+        "PoolRegistrationError",
+        "PoolAlreadyRegisteredError",
+        "SpecViolationError",
+        "HookedPoolRejectedError",
+        "DynamicFeePoolRejectedError",
+    ],
+)
+def test_admission_errors_catchable_as_value_error(exc_name: str) -> None:
+    """The whole hierarchy subclasses ValueError (backward compat with the
+    broad `except ValueError:` net in `build_paths`)."""
+    exc_type = getattr(apexbot.exceptions, exc_name)
+    msg = "rejected"
+    with pytest.raises(ValueError):  # ruff: ignore[pytest-raises-too-broad] — broad catch is the contract
+        raise exc_type(msg)
+
+
+# -----------------------------------------------------------------------
+# Seam-triggered tests — exercise the actual Bot.register_v{2,3,4}_pool
+# path so the typed mappers surface the right subclass at the boundary.
+# -----------------------------------------------------------------------
+
+
+class TestV2SeamAdmission:
+    def _register(self, bot: Bot) -> int:
+        return bot.register_v2_pool(
+            address=V2_DAI_WETH_ADDR,
+            token0=WETH,
+            token1=DAI,
+            reserve0=1,
+            reserve1=2,
+            gamma_numer0=997,
+            fee_denom0=1000,
+            gamma_numer1=997,
+            fee_denom1=1000,
+            factory=UNISWAP_V2_FACTORY,
+        )
+
+    def test_duplicate_address_returns_the_existing_handle(self) -> None:
+        """Get-or-register: a same-address + same-family + same-identity
+        re-registration answers the EXISTING pool id (no raise)."""
+        bot = Bot(chain_id=1)
+        first = self._register(bot)
+        second = self._register(bot)
+        assert second == first
+
+    def test_different_family_collision_still_raises(self) -> None:
+        """A different family at the same address is not an answer — the
+        family-guarded get half does not fire and the typed refusal stands."""
+        bot = Bot(chain_id=1)
+        self._register(bot)
+        with pytest.raises(PoolAlreadyRegisteredError) as exc_info:
+            bot.register_v3_pool(
+                address=V2_DAI_WETH_ADDR,
+                token0=WETH,
+                token1=DAI,
+                fee=3000,
+                tick_spacing=60,
+                factory=UNISWAP_V3_FACTORY,
+                sqrt_price_x96=V3_SQRT_1_TO_1,
+                liquidity=0,
+                tick=0,
+            )
+        assert "already registered" in str(exc_info.value).lower()
+        assert str(V2_DAI_WETH_ADDR).lower() in str(exc_info.value).lower()
+
+    def test_overlarge_reserve0_raises_spec_violation_error(self) -> None:
+        """V2 reserves are `uint112` on-chain; > `uint112(-1)` is rejected up
+        front."""
+        bot = Bot(chain_id=1)
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v2_pool(
+                address=V2_DAI_WETH_ADDR,
+                token0=WETH,
+                token1=DAI,
+                reserve0=V2_RESERVE_OVER_112BIT,
+                reserve1=2,
+                gamma_numer0=997,
+                fee_denom0=1000,
+                gamma_numer1=997,
+                fee_denom1=1000,
+                factory=UNISWAP_V2_FACTORY,
+            )
+        msg = str(exc_info.value)
+        assert "reserve0" in msg
+        assert "uint112" in msg
+
+
+class TestAerodromeSeamAdmission:
+    """The Aerodrome V2 port joins the typed admission contract (the V2/V3
+    twin): a duplicate-identity re-registration is get-or-register (answers
+    the EXISTING handle) while a different-family / mismatched-identity
+    conflict surfaces as ``PoolAlreadyRegisteredError``, not the
+    ``PanicException`` a process-killing ``assert!`` used to raise.
+
+    Vectors use the real Base Aerodrome volatile factory so the EIP-1167
+    verify upstream of ``register_aerodrome_pool`` passes and the Rust
+    core's duplicate guard is what gets to fire (mirrors the V2/V3
+    cross-checked vectors above).
+    """
+
+    # Real Base Aerodrome V2 volatile pair (tBTC v2/WETH) — passes the
+    # EIP-1167 deployer/implementation verify for the (8453, factory) row.
+    AERO_V2_FACTORY = "0x420DD381b31aEf6683db6B902084cB0FFECe40Da"
+    POOL = "0x2722C8f9B5E2aC72D1f225f8e8c990E449ba0078"
+    TOKEN0 = "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b"
+    TOKEN1 = "0x4200000000000000000000000000000000000006"
+
+    def _kwargs(self) -> dict:
+        return {
+            "address": self.POOL,
+            "token0": self.TOKEN0,
+            "token1": self.TOKEN1,
+            "factory": self.AERO_V2_FACTORY,
+            "variant": "aerodrome-v2-volatile",
+            "stable": False,
+            "fee_numer": 3,
+            "fee_denom": 1000,
+            "token0_decimals": 18,
+            "token1_decimals": 18,
+            "reserve0": 1000,
+            "reserve1": 2000,
+            "update_block": 0,
+        }
+
+    def test_duplicate_address_returns_the_existing_handle(self) -> None:
+        """Get-or-register: the same-address + same-family + same-identity
+        re-registration answers the EXISTING Aerodrome handle (no raise)."""
+        bot = Bot(chain_id=8453)
+        first = bot.register_aerodrome_pool(**self._kwargs())
+        second = bot.register_aerodrome_pool(**self._kwargs())
+        assert second == first
+
+    def test_different_family_collision_still_raises(self) -> None:
+        """A different family at the same address is not an answer — the
+        typed refusal stands (and stays catchable as a ``ValueError``)."""
+        bot = Bot(chain_id=8453)
+        bot.register_aerodrome_pool(**self._kwargs())
+        with pytest.raises(PoolAlreadyRegisteredError) as exc_info:
+            bot.register_v2_pool(
+                address=self.POOL,
+                token0=self.TOKEN0,
+                token1=self.TOKEN1,
+                reserve0=1,
+                reserve1=2,
+                gamma_numer0=997,
+                fee_denom0=1000,
+                gamma_numer1=997,
+                fee_denom1=1000,
+                factory=self.AERO_V2_FACTORY,
+            )
+        assert "already registered" in str(exc_info.value).lower()
+        assert str(self.POOL).lower() in str(exc_info.value).lower()
+
+
+class TestV3SeamAdmission:
+    def _in_spec_kwargs(self) -> dict:
+        return {
+            "address": V3_UNI_USDC_WETH_500_ADDR,
+            "token0": USDC,
+            "token1": WETH,
+            "fee": 500,
+            "tick_spacing": 10,
+            "factory": UNISWAP_V3_FACTORY,
+            "sqrt_price_x96": V3_SQRT_1_TO_1,
+            "liquidity": 0,
+            "tick": 0,
+        }
+
+    def test_duplicate_address_returns_the_existing_handle(self) -> None:
+        """Get-or-register: a same-identity re-registration answers the
+        EXISTING V3 pool id (no raise)."""
+        bot = Bot(chain_id=1)
+        first = bot.register_v3_pool(**self._in_spec_kwargs())
+        second = bot.register_v3_pool(**self._in_spec_kwargs())
+        assert second == first
+
+    def test_out_of_spec_sqrt_price_raises_spec_violation_error(self) -> None:
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs()
+        kw["sqrt_price_x96"] = 1  # below MIN_SQRT_RATIO = 4_295_128_740
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v3_pool(**kw)
+        assert "sqrtPriceX96" in str(exc_info.value)
+
+    def test_out_of_range_tick_raises_spec_violation_error(self) -> None:
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs()
+        kw["tick"] = -887_273  # one below MIN_TICK = -887_272
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v3_pool(**kw)
+        assert "tick" in str(exc_info.value)
+
+    def test_sqrt_price_at_max_raises_spec_violation_error(self) -> None:
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs()
+        # MAX_SQRT_RATIO is the strict upper bound (TickMath rejects `>= MAX`).
+        # `sqrt_price_x96` is snapshot state, not part of CREATE2 — so verify_v3
+        # still passes, leaving the Rust core's `validate_sqrt_price` to reject.
+        sqrt_ratio_max = 1461446703485210103287273052203988822378723970342
+        kw["sqrt_price_x96"] = sqrt_ratio_max
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v3_pool(**kw)
+        assert "sqrtPriceX96" in str(exc_info.value)
+
+    def test_out_of_range_tick_spacing_raises_spec_violation_error(self) -> None:
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs()
+        kw["tick_spacing"] = 32_768  # one above MAX_TICK_SPACING = 32_767
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v3_pool(**kw)
+        assert "tickSpacing" in str(exc_info.value)
+
+
+class TestV4SeamAdmission:
+    """V4 admission doesn't do CREATE2 verify; the V4 vectors are arbitrary
+    (the team manager + pool_id just need to be fresh per test)."""
+
+    PM = "0x" + "44" * 20
+    POOL_ID = "0x" + "ee" * 32
+    C0 = "0x" + "00" * 20
+    C1 = "0x" + "01" * 20
+
+    def _in_spec_kwargs(self, pool_id_hex: str = POOL_ID) -> dict:
+        return {
+            "pool_manager": self.PM,
+            "pool_id_hex": pool_id_hex,
+            "currency0": self.C0,
+            "currency1": self.C1,
+            "fee": 500,
+            "tick_spacing": 10,
+            "hook_address": None,
+            "sqrt_price_x96": V3_SQRT_1_TO_1,
+            "liquidity": 1_000_000,
+            "tick": 0,
+            "block": 0,
+        }
+
+    def test_duplicate_returns_the_existing_handle(self) -> None:
+        """Get-or-register on the `(pool_manager, pool_id)` pair: a matching
+        pool key answers the EXISTING pool id (no raise)."""
+        bot = Bot(chain_id=1)
+        first = bot.register_v4_pool(**self._in_spec_kwargs())
+        second = bot.register_v4_pool(**self._in_spec_kwargs())
+        assert second == first
+
+    def test_different_identity_on_the_same_pair_still_raises(self) -> None:
+        """The same `(pool_manager, pool_id)` with a DIFFERENT pool key is
+        wire drift — the loud typed refusal stands."""
+        bot = Bot(chain_id=1)
+        bot.register_v4_pool(**self._in_spec_kwargs())
+        other = self._in_spec_kwargs()
+        other["currency0"] = "0x" + "99" * 20
+        with pytest.raises(PoolAlreadyRegisteredError):
+            bot.register_v4_pool(**other)
+
+    def test_out_of_spec_sqrt_price_raises_spec_violation_error(self) -> None:
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs("0x" + "e1" * 32)
+        kw["sqrt_price_x96"] = 1
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v4_pool(**kw)
+        assert "sqrtPriceX96" in str(exc_info.value)
+
+    def test_overlarge_v4_fee_raises_spec_violation_else_than_dynamic_fee(
+        self,
+    ) -> None:
+        """V4 `fee >= 1 << 24` (`V4_FEE_MAX`) is rejected as `SpecViolationError`,
+        NOT as `DynamicFeePoolRejectedError` — the `0x800000` high bit is the
+        dynamic-fee flag (handled as a separate, more-specific rejection);
+        `fee >= 1 << 24` is a different and more primitive kind of out-of-spec."""
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs("0x" + "e2" * 32)
+        kw["fee"] = 1 << 24  # V4_FEE_MAX
+        with pytest.raises(SpecViolationError) as exc_info:
+            bot.register_v4_pool(**kw)
+        assert "fee" in str(exc_info.value)
+
+    def test_hooked_pool_admitted_with_reserved_typed_error(self) -> None:
+        """Amount-modifying-hook V4 pools are admitted at registration
+        (simulations carry Caveats::HOOKED_POOL; hop projection excludes them
+        from solving). The typed HookedPoolRejectedError stays exposed
+        for API compatibility, but register_v4_pool no longer raises it."""
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs("0x" + "e3" * 32)
+        # low16 = 0x0080 = BEFORE_SWAP — amount-modifying
+        kw["hook_address"] = "0x" + "00" * 19 + "80"
+        bot.register_v4_pool(**kw)  # admitted; no HookedPoolRejectedError raised
+
+    def test_high_static_fee_raises_high_fee_pool_rejected_error(self) -> None:
+        """A static ``fee > 65535`` (u16::MAX) is protocol-valid but
+        exceeds the cmd_executor's 2-byte fee field, so it is rejected at
+        admission as ``HighFeePoolRejectedError`` (a distinct variant from the
+        dynamic-fee refusal + the ``fee >= 1<<24`` spec violation).
+
+        The check runs after the spec validators (which allow ``fee < 1<<24``)
+        and after the dynamic-fee flag check (``fee != 0x800000``), so a
+        static fee of 320_000 (a real mainnet 32%-fee pool) reaches this
+        variant and is refused with a typed message naming the fee.
+        """
+        bot = Bot(chain_id=1)
+        kw = self._in_spec_kwargs("0x" + "e9" * 32)
+        kw["fee"] = 320_000  # > u16::MAX (65_535), < 1 << 24, not 0x800000
+        with pytest.raises(HighFeePoolRejectedError) as exc_info:
+            bot.register_v4_pool(**kw)
+        assert "320000" in str(exc_info.value)
+        assert "65535" in str(exc_info.value)
+
+    def test_fee_at_u16_boundary_is_admitted_or_rejected_correctly(self) -> None:
+        """fee = 65_535 (u16::MAX) is the last encodable value (admitted);
+        fee = 65_536 is the first un-encodable (rejected as HighFee)."""
+        bot = Bot(chain_id=1)
+        kw_admit = self._in_spec_kwargs("0x" + "ea" * 32)
+        kw_admit["fee"] = 65_535
+        bot.register_v4_pool(**kw_admit)  # must not raise
+
+        bot = Bot(chain_id=1)
+        kw_reject = self._in_spec_kwargs("0x" + "eb" * 32)
+        kw_reject["fee"] = 65_536
+        with pytest.raises(HighFeePoolRejectedError):
+            bot.register_v4_pool(**kw_reject)

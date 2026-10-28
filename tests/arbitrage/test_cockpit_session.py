@@ -1,6 +1,6 @@
 """Cockpit session state — the one owner of pump-session coordination state.
 
-Epic Y7PA5A, task UKXADE. The block loop (``consume``) and the dispatch
+The block loop (``consume``) and the dispatch
 leaf (``dispatch``) must read the SAME ``_SessionState`` owned by the
 runner, instead of the session travelling as a 10-parameter signature
 + 9 kwargs.
@@ -13,19 +13,27 @@ streams, dispatch leaf monkeypatched). No anvil, no live RPC.
 
 from __future__ import annotations
 
-import asyncio
 import signal
 
 import pytest
 
 from apexbot.runner import BotRunner
+from apexbot.runner._consume import consume_result_batches
+from apexbot.runner._relay_posture import RelayPosture
+from apexbot.runner.bot_runner import InjectedActors, _SessionState
 from apexbot.runner.config import ArbitrageConfig
+from tests.fakes.bot import FakeBot as _FakeBot
+from tests.fakes.engine import FakeEngineRegistry as _FakeEngineRegistry
+from tests.fakes.runner_pipelines import StubPipeline
+from tests.helpers.boot_actors import inline_registration_scheduler
+from tests.helpers.identity_env import identity_env
+from tests.helpers.rpc_env import rpc_env
 
 
 @pytest.fixture(autouse=True)
-def _rpc_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("APEXBOT_RPC_HTTP_CHAINID_1", "http://localhost:8545")
-    monkeypatch.setenv("APEXBOT_RPC_WS_CHAINID_1", "ws://localhost:8546")
+def _rpc_env():
+    with rpc_env():
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -35,69 +43,12 @@ def _restore_sigint() -> None:
 
 
 def _cfg() -> ArbitrageConfig:
-    return ArbitrageConfig.from_env(
-        {
-            "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
-            "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
-            "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
-            "INJECT_EXECUTOR_CODE": "0",
-        },
-        live=True,
-        permutation=None,
-    )
-
-
-class _FakeEngine:
-    def resume(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def v2_pool_count(self) -> int:
-        return 0
-
-    def v3_pool_count(self) -> int:
-        return 0
-
-    def v4_pool_count(self) -> int:
-        return 0
-
-    def path_count(self) -> int:
-        return 0
-
-    async def pump_finished_future(self) -> None:
-        # Injected engines have no real pump: the awaitable contract is a
-        # future that never resolves (the real pre-finish consumer shape).
-        await asyncio.Event().wait()
-
-    async def block_stream(self):
-        return
-        yield  # pragma: no cover - async generator marker
-
-
-class _FakeEngineRegistry:
-    def __init__(self) -> None:
-        self.engine = _FakeEngine()
-        self.start_calls = 0
-
-    def start(self, node_http, node_ws, *, v3_snapshot, v4_snapshot, verify_state_view) -> int:
-        self.start_calls += 1
-        return 12_000
-
-
-class _FakeBot:
-    chain_id = 1
-
-    def release_python_state(self) -> None:
-        pass
-
-    def block_stream(self):  # pragma: no cover - the capturing consumer never iterates it
-        async def _empty():
-            return
-            yield {}  # pragma: no cover
-
-        return _empty()
+    with identity_env({
+        "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
+        "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
+        "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
+    }):
+        return ArbitrageConfig.build(live=True, permutation=None)
 
 
 class _FakeAsyncW3:
@@ -195,12 +146,16 @@ class TestSessionOwner:
 
         session_runner = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=_FakeEngineRegistry(),
-            async_w3=_FakeAsyncW3(),
-            snapshots=(object(), object(), None, None),
-            path_builder=lambda **kw: _noop(),
-            consumer=capturing_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=_FakeEngineRegistry(),
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **kw: _noop(),
+                consumer=capturing_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
             install_sigint=False,
         )
         async with session_runner:
@@ -210,49 +165,15 @@ class TestSessionOwner:
         assert owner is session_runner._session  # whitebox: the owner is private API
         assert owner.dispatcher is session_runner.dispatcher
 
-    async def test_dispatch_leaf_receives_the_same_owner(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
+    async def test_dispatch_leaf_receives_the_same_owner(self) -> None:
         """The loop and the dispatch leaf read one and the same owner."""
-        from apexbot.runner._consume import consume_result_batches
-        from apexbot.runner.bot_runner import _SessionState
 
-        captured: dict[str, object] = {}
-
-        def fake_dispatch_leaf(*args: object, **kwargs: object) -> object:
-            captured["positional"] = args
-            captured.update(kwargs)
-            return _noop()
-
-        monkeypatch.setattr("apexbot.runner._consume._dispatch_profitable", fake_dispatch_leaf)
-
-        # SIMPIPE option A: the default consumer path routes batches through
-        # the pipeline — the owner flows into the pipeline at construction,
-        # which is the same "one owner" contract the serial leaf asserted.
-        captured_pipelines: list[object] = []
-
-        class _StubPipeline:
-            def __init__(self, session: object, **kwargs: object) -> None:
-                captured_pipelines.append(session)
-
-            async def enqueue(
-                self,
-                results: object,
-                *,
-                block_timestamp: int,
-                base_fee_next: int,
-                payloads: dict[int, dict] | None = None,
-            ) -> None:
-                return None
-
-            def raise_if_failed(self) -> None:
-                return None
-
-            async def stop(self) -> None:
-                return None
-
-        monkeypatch.setattr("apexbot.runner._consume.SimSubmitPipeline", _StubPipeline)
+        # SIMPIPE option A: the consumer path routes batches through the
+        # pipeline — the owner flows into the pipeline at construction, which
+        # is the same "one owner" contract the serial leaf asserted. The
+        # session's pipeline factory supplies the stub so the consumer attaches
+        # a recording double instead of the real Rust sim seam.
+        StubPipeline.instances.clear()
 
         dispatcher = _FakeDispatcher(current_block=12_346)
         owner = _SessionState(
@@ -262,6 +183,7 @@ class TestSessionOwner:
             dispatcher=dispatcher,
             cfg=_cfg(),
             current_block=12_345,
+            pipeline_factory=StubPipeline,
         )
         await consume_result_batches(
             owner,
@@ -273,46 +195,15 @@ class TestSessionOwner:
         # SIMPIPE: the "same owner" contract now rides the pipeline seam -
         # the consumer must hand THE session owner into the pipeline (which
         # the sim+submit leaves read exclusively).
-        assert captured_pipelines == [owner], "dispatch pipeline did not receive the session owner"
-
-    async def test_owner_advances_with_the_block_clock(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The owner mirrors the newHeads clock as the loop applies it."""
-        from apexbot.runner._consume import consume_result_batches
-        from apexbot.runner.bot_runner import _SessionState
-
-        def fake_dispatch_leaf(*args: object, **kwargs: object) -> object:
-            return _noop()
-
-        monkeypatch.setattr(
-            "apexbot.runner._consume._dispatch_profitable",
-            fake_dispatch_leaf,
+        assert [stub.session for stub in StubPipeline.instances] == [owner], (
+            "dispatch pipeline did not receive the session owner"
         )
 
-        # SIMPIPE option A: the default consumer path constructs the pipeline
-        # — keep the fake-engine session out of the real Rust seam.
-        class _StubPipeline:
-            def __init__(self, session: object, **kwargs: object) -> None:
-                return None
+    async def test_owner_advances_with_the_block_clock(self) -> None:
+        """The owner mirrors the newHeads clock as the loop applies it."""
 
-            async def enqueue(
-                self,
-                results: object,
-                *,
-                block_timestamp: int,
-                base_fee_next: int,
-                payloads: dict[int, dict] | None = None,
-            ) -> None:
-                return None
-
-            def raise_if_failed(self) -> None:
-                return None
-
-            async def stop(self) -> None:
-                return None
-
-        monkeypatch.setattr("apexbot.runner._consume.SimSubmitPipeline", _StubPipeline)
+        # SIMPIPE option A: the session's pipeline factory constructs the
+        # stub — keep the fake-engine session out of the real Rust seam.
         owner = _SessionState(
             engine_registry=_FakeEngineRegistry(),
             async_w3=_FakeAsyncW3(),
@@ -320,6 +211,7 @@ class TestSessionOwner:
             dispatcher=_FakeDispatcher(current_block=12_346),
             cfg=_cfg(),
             current_block=12_345,
+            pipeline_factory=StubPipeline,
         )
         await consume_result_batches(
             owner,

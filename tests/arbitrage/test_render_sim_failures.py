@@ -10,21 +10,34 @@ path reverted against WHICH pools.
 These tests stub the ``DispatchOutcome`` shape (the PyO3 pyclass is too
 heavy to instantiate without a full simulate round-trip; the renderer only
 reads the two attributes — ``failures: list[dict]`` and ``path_infos:
-dict[int, dict]`` — so a ``SimpleNamespace`` is sufficient). WEFVGE:
+dict[int, dict]`` — so ``FakeDispatchOutcome`` carries exactly those attrs)..
 ``path_infos`` values are plain dicts (``{path_type, hops: [hop_dict, …]}``),
 not the retired ``*HopInfo`` dataclasses.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from apexbot.runner._render import _render_sim_failures
+from apexbot.diagnostics import FailureAction, failure_action
+from apexbot.exceptions.base import ApexbotValueError
+from apexbot.runner import _render
+from apexbot.runner._render import _render_sim_failures, format_failure_breakdown, hop_fields
+from tests.fakes.session import FakeDispatchOutcome
+from tests.helpers import verdict_probe as probe
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
+
+#: One failure in the bucket the ignore-set tests name.
+_EMPTY_FAILURE: dict[str, Any] = {
+    "path_id": 1,
+    "bucket": "empty",
+    "fail_index": 3,
+    "revert_data": "0x",
+}
 
 WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -33,7 +46,7 @@ USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 def _hops() -> list[dict[str, Any]]:
     """A 2-hop WETH→USDC→WETH path for the hop-token-summary check.
 
-    WEFVGE: plain dicts (the ``outcome.path_infos`` render shape) — the
+    Plain dicts (the ``outcome.path_infos`` render shape) — the
     retired ``V2HopInfo`` dataclass is gone. The renderer reads ``family``
     + ``token0/1_address`` / ``zfo`` off the dict directly.
     """
@@ -60,24 +73,32 @@ def _hops() -> list[dict[str, Any]]:
 def _outcome(failures: list[dict[str, Any]]) -> Any:
     """A stub ``DispatchOutcome`` exposing only the renderer-read attrs."""
     path_info = {"path_type": "V2-V2", "hops": _hops()}
-    return SimpleNamespace(
+    return FakeDispatchOutcome(
         failures=failures,
         path_infos={1: path_info, 2: path_info},
     )
 
 
-@pytest.fixture(autouse=True)
-def _disable_sim_exit_on_fail(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Disable the ``sys.exit(3)`` trap for renderer unit tests.
+def _render(
+    outcome: Any,
+    *,
+    armed: bool = False,
+    ignore: str = "",
+    action: FailureAction | None = None,
+) -> None:
+    """Render one failure batch with the tripwire values threaded explicitly.
 
-    ``_render_sim_failures`` exits on the first non-ignored failure bucket when
-    ``APEXBOT_SIM_EXIT_ON_FAIL`` is set (default ``"1"`` — the aggressive
-    production default per AGENTS-APEXBOT-459). These tests exercise the
-    RENDERING contract (the ``[sim-fail]`` / ``[sim-diag]`` lines), NOT the
-    trap, so the trap is force-disabled here to keep the failure records
-    renderable.
+    The renderer takes the resolved trap values as parameters, so a test arms
+    or disarms by passing them rather than by poking the process verdict, and
+    hands the resolved ``sim_failure`` bucket action down the same way.
     """
-    monkeypatch.setenv("APEXBOT_SIM_EXIT_ON_FAIL", "0")
+    _render_sim_failures(
+        outcome,
+        current_block=100,
+        sim_exit_on_fail=armed,
+        exit_ignore_buckets=ignore,
+        sim_failure_action=action,
+    )
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────
@@ -85,7 +106,7 @@ def _disable_sim_exit_on_fail(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_no_failures_emits_nothing(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome([]), current_block=100)
+        _render(_outcome([]))
     assert not any("[sim-fail]" in r.message for r in caplog.records)
 
 
@@ -105,7 +126,7 @@ def test_each_failure_emits_one_line_with_attribution(caplog: pytest.LogCaptureF
         },
     ]
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
+        _render(_outcome(failures))
 
     lines = [r.message for r in caplog.records if r.message.startswith("[sim-fail]")]
     assert len(lines) == 2
@@ -126,7 +147,7 @@ def test_missing_path_info_falls_back_gracefully(caplog: pytest.LogCaptureFixtur
     # path_id 99 isn't in path_infos → renderer must not crash, emits "(path_info missing)".
     failures = [{"path_id": 777, "bucket": "rpc-failed", "fail_index": None, "revert_data": "0x"}]
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
+        _render(_outcome(failures))
     lines = [r.message for r in caplog.records if r.message.startswith("[sim-fail]")]
     assert len(lines) == 1
     assert "path=777" in lines[0]
@@ -144,7 +165,7 @@ def test_overflow_emits_summary_trailing_line(caplog: pytest.LogCaptureFixture) 
         for i in range(30)
     ]
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
+        _render(_outcome(failures))
     lines = [r.message for r in caplog.records if r.message.startswith("[sim-fail]")]
     detail_lines = [m for m in lines if "path=" in m]
     summary_lines = [m for m in lines if "(+5 more)" in m]
@@ -154,7 +175,7 @@ def test_overflow_emits_summary_trailing_line(caplog: pytest.LogCaptureFixture) 
 
 
 def test_reverting_frame_surfaces_deep_attribution(caplog: pytest.LogCaptureFixture) -> None:
-    # Ergo epic 63I7WJ — the inspector-captured reverting frame: the CONTRACT
+    # The inspector-captured reverting frame: the CONTRACT
     # that reverted (not the top-level bubble), its call depth, selector, + the
     # classify_revert label. Plus the swaps captured before the revert.
     failures = [
@@ -184,7 +205,7 @@ def test_reverting_frame_surfaces_deep_attribution(caplog: pytest.LogCaptureFixt
         }
     ]
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
+        _render(_outcome(failures))
     lines = [r.message for r in caplog.records if r.message.startswith("[sim-fail]")]
     assert len(lines) == 1
     line = lines[0]
@@ -201,66 +222,220 @@ def test_reverting_frame_surfaces_deep_attribution(caplog: pytest.LogCaptureFixt
     assert "fail_idx=" not in line
 
 
+# ── format_failure_breakdown ─────────────────────────────────────────────
+
+
+def test_format_breakdown_sorts_by_count_desc_then_name() -> None:
+    """Breakdown lists the most common root cause first for at-a-glance reading."""
+    buckets = {
+        "CurrencyNotSettled": 9,
+        "no-profit": 5,
+        "ERC20: transfer amount exceeds balance": 2,
+        "rpc-failed": 9,  # tie with CurrencyNotSettled → name breaks tie
+    }
+    breakdown = format_failure_breakdown(buckets)
+    # Ties (9==9) broken by name → "CurrencyNotSettled" before "rpc-failed".
+    # Remaining entries ordered by count desc → no-profit(5) before ERC20…(2).
+    assert breakdown == (
+        "CurrencyNotSettled=9 rpc-failed=9 no-profit=5 ERC20: transfer amount exceeds balance=2"
+    )
+
+
+def test_format_breakdown_empty() -> None:
+    """An empty tally yields the empty string (caller skips the suffix)."""
+    result = format_failure_breakdown({})
+    assert isinstance(result, str)
+    assert len(result) == 0
+
+
+# ── hop_fields: the ONE family-string → PoolKind read ────────────────────
+
+
+def test_unknown_hop_family_raises_in_strict_mode() -> None:
+    """A family string outside the PoolKind taxonomy raises in strict mode (the
+    [profit] render path) — an unknown render-seam family is loud, never
+    silently branched. Lenient mode (``default=``) keeps the fixture-dump
+    semantics and is exercised by every tripwire test above.
+    """
+    with pytest.raises(ValueError, match="Unsupported hop family: 'V5'"):
+        hop_fields({"family": "V5"})
+
+
+# ── failure_action: the real Rust matrix → FailureAction members ─────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason", "expected"),
+    [
+        ("verify_mismatch", None, FailureAction.QUARANTINE),
+        ("sim_failure", None, FailureAction.EVENT),
+        ("sim_failure", "revert_pool_state", FailureAction.EVENT),
+        ("sim_failure", "pre_encode", FailureAction.QUARANTINE),
+        ("sim_failure", "revert_economics", FailureAction.OBSERVE),
+        ("sim_failure", "rpc", FailureAction.EVENT),
+        ("submit_failure", None, FailureAction.EVENT),
+        ("monitor_failure", None, FailureAction.EVENT),
+        ("ws_completeness", None, FailureAction.EXIT),
+        ("drain_stall", None, FailureAction.EXIT),
+        ("drain_dead", None, FailureAction.EXIT),
+        ("late_log", None, FailureAction.EVENT),
+        ("brand_new_bucket", None, FailureAction.EVENT),  # the evolution floor
+    ],
+)
+def test_failure_action_maps_the_rust_matrix(
+    kind: str, reason: str | None, expected: FailureAction
+) -> None:
+    """The Rust ``failure_policy`` matrix is the single source of truth; the
+    wrapper returns its spellings as FailureAction MEMBERS (this consults the
+    real PyO3 pyfunction — no stub, no process-global override installed)."""
+    assert failure_action(kind, reason) is expected
+
+
+def test_failure_action_wire_drift_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wire string outside the FailureAction vocabulary is Rust/Python
+    matrix drift — loud. Stubbed at the ``_diagnostics.failure_action`` FFI
+    boundary (the module attribute; the wrapper exposes no injectable seam)."""
+    import apexbot.diagnostics as diag
+
+    monkeypatch.setattr(
+        diag._diagnostics,
+        "failure_action",
+        lambda kind, reason=None: "obliterate",
+    )
+    with pytest.raises(ApexbotValueError, match="Unrecognized failure action 'obliterate'"):
+        failure_action("sim_failure", None)
+
+
 # ── Tripwire bucket-fatal semantics (fail hard + loud, no default mask) ──
 
 
-def test_sim_failures_continue_by_default(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_sim_failures_continue_by_default(caplog: pytest.LogCaptureFixture) -> None:
     """ADR-040: the default ``sim_failure`` bucket action is ``event`` - the
     renderer logs the keyed loud event and the bot KEEPS RUNNING. The
-    D63GSE-era fail-fast-by-default is retired; exit is now an explicit
+    Fail-fast-by-default is retired; exit is now an explicit
     per-bucket operator override (``[failure_policy]`` in config.toml), not an
     implicit default.
     """
-    monkeypatch.setenv("APEXBOT_SIM_EXIT_ON_FAIL", "1")
-    monkeypatch.delenv("APEXBOT_SIM_EXIT_IGNORE_BUCKETS", raising=False)
     failures = [{"path_id": 1, "bucket": "empty", "fail_index": 3, "revert_data": "0x"}]
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
+        _render(_outcome(failures), armed=True)
     # No exit: the trap logs the loud continuing event instead.
     traps = [r.message for r in caplog.records if "[sim-trap]" in r.message]
     assert any("continuing" in m for m in traps), "default must continue, not exit"
     assert any("[sim-fail]" in r.message for r in caplog.records)
 
 
-def test_explicitly_ignoring_a_bucket_opts_out(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Dumbing the tripwire down is an EXPLICIT operator opt-in (the env var),
-    not a default: setting APEXBOT_SIM_EXIT_IGNORE_BUCKETS=empty makes that
-    bucket non-fatal. There is no implicit mask otherwise.
+def test_ignoring_a_bucket_opts_the_trap_out(caplog: pytest.LogCaptureFixture) -> None:
+    """Narrowing an armed trap is an EXPLICIT operator opt-in, not a default.
+    The ignore set is the declared ``simulation.exit_ignore_buckets`` key, so
+    the trap stays armed and the named bucket stops counting. There is no
+    implicit mask: an armed process with no list still traps. The EXIT action
+    is injected as the resolved bucket action — reaching the policy (the trap
+    did not short-circuit) would SystemExit and fail the test.
     """
-    monkeypatch.setenv("APEXBOT_SIM_EXIT_ON_FAIL", "1")
-    monkeypatch.setenv("APEXBOT_SIM_EXIT_IGNORE_BUCKETS", "empty")
-    failures = [{"path_id": 1, "bucket": "empty", "fail_index": 3, "revert_data": "0x"}]
+    armed, ignore = _arm_from(
+        {"APEXBOT_SIM_EXIT_ON_FAIL": "1", "APEXBOT_SIM_EXIT_IGNORE_BUCKETS": "empty"},
+        operator_file=None,
+    )
     with caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
-    lines = [r.message for r in caplog.records if r.message.startswith("[sim-fail]")]
-    assert len(lines) == 1
-    assert "bucket=empty" in lines[0]
-    assert not any("[sim-trap]" in r.message for r in caplog.records)
+        _render(_outcome([_EMPTY_FAILURE]), armed=armed, ignore=ignore, action=FailureAction.EXIT)
+    assert armed is True
+    # The ignored bucket short-circuits the trap: reaching here without a
+    # SystemExit is the assertion, and the failure line still rendered.
+    assert any("[sim-fail]" in r.message for r in caplog.records)
+
+
+def test_the_operator_file_can_ignore_a_bucket_too(tmp_path: Path) -> None:
+    """The file layer narrows the trap, which only the environment could."""
+    body = "sim_exit_on_fail = true\nexit_ignore_buckets = 'empty'\n"
+    with probe.operator_file(f"[simulation]\n{body}") as written:
+        armed, ignore = _arm_from(operator_file=written)
+    _render(_outcome([_EMPTY_FAILURE]), armed=armed, ignore=ignore, action=FailureAction.EXIT)
+    assert armed is True
+    assert ignore == "empty"
 
 
 def test_operator_exit_override_still_traps(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The exit path survives ADR-040: when the operator's per-bucket policy
     says ``exit`` for ``sim_failure`` (a ``[failure_policy]`` override), the
-    trap fires (``SystemExit(3)``) after the fixture dump. This test stubs the
-    policy consult - the real resolution is boot-validated Rust-side; here we
-    deterministically test the EXIT WIRING without mutating process-global
-    Rust state.
+    trap fires (``SystemExit(3)``) after the fixture dump. This test injects
+    the resolved EXIT action - the real resolution is boot-validated
+    Rust-side; here we deterministically test the EXIT WIRING without mutating
+    process-global Rust state.
     """
-    import apexbot.diagnostics as diag
-
-    monkeypatch.setattr(diag, "failure_action", lambda kind, reason=None: "exit")
-    monkeypatch.setenv("APEXBOT_SIM_EXIT_ON_FAIL", "1")
-    monkeypatch.delenv("APEXBOT_SIM_EXIT_IGNORE_BUCKETS", raising=False)
     failures = [
         {"path_id": 1, "bucket": "Error(string)", "fail_index": 3, "revert_data": "0x08c379a0"}
     ]
     with pytest.raises(SystemExit) as ei, caplog.at_level("INFO", logger="apexbot"):
-        _render_sim_failures(_outcome(failures), current_block=100)
+        _render(_outcome(failures), armed=True, action=FailureAction.EXIT)
     assert ei.value.code == 3
     assert any("[sim-trap]" in r.message for r in caplog.records)
+
+
+# ── Which layer decides the armed state ──────────────────────────────────
+
+
+def _arm_from(
+    env: dict[str, str] | None = None,
+    *,
+    operator_file: Path | None = None,
+) -> tuple[bool, str]:
+    """The trap's armed state and ignore set for a hypothetical cascade.
+
+    The renderer takes both as values its caller resolved, so a test resolves
+    them through ``resolve_hypothetical`` and hands them in: the declared
+    ``simulation.*`` keys decide, with no fresh interpreter involved.
+    """
+    values = probe.hypothetical_values(env, operator_file=operator_file)
+    return (
+        bool(values.simulation.sim_exit_on_fail),
+        str(values.simulation.exit_ignore_buckets),
+    )
+
+
+def test_a_bare_invocation_leaves_the_tripwire_disarmed(tmp_path: Path) -> None:
+    """THE POSTURE, named: nothing arms the tripwire, so it does not fire.
+
+    ``simulation.sim_exit_on_fail`` declares ``false``, and the trap reads that
+    declared value, where it used to default to armed inside Python. So an
+    invocation that names no layer at all is DISARMED. The shipped run is
+    unaffected: ``run_bot.sh`` already exports
+    ``APEXBOT_SIM_EXIT_ON_FAIL=0``, so the deployment posture is the one the
+    schema already declared. What this pins is that a process which
+    configures nothing no longer inherits a tripwire from Python.
+    """
+    with probe.operator_file("[simulation]\n") as written:
+        armed, ignore = _arm_from(operator_file=written)
+    assert armed is False, "an invocation that names no layer is disarmed"
+    _render(_outcome([_EMPTY_FAILURE]), armed=armed, ignore=ignore)
+
+
+def test_the_operator_file_can_arm_the_tripwire(tmp_path: Path) -> None:
+    """The file layer reaches the trap in the arming direction too.
+
+    The pair of file-layer tests is the point: a change that left the trap
+    permanently off would pass the disarming test alone.
+    """
+    with probe.operator_file("[simulation]\nsim_exit_on_fail = true\n") as written:
+        armed, ignore = _arm_from(operator_file=written)
+    assert armed is True, "the file layer must be able to arm the trap"
+    with pytest.raises(SystemExit) as ei:
+        _render(_outcome([_EMPTY_FAILURE]), armed=armed, ignore=ignore, action=FailureAction.EXIT)
+    assert ei.value.code == 3
+
+
+def test_the_operator_file_can_disarm_the_tripwire(tmp_path: Path) -> None:
+    """The file layer is honoured in the direction that used to be impossible.
+
+    An operator who wrote ``sim_exit_on_fail = false`` into the operator file
+    -- the primary layer -- had it ignored, because the trap read only the
+    process environment and armed itself otherwise.
+    """
+    with probe.operator_file("[simulation]\nsim_exit_on_fail = false\n") as written:
+        armed, ignore = _arm_from(operator_file=written)
+    assert armed is False, "the operator file must be able to disarm"
+    _render(_outcome([_EMPTY_FAILURE]), armed=armed, ignore=ignore)

@@ -1,4 +1,4 @@
-//! Live submission seam — parity-ledger row 18 (ergo `L4E7RI`, Gap G4).
+//! Live submission seam — parity-ledger row 18 (Gap G4).
 //!
 //! Mirrors `src/apexbot/runner/_dispatch.py::_submit_batch_records`: the
 //! driver applies the mutual-exclusivity guard, the `dry_run` guard, and the
@@ -14,6 +14,17 @@
 //!
 //! RPC-gated: [`LiveSubmissionSeam`] needs an `AlloyProvider` + `TxSigner` +
 //! `ReceiptProbe`; only the live arm (`SMOKE_RPC_URL` + `--live`) constructs it.
+//!
+//! Post-T1 the authority is the only nonce issuer: `dispatch_and_submit` takes
+//! an `&Arc<NonceLane>`, never a caller-supplied `u64`. Post-cut-over the
+//! seam deals ONLY in the core record vocabulary (`SubmitRecord`): the
+//! driver no longer re-shapes submit outcomes into a local decision type —
+//! one record vocabulary, a driver's remaining responsibility is display. This exercise builds no
+//! strategy host, so [`LiveSubmissionSeam::new`] mints the host's one-account
+//! `NonceAuthority` + `SubmissionLedger` directly (the standalone sidecar's
+//! host-of-size-one shape) and the lane stamps every operator nonce. The
+//! driver's `operator_nonce` is retained only as the submission-time chain seed
+//! (`NonceLane::observe_chain_nonce`), never as a private reservation.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -22,57 +33,15 @@ use std::sync::{Arc, Mutex};
 
 use apexbot::rpc::provider::AlloyProvider;
 use apexbot::submission::{
-    dispatch_and_submit, monitor_pending_transaction, Dispatcher, MonitorOutcome, PoolKey,
-    ReceiptProbe, SkipReason, SubmitCandidate, SubmitRecord, SubmittedTx, TxSigner,
+    dispatch_and_submit, monitor_pending_transaction, Dispatcher, MonitorOutcome, NonceLane,
+    PoolKey, ReceiptProbe, SkipReason, SubmissionLedger, SubmissionTarget, SubmitCandidate,
+    SubmitRecord, SubmittedTx, TxSigner,
 };
+use apexbot::substrate::nonce::NonceAuthority;
 
-/// The driver's typed submit decision (the RSP-8 diff surface).
-#[derive(Clone, Debug, PartialEq)]
-pub enum SubmitDecision {
-    /// The tx was broadcast.
-    Submitted {
-        /// The path id.
-        path_id: u64,
-        /// The broadcast tx hash.
-        tx_hash: alloy::primitives::B256,
-        /// The claimed nonce.
-        nonce: u64,
-    },
-    /// The candidate was skipped (the typed core reason).
-    Skipped {
-        /// The path id.
-        path_id: u64,
-        /// The typed skip reason.
-        reason: SkipReason,
-    },
-}
-
-impl SubmitDecision {
-    /// The stable machine label (the RSP-8 diff column).
-    #[must_use]
-    pub const fn label(&self) -> &'static str {
-        match self {
-            Self::Submitted { .. } => "submitted",
-            Self::Skipped { reason, .. } => match reason {
-                SkipReason::PoolsClaimed => "skipped-pools-claimed",
-                SkipReason::DryRun => "skipped-dry-run",
-                SkipReason::InjectCode => "skipped-inject-code",
-                SkipReason::BroadcastFailed(_) => "skipped-broadcast-failed",
-            },
-        }
-    }
-
-    /// The candidate's path id.
-    #[must_use]
-    pub const fn path_id(&self) -> u64 {
-        match self {
-            Self::Submitted { path_id, .. } | Self::Skipped { path_id, .. } => *path_id,
-        }
-    }
-}
-
-/// The boxed future the signing seam returns.
-pub type SeamFuture<'a> = Pin<Box<dyn Future<Output = Result<SubmitDecision, String>> + Send + 'a>>;
+/// The boxed future the signing seam returns: the core's ONE submit record
+/// for the one candidate handed in.
+pub type SeamFuture<'a> = Pin<Box<dyn Future<Output = Result<SubmitRecord, String>> + Send + 'a>>;
 
 /// The driver's signing boundary.
 ///
@@ -89,7 +58,8 @@ pub trait SubmissionSeam: Send + Sync {
     ) -> SeamFuture<'_>;
 }
 
-/// Submit a batch with the Python `_submit_batch_records` guard order.
+/// Submit a batch with the Python `_submit_batch_records` guard order,
+/// returning the core's typed [`SubmitRecord`]s (one per candidate).
 ///
 /// 1. Sort best-first by net profit (the core re-asserts this; the driver
 ///    mirrors the seam contract).
@@ -112,7 +82,7 @@ pub async fn submit_batch(
     current_block: u64,
     dry_run: bool,
     inject_code: bool,
-) -> Result<Vec<SubmitDecision>, String> {
+) -> Result<Vec<SubmitRecord>, String> {
     candidates.sort_by_key(|c| std::cmp::Reverse(c.net_profit));
     let mut committed_pools: HashSet<PoolKey> = HashSet::new();
     let mut decisions = Vec::with_capacity(candidates.len());
@@ -124,7 +94,7 @@ pub async fn submit_batch(
             d.is_path_blocked(&path_pools, &committed_pools)
         };
         if blocked {
-            decisions.push(SubmitDecision::Skipped {
+            decisions.push(SubmitRecord::Skipped {
                 path_id: candidate.path_id,
                 reason: SkipReason::PoolsClaimed,
             });
@@ -135,7 +105,7 @@ pub async fn submit_batch(
             // mutual exclusivity is respected, then skip WITHOUT touching the
             // seam.
             committed_pools.extend(path_pools);
-            decisions.push(SubmitDecision::Skipped {
+            decisions.push(SubmitRecord::Skipped {
                 path_id: candidate.path_id,
                 reason: SkipReason::DryRun,
             });
@@ -143,7 +113,7 @@ pub async fn submit_batch(
         }
         if inject_code {
             committed_pools.extend(path_pools);
-            decisions.push(SubmitDecision::Skipped {
+            decisions.push(SubmitRecord::Skipped {
                 path_id: candidate.path_id,
                 reason: SkipReason::InjectCode,
             });
@@ -157,6 +127,12 @@ pub async fn submit_batch(
 }
 
 /// The live signing seam: delegates to `apexbot::submission::dispatch_and_submit`.
+///
+/// Post-T1 the authority is the only nonce issuer, so the seam carries a
+/// [`NonceLane`] rather than issuing a caller-controlled `u64`. The exercise
+/// builds no strategy host: [`Self::new`] mints the host's one-account
+/// authority + ledger directly, the standalone sidecar's host-of-size-one
+/// shape, and every submission stamps through that lane.
 pub struct LiveSubmissionSeam<'a> {
     /// The shared dispatcher (nonce + pool claims + monitor tasks).
     pub dispatcher: &'a Arc<Mutex<Dispatcher>>,
@@ -168,6 +144,40 @@ pub struct LiveSubmissionSeam<'a> {
     pub probe: Arc<dyn ReceiptProbe + Send + Sync>,
     /// Whether executor code is injected (unsafe to broadcast).
     pub inject_code: bool,
+    /// The sign-time nonce seam: the exercise's standalone one-account
+    /// authority, shared by every candidate this seam submits.
+    pub nonce_lane: Arc<NonceLane>,
+}
+
+impl<'a> LiveSubmissionSeam<'a> {
+    /// Bind the live seam to a fresh standalone settlement lane.
+    ///
+    /// The standalone bin mints a host of size one around its own authority;
+    /// this exercise has no strategy host, so it mints the same genesis
+    /// (`NonceAuthority::new(0)`) plus a `SubmissionLedger` for the `settlement`
+    /// strategy. [`SubmissionSeam::dispatch_one`] seeds the authority from the
+    /// driver's submission-time chain read before the lane stamps.
+    #[must_use]
+    pub fn new(
+        dispatcher: &'a Arc<Mutex<Dispatcher>>,
+        provider: &'a AlloyProvider,
+        signer: &'a TxSigner,
+        probe: Arc<dyn ReceiptProbe + Send + Sync>,
+        inject_code: bool,
+    ) -> Self {
+        Self {
+            dispatcher,
+            provider,
+            signer,
+            probe,
+            inject_code,
+            nonce_lane: Arc::new(NonceLane::new(
+                Arc::new(NonceAuthority::new(0)),
+                Arc::new(SubmissionLedger::new()),
+                "settlement",
+            )),
+        }
+    }
 }
 
 impl SubmissionSeam for LiveSubmissionSeam<'_> {
@@ -177,6 +187,10 @@ impl SubmissionSeam for LiveSubmissionSeam<'_> {
         operator_nonce: u64,
         current_block: u64,
     ) -> SeamFuture<'_> {
+        // The driver's `operator_nonce` is the submission-time chain read, not
+        // a reservation: seed the authority so the lane's first stamp cannot
+        // re-issue a nonce the chain already consumed.
+        self.nonce_lane.observe_chain_nonce(operator_nonce);
         Box::pin(async move {
             let outcome = dispatch_and_submit(
                 vec![candidate],
@@ -184,14 +198,27 @@ impl SubmissionSeam for LiveSubmissionSeam<'_> {
                 self.provider,
                 self.signer,
                 Arc::clone(&self.probe),
-                operator_nonce,
+                &self.nonce_lane,
                 current_block,
                 false,
                 self.inject_code,
+                // No relay fan-out: the standalone example submits to its
+                // configured provider only (the exercise's relay posture is
+                // Python-runner policy).
+                &[],
+                // No MEVBlocker bid target: this example is a public-mempool
+                // submitter, not a target-tx backrunner.
+                SubmissionTarget::Public,
             )
             .await
             .map_err(|e| e.to_string())?;
-            map_single_record(outcome.records)
+            // One candidate in, exactly one core record out (the core's
+            // contract for a single-candidate batch).
+            outcome
+                .records
+                .into_iter()
+                .next()
+                .ok_or_else(|| "dispatch_and_submit returned no records".to_string())
         })
     }
 }
@@ -215,30 +242,6 @@ pub async fn monitor_with_config(
     monitor_pending_transaction(tx, probe, dispatcher, blocks_before_nonce_expires)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// Map the core's single-record submit outcome into the driver decision.
-///
-/// # Errors
-///
-/// Returns an error only if the core returned no records for a non-empty
-/// single-candidate batch (a contract violation).
-pub fn map_single_record(records: Vec<SubmitRecord>) -> Result<SubmitDecision, String> {
-    match records.into_iter().next() {
-        Some(SubmitRecord::Submitted {
-            path_id,
-            tx_hash,
-            nonce,
-        }) => Ok(SubmitDecision::Submitted {
-            path_id,
-            tx_hash,
-            nonce,
-        }),
-        Some(SubmitRecord::Skipped { path_id, reason }) => {
-            Ok(SubmitDecision::Skipped { path_id, reason })
-        }
-        None => Err("dispatch_and_submit returned no records".to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -280,7 +283,7 @@ mod tests {
             let calls = &self.calls;
             Box::pin(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Ok(SubmitDecision::Submitted {
+                Ok(SubmitRecord::Submitted {
                     path_id: candidate.path_id,
                     tx_hash: B256::ZERO,
                     nonce: 0,
@@ -305,7 +308,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(seam.calls.load(Ordering::SeqCst), 0, "dry-run signed!");
-        assert!(decisions.iter().all(|d| d.label() == "skipped-dry-run"));
+        assert!(decisions.iter().all(|record| matches!(
+            record,
+            SubmitRecord::Skipped {
+                reason: SkipReason::DryRun,
+                ..
+            }
+        )));
         assert_eq!(decisions.len(), 2);
     }
 
@@ -325,7 +334,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(seam.calls.load(Ordering::SeqCst), 2);
-        assert!(decisions.iter().all(|d| d.label() == "submitted"));
+        assert!(decisions
+            .iter()
+            .all(|record| matches!(record, SubmitRecord::Submitted { .. })));
     }
 
     #[tokio::test]
@@ -344,7 +355,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(seam.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(decisions[0].label(), "skipped-inject-code");
+        assert!(matches!(
+            &decisions[0],
+            SubmitRecord::Skipped {
+                reason: SkipReason::InjectCode,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -370,6 +387,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(seam.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(decisions[0].label(), "skipped-pools-claimed");
+        assert!(matches!(
+            &decisions[0],
+            SubmitRecord::Skipped {
+                reason: SkipReason::PoolsClaimed,
+                ..
+            }
+        ));
     }
 }

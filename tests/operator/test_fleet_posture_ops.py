@@ -1,4 +1,4 @@
-"""Fleet-posture operator ops (JCI2FW Part B): wire round-trip over a live socket.
+"""Fleet-posture operator ops: wire round-trip over a live socket.
 
 Covers the `set_fleet_posture` / `get_fleet_posture` ops through
 :func:`handle_fleet_posture_op` — the helper the runner's operator handler
@@ -7,8 +7,8 @@ routes them through — over a REAL unix socket
 unknown-key rejection, empty-patch rejection, typed-refusal surfacing, and
 the `effective` passthrough of :func:`wrap_handler`. The validation rules
 themselves live ONCE in the Rust core (`PosturePolicyPatch::validate`,
-unit-tested in `rust/crates/apexbot-workers/src/posture.rs`) and are
-exercised through the compiled verb in `tests/rust/test_fleet_posture_ffi.py`.
+unit-tested in `rust/crates/engine/apexbot-workers/src/posture.rs`) and are
+exercised through the compiled verb in `tests/dispatch/test_fleet_posture_ffi.py`.
 """
 
 from __future__ import annotations

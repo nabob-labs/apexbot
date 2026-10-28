@@ -18,12 +18,16 @@ directly from their submodules:
 
 from apexbot._ffi import (
     ArbitrageEngine,
+    RegistrationLifecycle,
+    RetryPolicy,
+    session_phase_next,
     solve_balancer_weighted_basket,
-    verification_retry_policy_defaults,
 )
 
 __all__ = (
     "ArbitrageEngine",
+    "RegistrationLifecycle",
+    "RetryPolicy",
+    "session_phase_next",
     "solve_balancer_weighted_basket",
-    "verification_retry_policy_defaults",
 )

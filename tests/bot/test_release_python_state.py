@@ -1,11 +1,10 @@
 """Tests for Bot.release_python_state() — the Python-state teardown handshake.
 
 After the Rust engine takes ownership of canonical pool/token state, the Bot's
-Python-side caches (tracker `_tracked_pools`/`_untracked_pools` + snapshots,
-the pool + token registries) are scaffolding that should be dropped so the hot
-loop only holds the engine + the async Alloy provider handle. This encodes the 15-line
-hand-rolled trim block from `main()` behind a single Bot method, so the example
-stops reverse-engineering Bot internals.
+Python-side caches (the pool + token registries) are scaffolding that should be
+dropped so the hot loop only holds the engine + the async Alloy provider handle.
+This encodes the 15-line hand-rolled trim block from `main()` behind a single
+Bot method, so the example stops reverse-engineering Bot internals.
 
 The mid-lifecycle release is *not* end-of-life: the live pump keeps writing V3
 Mint/Burn/Swap through the shared Rust ``BotState``. So the release must NOT
@@ -16,16 +15,13 @@ storage is dropped; Rust stays canonical.
 """
 
 import pathlib
-from threading import Lock
 from unittest.mock import MagicMock
 
 from apexbot.arbitrage.engine_registry import ArbitrageEngine
 from apexbot.bot import Bot
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.config import DatabaseSettings, ApexbotConfig
 from apexbot.provider import AlloyProvider
-from apexbot.uniswap.trackers import UniswapV2PoolTracker
-from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.fakes.pools import FakeSessionPool
 
 # V3 Mint topic — keccak256("Mint(address,address,int24,int24,uint128,uint256,uint256)").
 _V3_MINT_TOPIC = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
@@ -52,12 +48,9 @@ def _mint_data(amount: int) -> str:
     return "0x" + (sender + word1 + zero + zero).hex()
 
 
-def _make_test_config(tmp_path: pathlib.Path, chain_id: int = 1) -> ApexbotConfig:
-    return ApexbotConfig(
-        database=DatabaseSettings(path=tmp_path / "test.db"),
-        rpc={1: ETHEREUM_ARCHIVE_NODE_HTTP_URI},
-        default_chain_id=chain_id,
-    )
+def _test_session(tmp_path: pathlib.Path, chain_id: int = 1) -> dict[str, object]:
+    """The explicit keyword overrides a session under test runs with."""
+    return {"chain_id": chain_id, "database": str(tmp_path / "test.db")}
 
 
 def _fake_provider(chain_id: int = 1) -> AlloyProvider:
@@ -66,64 +59,17 @@ def _fake_provider(chain_id: int = 1) -> AlloyProvider:
     return provider
 
 
-class _FakeTrackerWithSnapshot:
-    """Minimal tracker exercising the unload_snapshot() conditional.
-
-    Mirrors the shape AbstractPoolTracker concrete subclasses present:
-    `_tracked_pools`, `_untracked_pools`, and an optional `unload_snapshot`.
-    """
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        self._tracked_pools: dict[str, object] = {"0xpool": object()}
-        self._untracked_pools: set[str] = {"0xother"}
-        self.snapshot_unloaded = False
-
-    def unload_snapshot(self) -> None:
-        self.snapshot_unloaded = True
-
-
 class TestReleasePythonState:
     """Bot.release_python_state() — drop Python caches after Rust owns state."""
 
-    def test_release_clears_tracker_caches(self, tmp_path: pathlib.Path) -> None:
-        config = _make_test_config(tmp_path)
-        bot = Bot(config, provider=_fake_provider(1))
-
-        factory = "0x5C69bEe701ef814E44274f655e7632cB715C14B6"
-        tracker = bot.add_tracker(UniswapV2PoolTracker, factory_address=factory)
-        # seed non-empty caches
-        assert tracker._tracked_pools == {}
-        tracker._tracked_pools["0xdead"] = object()
-        tracker._untracked_pools.add("0xbeef")
-
-        bot.release_python_state()
-
-        assert tracker._tracked_pools == {}
-        assert tracker._untracked_pools == set()
-
-    def test_release_calls_unload_snapshot_where_present(self, tmp_path: pathlib.Path) -> None:
-        config = _make_test_config(tmp_path)
-        bot = Bot(config, provider=_fake_provider(1))
-
-        fake_key = get_checksum_address("0x0000000000000000000000000000000000000001")
-        fake = _FakeTrackerWithSnapshot()
-        bot._trackers[fake_key] = fake
-
-        bot.release_python_state()
-
-        assert fake.snapshot_unloaded is True
-        assert fake._tracked_pools == {}
-        assert fake._untracked_pools == set()
-
     def test_release_resets_pool_and_token_registries(self, tmp_path: pathlib.Path) -> None:
-        config = _make_test_config(tmp_path)
-        bot = Bot(config, provider=_fake_provider(1))
+        session = _test_session(tmp_path)
+        bot = Bot(**session, provider=_fake_provider(1))
 
         # seed the registries with sentinel storage via their _storage()
         bot.pools.add(
             pool_address="0x0000000000000000000000000000000000000002",
-            pool=object(),  # type: ignore[arg-type]
+            pool=FakeSessionPool("0x0000000000000000000000000000000000000002"),
             chain_id=1,
         )
         # TokenRegistry has a different add signature; just assert reset clears
@@ -135,12 +81,8 @@ class TestReleasePythonState:
         assert len(bot.tokens) == 0
 
     def test_release_is_idempotent(self, tmp_path: pathlib.Path) -> None:
-        config = _make_test_config(tmp_path)
-        bot = Bot(config, provider=_fake_provider(1))
-        bot.add_tracker(
-            UniswapV2PoolTracker,
-            factory_address="0x5C69bEe701ef814E44274f655e7632cB715C14B6",
-        )
+        session = _test_session(tmp_path)
+        bot = Bot(**session, provider=_fake_provider(1))
 
         bot.release_python_state()
         # second call must not raise
@@ -159,8 +101,8 @@ class TestReleasePythonState:
         every Swap was dropped, and the tick map froze at its verify-time value
         (the V3 desync in the permutation run — e.g. 0x88e6A0c2 tick 201020).
         """
-        config = _make_test_config(tmp_path)
-        bot = Bot(config, provider=_fake_provider(1))
+        session = _test_session(tmp_path)
+        bot = Bot(**session, provider=_fake_provider(1))
         py_bot = bot._py_bot
 
         address = get_checksum_address("0x88e6A0c2dDD26FEEb64F039a2c41296Fcb3F5640")
@@ -182,7 +124,7 @@ class TestReleasePythonState:
         # (Rust, above) AND the Python pool registry (here). release iterates
         # the Python registry, so the pool must be present there for the bug
         # path to touch Rust.
-        bot.pools.add(pool_address=address, pool=object(), chain_id=1)  # type: ignore[arg-type]
+        bot.pools.add(pool_address=address, pool=FakeSessionPool(address), chain_id=1)  # type: ignore[arg-type]
 
         assert py_bot.pool_count() == 1
 
@@ -206,8 +148,8 @@ class TestReleasePythonState:
         (``registered=false``) instead of applying it. This asserts the exact
         delivery path — the seeded tick's gross reflects the Mint after release.
         """
-        config = _make_test_config(tmp_path)
-        bot = Bot(config, provider=_fake_provider(1))
+        session = _test_session(tmp_path)
+        bot = Bot(**session, provider=_fake_provider(1))
         py_bot = bot._py_bot
         engine = ArbitrageEngine(py_bot=py_bot)
 
@@ -231,7 +173,7 @@ class TestReleasePythonState:
             # the quarantine lifecycle is honored.
             coverage="sparse",
         )
-        bot.pools.add(pool_address=address, pool=object(), chain_id=1)  # type: ignore[arg-type]
+        bot.pools.add(pool_address=address, pool=FakeSessionPool(address), chain_id=1)  # type: ignore[arg-type]
 
         bot.release_python_state()
 

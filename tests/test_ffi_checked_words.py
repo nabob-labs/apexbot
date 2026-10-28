@@ -1,10 +1,10 @@
-"""T1 (3WTDFK): the FFI checked-word invariant — known words in, checked-empty words out.
+"""The FFI checked-word invariant — known words in, checked-empty words out.
 
-``LiquidityPool.update_tick_data`` (the FFI boundary) must record the checked
-bitmap words the caller passes into Rust ``known_bitmap_words`` (Sparse pools
-only — a Tracked pool's bitmap is complete, so nothing is recorded) and
-tick_bitmap_snapshot() must surface a known-but-empty word as a ``(0, block)``
-entry (Sparse only). That is the contract that retires the companion's
+Registration (``Bot.register_v3_pool`` / ``register_v4_pool``) must record the
+checked bitmap words the caller passes in ``known_bitmap_words`` (Sparse pools
+only — a Tracked pool's bitmap is complete, so nothing is recorded) and the
+``tick_bitmap`` getter must surface a known-but-empty word as a known WORD
+(Sparse only). That is the contract that retires the companion's
 ``_bitmap_override`` shadow: a caller-checked word is never re-fetched.
 
 Offline (no anvil, no live RPC): pools register directly in an in-memory
@@ -19,7 +19,7 @@ _ZERO_ADDRESS = "0x" + "00" * 20
 _TOKEN1_ADDRESS = "0x" + "11" * 20
 
 
-def _register_sparse_v3(bot: Bot, *, tick_data_fetcher=None) -> int:
+def _register_sparse_v3(bot: Bot, *, tick_data_fetcher=None, known_bitmap_words=None) -> int:
     """Sparse V3 pool at tick 0, ratio 1:1, 0.3% fee, empty `tick_data`."""
     return bot.register_v3_pool(
         _ZERO_ADDRESS,
@@ -32,28 +32,26 @@ def _register_sparse_v3(bot: Bot, *, tick_data_fetcher=None) -> int:
         1_000_010_000_000,
         0,
         tick_data_fetcher=tick_data_fetcher,
+        known_bitmap_words=known_bitmap_words,
     )
 
 
-def _snapshot(pool: object) -> dict[int, tuple[int, int]]:
-    """Normalize a `tick_bitmap_snapshot()` dict to plain python ints."""
-    return {
-        int(word): (int(row[0]), int(row[1]))
-        for word, row in pool.tick_bitmap_snapshot().items()
-    }
+def _snapshot(pool: object) -> set[int]:
+    """The `tick_bitmap` getter's known-WORD set, normalized to plain ints."""
+    return {int(word) for word in pool.concentrated_liquidity().tick_bitmap}
 
 
-def test_sparse_checked_zero_word_survives_in_snapshot() -> None:
+def test_sparse_registration_known_bitmap_words_survive_in_snapshot() -> None:
     bot = Bot(chain_id=1)
-    pool = bot.get_pool(_register_sparse_v3(bot))
-    # Words 0 and 1 were each checked on-chain and came back empty.
-    pool.update_tick_data({1: (0, 100), 0: (0, 100)}, {}, 100)
+    # Words 0 and 1 were each checked on-chain at construction and came back
+    # empty.
+    pool = bot.get_pool(_register_sparse_v3(bot, known_bitmap_words=[1, 0]))
     snap = _snapshot(pool)
-    assert snap.get(1) == (0, 100), f"checked-empty word 1 must survive: {snap}"
-    assert snap.get(0) == (0, 100), f"checked-empty word 0 must survive: {snap}"
+    assert 1 in snap, f"registration-seeded checked word 1 must survive: {snap}"
+    assert 0 in snap, f"registration-seeded checked word 0 must survive: {snap}"
 
 
-def test_sparse_checked_zero_word_prevents_refetch() -> None:
+def test_sparse_registration_known_bitmap_words_prevent_refetch() -> None:
     bot = Bot(chain_id=1)
     calls: list[tuple[int, int]] = []
 
@@ -61,12 +59,15 @@ def test_sparse_checked_zero_word_prevents_refetch() -> None:
         calls.append((word, block))
         return {}
 
-    pool = bot.get_pool(_register_sparse_v3(bot, tick_data_fetcher=fake_fetcher))
-    pool.update_tick_data({0: (0, 100)}, {}, 100)
+    pool = bot.get_pool(
+        _register_sparse_v3(
+            bot,
+            tick_data_fetcher=fake_fetcher,
+            known_bitmap_words=[0],
+        ),
+    )
     snap = _snapshot(pool)
-    assert snap.get(0) == (0, 100), f"checked word must appear present-but-zero: {snap}"
-    # The swap starts in word 0: without the check it would fetch once
-    # (baseline in test_v3_sparse_fetch_seam); with it, never.
+    assert 0 in snap, f"registration-seeded word must appear present: {snap}"
     amount = int(
         pool.calculate_tokens_out_with_fetch(
             zero_for_one=True,
@@ -74,16 +75,16 @@ def test_sparse_checked_zero_word_prevents_refetch() -> None:
             block=100,
         ),
     )
-    assert amount > 0, "a checked (empty) word must compute, not miss"
+    assert amount > 0, "a registration-checked (empty) word must compute, not miss"
     # The swap also crosses the adjacent (genuinely unknown) word -1 — that
-    # fetch is correct. The contract under test: the caller-checked word 0
-    # must never be a fetch target.
+    # fetch is correct. The contract under test: the word checked at
+    # registration must never be a fetch target.
     assert all(w != 0 for (w, _b) in calls), (
-        f"the caller-checked word 0 must not be fetched: {calls}",
+        f"the registration-checked word 0 must not be fetched: {calls}",
     )
 
 
-def test_tracked_update_tick_data_adds_no_bitmap_entries() -> None:
+def test_tracked_registration_known_bitmap_words_ignored() -> None:
     bot = Bot(chain_id=1)
     rows = {0: (10_000_000_000_000, 5_000_000_000_000, 0)}
     pool_id = bot.register_v3_pool(
@@ -99,69 +100,69 @@ def test_tracked_update_tick_data_adds_no_bitmap_entries() -> None:
         tick_data=rows,
         update_block=0,
         coverage="tracked",
+        known_bitmap_words=[3],
     )
-    pool = bot.get_pool(pool_id)
-    pool.update_tick_data({3: (0, 50)}, dict(rows), 50)
-    words = set(_snapshot(pool))
-    assert words == {0}, f"Tracked bitmap is derived from tick rows only: {words}"
+    words = _snapshot(bot.get_pool(pool_id))
+    assert words == {0}, f"Tracked pools ignore checked words: {words}"
 
 
-def test_v4_sparse_checked_zero_word_survives_in_snapshot() -> None:
+def _v4_pool_id_hex(currency0: str, currency1: str, fee: int, tick_spacing: int) -> str:
     from apexbot.abi import encode
     from apexbot.crypto import keccak256
-    from tests.helpers.erc20_factory import make_erc20
-    from tests.helpers.v4_pool_factory import make_v4_pool
 
-    c0, c1 = _TOKEN1_ADDRESS, "0x" + "22" * 20
-    pool_manager = "0x" + "33" * 20
-    pool_id_hex = "0x" + keccak256(
-        encode(
-            types=["address", "address", "uint24", "int24", "address"],
-            args=[c0, c1, 3000, 60, _ZERO_ADDRESS],
-        )
-    ).hex()
-    token0 = make_erc20(Bot(), c0, name="a", symbol="A", decimals=18, chain_id=1)
-    token1 = make_erc20(Bot(), c1, name="b", symbol="B", decimals=18, chain_id=1)
-    pool = make_v4_pool(
-        pool_id=pool_id_hex,
-        pool_manager_address=pool_manager,
-        token0=token0,
-        token1=token1,
-        fee=3000,
-        tick_spacing=60,
-        sqrt_price_x96=1 << 96,
-        tick=0,
-        liquidity=1_000_010_000_000,
-        protocol_fee_zero_for_one=0,
-        protocol_fee_one_for_zero=0,
-        lp_fee=0,
-        state_block=0,
-        coverage="sparse",
+    return (
+        "0x"
+        + keccak256(
+            encode(
+                types=["address", "address", "uint24", "int24", "address"],
+                args=[currency0, currency1, fee, tick_spacing, _ZERO_ADDRESS],
+            )
+        ).hex()
     )
-    handle = pool._py_pool
-    handle.update_tick_data({1: (0, 100)}, {}, 100)
-    snap = _snapshot(handle)
-    assert snap.get(1) == (0, 100), f"V4 checked-empty word must survive: {snap}"
 
 
-# ── T3 (OMDCIY) — Tracked intake consistency rejection ──────────────────────
-# A Db snapshot whose bitmap and tick rows contradict each other must be
-# rejected AT INTAKE with a ValueError that names the conflict — never
-# registered as Tracked (Q3': Tracked pools carry no bitmap in memory, so
-# there is no later cross-check; intake is the only gate).
+def test_v4_sparse_registration_known_bitmap_words_survive_in_snapshot() -> None:
+    bot = Bot(chain_id=1)
+    currency0, currency1 = _TOKEN1_ADDRESS, "0x" + "22" * 20
+    pool = bot.get_pool(
+        bot.register_v4_pool(
+            "0x" + "33" * 20,
+            _v4_pool_id_hex(currency0, currency1, 3000, 60),
+            currency0,
+            currency1,
+            3000,
+            60,
+            None,
+            1 << 96,
+            1_000_010_000_000,
+            0,
+            0,
+            known_bitmap_words=[1],
+        ),
+    )
+    snap = _snapshot(pool)
+    assert 1 in snap, f"V4 registration-seeded checked word must survive: {snap}"
 
 
-def test_assemble_v3_inconsistent_tracked_snapshot_rejected_at_intake(tmp_path):
+# ── T3 — Tracked intake gate (chain truth) ────────────────────────────
+# The snapshot-internal bit<->row tautology is RETIRED as an intake gate
+# (schema/decode validation owns it now): a Tracked snapshot's rows are now
+# reconciled against the word bitmaps READ FROM CHAIN at the snapshot block.
+# With no chain transport wired the gate refuses with a typed RuntimeError —
+# never a silent pass, and never a ValueError claiming a snapshot conflict.
+
+
+def test_assemble_v3_tracked_snapshot_without_chain_transport_refused(tmp_path):
     import sqlite3
 
     import pytest
 
     from apexbot._ffi import Bot
-    from apexbot._ffi.db import db_create_new_database
+    from apexbot._ffi.db import db_upgrade_database
 
     pool_addr = "0x2222222222222222222222222222222222222222"
     db_path = str(tmp_path / "inconsistent.sqlite")
-    db_create_new_database(db_path)
+    db_upgrade_database(db_path)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
@@ -187,16 +188,13 @@ def test_assemble_v3_inconsistent_tracked_snapshot_rejected_at_intake(tmp_path):
             "(pool_id, tick_spacing, liquidity_update_block, liquidity_update_log_index, fee_token0, fee_token1, fee_denominator) "
             "VALUES (1, 10, NULL, NULL, 0, 0, 1)",
         )
-        # The row is at tick 20 (compressed position 2 at spacing 10) but the
-        # bitmap word 0 has bit 1 set (tick 10) — the two contradict.
+        # A live row at tick 20 (compressed position 2 at spacing 10). The
+        # retired `initialization_maps` word-VALUE rows are gone with the
+        # tables — only the tick rows remain.
         conn.execute(
             "INSERT INTO liquidity_positions "
             "(id, pool_id, tick, liquidity_net, liquidity_gross) "
             "VALUES (1, 1, 20, '100', '100')",
-        )
-        conn.execute(
-            "INSERT INTO initialization_maps (id, pool_id, word, bitmap) "
-            "VALUES (1, 1, 0, '2')",
         )
         conn.commit()
     finally:
@@ -205,34 +203,13 @@ def test_assemble_v3_inconsistent_tracked_snapshot_rejected_at_intake(tmp_path):
     bot = Bot(1)
     bot.load_snapshot_from_db(db_path, 1)
 
-    with pytest.raises(
-        ValueError, match=r"Tracked tick map inconsistent at intake"
-    ) as excinfo:
+    # The snapshot-internal bit<->row tautology is retired as an intake gate
+    # (schema/decode validation owns it now), and the word-VALUE tables are
+    # dropped. What refuses is the MISSING CHAIN TRANSPORT: a typed
+    # RuntimeError, never a silent pass and never a ValueError naming a
+    # snapshot conflict.
+    with pytest.raises(RuntimeError, match=r"chain transport"):
         bot.assemble_v3_tick_map(pool_addr, tick_spacing=10)
-    message = str(excinfo.value)
-    # The error must name the conflicting position and show both sides of
-    # the contradiction (the side reported may vary by HashMap order).
-    assert "word 0" in message
-    assert "(tick 10)" in message or "(tick 20)" in message
-    assert "bitmap_bit" in message
-    assert "row_gross_positive" in message
-
-    # A consistent snapshot (bit 2 ↔ row tick 20) is accepted as Tracked.
-    # Fresh Bot: the first bot's held read transaction predates the UPDATE
-    # (WAL snapshot isolation) and would keep seeing the old bitmap.
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.execute("UPDATE initialization_maps SET bitmap = '4' WHERE id = 1")
-        conn.commit()
-    finally:
-        conn.close()
-    bot2 = Bot(1)
-    bot2.load_snapshot_from_db(db_path, 1)
-    result = bot2.assemble_v3_tick_map(pool_addr, tick_spacing=10)
-    assert result is not None
-    tick_data, coverage = result
-    assert coverage == "tracked"
-    assert set(tick_data) == {20}
 
 
 if __name__ == "__main__":

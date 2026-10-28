@@ -19,8 +19,9 @@ There are two orthogonal axes:
    → Resumed. It never interleaves with per-epoch work; see its table below.
 2. **The block-epoch stage machine** — the per-epoch stages of one block, below.
 
-The existing `EnginePhase` enum (`Created`/`Subscribed`/`SnapshotLoaded`/
-`Backfilled`/`Resumed`) is remapped in full onto axis 1: its role —
+The existing `PumpPhase` enum (formerly `EnginePhase`;
+`Created`/`Subscribed`/`SnapshotLoaded`/`Backfilled`/`Resumed`) is remapped in
+full onto axis 1: its role —
 registration/snapshot/backfill ordering — is runtime-level, not per-epoch, so
 it contributes no sub-state to the `Solved`/`Simulated` stage rows.
 
@@ -145,7 +146,7 @@ The parallel accounting system is deleted, not wrapped (Q6: hard cutover):
 | 8 | `BF43PM` | Per-stage OTel spans + metrics carrying epoch attributes | observable across all |
 | 9 | `SZJUKL` | Seam retirement: delete `DrainSink`/`Engine`/`SolveCoordinator`/`drain_lock`/`DispatchOwner`/`DrainerHealth` (seams #1, #3) | Published-edge + drive wiring |
 | 10 | `5WTYYQ` | Extract `apexbot-ingestion` (pyo3-free); Python becomes a Published-edge sink | Subscribed + Published |
-| 11 | `PLRGIN` | Regression: capture-replay sweep + live Jaeger soak A/B; flip ADR-041 to implemented; update `CONTEXT.md` vocabulary | proves all |
+| 11 | `PLRGIN` | Regression: capture-replay sweep + live Jaeger soak A/B; flip ADR-041 to implemented; update `GLOSSARY.md` vocabulary | proves all |
 The order above is dependency-ordered per `ergo`; #8 (`BF43PM`) and #9
 (`SZJUKL`) may interleave once #7 lands.
 
@@ -162,7 +163,7 @@ retirement `SZJUKL`, transport extraction `5WTYYQ`, final integration `PLRGIN`.
 
 **`apexbot-ingestion` — the pyo3-free WS transport** (boundary contract: *ingestion
 emits, the runtime decides* — the crate knows nothing about `BotState` or the stage
-machine). Source: `rust/crates/apexbot-ingestion/src/`
+machine). Source: `rust/crates/foundation/apexbot-ingestion/src/`
 
 - `ingestor.rs` — `WsIngestor`: one WS connection; `newHeads` + **unfiltered** `logs`
   merged into one `IngestEvent` stream (`stream_select`, fair interleave).
@@ -202,7 +203,7 @@ machine). Source: `rust/crates/apexbot-ingestion/src/`
   rewind even though the block moves down); `ensure_current` fail-fasts stale
   contexts with `StaleEpoch`.
 - `bot_core/epoch_delta.rs` — `EpochDelta` (LXDY4C): the per-epoch touched-pool
-  ledger keyed by `AffectedKey` (`apexbot-solvers`), recorded as a byproduct of
+  ledger keyed by `AffectedKey` (`apexbot_pools::solve`), recorded as a byproduct of
   `Bot::dispatch_log`; `take_keys` is the drain's atomic consumption; a rewind
   RELABELS the ledger (`set_epoch`) and retains keys (solve-cursor state, not
   block-window state).
@@ -241,7 +242,7 @@ machine). Source: `rust/crates/apexbot-ingestion/src/`
   collapsed into one. Owns the two genuine-async-boundary channels retained from
   ADR-006/027: the block clock (`BlockClockPipe`, header ticks, never queued behind
   solver work) and the result batch written at the Published edge.
-- `arb_engine/solve_cycle.rs` — the detached solve cycle (unconditional
+- `arb_engine/solve_cycle/` — the detached solve cycle (unconditional
   since the WFF6MM cutover; the `APEXBOT_DETACHED_SOLVES` stance retired with
   the in-cycle arm): the solve cycle enqueues and returns, collapsing the
   engine-`Mutex` hold on the solve path to enqueue-end.

@@ -32,8 +32,8 @@ simulation revert (eth_call in simulate_one)
 
 | Stage | File |
 |---|---|
-| Snapshot build + onchain fetch + recompute | `rust/crates/apexbot-bot/src/arb_engine/diagnostic.rs` |
-| PyO3 entry (`diagnostic_inspect_path`) | `rust/crates/apexbot-python/src/bot/engine/solve.rs` |
+| Snapshot build + onchain fetch + recompute | `rust/crates/engine/apexbot-bot/src/arb_engine/diagnostic.rs` |
+| PyO3 entry (`diagnostic_inspect_path`) | `rust/crates/shells/apexbot-python/src/bot/engine/solve.rs` |
 | Always-on emit + JSON-line builder | `examples/eth_backrun_v2_v3_v4_rust.py`, `examples/eth_backrun_helpers.py` |
 | Classifier + TSV driver | `logs/permutation_analyzer.py`, `logs/test_all_permutations.sh` |
 

@@ -32,7 +32,7 @@ The driver is a script, not a module, and the tests reach *into* the script for 
 
 **The driver stays in the Python companion.** It is Python-ecosystem orchestration:
 
-- it owns the asyncio event loop, the `main()` policy, SIGINT install/restore, `dotenv`,
+- it owns the asyncio event loop, the `main()` policy, SIGINT install/restore,
   and the CLI (`_build_arg_parser`) — every one of which `docs/migration-guides/
   three-layer-transition.md` (removed in the stale-docs cleanup `71ec78b2`) §2.4 /
   `rust-owned-bot.md` class as `stays-python`;
@@ -73,7 +73,7 @@ class BotRunner:
         path_builder: Callable[..., Awaitable[None]] | None = None,
         consumer: Callable[..., Awaitable[None]] | None = None,
         install_sigint: bool = True,
-        background_registration: bool | None = None,
+        scheduler: Callable[[Coroutine[Any, Any, None]], asyncio.Task[Any]] = asyncio.create_task,
     ) -> None: ...
 
     async def start(self) -> "BotRunner":
@@ -106,7 +106,7 @@ class BotRunner:
 | Config + pure helpers | `BackrunConfig`, `classify_revert`, `format_failure_breakdown`, `filter_thin_margin_results`, `format_sim_diag_line` (moved from `eth_backrun_helpers.py`) | — |
 | Pure pool direction | `resolve_directions` (moved to `runner/build_paths.py` — see §10 deviation) | — |
 | Module constants | factory/pool-manager/WETH/executor constants, `REG_*`, `PATH_PERMUTATION_FILTER`, `MIN_*` (→ `runner/driver_constants.py`) | — |
-| CLI + entrypoint | `build_backrun_arg_parser` (→ `runner/cli.py` — see §10 deviation) | `main()`, `if __name__ == "__main__"`, SIGINT wrapper, `dotenv` read |
+| CLI + entrypoint | `build_backrun_arg_parser` (→ `runner/cli.py` — see §10 deviation) | `main()`, `if __name__ == "__main__"`, SIGINT wrapper |
 
 `_build_arg_parser` was to stay example-side (CLI policy) per this spike, but the final
 gate (zero `from examples.eth_backrun` imports in `tests/`/`src/`) forced it into the
@@ -177,8 +177,9 @@ unchanged in semantics**. The only diff is the import target:
 
 Production call sites rename `BackrunSession(...)` → `BotRunner(...)` in the same commit
 (examples/eth_backrun_v2_v3_v4_rust.py `main()`), so the fake-injection constructor defaults
-(`background_registration` auto-select, injectable actors) are asserted by the existing
-orchestration tests with **no behavior change**.
+(the registration `scheduler` seam — production `asyncio.create_task`, with the deterministic
+test double for replayable hand-offs — and the other injectable actors) are asserted by the
+existing orchestration tests with **no behavior change**.
 
 ## 7. ADR interaction
 

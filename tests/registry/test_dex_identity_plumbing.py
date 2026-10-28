@@ -1,4 +1,4 @@
-"""ADR-005 slice 7 step 3 — additive `dex` plumbing tests.
+"""Additive `dex` plumbing tests.
 
 Non-breaking foundation: the pool type registry gains a `dex_identity`
 field, `UniswapV2Pool.__init__` gains an additive `dex` param (explicit
@@ -22,7 +22,7 @@ from apexbot._ffi import Bot
 from apexbot._ffi.dex_identity import DexIdentity, dex_identity
 from apexbot.aerodrome.pools import AerodromeV2Pool
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.registry.pool_type import pool_type_registry
+from apexbot.registry.pool_type import PoolRegistration, pool_type_registry
 from apexbot.uniswap.v2_liquidity_pool import UniswapV2Pool
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v2_pool_factory import make_v2_pool
@@ -39,7 +39,7 @@ def _make_token(addr: str, *, symbol: str, decimals: int, name: str = "") -> Erc
 
 # Canonical-chain factories (from src/apexbot/{uniswap,sushiswap,pancakeswap,
 # swapbased,camelot}/__init__.py — cross-checked against the Rust DexIdentity
-# presets in slice 6).
+# presets).
 UNISWAP_V2_MAINNET_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 SUSHISWAP_V2_MAINNET_FACTORY = "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
 PANCAKESWAP_V2_MAINNET_FACTORY = "0x1097053Fd2ea711dad45caCcc45EfF7548fCB362"
@@ -70,11 +70,13 @@ class TestRegistryDexIdentity:
         uniswap = dex_identity("uniswap-v2")
         assert uniswap is not None
         pool_type_registry.register(
-            UniswapV2Pool,
-            chain_id=_TEST_CHAIN,
-            factory_address=_TEST_FACTORY,
-            pool_init_hash=UNISWAP_INIT_HASH,
-            dex_identity=uniswap,
+            PoolRegistration(
+                pool_class=UniswapV2Pool,
+                chain_id=_TEST_CHAIN,
+                factory_address=_TEST_FACTORY,
+                pool_init_hash=UNISWAP_INIT_HASH,
+                dex_identity=uniswap,
+            )
         )
         try:
             resolved = pool_type_registry.get_v2_identity(_TEST_CHAIN, _TEST_FACTORY)
@@ -88,9 +90,11 @@ class TestRegistryDexIdentity:
     def test_get_v2_identity_returns_none_when_registered_without_preset(self) -> None:
         """A registration without dex_identity → get_v2_identity() returns None."""
         pool_type_registry.register(
-            UniswapV2Pool,
-            chain_id=_TEST_CHAIN,
-            factory_address=_TEST_FACTORY,
+            PoolRegistration(
+                pool_class=UniswapV2Pool,
+                chain_id=_TEST_CHAIN,
+                factory_address=_TEST_FACTORY,
+            )
         )
         assert pool_type_registry.get_v2_identity(_TEST_CHAIN, _TEST_FACTORY) is None
 
@@ -107,11 +111,13 @@ class TestRegistryDexIdentity:
         uniswap = dex_identity("uniswap-v2")
         assert uniswap is not None
         pool_type_registry.register(
-            UniswapV2Pool,
-            chain_id=_TEST_CHAIN,
-            factory_address=_TEST_FACTORY,
-            pool_init_hash=UNISWAP_INIT_HASH,
-            dex_identity=uniswap,
+            PoolRegistration(
+                pool_class=UniswapV2Pool,
+                chain_id=_TEST_CHAIN,
+                factory_address=_TEST_FACTORY,
+                pool_init_hash=UNISWAP_INIT_HASH,
+                dex_identity=uniswap,
+            )
         )
         try:
             assert pool_type_registry.get_v2_class(_TEST_CHAIN, _TEST_FACTORY) is UniswapV2Pool
@@ -165,10 +171,10 @@ class TestSingletonDexPresets:
         )
 
     def test_preset_fields_match_rust_constants(self) -> None:
-        """The registered preset's fields match the slice-6 Rust constants."""
+        """The registered preset's fields match the Rust constants."""
         ident = pool_type_registry.get_v2_identity(1, UNISWAP_V2_MAINNET_FACTORY)
         assert ident is not None
-        # Cross-checked against `UNISWAP_V2` Rust preset (slice 6).
+        # Cross-checked against `UNISWAP_V2` Rust preset.
         assert ident.factory == UNISWAP_V2_MAINNET_FACTORY
         assert ident.deployer == ident.factory  # Uniswap V2 uses factory as deployer
         assert ident.init_hash == UNISWAP_INIT_HASH
@@ -181,8 +187,8 @@ class TestSingletonDexPresets:
         """Aerodrome V2 is deferred (TODO-e30504ed) — no dex_identity registered.
 
         The Aerodrome V2 factory IS registered (with AerodromeV2Pool as the
-        pool_class), but step 3 does NOT wire a dex_identity for it — Aerodrome
-        doesn't collapse in slice 7. So get_v2_identity() returns None for it,
+        pool_class), but no dex_identity is wired for it — Aerodrome V2 has no
+        collapsed DexIdentity. So get_v2_identity() returns None for it,
         even though get_v2_class() returns AerodromeV2Pool.
         """
 
@@ -192,7 +198,7 @@ class TestSingletonDexPresets:
 
 
 class TestLiquidityPoolDexIdentity:
-    """`_from_py_pool` recovers dex identity off the handle (OGTTCS slim seam).
+    """`from_handle` recovers dex identity off the handle.
 
     After the Polars-style slim seam, ``dex`` is ALWAYS present on the pool —
     resolved from the registered variant via ``py_pool.dex`` (Rust's

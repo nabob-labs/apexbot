@@ -5,7 +5,7 @@
 > (the decision record). This page is the *how to use it*.
 >
 > **Crate:** `apexbot-executor`. All examples compile against
-> `rust/crates/apexbot-executor/`.
+> `rust/crates/foundation/apexbot-executor/`.
 
 ## The production entry point: `encode_cmd_stream`
 
@@ -20,7 +20,7 @@ let cmd_bytes = encode_cmd_stream(
     &path.path_info,            // the ordered hops (PathInfo)
     path.optimal_input,         // entry capital (u128)
     &path.hop_outputs,          // per-hop forward outputs (solver-computed)
-    &path.consumed_inputs,      // per-hop executable input (CL-clamped)
+    &path.consumed_inputs,      // per-hop executable input (concentrated-liquidity clamped)
     ctx.executor_address,      // the cmd_executor contract
     ctx.pool_manager_address,   // the Uniswap V4 PoolManager
     ctx.weth_address,           // WETH9
@@ -151,7 +151,7 @@ let execute_config = config_for_options(path.opts, U256::ZERO);
 let execute_calldata = encode_execute_call(ctx.executor_address, &cmd_bytes, execute_config)?;
 ```
 
-See `rust/crates/apexbot-arbitrage/src/simulator.rs` (~`build_execute_tx`)
+See `rust/crates/engine/apexbot-arbitrage/src/simulator.rs` (~`build_execute_tx`)
 for the full production path, including the pre/post balance reads that prove
 profitability.
 
@@ -296,18 +296,18 @@ executor's balance at callback-end. `V4Unlock { inner, .. }` nests its unlock
 callback and emits `V4UnlockEnd` after it. Depth-first walk = execution order.
 
 The full `PlanStep` variant set lives in
-`rust/crates/apexbot-executor/src/grammar_plan.rs`; the axis vocabulary a
+`rust/crates/foundation/apexbot-executor/src/grammar_plan.rs`; the axis vocabulary a
 new family can consume is documented on the axis enums in
-`rust/crates/apexbot-executor/src/grammar_walker.rs` (`TerminalForm`,
+`rust/crates/foundation/apexbot-executor/src/grammar_walker.rs` (`TerminalForm`,
 `RepayMechanism`, `SeedDelivery` — each field's doc comment states when it is
-set and who consumes it) and in the `CONTEXT.md` walker glossary.
+set and who consumes it) and in the `GLOSSARY.md` walker glossary.
 
 ## Where to look next
 
 - **The architecture doc:** [executor-command-grammar.md](executor-command-grammar.md) — the *why* and the invariant model.
 - **The decision records:** [ADR-029](../adr/ADR-029-executor-command-grammar-axes.md) (the axes, the hybrid, the additive proof), [ADR-030](../adr/ADR-030-derivation-outcome-tri-state.md) (the derive tri-state), [ADR-031](../adr/ADR-031-executor-plan-walker.md) (the facts-driven walker).
 - **The walker lineage:** [executor-walker-spike.md](executor-walker-spike.md) (the spike that de-risked the schema) and ADR-031's Resolution paragraph (the T1–T6 decomposition record; the standalone ledger doc was removed in the stale-docs cleanup `71ec78b2`).
-- **The V4 ledger rules:** [`grammar_ledger.rs`](../../rust/crates/apexbot-executor/src/grammar_ledger.rs) — the PM net-zero-at-unlock-close invariant (the V4 master rule, stated on the V4 ledger ops).
+- **The V4 ledger rules:** [`grammar_ledger.rs`](../../rust/crates/foundation/apexbot-executor/src/grammar_ledger.rs) — the PM net-zero-at-unlock-close invariant (the V4 master rule, stated on the V4 ledger ops).
 - **The Plan-tree decision:** [executor-command-grammar.md](executor-command-grammar.md) §"What 'derived' means here (the `6ZIE5X` decision, realized)" — why the Plan tree (mechanism (iii)) over byte-decoding / `enc_*`-instrumentation.
 - **The model record:** [ADR-029](../adr/ADR-029-executor-command-grammar-axes.md) (the axes + open-ledger model) and [executor-command-grammar.md](executor-command-grammar.md) (the realized architecture that the model plan doc preceded).
-- **The tests of record:** `tests/composers_parity.rs`, `tests/composers_3hop_parity.rs` (golden-master byte-parity), `rust/crates/apexbot-simulation/tests/harness_declarative.rs` (the runtime matrix), and the `rule_walker_shadows_*` unit tests in `grammar_walker/shapes/three_hop.rs` (post-cutover pinning of the current enclosure per topology-rule group).
+- **The tests of record:** `tests/composers_parity.rs`, `tests/composers_3hop_parity.rs` (golden-master byte-parity), `rust/crates/engine/apexbot-simulation/tests/harness_declarative.rs` (the runtime matrix), and the `rule_walker_shadows_*` unit tests in `grammar_walker/shapes/three_hop.rs` (post-cutover pinning of the current enclosure per topology-rule group).

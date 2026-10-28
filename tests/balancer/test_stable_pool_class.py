@@ -35,6 +35,7 @@ from apexbot.provider import AlloyProvider
 from tests.helpers.balancer_pool_factory import make_balancer_stable_pool
 from tests.helpers.contract_compat import ContractCompat
 from tests.helpers.erc20_factory import make_erc20
+from tests.sweep_pin import SWEEP_FORK_BLOCK, SweepPinHygiene
 
 pytestmark = pytest.mark.online_rpc
 
@@ -291,6 +292,12 @@ def _query_swap(
         pytest.skip(f"On-chain query reverted: {e}")
 
 
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
+class TestPinnedForkHygiene(SweepPinHygiene):
+    """The pin is part of the expected value; assert it instead of assuming it."""
+
+
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
 class TestBalancerV2StablePoolMetaStable:
     """Test BalancerV2StablePool against on-chain for MetaStablePools.
 
@@ -430,6 +437,7 @@ class TestBalancerV2StablePoolMetaStable:
             assert python_in == on_chain_in, f"pct=1/{pct}: diff={python_in - on_chain_in}"
 
 
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
 class TestBalancerV2StablePoolComposableExact:
     """Test BalancerV2StablePool against on-chain for ComposableStablePools
     with a CacheAwareRateProvider injected.
@@ -575,6 +583,7 @@ class TestBalancerV2StablePoolComposableExact:
             assert python_in == on_chain_in, f"pct=1/{pct}: diff={python_in - on_chain_in}"
 
 
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
 class TestBalancerV2StablePoolComposableStaleRates:
     """Test that ComposableStablePools without a live rate_provider raise
     StaleRateResult, and that the wrapped values are close

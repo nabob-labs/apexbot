@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from apexbot.checksum_cache import get_checksum_address
-from apexbot.crypto import keccak256
-from apexbot.utils.bytes import to_bytes
+from apexbot.contract import _rs_create2_address
+from apexbot.utils.bytes import to_0x_hex
 
 if TYPE_CHECKING:
-    from apexbot._ffi import ChecksummedAddress
+    from apexbot.types.chain import ChecksummedAddress
 
 
 def create2_address(
@@ -20,7 +19,9 @@ def create2_address(
     """Generate the deterministic CREATE2 address.
 
     Given a deployer, salt, and the keccak hash of the contract creation
-    (init) bytecode.
+    (init) bytecode. Delegating shell over
+    ``apexbot._ffi.create2_address`` — the derivation lives in the Rust
+    ``apexbot_uniswap::create2`` module.
 
     References:
         - https://eips.ethereum.org/EIPS/eip-1014
@@ -30,8 +31,8 @@ def create2_address(
         The computed value.
 
     """
-    return get_checksum_address(
-        keccak256(b"\xff" + to_bytes(deployer) + to_bytes(salt) + to_bytes(init_code_hash))[
-            -20:
-        ],  # Contract address is the least significant 20 bytes from the 32 byte hash
+    return _rs_create2_address(
+        to_0x_hex(deployer),
+        to_0x_hex(salt),
+        to_0x_hex(init_code_hash),
     )

@@ -4,7 +4,6 @@
     reason = "integration test asserts on the known-valid example boot output"
 )]
 //! G6 telemetry acceptance for the standalone settlement-bot example
-//! (ergo ZOBXVC, epic RGZG4S).
 //!
 //! Shells the built example against the frozen parity.db fixture and asserts
 //! the pure-Rust driver now boots the same observability stack the Python
@@ -23,7 +22,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
-const DB_REL: &str = "../../crates/apexbot-db/tests/fixtures/parity.db";
+const DB_REL: &str = "../../crates/foundation/apexbot-db/tests/fixtures/parity.db";
 
 fn db_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DB_REL)
@@ -38,14 +37,18 @@ fn base_command() -> Command {
     command.env("HOME", std::env::temp_dir());
     command.env("PATH", std::env::var("PATH").unwrap_or_default());
     command.env("APEXBOT_FIXTURE_DB", db_path());
-    // Same killswitch discipline as boot_gate.rs: the committed fixture is
-    // Alembic-head-stamped and four parallel tests shell out drivers that
-    // would otherwise race an in-place heal of the shared file.
-    command.env("APEXBOT_DB_AUTO_HEAL", "0");
+    // The committed fixture is Alembic-head-stamped and shared by four
+    // parallel shell-outs; the plain opens never heal (opening never
+    // mutates), so nothing here can rewrite the shared file.
     command.env("APEXBOT_RPC_HTTP_CHAINID_1", "http://127.0.0.1:1");
     command.env("APEXBOT_RPC_WS_CHAINID_1", "ws://127.0.0.1:1");
     command.env("APEXBOT_DISCOVERY_CHAIN_ID", "8453");
     command.env("APEXBOT_METRICS_ADDR", "127.0.0.1:0");
+    // Same facet discipline as boot_gate.rs: the hermetic boot has no config
+    // file, so schema defaults leave every facet inactive and the
+    // stance-independent arm gate refuses the settled-block arm. Activate it
+    // through the 12-factor cascade like any other APEXBOT_* key.
+    command.env("APEXBOT_STRATEGY_SETTLEMENT_ACTIVE", "1");
     command
 }
 

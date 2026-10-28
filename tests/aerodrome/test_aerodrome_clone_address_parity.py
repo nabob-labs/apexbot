@@ -1,6 +1,6 @@
 """Aerodrome EIP-1167 clone-address derivation — Rust↔Python parity gate.
 
-Ergo S5SJXF/U43OVR: the Aerodrome V2/V3 deterministic pool-address derivation
+The Aerodrome V2/V3 deterministic pool-address derivation
 (a CREATE2 deployment of an EIP-1167 minimal proxy of a master
 implementation contract, the salt keyed on ``stable`` (V2) /
 ``tick_spacing`` (V3)) is ported to the pure-Rust
@@ -8,7 +8,7 @@ implementation contract, the salt keyed on ``stable`` (V2) /
 ``apexbot._ffi.compute_aerodrome_v2_pool_address`` /
 ``compute_aerodrome_v3_pool_address`` pyfunctions.
 
-Per the §4.2 red-green parity protocol, this module asserts byte-for-byte
+Per the parity gate (`docs/architecture/parity-gate.md`), this module asserts byte-for-byte
 agreement between the Rust pyfunctions and the Python parity oracle
 (``aerodrome.functions.generate_aerodrome_*``) over a Base-deployment
 fixture corpus. The Rust ``#[cfg(test)]`` corpus pins the same fixtures
@@ -128,7 +128,7 @@ def test_bytes_inputs_match_hex_inputs() -> None:
     # The delegation preserves the original bytes-based contract: a
     # str|bytes input pair must produce the same address as the hex-string
     # form. Regression guard for the `str(bytes)` cast that would yield a
-    # `"b'...'""` parse failure (WLJD2Y cleanup).
+    # `"b'...'""` parse failure.
     from_hex = generate_aerodrome_v2_pool_address(
         deployer_address=AERODROME_V2_DEPLOYER,
         token_addresses=(BASE_WETH, BASE_AERO),
@@ -151,9 +151,9 @@ def test_bytes_inputs_match_hex_inputs() -> None:
 class TestRegisterTimeVerification:
     """register_aerodrome_pool recomputes the EIP-1167 address and rejects a mismatch.
 
-    The Fork-A JC6OFG parity gap for Aerodrome: registering against the real
+    The Fork-A parity gap for Aerodrome: registering against the real
     Base factory verifies the declared address against the JSON-sourced deployer
-    + implementation (WLJD2Y). Non-JSON factories skip verification.
+    + implementation. Non-JSON factories skip verification.
     """
 
     def test_correct_address_accepts(self) -> None:

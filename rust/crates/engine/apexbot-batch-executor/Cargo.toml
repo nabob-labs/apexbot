@@ -1,0 +1,56 @@
+[package]
+name = "apexbot-batch-executor"
+description = "Core batch executor: the per-batch dispatch choreography — assembly, payload merge, and the ordered sim-submit lane — as one value-configured engine module."
+keywords = ["mev", "arbitrage", "batch", "dispatch"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5", features = ["full"] }
+# The resolved verdict (`BotConfig`) the executor policy converts FROM: the
+# single configuration authority (ADR-065) lives in this foundation crate,
+# and the engine←foundation direction is the existing dependency edge (the
+# config crate depends only on the TOML stack — no cycle).
+apexbot-config.workspace = true
+# The sim fan-out + the typed sim-failure record (`SimFailure`) the outcome
+# records carry, plus the policy registries (divergence / FoT) the assembly
+# stage reads at its bookends.
+apexbot-arbitrage.workspace = true
+# `BotState` (the staleness gate reads the shared state owner) + the
+# simulate-dispatch telemetry span (ADR-043).
+apexbot-bot.workspace = true
+apexbot-substrate.workspace = true
+# `EncodeOptions` / `PathInfo` / `HopInfo` / `WarmupSlots` (the composer seam).
+apexbot-executor.workspace = true
+# `AlloyProvider` — the sim leaf's cold-miss DB fallback + the submit leaf's
+# broadcast surfaces.
+apexbot-rpc.workspace = true
+# The cross-block warm-code cache the fan-out handle build consumes.
+apexbot-simulation.workspace = true
+# The ordered lane (`SimSubmitPipeline`) + the production submit leaf
+# (`dispatch_and_submit`) + the policy state (`PathSuppression`, `Dispatcher`).
+apexbot-submission.workspace = true
+# `WarmCodeCacheInner::shared_default()` returns a parking_lot RwLock; the
+# config holds that arc type.
+parking_lot = "^0.13"
+tokio = { version = "^1.54", default-features = false, features = ["sync"] }
+tracing = { version = "^0.1" }
+# `op_info!` — the closed-domain telemetry macro (the exec target the
+# submit-arm forensic line emits under) + the address-parse helper the test
+# fixtures share with the other crates.
+apexbot-core.workspace = true
+
+[dev-dependencies]
+# The event-capture layer the forensic-emission test asserts through.
+tracing-subscriber = { version = "^0.3", default-features = false, features = [
+    "std",
+    "registry",
+] }
+tokio = { version = "^1.54", features = ["rt-multi-thread", "macros", "time"] }

@@ -1,4 +1,4 @@
-"""Typed cockpit phase machine (epic Y7PA5A, task 5OV35X).
+"""Typed cockpit phase machine.
 
 The driver cockpit enforces its startup ordering through a private
 ``_Phase`` machine: New -> Started -> Running -> Closed. Illegal
@@ -13,21 +13,24 @@ seam pattern as ``test_arbitrage_session.py``); no anvil, no live RPC.
 
 from __future__ import annotations
 
-import asyncio
 import signal
 
 import pytest
 
 from apexbot.runner import BotRunner
-from apexbot.runner.bot_runner import PhaseError
+from apexbot.runner._relay_posture import RelayPosture
+from apexbot.runner.bot_runner import InjectedActors, PhaseError
 from apexbot.runner.config import ArbitrageConfig
+from tests.fakes.bot import FakeBot as _FakeBot
+from tests.fakes.engine import FakeEngineRegistry as _FakeEngineRegistry
+from tests.helpers.identity_env import identity_env
+from tests.helpers.rpc_env import rpc_env
 
 
 @pytest.fixture(autouse=True)
-def _rpc_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Chain-1 RPC envvars must be present for ``from_env`` (never connected)."""
-    monkeypatch.setenv("APEXBOT_RPC_HTTP_CHAINID_1", "http://localhost:8545")
-    monkeypatch.setenv("APEXBOT_RPC_WS_CHAINID_1", "ws://localhost:8546")
+def _rpc_env():
+    with rpc_env():
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -37,71 +40,12 @@ def _restore_sigint() -> None:
 
 
 def _cfg() -> ArbitrageConfig:
-    return ArbitrageConfig.from_env(
-        {
-            "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
-            "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
-            "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
-            "INJECT_EXECUTOR_CODE": "0",
-        },
-        live=True,
-        permutation=None,
-    )
-
-
-class _FakeEngine:
-    def resume(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def v2_pool_count(self) -> int:
-        return 0
-
-    def v3_pool_count(self) -> int:
-        return 0
-
-    def v4_pool_count(self) -> int:
-        return 0
-
-    def path_count(self) -> int:
-        return 0
-
-    async def pump_finished_future(self) -> None:
-        # Injected engines have no real pump: the awaitable contract is a
-        # future that never resolves (the real pre-finish consumer shape).
-        await asyncio.Event().wait()
-
-    async def block_stream(self):
-        return
-        yield  # pragma: no cover - async generator marker
-
-
-class _FakeEngineRegistry:
-    def __init__(self) -> None:
-        self.engine = _FakeEngine()
-        self.start_calls = 0
-
-    def start(self, node_http, node_ws, *, v3_snapshot, v4_snapshot, verify_state_view) -> int:
-        self.start_calls += 1
-        return 12_000
-
-
-class _FakeBot:
-    chain_id = 1
-
-    def release_python_state(self) -> None:
-        pass
-
-    def block_stream(self):  # pragma: no cover - consumer is a no-op here
-        # The injected consumer never iterates it; an immediately-empty
-        # stream is enough for run() to acquire + pass through.
-        async def _empty():
-            return
-            yield {}  # pragma: no cover
-
-        return _empty()
+    with identity_env({
+        "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
+        "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
+        "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
+    }):
+        return ArbitrageConfig.build(live=True, permutation=None)
 
 
 class _FakeAsyncW3:
@@ -115,12 +59,15 @@ class _FakeAsyncW3:
 def _session() -> BotRunner:
     return BotRunner(
         _cfg(),
-        bot=_FakeBot(),
-        engine_registry=_FakeEngineRegistry(),
-        async_w3=_FakeAsyncW3(),
-        snapshots=(object(), object(), None, None),
-        path_builder=lambda **kw: _noop(),
-        consumer=lambda **kw: _noop(),
+        actors=InjectedActors(
+            settlement_arm=True,
+            bot=_FakeBot(),
+            engine_registry=_FakeEngineRegistry(),
+            async_w3=_FakeAsyncW3(),
+            path_builder=lambda **kw: _noop(),
+            consumer=lambda **kw: _noop(),
+            relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+        ),
         install_sigint=False,
     )
 
@@ -156,7 +103,7 @@ class TestPhaseMachine:
         second = await session.start()
         assert first is session
         assert second is session
-        assert registry.start_calls == 1
+        assert len(registry.start_calls) == 1
 
     async def test_shutdown_before_start_does_not_raise(self) -> None:
         session = _session()

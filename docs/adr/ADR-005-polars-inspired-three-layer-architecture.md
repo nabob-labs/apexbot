@@ -123,6 +123,15 @@ bindings a sibling crate.
 
 ### Layer naming
 
+> **Superseded by [ADR-032](ADR-032-pyclass-python-naming.md).** The Py-prefix
+> rule below was reversed: Python-visible names on `apexbot._ffi` carry no
+> `Py`/`Rust` prefix of any kind (both sets are gate-asserted empty), and the
+> module path is the disambiguator (`apexbot._ffi.Bot` vs `apexbot.bot.Bot`).
+> The *layer* separation this section describes (core / wrapper / companion)
+> stands; the *names* do not — ADR-032 is canonical for naming. The `PyBot` /
+> `PyLiquidityPool` / `PyErc20Token` names used throughout this ADR are the
+> pre-rename spellings of today's `Bot` / `LiquidityPool` / `Erc20Token`.
+
 Naming follows the Polars rule **unconditionally**: the `Py` prefix is kept on the
 PyO3 wrapper both as the Rust struct name *and* as the Python-exposed name; the bare
 noun is reserved for the Python companion class. No `#[pyclass(name = "...")]`
@@ -273,9 +282,9 @@ Two targets are deferred, both consequences of this ADR's standalone-core direct
   `pyo3` — a packaging change, not a rewrite (core structs like `Bot`/`V3PoolState`
   already import no `pyo3`). **The mechanical relocation + virtual-manifest workspace
   restructure is DONE** (the `apexbot_rs` binding layer now lives at
-  `rust/crates/apexbot-python/` as a peer of the seven pyo3-free cores; `rust/Cargo.toml`
+  `rust/crates/shells/apexbot-python/` as a peer of the pyo3-free cores; `rust/Cargo.toml`
   is a pure virtual manifest — see ergo `DPSVCH`). The umbrella Rust crate
-  `apexbot` (`rust/crates/apexbot/`) re-exports the cores with zero `pyo3`, and
+  `apexbot` (`rust/crates/facade/apexbot/`) re-exports the cores with zero `pyo3`, and
   `examples/standalone_consumer.rs` is the standalone-Rust-consumer smoke test
   (constructs a `BotState`, registers a V2 pool via the `UNISWAP_V2` preset, runs a
   swap calc — no Python in the build) — see ergo `KWTAXJ`. **Remains deferred:**

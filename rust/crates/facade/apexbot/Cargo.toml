@@ -1,0 +1,149 @@
+[package]
+name = "apexbot"
+description = "Umbrella Rust crate: re-exports the pyo3-free apexbot core surface (Bot state, DexIdentity presets, calc math) for standalone Rust consumers."
+keywords = ["mev", "arbitrage", "evm", "uniswap", "bot"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# The umbrella is pure-Rust: it pulls ONLY the pyo3-free core crates and
+# re-exports them. It has NO `pyo3` dependency (verified by
+# `rg 'use pyo3' rust/crates/facade/apexbot` — empty). A standalone Rust consumer
+# `cargo add apexbot` gets `BotState`/`DexIdentity`/presets/calc with zero
+# Python in the build graph (ADR-005 standalone claim, made concrete by
+# `examples/standalone_consumer.rs`). The binding layer (`apexbot_rs` cdylib,
+# built from `crates/shells/apexbot-python/`) is a separate workspace member that
+# DOES pull pyo3; the umbrella never depends on it.
+[dependencies]
+parking_lot = { version = "^0.13" }
+alloy = { version = "^2.5", features = ["full"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }
+apexbot-config.workspace = true
+apexbot-aave.workspace = true
+apexbot-abi.workspace = true
+apexbot-math.workspace = true
+hashbrown.workspace = true
+apexbot-bot.workspace = true
+apexbot-core.workspace = true
+apexbot-ingestion.workspace = true
+apexbot-db.workspace = true
+apexbot-decoders.workspace = true
+apexbot-execution.workspace = true
+apexbot-executor.workspace = true
+apexbot-fork.workspace = true
+# The net-profit order index — re-exported for standalone consumers; the
+# `apexbot-arbitrage` edge below enables its `order-index` feature so
+# `dispatch_profitable` gets the deterministic pre-sim selection in every
+# umbrella build (ADR-024).
+apexbot-order-index.workspace = true
+apexbot-pathfinding.workspace = true
+apexbot-pool-updater.workspace = true
+apexbot-pools.workspace = true
+apexbot-price.workspace = true
+apexbot-rpc.workspace = true
+# Per-session run artifacts (stdout log + trace JSONL) - engine-general and
+# pyo3-free; standalone consumers reach it as `apexbot::runs`.
+apexbot-runs.workspace = true
+apexbot-simulation.workspace = true
+apexbot-arbitrage = { workspace = true, features = ["order-index"] }
+# The core batch executor (the per-batch dispatch choreography both
+# first-class consumers drive) — re-exported as `apexbot::batch_executor`.
+apexbot-batch-executor.workspace = true
+apexbot-strategy.workspace = true
+apexbot-submission.workspace = true
+apexbot-substrate.workspace = true
+apexbot-uniswap.workspace = true
+# The role-switching worker fleet (ADR-042): FSM, budget authority,
+# bounded priority dispatch, cordon posture — pyo3-free core for the
+# standalone Rust consumer.
+apexbot-workers.workspace = true
+apexbot-eventhub.workspace = true
+
+[features]
+# OTel observability passthrough (Gap G6): forward
+# `apexbot-bot/otel` so a `cargo add apexbot, features = ["otel"]`
+# consumer reaches `apexbot::bot::{otel, metrics, instruments}`. Those
+# modules are `#[cfg(feature = "otel")]` in apexbot-bot, so without this
+# passthrough they are unreachable through the umbrella — the gap that left
+# the pure-Rust settlement-bot example with no telemetry at all.
+otel = ["apexbot-bot/otel"]
+# Drain-path profiling passthrough: forwards `apexbot-bot/hotpath` so a
+# `cargo add apexbot, features = ["hotpath"]` consumer compiles the
+# `#[hotpath::measure]` spans on the pump → EngineStages solve path as real
+# instrumentation and the pump-lifetime guard (`BlockPump::run_with_stream`,
+# apexbot-bot/src/profiling.rs) flushes its report. Without this forward the
+# spans stayed compile-time no-ops through the umbrella — the gap that left
+# the pure-Rust settlement-bot example unable to flush a hotpath report at
+# all. The guard itself stays env-gated (`APEXBOT_HOTPATH=1`): the feature
+# widens what CAN be measured, never what default runs do. The narrower
+# variants (`hotpath-cpu`/`hotpath-alloc`/`hotpath-prometheus`) stay
+# unforwarded — they tune profiling posture, not consumer reachability.
+hotpath = ["apexbot-bot/hotpath"]
+# The replay bench's statement-ledger passthrough (ADR-068 D6 measurement):
+# forwards to apexbot-db's test/bench-only SQL ledger feature. Default OFF,
+# mirroring apexbot-db (the ledger never compiles into production paths).
+sql-ledger = ["apexbot-db/sql-ledger"]
+
+# The replay bench (GLOSSARY "replay bench", ADR-068 D6) measures the
+# statement ledger, so it only builds under the `sql-ledger` passthrough —
+# `just bench-updaters` is the one command that sets it.
+[[bench]]
+name = "updater_replay_bench"
+harness = false
+required-features = ["sql-ledger"]
+
+# The wave-2 EVM-oracle capture generator replays its SQL goldens through the
+# statement-ledger wrapper, so like the bench above it only builds under the
+# `sql-ledger` passthrough — a default-features target sweep (the workspace
+# clippy gate) must skip it instead of dying on E0432
+# (`apexbot_db::sql_ledger` is cfg'd out of apexbot-db).
+# `just check-evm-captures` is the one command that carries the feature.
+[[example]]
+name = "generate_evm_oracle_captures"
+required-features = ["sql-ledger"]
+
+# The wave-3 aave-side adversarial capture generator replays its
+# SQL goldens through the statement-ledger wrapper the same way — the same
+# `sql-ledger` passthrough applies.
+# `just check-aave-captures` is the one command that carries the feature.
+[[example]]
+name = "generate_aave_adversarial_captures"
+required-features = ["sql-ledger"]
+
+# The wave-4 upgrade-span recorder drives the live chunk loop and replays its
+# SQL goldens through the statement-ledger wrapper, so the same `sql-ledger`
+# passthrough applies.
+[[example]]
+name = "generate_aave_upgrade_windows"
+required-features = ["sql-ledger"]
+
+# The wave-5 config-dispatch span recorder drives the live chunk
+# loop and replays its SQL goldens through the statement-ledger wrapper, so the
+# same `sql-ledger` passthrough applies — a default-features target sweep (the
+# workspace clippy gate / `just check-rust-consumer`) must skip it instead of
+# dying on E0432 (`apexbot_db::sql_ledger` is cfg'd out of apexbot-db).
+# The example's usage block carries the one invocation that enables it:
+# `cargo run --features apexbot/sql-ledger --example generate_aave_config_windows`.
+[[example]]
+name = "generate_aave_config_windows"
+required-features = ["sql-ledger"]
+
+[dev-dependencies]
+# The record_updater_cassette example seeds throwaway harness DBs (temp
+# dirs) and drives the raw `exchanges` row the replay suites seed (the
+# same UPDATE the suite code runs - no `activate_exchange` substrate yet).
+rusqlite = { version = "^0.40" }
+tempfile = { version = "^3.27" }
+async-trait = "0.1"
+alloy = { version = "^2.5", features = ["full"] }
+revm = { version = "^43.0", default-features = false }
+tokio = { version = "^1.54", features = ["rt-multi-thread", "macros"] }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }

@@ -4,7 +4,7 @@
     clippy::doc_markdown,
     reason = "boot-gate integration test asserts on known-valid fixture output; the ledger identifiers in the parse contract are deliberately unbackticked in prose"
 )]
-//! RSP-8 fixture boot gate — the executable parity ledger (ergo 23DLCY).
+//! RSP-8 fixture boot gate — the executable parity ledger .
 //!
 //! Shells the built settlement-bot binary against the frozen parity.db
 //! fixture with no RPC (--smoke-offline) and diffs its machine-checkable
@@ -42,7 +42,7 @@ use std::process::Command;
 use serde_json::Value;
 
 const ORACLE_REL: &str = "../../../tests/standalone_parity/fixtures/settlement_bot_boot.json";
-const DB_REL: &str = "../../crates/apexbot-db/tests/fixtures/parity.db";
+const DB_REL: &str = "../../crates/foundation/apexbot-db/tests/fixtures/parity.db";
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -248,12 +248,24 @@ fn run_binary(discovery_chain_id: Option<&str>) -> String {
     // The committed chain-8453 fixture is Alembic-head-stamped. Pin the
     // ADR-052 D1 heal-at-open killswitch so the spawned drivers read it
     // read-only: the three #[test]s run on parallel threads and would
-    // otherwise race an in-place heal of the shared file (SQLITE_IOERR /
-    // "index ix_aave_asset_config_asset already exists") and fail the boot.
-    command.env("APEXBOT_DB_AUTO_HEAL", "0");
+    // otherwise race an in-place heal of the shared file (SQLITE_IOERR, and
+    // the rename/swap contention of the out-of-place heal) and fail the boot.
+    //
+    // Historical note: one symptom this workaround swallowed — "index
+    // ix_aave_asset_config_asset already exists" — was the head DDL's
+    // non-idempotent `CREATE INDEX` (the `CREATE TABLE`s already had
+    // `IF NOT EXISTS`). Every `CREATE [UNIQUE] INDEX` in `schema_head.sql` now
+    // carries `IF NOT EXISTS`, so replaying the head DDL on a racing fresh open
+    // is safe; the plain opens never heal either, so the heal's file-rename
+    // swap — a hazard the DDL idempotence does not address — cannot fire here.
     command.env("APEXBOT_RPC_HTTP_CHAINID_1", "http://127.0.0.1:1");
     command.env("APEXBOT_RPC_WS_CHAINID_1", "ws://127.0.0.1:1");
-    // Hermetic telemetry (Gap G6 / ergo ZOBXVC): the example now boots the
+    // The hermetic boot has no config file, so its facets fall to schema
+    // defaults (every facet inactive) — and the stance-independent arm gate
+    // refuses an inactive settlement facet. Activate the settled-block arm
+    // the way the 12-factor cascade does for any other APEXBOT_* key.
+    command.env("APEXBOT_STRATEGY_SETTLEMENT_ACTIVE", "1");
+    // Hermetic telemetry (Gap G6 /): the example now boots the
     // Prometheus scrape endpoint, so bind an ephemeral port per test binary
     // instead of racing the default 127.0.0.1:9464 across parallel tests.
     command.env("APEXBOT_METRICS_ADDR", "127.0.0.1:0");

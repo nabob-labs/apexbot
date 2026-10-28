@@ -4,34 +4,10 @@ from __future__ import annotations
 
 from fractions import Fraction
 from itertools import starmap
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, Self, cast, runtime_checkable
 
-from apexbot.balancer.libraries.constants import ONE
 from apexbot.balancer.libraries.scaling_helpers import _compute_scaling_factor
-from apexbot.balancer.math import (
-    fixed_point_div_down as _rs_div_down,
-)
-from apexbot.balancer.math import (
-    fixed_point_div_up as _rs_div_up,
-)
-from apexbot.balancer.math import (
-    fixed_point_mul_down as _rs_mul_down,
-)
-from apexbot.balancer.math import (
-    stable_calc_in_given_out as _rs_calc_in_given_out,
-)
-from apexbot.balancer.math import (
-    stable_calc_out_given_in as _rs_calc_out_given_in,
-)
-from apexbot.balancer.math import (
-    stable_calculate_invariant as _rs_calculate_invariant,
-)
-from apexbot.balancer.math import (
-    stable_calculate_invariant_deployed as _rs_calculate_invariant_deployed,
-)
-from apexbot.balancer.math import (
-    weighted_subtract_swap_fee_amount as _rs_subtract_swap_fee_amount,
-)
+from apexbot.balancer.math import fixed_point_mul_down
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.erc20 import Erc20Token
 from apexbot.exceptions import ApexbotValueError
@@ -44,9 +20,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.chain import ChecksummedAddress
 
 # Enum for deployed StableMath invariant versions.
@@ -89,7 +63,7 @@ class _HandleRateProviderAdapter:
     is ``_resolve_scaling_factors`` (which calls the handle directly).
     """
 
-    def __init__(self, py_pool: LiquidityPool) -> None:
+    def __init__(self, py_pool: Pool) -> None:
         self._py_pool = py_pool
 
     def get_rates(self, block_identifier: int | str | None = None) -> tuple[int, ...]:
@@ -142,14 +116,14 @@ class BalancerV2StablePool(AbstractLiquidityPool):
     type PoolState = BalancerV2PoolState
     FEE_DENOMINATOR = 1 * 10**18
 
-    # Class-scope instance-attribute declarations (red-knot): `_from_py_pool`
+    # Class-scope instance-attribute declarations (red-knot): `from_handle`
     # assigns these on `Self`; declare them at class scope so attribute reads
     # in helper methods resolve (mirrors the weighted companion).
     address: ChecksummedAddress
     pool_id: bytes
     pool_specialization: int
     vault: ChecksummedAddress
-    _py_pool: LiquidityPool
+    _py_pool: Pool
     _tokens: tuple[Erc20Token, ...]
     scaling_factors: tuple[int, ...]
     fee: Fraction
@@ -157,21 +131,20 @@ class BalancerV2StablePool(AbstractLiquidityPool):
     bpt_idx: int | None
     invariant_version: int
     _base_scaling_factors: tuple[int, ...]
-    _non_bpt_indices: tuple[int, ...]
     _rate_provider_is_static: bool
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:  # ruff:ignore[unused-method-argument]
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # ruff: ignore[unused-method-argument]
         """Direct construction is forbidden.
 
         ``BalancerV2StablePool`` is a Python companion over a Rust-owned
-        ``LiquidityPool`` handle. Use the registered entry points instead:
+        ``Pool`` handle. Use the registered entry points instead:
 
         - Production: ``Bot.build_pool(address)``
         - Tests: ``make_balancer_stable_pool(...)``
 
         Both register the pool in Rust (including the optional rate provider
-        as the stored I/O trait object), obtain the ``LiquidityPool``
-        handle, and wrap it via :meth:`_from_py_pool`.
+        as the stored I/O trait object), obtain the ``Pool``
+        handle, and wrap it via :meth:`from_handle`.
 
         Raises:
             TypeError: Always. Direct construction is not supported.
@@ -181,13 +154,13 @@ class BalancerV2StablePool(AbstractLiquidityPool):
             f"{type(self).__name__} cannot be constructed directly. "
             "Use Bot.build_pool(address) (production) or "
             "make_balancer_stable_pool(...) (tests) to register the pool in "
-            "Rust and obtain the LiquidityPool handle to wrap."
+            "Rust and obtain the Pool handle to wrap."
         )
         raise TypeError(msg)
 
     @classmethod
-    def _from_py_pool(cls, py_pool: LiquidityPool) -> Self:
-        """Wrap a Rust-owned ``LiquidityPool`` handle as a Python companion.
+    def from_handle(cls, py_pool: Pool) -> Self:
+        """Wrap a Rust-owned ``Pool`` handle as a Python companion.
 
         Internal seam (ADR-005, Polars-style ``_from_pydf`` pattern). Every
         identity field (vault, pool_id, tokens, amp, scaling_factors,
@@ -209,7 +182,7 @@ class BalancerV2StablePool(AbstractLiquidityPool):
 
         if py_pool.pool_family != "balancer-stable":
             msg = (
-                "LiquidityPool handle is not a Balancer stable pool "
+                "Pool handle is not a Balancer stable pool "
                 f"(got pool_family {py_pool.pool_family!r})"
             )
             raise ApexbotValueError(message=msg)
@@ -232,10 +205,7 @@ class BalancerV2StablePool(AbstractLiquidityPool):
                 "(ADR-006): get_balancer_stable_tokens returned None"
             )
             raise ApexbotValueError(message=msg)
-        self._tokens = tuple(
-            Erc20Token._from_py_token(t)  # ruff:ignore[private-member-access]
-            for t in py_tokens
-        )
+        self._tokens = tuple(Erc20Token.from_handle(t) for t in py_tokens)
 
         self.amp = py_pool.balancer_amp
         self.bpt_idx = py_pool.balancer_bpt_index
@@ -261,11 +231,6 @@ class BalancerV2StablePool(AbstractLiquidityPool):
         # 1e18 fallback for the no-provider case).
         self._rate_provider_is_static = py_pool.balancer_stable_rate_provider_is_static
 
-        # Precompute non-BPT index mapping for ComposableStablePool.
-        if self.bpt_idx is not None:
-            self._non_bpt_indices = tuple(i for i in range(len(self._tokens)) if i != self.bpt_idx)
-        else:
-            self._non_bpt_indices = tuple(range(len(self._tokens)))
         return self
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -295,12 +260,12 @@ class BalancerV2StablePool(AbstractLiquidityPool):
     def balances(self) -> tuple[int, ...]:
         """Balances.
 
-        Read from the Rust core via the ``LiquidityPool`` handle
-        (ADR-005 slice 12d). Rust ``BotState`` is the single source of truth
+        Read from the Rust core via the ``Pool`` handle.
+        Rust ``BotState`` is the single source of truth
         for the mutable ``balances`` slot; this getter returns the live tuple
         (one U256 per token, including BPT for Composable pools).
         """
-        return tuple(self._py_pool.balancer_stable_balances)
+        return cast("tuple[int, ...]", tuple(self._py_pool.balance_vector().balances))
 
     @property
     def state(self) -> PoolState:
@@ -318,15 +283,15 @@ class BalancerV2StablePool(AbstractLiquidityPool):
                 unreachable for a companion built over a registered handle).
 
         """
-        snap = self._py_pool.snapshot_balancer_stable()
-        if snap is None:  # pragma: no cover - defensive, unreachable in practice
+        try:
+            view = self._py_pool.balance_vector()
+        except ValueError as exc:
             msg = f"No Balancer stable pool state available for {self.address}"
-            raise ApexbotValueError(message=msg)
-        balances, block = snap
+            raise ApexbotValueError(message=msg) from exc
         return BalancerV2PoolState(
             address=self.address,
-            balances=tuple(balances),
-            block=block,
+            balances=tuple(view.balances),
+            block=view.update_block,
         )
 
     @property
@@ -338,7 +303,7 @@ class BalancerV2StablePool(AbstractLiquidityPool):
     def rate_provider(self) -> BalancerRateProvider | None:
         """The rate provider for per-block rate resolution, if available.
 
-        With the sealed seam (ADR-005 MBWSGP) the provider is the stored Rust
+        With the sealed seam (ADR-005) the provider is the stored Rust
         I/O trait object, queried via the handle. This property returns
         ``None`` when the stored provider is static (the no-I/O fallback).
         """
@@ -356,56 +321,6 @@ class BalancerV2StablePool(AbstractLiquidityPool):
         """
         # ComposableStablePools always need fresh rates for exact matching
         return self.bpt_idx is not None and not self._rate_provider_is_static
-
-    @staticmethod
-    def _upscale(amount: int, scaling_factor: int) -> int:
-        """Upscale a token amount using the scaling factor (mulDown).
-
-        Returns:
-            The computed integer value.
-
-        """
-        return _rs_mul_down(amount, scaling_factor)
-
-    @staticmethod
-    def _downscale_down(amount: int, scaling_factor: int) -> int:
-        """Downscale a token amount, rounding down (divDown).
-
-        Returns:
-            The computed integer value.
-
-        """
-        return _rs_div_down(amount, scaling_factor)
-
-    @staticmethod
-    def _downscale_up(amount: int, scaling_factor: int) -> int:
-        """Downscale a token amount, rounding up (divUp).
-
-        Returns:
-            The computed integer value.
-
-        """
-        return _rs_div_up(amount, scaling_factor)
-
-    def _subtract_swap_fee_amount(self, amount: int) -> int:
-        """Subtract swap fee from amount (mulUp for fee, matches deployed contract).
-
-        Returns:
-            The computed integer value.
-
-        """
-        fee_scaled = int(self.fee * self.FEE_DENOMINATOR)
-        return _rs_subtract_swap_fee_amount(amount, fee_scaled)
-
-    def _add_swap_fee_amount(self, amount: int) -> int:
-        """Add swap fee to amount (divUp, matches deployed contract).
-
-        Returns:
-            The computed integer value.
-
-        """
-        fee_scaled = int(self.fee * self.FEE_DENOMINATOR)
-        return _rs_div_up(amount, ONE - fee_scaled)
 
     def _resolve_scaling_factors(
         self,
@@ -428,58 +343,19 @@ class BalancerV2StablePool(AbstractLiquidityPool):
         if self._rate_provider_is_static:
             return self.scaling_factors
 
-        # Resolve block_identifier → Option<u64> for the Rust trait object.
+        # Resolve block_identifier -> Option<u64> for the Rust trait object.
         # A str ("latest") or None maps to None (latest); an int maps to Some.
         block_opt = block_identifier if isinstance(block_identifier, int) else None
         rates = self._py_pool.fetch_balancer_stable_rates(block_opt)
         if rates is None:
             msg = "no Balancer stable rate provider available"
             raise ApexbotValueError(message=msg)
-        return tuple(starmap(_rs_mul_down, zip(self._base_scaling_factors, rates, strict=True)))
-
-    @staticmethod
-    def _upscale_balances(balances: Sequence[int], scaling_factors: Sequence[int]) -> list[int]:
-        """Upscale all balances using the given scaling factors.
-
-        Returns:
-            A list of results.
-
-        """
-        return list(starmap(_rs_mul_down, zip(balances, scaling_factors, strict=False)))
-
-    def _compute_invariant(self, upscaled_balances: list[int]) -> int:
-        """Compute invariant using the pool's deployed StableMath version.
-
-        V1 (INVARIANT_V1): always-roundDown, D_P accumulation.
-        V2 (INVARIANT_V2): round_up=True for swaps, P_D accumulation.
-
-        Returns:
-            The computed integer value.
-
-        """
-        # For ComposableStablePool, drop BPT before computing invariant
-        if self.bpt_idx is not None:
-            balances_for_inv = [upscaled_balances[i] for i in self._non_bpt_indices]
-        else:
-            balances_for_inv = upscaled_balances
-
-        if self.invariant_version == INVARIANT_V1:
-            return _rs_calculate_invariant(self.amp, balances_for_inv)
-        return _rs_calculate_invariant_deployed(self.amp, balances_for_inv, round_up=True)
-
-    def _skip_bpt_index(self, index: int) -> int:
-        """Map a full token list index to the non-BPT index.
-
-        Matches Solidity's _skipBptIndex: returns index if index < bpt_idx,
-        otherwise index - 1.
-
-        Returns:
-            The computed integer value.
-
-        """
-        if self.bpt_idx is None:
-            return index
-        return index if index < self.bpt_idx else index - 1
+        return cast(
+            "tuple[int, ...]",
+            tuple(
+                starmap(fixed_point_mul_down, zip(self._base_scaling_factors, rates, strict=True))
+            ),
+        )
 
     def _should_warn_stale_rates(self) -> bool:
         """Whether a StaleRateResult should wrap the computed result.
@@ -509,72 +385,42 @@ class BalancerV2StablePool(AbstractLiquidityPool):
     ) -> int:
         """Compute the amount of token_out received for a GIVEN_IN swap.
 
-        Flow (matches deployed MetaStablePool and ComposableStablePool):
-        1. Subtract swap fee from raw input amount
-        2. Upscale fee-adjusted input and balances (using block-specific rates)
-        3. Compute outGivenIn (in scaled space, using adjusted indices)
-        4. Downscale down the output
+        Thin driver shell over the Rust core: token/scale resolution stays
+        Python-side (the MetaStable block-rate lookup is driver data), the
+        swap math is fully Rust-owned.
 
-        For ComposableStablePools without a live rate provider, the result
-        is wrapped in ``StaleRateResult`` because construction-time
-        rates may be stale. Pass ``block_identifier`` with a live rate provider
-        for exact-integer matching.
+        For ComposableStablePools without a live rate provider the result
+        is wrapped in ``StaleRateResult`` because construction-time rates
+        may be stale.
 
         Returns:
-            The computed integer value.
+            The computed integer value (unwrapped from ``StaleRateResult``
+            semantics when rates cannot be stale).
 
         Raises:
             StaleRateResult: See function documentation.
 
         """
-        if override_state is not None:
-            balances = list(override_state.balances)
-        else:
-            balances = list(self.balances)
-
-        token_in_idx = self._tokens.index(token_in)
-        token_out_idx = self._tokens.index(token_out)
-
-        # Resolve scaling factors at the target block
-        sf = self._resolve_scaling_factors(block_identifier)
-
-        # Step 1: Subtract fee from raw amount
-        amount_after_fee = self._subtract_swap_fee_amount(token_in_quantity)
-
-        # Step 2: Upscale balances and fee-adjusted amount
-        upscaled_balances = self._upscale_balances(balances, sf)
-        amount_in_scaled = self._upscale(amount_after_fee, sf[token_in_idx])
-
-        # Step 3: Compute outGivenIn with adjusted indices
-        adjusted_in = self._skip_bpt_index(token_in_idx)
-        adjusted_out = self._skip_bpt_index(token_out_idx)
-
-        # For ComposableStablePool, use non-BPT balances
-        if self.bpt_idx is not None:
-            inv_balances = [upscaled_balances[i] for i in self._non_bpt_indices]
-        else:
-            inv_balances = upscaled_balances
-
-        invariant = self._compute_invariant(upscaled_balances)
-
-        amount_out_scaled = _rs_calc_out_given_in(
-            self.amp,
-            list(inv_balances),
-            adjusted_in,
-            adjusted_out,
-            amount_in_scaled,
-            invariant,
+        idx_in = self._tokens.index(token_in)
+        idx_out = self._tokens.index(token_out)
+        override_balances = list(override_state.balances) if override_state is not None else None
+        override_scaling_factors = (
+            None
+            if self._rate_provider_is_static
+            else list(self._resolve_scaling_factors(block_identifier))
         )
-
-        # Step 4: Downscale down
-        result = self._downscale_down(amount_out_scaled, sf[token_out_idx])
-
+        result: int = self._py_pool.calculate_tokens_out_for_pair(
+            index_in=idx_in,
+            index_out=idx_out,
+            amount_in=token_in_quantity,
+            override_balances=override_balances,
+            override_scaling_factors=override_scaling_factors,
+        )
         if self._should_warn_stale_rates():
             raise StaleRateResult(
                 amount_in=token_in_quantity,
                 amount_out=result,
             )
-
         return result
 
     def calculate_tokens_in_from_tokens_out(
@@ -585,18 +431,10 @@ class BalancerV2StablePool(AbstractLiquidityPool):
         override_state: PoolState | None = None,
         block_identifier: int | str | None = None,
     ) -> int:
-        """Compute the amount of token_in needed for a GIVEN_OUT swap.
+        """Compute how many tokens must be sent to take `token_out_quantity` out.
 
-        Flow (matches deployed MetaStablePool and ComposableStablePool):
-        1. Upscale output amount and balances (using block-specific rates)
-        2. Compute inGivenOut (in scaled space, using adjusted indices)
-        3. Downscale up the input amount
-        4. Add swap fee to raw amount
-
-        For ComposableStablePools without a live rate provider, the result
-        is wrapped in ``StaleRateResult`` because construction-time
-        rates may be stale. Pass ``block_identifier`` with a live rate provider
-        for exact-integer matching.
+        Thin driver shell over the Rust core: the MetaStable block-rate
+        resolution stays Python-side, the swap math is fully Rust-owned.
 
         Returns:
             The computed integer value.
@@ -605,54 +443,26 @@ class BalancerV2StablePool(AbstractLiquidityPool):
             StaleRateResult: See function documentation.
 
         """
-        if override_state is not None:
-            balances = list(override_state.balances)
-        else:
-            balances = list(self.balances)
-
-        token_in_idx = self._tokens.index(token_in)
-        token_out_idx = self._tokens.index(token_out)
-
-        # Resolve scaling factors at the target block
-        sf = self._resolve_scaling_factors(block_identifier)
-
-        # Step 1: Upscale balances and output amount
-        upscaled_balances = self._upscale_balances(balances, sf)
-        amount_out_scaled = self._upscale(token_out_quantity, sf[token_out_idx])
-
-        # Step 2: Compute inGivenOut with adjusted indices
-        adjusted_in = self._skip_bpt_index(token_in_idx)
-        adjusted_out = self._skip_bpt_index(token_out_idx)
-
-        # For ComposableStablePool, use non-BPT balances
-        if self.bpt_idx is not None:
-            inv_balances = [upscaled_balances[i] for i in self._non_bpt_indices]
-        else:
-            inv_balances = upscaled_balances
-
-        invariant = self._compute_invariant(upscaled_balances)
-
-        amount_in_scaled = _rs_calc_in_given_out(
-            self.amp,
-            list(inv_balances),
-            adjusted_in,
-            adjusted_out,
-            amount_out_scaled,
-            invariant,
+        idx_in = self._tokens.index(token_in)
+        idx_out = self._tokens.index(token_out)
+        override_balances = list(override_state.balances) if override_state is not None else None
+        override_scaling_factors = (
+            None
+            if self._rate_provider_is_static
+            else list(self._resolve_scaling_factors(block_identifier))
         )
-
-        # Step 3: Downscale up
-        in_raw = self._downscale_up(amount_in_scaled, sf[token_in_idx])
-
-        # Step 4: Add fee
-        result = self._add_swap_fee_amount(in_raw)
-
+        result: int = self._py_pool.calculate_tokens_in_for_pair(
+            index_in=idx_in,
+            index_out=idx_out,
+            amount_out=token_out_quantity,
+            override_balances=override_balances,
+            override_scaling_factors=override_scaling_factors,
+        )
         if self._should_warn_stale_rates():
             raise StaleRateResult(
                 amount_in=result,
                 amount_out=token_out_quantity,
             )
-
         return result
 
     def external_update(
@@ -662,10 +472,10 @@ class BalancerV2StablePool(AbstractLiquidityPool):
         """Apply an external state update with new balances.
 
         Delegates to the Rust core
-        (``LiquidityPool.apply_balancer_stable_balance_update``) which
+        (``Pool.apply_balancer_stable_balance_update``) which
         journals the prior balances (genesis-anchor V2-style discipline) and
-        lands the new balances + ``update_block`` atomically
-        (ADR-005 slice 12d). The ``_state_lock`` + double-check-after-acquire
+        lands the new balances + ``update_block`` atomically. The
+        ``_state_lock`` + double-check-after-acquire
         pattern is gone — Rust's internal write lock handles atomicity; the
         registration-state precondition is enforced by the Rust core's
         silent-no-op-on-older-block contract.
@@ -678,7 +488,7 @@ class BalancerV2StablePool(AbstractLiquidityPool):
         """
         if self.state.block is not None and update.block_number < self.state.block:
             return
-        applied = self._py_pool.apply_balancer_stable_balance_update(
+        applied = self._py_pool.apply_balances(
             list(update.balances),
             update.block_number,
         )

@@ -35,7 +35,7 @@ verified: 68/68 non-reverting exact matches, 0 mismatches, 24 liquidity reverts
 
 Pinned to Ethereum mainnet block 24,407,242 (tip minus ~1M), served by a
 local archive node (URI configurable via ``tests.env``; see
-``ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
+``TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
 """
 
 from __future__ import annotations
@@ -52,8 +52,12 @@ from apexbot._ffi import Bot
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.constants import MAX_INT128, ZERO_ADDRESS
 from apexbot.exceptions.pool import IncompleteSwap
-from apexbot.fork import AnvilFork
-from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from apexbot.fork import AnvilFork, ForkLaunchConfig
+from tests.conftest import TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.contract_compat import make_contract
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v4_pool_factory import make_v4_pool
@@ -147,6 +151,7 @@ def _build_eth_usdc_v4_io_free() -> UniswapV4Pool:
         lp_fee=scalars["lp_fee"],
         tick_data=tick_data,
         state_block=cassette["block"],
+        py_bot=_PYBOT,
     )
 
 
@@ -204,10 +209,12 @@ class _RecordFork(AbstractContextManager):
     def __enter__(self) -> Self:
         if self._recording:
             self.fork = AnvilFork(
-                fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+                fork_url=TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI,
                 fork_block=UNISWAP_V4_PARITY_BLOCK,
-                storage_caching=True,
-                anvil_opts=["--accounts=0"],
+                launch=ForkLaunchConfig(
+                    storage_caching=True,
+                    anvil_opts=["--accounts=0"],
+                ),
             )
         return self
 
@@ -299,3 +306,17 @@ def test_cached_calculations_v4_eth_usdc(golden_factory) -> None:
                 except IncompleteSwap as exc:
                     calc = exc.amount_in
             assert calc == oracle.value, f"{key}: helper={calc} quoter={oracle.value}"
+
+
+_PARITY_TEST_NAME = "test_cached_calculations_v4_eth_usdc"
+
+
+def test_golden_keys_exactly_match_the_oracle_surface(request: pytest.FixtureRequest) -> None:
+    """The golden file holds exactly the keys this module's replay drives.
+
+    Replay fails loud on a missing key but stays silent on a stale extra one —
+    nothing looks it up. Set-equality against the recorded file closes that
+    drift: a shrunken case list cannot leave orphaned oracle entries behind."""
+    lp = _build_eth_usdc_v4_io_free()
+    expected = {key for _method, key, *_rest in _parity_cases(lp)}
+    assert_golden_keys_exact(request, _PARITY_TEST_NAME, expected)

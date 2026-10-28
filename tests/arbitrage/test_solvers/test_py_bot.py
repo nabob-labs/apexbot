@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from apexbot._ffi import Bot
+from apexbot.provider.call_helpers import encode_function_calldata
+from tests.helpers.synthetic_logs import v2_sync, v3_burn
 
 
 class TestPyBotV2Pool:
@@ -174,11 +176,11 @@ class TestPyBotV2Pool:
         result = core.calculate_tokens_out(pool_id, zero_for_one=True, amount_in=0)
         assert result == 0
 
-    def test_unknown_pool_id_returns_zero(self):
-        """Unknown pool ID should return zero (not raise)."""
+    def test_unknown_pool_id_is_a_typed_refusal(self):
+        """An unregistered pool ID at a use site aborts loudly (never a fabricated zero)."""
         core = Bot()
-        result = core.calculate_tokens_out(999, zero_for_one=True, amount_in=100)
-        assert result == 0
+        with pytest.raises(ValueError, match="not registered"):
+            core.calculate_tokens_out(999, zero_for_one=True, amount_in=100)
 
 
 class TestPoolHandle:
@@ -206,7 +208,7 @@ class TestPoolHandle:
         return core, pool_id
 
     def test_get_pool_returns_handle(self):
-        """get_pool() returns a LiquidityPool handle for a registered pool."""
+        """get_pool() returns a Pool handle for a registered pool."""
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
@@ -260,7 +262,7 @@ class TestPoolHandle:
 
 
 class TestPoolHandleState:
-    """LiquidityPool state read getters + per-handle mutations (ADR-005 slice 4 step 2)."""
+    """Pool state read getters + per-handle mutations."""
 
     POOL_ADDR = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     TOKEN0_ADDR = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -288,24 +290,29 @@ class TestPoolHandleState:
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
-        assert pool.reserve0 == 1000
-        assert pool.reserve1 == 2000
-        assert pool.update_block == 0  # update_block defaults to 0 at registration
+        view = pool.reserve_pair()
+        assert view.reserve0 == 1000
+        assert view.reserve1 == 2000
+        assert view.update_block == 0  # update_block defaults to 0 at registration
 
     def test_pool_snapshot_is_atomic(self):
         """snapshot() reads reserves+block under one read guard (atomicity).
 
         The companion's simulate_* methods build a state object from this
-        single snapshot so a Rust-side sync_reserves (pump) can't interleave
-        between separate reserve0/reserve1 reads.
+        single snapshot so a Rust-side pump apply can't interleave between
+        separate reserve0/reserve1 reads.
         """
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
-        pool.sync_reserves(reserve0=2000, reserve1=1000, block_number=10)
+        core.dispatch_log(
+            address=self.POOL_ADDR,
+            block_number=10,
+            **v2_sync(reserve0=2000, reserve1=1000),
+        )
 
-        r0, r1, block = pool.snapshot()
-        assert (r0, r1, block) == (2000, 1000, 10)
+        view = pool.reserve_pair()
+        assert (view.reserve0, view.reserve1, view.update_block) == (2000, 1000, 10)
 
     def test_pool_snapshot_returns_none_for_v3(self):
         """snapshot() returns None for non-V2 pools (no V2 state to read)."""
@@ -323,27 +330,37 @@ class TestPoolHandleState:
         )
         pool = core.get_pool(pool_id)
         assert pool is not None
-        assert pool.snapshot() is None
+        with pytest.raises(ValueError, match="reserve-pair"):
+            pool.reserve_pair()
 
-    def test_pool_sync_reserves_updates_state(self):
-        """sync_reserves journals + lands the new state on the handle."""
+    def test_pool_sync_updates_state(self):
+        """A dispatched Sync journals + lands the new state on the handle."""
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
         assert pool.journal_len() == 1  # genesis
 
-        pool.sync_reserves(reserve0=2000, reserve1=1000, block_number=10)
-        assert pool.reserve0 == 2000
-        assert pool.reserve1 == 1000
-        assert pool.update_block == 10
+        core.dispatch_log(
+            address=self.POOL_ADDR,
+            block_number=10,
+            **v2_sync(reserve0=2000, reserve1=1000),
+        )
+        view = pool.reserve_pair()
+        assert view.reserve0 == 2000
+        assert view.reserve1 == 1000
+        assert view.update_block == 10
         assert pool.journal_len() == 2  # genesis + block-10 transition
 
     def test_pool_handle_sync_is_equivalent_to_pybot_update(self):
-        """sync_reserves and Bot.update_v2_pool land the same state."""
+        """A dispatched Sync and Bot.update_v2_pool land the same state."""
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
-        pool.sync_reserves(reserve0=2000, reserve1=1000, block_number=10)
+        core.dispatch_log(
+            address=self.POOL_ADDR,
+            block_number=10,
+            **v2_sync(reserve0=2000, reserve1=1000),
+        )
 
         core2 = Bot()
         pool_id2 = core2.register_v2_pool(
@@ -361,70 +378,51 @@ class TestPoolHandleState:
         core2.update_v2_pool(self.POOL_ADDR, 2000, 1000, 10)
         pool2 = core2.get_pool(pool_id2)
         assert pool2 is not None
-        assert (pool.reserve0, pool.reserve1, pool.update_block) == (
-            pool2.reserve0,
-            pool2.reserve1,
-            pool2.update_block,
+        assert (
+            pool.reserve_pair().reserve0,
+            pool.reserve_pair().reserve1,
+            pool.reserve_pair().update_block,
+        ) == (
+            pool2.reserve_pair().reserve0,
+            pool2.reserve_pair().reserve1,
+            pool2.reserve_pair().update_block,
         )
 
-    def test_pool_restore_lands_at_previous_block(self):
-        """Handle.restore_before_block lands at the largest block below target."""
+    def test_reorg_log_restores_the_pre_block_state(self):
+        """A removed Sync log rolls the pool back through its journal."""
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
         # Genesis@0 (1000,2000); block-10 after (2000,1000); block-20 after (3000,500).
-        pool.sync_reserves(2000, 1000, 10)
-        pool.sync_reserves(3000, 500, 20)
+        core.dispatch_log(
+            address=self.POOL_ADDR, block_number=10, **v2_sync(reserve0=2000, reserve1=1000)
+        )
+        reorged = v2_sync(reserve0=3000, reserve1=500)
+        core.dispatch_log(address=self.POOL_ADDR, block_number=20, **reorged)
 
-        result = pool.restore_before_block(20)
-        assert result is not None
-        r0, r1, block = result
-        assert (r0, r1) == (2000, 1000)
-        assert block == 10
-        # State landed at block 10.
-        assert (pool.reserve0, pool.reserve1, pool.update_block) == (2000, 1000, 10)
+        # The block-20 event is reorged away → the state lands at block 10.
+        assert (
+            core.dispatch_reorg_log(address=self.POOL_ADDR, block_number=20, **reorged)
+            == "restored"
+        )
+        view = pool.reserve_pair()
+        assert (view.reserve0, view.reserve1, view.update_block) == (2000, 1000, 10)
 
-    def test_pool_restore_noop_when_target_after_newest(self):
-        """Handle.restore_before_block(N>newest) no-ops, returning current."""
+    def test_reorg_log_at_registration_is_a_too_deep_refusal(self):
+        """A removed log at the genesis block has no prior state → ValueError.
+
+        Production shuts the pump down on this (a too-deep reorg cannot be
+        restored); the FFI surfaces it as a refusal and leaves state untouched.
+        """
         core, pool_id = self._make_core_with_pool()
         pool = core.get_pool(pool_id)
         assert pool is not None
-        pool.sync_reserves(2000, 1000, 10)
-
-        result = pool.restore_before_block(100)
-        assert result is not None
-        r0, r1, block = result
-        assert (r0, r1, block) == (2000, 1000, 10)
-
-    def test_pool_restore_past_registration_raises(self):
-        """Handle.restore at/before genesis raises ValueError (decision 3)."""
-        core, pool_id = self._make_core_with_pool()
-        pool = core.get_pool(pool_id)
-        assert pool is not None
-        with pytest.raises(ValueError, match="No pool state known prior to block 0"):
-            pool.restore_before_block(0)
-
-    def test_pool_discard_past_newest_raises(self):
-        """Handle.discard past newest raises ValueError (decision 2)."""
-        core, pool_id = self._make_core_with_pool()
-        pool = core.get_pool(pool_id)
-        assert pool is not None
-        pool.sync_reserves(2000, 1000, 10)
-        with pytest.raises(ValueError, match="No pool state known at or after block 100"):
-            pool.discard_before_block(100)
-
-    def test_pool_discard_keeps_rest(self):
-        """Handle.discard removes deltas below target, keeping the rest."""
-        core, pool_id = self._make_core_with_pool()
-        pool = core.get_pool(pool_id)
-        assert pool is not None
-        pool.sync_reserves(2000, 1000, 10)
-        pool.sync_reserves(3000, 500, 20)
-        pool.sync_reserves(4000, 250, 30)
-        assert pool.journal_len() == 4  # genesis + 10 + 20 + 30
-
-        pool.discard_before_block(20)  # drops genesis@0 + block-10
-        assert pool.journal_len() == 2  # 20 + 30 remain
+        with pytest.raises(ValueError, match="NoStatePriorToBlock"):
+            core.dispatch_reorg_log(
+                address=self.POOL_ADDR, block_number=0, **v2_sync(reserve0=1000, reserve1=2000)
+            )
+        view = pool.reserve_pair()
+        assert (view.reserve0, view.reserve1) == (1000, 2000)
 
 
 class TestTokenHandle:
@@ -442,8 +440,8 @@ class TestTokenHandle:
             decimals=18,
             chain_id=1,
         )
-        # ADR-003 Slice 5: register_token returns the Erc20Token handle; the
-        # getters read Rust-owned metadata back through Bot's token map.
+        # register_token returns the Erc20Token handle; the getters read
+        # Rust-owned metadata back through Bot's token map.
         assert token is not None
         assert token.address == self.TOKEN_ADDR  # alloy preserves checksum case
         assert token.symbol == "WETH"
@@ -492,7 +490,6 @@ class TestV2SwapEncoding:
         result = core.encode_swap(
             pool_id, zero_for_one=True, amount_out=181, recipient=self.RECIPIENT
         )
-        assert result is not None
         to_hex, calldata_hex, value = result
 
         # Selector is 022c0d9f
@@ -509,18 +506,16 @@ class TestV2SwapEncoding:
         result = core.encode_swap(
             pool_id, zero_for_one=True, amount_out=181, recipient=self.RECIPIENT
         )
-        assert result is not None
         _, calldata_hex, _ = result
 
-        # Pinned reference calldata: the ABI encoding of
-        # swap(amount0_out=0, amount1_out=181, recipient=RECIPIENT,
-        # data=b''). Pinned from eth_abi 5.x + Rust function_selector
-        # (keccak pinned in 5JKNQH) at the EC6ZXG sweep; bytes permanent.
+        # Oracle-built reference calldata: the ABI encoding of
+        # swap(uint256,uint256,address,bytes) with args 0, 181, self.RECIPIENT, b"".
         expected = (
-            "0x022c0d9f000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000000000000b5000000000000000000000000bbbbbbbbbbbbbb"
-            "bbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000000000000000000000000000000000000000000000000"
-            "800000000000000000000000000000000000000000000000000000000000000000"
+            "0x"
+            + encode_function_calldata(
+                function_prototype="swap(uint256,uint256,address,bytes)",
+                function_arguments=[0, 181, self.RECIPIENT, b""],
+            ).hex()
         )
         assert calldata_hex == expected
 
@@ -531,18 +526,16 @@ class TestV2SwapEncoding:
         result = core.encode_swap(
             pool_id, zero_for_one=False, amount_out=181, recipient=self.RECIPIENT
         )
-        assert result is not None
         _, calldata_hex, _ = result
 
-        # Pinned reference calldata: the ABI encoding of
-        # swap(amount0_out=181, amount1_out=0, recipient=RECIPIENT,
-        # data=b''). Pinned from eth_abi 5.x + Rust function_selector
-        # (keccak pinned in 5JKNQH) at the EC6ZXG sweep; bytes permanent.
+        # Oracle-built reference calldata: the ABI encoding of
+        # swap(uint256,uint256,address,bytes) with args 0, 181, self.RECIPIENT, b"".
         expected = (
-            "0x022c0d9f00000000000000000000000000000000000000000000000000000000000000b500000000000000"
-            "00000000000000000000000000000000000000000000000000000000000000000000000000bbbbbbbbbbbbbb"
-            "bbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000000000000000000000000000000000000000000000000"
-            "800000000000000000000000000000000000000000000000000000000000000000"
+            "0x"
+            + encode_function_calldata(
+                function_prototype="swap(uint256,uint256,address,bytes)",
+                function_arguments=[181, 0, self.RECIPIENT, b""],
+            ).hex()
         )
         assert calldata_hex == expected
 
@@ -560,18 +553,16 @@ class TestV2SwapEncoding:
         assert pool is not None
 
         result = pool.encode_swap(zero_for_one=True, amount_out=181, recipient=self.RECIPIENT)
-        assert result is not None
         _, calldata_hex, _ = result
 
-        # Pinned reference calldata: the ABI encoding of
-        # swap(amount0_out=0, amount1_out=181, recipient=RECIPIENT,
-        # data=b''). Pinned from eth_abi 5.x + Rust function_selector
-        # (keccak pinned in 5JKNQH) at the EC6ZXG sweep; bytes permanent.
+        # Oracle-built reference calldata: the ABI encoding of
+        # swap(uint256,uint256,address,bytes) with args 0, 181, self.RECIPIENT, b"".
         expected = (
-            "0x022c0d9f000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            "000000000000000000000000000000000000000000000000b5000000000000000000000000bbbbbbbbbbbbbb"
-            "bbbbbbbbbbbbbbbbbbbbbbbbbb00000000000000000000000000000000000000000000000000000000000000"
-            "800000000000000000000000000000000000000000000000000000000000000000"
+            "0x"
+            + encode_function_calldata(
+                function_prototype="swap(uint256,uint256,address,bytes)",
+                function_arguments=[0, 181, self.RECIPIENT, b""],
+            ).hex()
         )
         assert calldata_hex == expected
 
@@ -627,99 +618,10 @@ class TestV2ReorgJournal:
         core.update_v2_pool(self.POOL_ADDR, 2500, 750, 10)
         assert core.v2_journal_len(pool_id) == 2  # still 2 (genesis + block-10)
 
-    def test_discard_before_block(self):
-        """discard_before_block removes deltas below target, keeping the rest."""
-        core, pool_id = self._make_core_with_pool()
-        core.update_v2_pool(self.POOL_ADDR, 2000, 1000, 10)
-        core.update_v2_pool(self.POOL_ADDR, 3000, 500, 20)
-        core.update_v2_pool(self.POOL_ADDR, 4000, 250, 30)
-        # genesis@0, 10, 20, 30 → four deltas
-        assert core.v2_journal_len(pool_id) == 4
-
-        # Discard < 20 → drops genesis@0 and block-10, keeps 20 and 30.
-        core.v2_discard_before_block(pool_id, 20)
-        assert core.v2_journal_len(pool_id) == 2
-
-    def test_restore_before_block_lands_at_previous_block(self):
-        """restore(N) lands at the largest block < N, returning that state."""
-        core, pool_id = self._make_core_with_pool()
-        # Genesis@0 (after 1000,2000); block-10 after (2000,1000);
-        # block-20 after (3000,500); block-30 after (4000,250).
-        core.update_v2_pool(self.POOL_ADDR, 2000, 1000, 10)
-        core.update_v2_pool(self.POOL_ADDR, 3000, 500, 20)
-        core.update_v2_pool(self.POOL_ADDR, 4000, 250, 30)
-
-        # Restore before block 20: lands at block 10, returns its landed-at
-        # (after) state (2000, 1000) at block 10 — NOT the block-20 delta's
-        # before-values at block 20 (the pre-slice-4 behavior).
-        result = core.v2_restore_before_block(pool_id, 20)
-        assert result is not None
-        r0, r1, block = result
-        assert r0 == 2000
-        assert r1 == 1000
-        assert block == 10
-
-    def test_restore_syncs_current_reserves(self):
-        """Restoring lands the current reserves at the landed-at state."""
-        core, pool_id = self._make_core_with_pool()
-        core.update_v2_pool(self.POOL_ADDR, 2000, 1000, 10)
-        core.update_v2_pool(self.POOL_ADDR, 3000, 500, 20)
-
-        # Restore before block 20 → lands at block 10 → reserves (2000, 1000).
-        core.v2_restore_before_block(pool_id, 20)
-
-        # V2 exact-in(100, 2000, 1000, 3/1000) = 47
-        result = core.calculate_tokens_out(pool_id, zero_for_one=True, amount_in=100)
-        assert result == 47
-
-    def test_restore_noop_returns_current_when_target_after_newest(self):
-        """restore(N>newest) no-ops and returns the current landed-at state.
-
-        Pre-slice-4 this returned the pre-newest BEFORE values (a silent
-        wrong-answer footgun); the landed-at journal returns AFTER (current).
-        """
-        core, pool_id = self._make_core_with_pool()
-        # Genesis@0 (1000,2000); block-10 after (2000,1000). Newest = 10.
-        core.update_v2_pool(self.POOL_ADDR, 2000, 1000, 10)
-
-        # Target (100) is after the newest (10) → no-op, returns current.
-        result = core.v2_restore_before_block(pool_id, 100)
-        assert result is not None
-        r0, r1, block = result
-        assert (r0, r1) == (2000, 1000)
-        assert block == 10
-
-    def test_restore_past_registration_raises(self):
-        """restore at/before the genesis block raises ValueError (decision 3).
-
-        Rolling back past registration is a hard error, not a silent no-op.
-        """
-        core, pool_id = self._make_core_with_pool()
-        # Genesis is at block 0 (update_block default). Restoring to 0 →
-        # no state before registration exists.
-        with pytest.raises(ValueError, match="No pool state known prior to block 0"):
-            core.v2_restore_before_block(pool_id, 0)
-
-    def test_discard_past_newest_raises(self):
-        """discard past the newest delta raises ValueError (decision 2).
-
-        Would remove every known state — was a panic pre-slice-4.
-        """
-        core, pool_id = self._make_core_with_pool()
-        core.update_v2_pool(self.POOL_ADDR, 2000, 1000, 10)
-        # Newest is block 10; discarding before 100 would drop everything.
-        with pytest.raises(ValueError, match="No pool state known at or after block 100"):
-            core.v2_discard_before_block(pool_id, 100)
-
     def test_journal_len_unknown_pool_returns_zero(self):
         """v2_journal_len returns 0 for unknown pool ID."""
         core = Bot()
         assert core.v2_journal_len(999) == 0
-
-    def test_restore_unknown_pool_returns_none(self):
-        """v2_restore_before_block returns None for unknown pool ID."""
-        core = Bot()
-        assert core.v2_restore_before_block(999, 10) is None
 
 
 class TestV3PoolState:
@@ -834,12 +736,11 @@ class TestV3PoolState:
 
         # The seed landed inline — NO update_tick_data call was made. If the
         # seed were lost (pre-fix: empty tick_data), this snapshot is empty.
-        assert pool.tick_data_snapshot() == seed_rows
+        assert pool.concentrated_liquidity().tick_data == seed_rows
 
         # update_block advanced to the seed block (not the hardcoded 0).
-        assert pool.snapshot_v3() is not None
-        _, _, _, seeded_block = pool.snapshot_v3()  # type: ignore[misc]
-        assert seeded_block == 100
+        view = pool.concentrated_liquidity()
+        assert view.update_block == 100
 
     def test_register_v3_pool_inline_seed_survives_concurrent_update(self):
         """A pump liquidity update after the inline seed is NOT clobbered.
@@ -870,13 +771,12 @@ class TestV3PoolState:
         assert pool is not None
 
         # Pump-phase burn at a later block: applies on top of the seed.
-        assert pool.apply_liquidity_update(
-            tick_lower=0,
-            tick_upper=60,
-            liquidity_delta=-500_000,
+        core.dispatch_log(
+            address=self.POOL_ADDR,
             block_number=150,
+            **v3_burn(tick_lower=0, tick_upper=60, amount=500_000),
         )
-        snapshot = pool.tick_data_snapshot()
+        snapshot = pool.concentrated_liquidity().tick_data
         # The burn SURVIVED — tick 0's gross halved from the seed's 1_000_000
         # to 500_000 at the burn's block (150). If the seed had been applied
         # AFTER the burn (the pre-fix clobber), gross would still be 1_000_000
@@ -894,59 +794,10 @@ class TestV3PoolState:
         core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 2000, 3000000, 20, 42)
         assert core.v3_journal_len(pool_id) == 1  # Still 1, not 2
 
-    def test_v3_discard_before_block(self):
-        """discard_before_block removes old V3 deltas."""
-        core, pool_id = self._make_core_with_v3_pool()
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 1000, 2000000, 10, 10)
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 2000, 3000000, 20, 20)
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 3000, 4000000, 30, 30)
-        assert core.v3_journal_len(pool_id) == 3
-
-        core.v3_discard_before_block(pool_id, 20)
-        assert core.v3_journal_len(pool_id) == 2  # blocks 20 and 30 remain
-
-    def test_v3_restore_before_block(self):
-        """restore_before_block rolls back V3 state."""
-        core, pool_id = self._make_core_with_v3_pool()
-        # Initial: sqrt_price=SQUARE_PRICE_X96, liquidity=1000000, tick=0
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 1000, 2000000, 10, 10)
-        # After block 10: current=(SQ+1000, 2000000, 10)
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 2000, 3000000, 20, 20)
-        # After block 20: current=(SQ+2000, 3000000, 20)
-
-        # Restore before block 20: pops block-20 delta, returns the before-values
-        # (the reverted state's update_block = 10 — the restored state is the
-        # block-10 snapshot, per ADR-016 "post-restore fields are the before-values").
-        result = core.v3_restore_before_block(pool_id, 20)
-        assert result is not None
-        spx, liq, tick, block = result
-        assert spx == self.SQRT_PRICE_X96 + 1000
-        assert liq == 2000000
-        assert tick == 10
-        assert block == 10
-
-    def test_v3_restore_syncs_current_state(self):
-        """Restoring also updates the pool's current scalar state."""
-        core, pool_id = self._make_core_with_v3_pool()
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 1000, 2000000, 10, 10)
-        core.update_v3_pool(self.POOL_ADDR, self.SQRT_PRICE_X96 + 2000, 3000000, 20, 20)
-
-        # Restore before block 20
-        core.v3_restore_before_block(pool_id, 20)
-
-        # Verify current state is rolled back by doing another update
-        # and checking journal length
-        assert core.v3_journal_len(pool_id) == 1  # Only block-10 delta remains
-
     def test_v3_journal_len_unknown_pool_returns_zero(self):
         """v3_journal_len returns 0 for unknown pool ID."""
         core = Bot()
         assert core.v3_journal_len(999) == 0
-
-    def test_v3_restore_unknown_pool_returns_none(self):
-        """v3_restore_before_block returns None for unknown pool ID."""
-        core = Bot()
-        assert core.v3_restore_before_block(999, 10) is None
 
     def test_v2_journal_methods_on_v3_pool_return_zero(self):
         """V2 journal methods correctly return 0/None for V3 pools."""
@@ -969,14 +820,13 @@ class TestV3PoolState:
             factory=self.FACTORY_ADDR,
         )
         assert core.v3_journal_len(pool_id) == 0
-        assert core.v3_restore_before_block(pool_id, 10) is None
 
 
 class TestDexIdentityPresets:
-    """ADR-005 slice 6 — DEX identity presets exposed via the Rust extension.
+    """DEX identity presets exposed via the Rust extension.
 
     The Python seam (`dex_identity(variant)` → `DexIdentity`) exposes the
-    Rust-core `DexIdentity` preset registry so a slice-7 Python builder can
+    Rust-core `DexIdentity` preset registry so a Python builder can
     resolve a DEX's canonical-chain deployment data (factory, deployer, init
     hash, default fees, reserve ABI shape) without a Python-side preset table.
     The field values MUST match the Python ClassVars they supersede — these
@@ -996,7 +846,7 @@ class TestDexIdentityPresets:
         assert (
             ident.init_hash == "0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f"
         )
-        # Fraction(3, 1000) fee → RETAINED fraction (997, 1000). Slice-5 convention.
+        # Fraction(3, 1000) fee → RETAINED fraction (997, 1000).
         assert ident.fee_token0 == (997, 1000)
         assert ident.fee_token1 == (997, 1000)
         assert ident.reserves_abi == ["uint112", "uint112"]

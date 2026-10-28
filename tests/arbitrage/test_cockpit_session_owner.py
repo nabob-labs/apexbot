@@ -1,4 +1,4 @@
-"""FJA2Z7: session state as the cockpit's one owner (candidate 5).
+"""Session state as the cockpit's one owner (candidate 5).
 
 The ``_SessionState`` built in ``start()`` is the ONE owner of the cockpit's
 coordination values — the actors, the dispatcher, the block clock, the sim
@@ -16,21 +16,29 @@ with the runner-built owner + injected streams). No anvil, no live RPC.
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import signal
 
 import pytest
 
+from apexbot._ffi import session_phase_next
 from apexbot.runner import BotRunner
 from apexbot.runner._consume import consume_result_batches
-from apexbot.runner.bot_runner import PhaseError, _Phase, _SessionState
+from apexbot.runner._relay_posture import RelayPosture
+from apexbot.runner.bot_runner import InjectedActors, PhaseError, _Phase, _SessionState
 from apexbot.runner.config import ArbitrageConfig
+from tests.fakes.bot import FakeBot as _FakeBot
+from tests.fakes.engine import FakeEngineRegistry as _FakeEngineRegistry
+from tests.fakes.runner_pipelines import StubPipeline
+from tests.helpers.boot_actors import inline_registration_scheduler
+from tests.helpers.identity_env import identity_env
+from tests.helpers.rpc_env import rpc_env
 
 
 @pytest.fixture(autouse=True)
-def _rpc_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("APEXBOT_RPC_HTTP_CHAINID_1", "http://localhost:8545")
-    monkeypatch.setenv("APEXBOT_RPC_WS_CHAINID_1", "ws://localhost:8546")
+def _rpc_env():
+    with rpc_env():
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -40,69 +48,12 @@ def _restore_sigint() -> None:
 
 
 def _cfg() -> ArbitrageConfig:
-    return ArbitrageConfig.from_env(
-        {
-            "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
-            "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
-            "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
-            "INJECT_EXECUTOR_CODE": "0",
-        },
-        live=True,
-        permutation=None,
-    )
-
-
-class _FakeEngine:
-    def resume(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def v2_pool_count(self) -> int:
-        return 0
-
-    def v3_pool_count(self) -> int:
-        return 0
-
-    def v4_pool_count(self) -> int:
-        return 0
-
-    def path_count(self) -> int:
-        return 0
-
-    async def pump_finished_future(self) -> None:
-        # Injected engines have no real pump: the awaitable contract is a
-        # future that never resolves (the real pre-finish consumer shape).
-        await asyncio.Event().wait()
-
-    async def block_stream(self):
-        return
-        yield  # pragma: no cover - async generator marker
-
-
-class _FakeEngineRegistry:
-    def __init__(self) -> None:
-        self.engine = _FakeEngine()
-        self.start_calls = 0
-
-    def start(self, node_http, node_ws, *, v3_snapshot, v4_snapshot, verify_state_view) -> int:
-        self.start_calls += 1
-        return 12_000
-
-
-class _FakeBot:
-    chain_id = 1
-
-    def release_python_state(self) -> None:
-        pass
-
-    def block_stream(self):  # pragma: no cover - the noop consumer never iterates it
-        async def _empty():
-            return
-            yield {}  # pragma: no cover
-
-        return _empty()
+    with identity_env({
+        "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
+        "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
+        "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
+    }):
+        return ArbitrageConfig.build(live=True, permutation=None)
 
 
 class _FakeAsyncW3:
@@ -149,17 +100,20 @@ def _noop():
 
 
 def _runner(**overrides: object) -> BotRunner:
-    kwargs: dict[str, object] = {
+    actors: dict[str, object] = {
         "bot": _FakeBot(),
         "engine_registry": _FakeEngineRegistry(),
         "async_w3": _FakeAsyncW3(),
-        "snapshots": (object(), object(), None, None),
         "path_builder": lambda **kw: _noop(),
         "consumer": lambda **kw: _noop(),
-        "install_sigint": False,
+        "relay_posture": RelayPosture(relay_urls=["http://offline-test.relay"]),
+        "scheduler": inline_registration_scheduler,
     }
-    kwargs.update(overrides)
-    return BotRunner(_cfg(), **kwargs)  # type: ignore[arg-type]
+    install_sigint = overrides.pop("install_sigint", False)
+    actors.update(overrides)
+    return BotRunner(  # type: ignore[arg-type]
+        _cfg(), actors=InjectedActors(settlement_arm=True, **actors), install_sigint=install_sigint
+    )
 
 
 class AsyncOnce:
@@ -201,33 +155,9 @@ def _empty_batch() -> dict[str, object]:
     }
 
 
-class _StubPipeline:
-    """Stands in for ``SimSubmitPipeline`` at the consumer's module seam."""
-
-    def __init__(self, session: object, **kwargs: object) -> None:
-        self.session = session
-
-    async def enqueue(
-        self,
-        results: object,
-        *,
-        block_timestamp: int,
-        base_fee_next: int,
-        payloads: dict[int, dict] | None = None,
-    ) -> None:
-        return None
-
-    def raise_if_failed(self) -> None:
-        return None
-
-    async def stop(self) -> None:
-        return None
-
-
 @pytest.fixture(name="stub_pipeline")
-def _stub_pipeline(monkeypatch: pytest.MonkeyPatch) -> type[_StubPipeline]:
-    monkeypatch.setattr("apexbot.runner._consume.SimSubmitPipeline", _StubPipeline)
-    return _StubPipeline
+def _stub_pipeline() -> type[StubPipeline]:
+    return StubPipeline
 
 
 async def _drive_one_block(session: _SessionState, *, tick: int) -> None:
@@ -276,7 +206,7 @@ class TestStartReentryIdempotence:
         second = await runner.start()
 
         assert second is first is runner
-        assert registry.start_calls == 1, "re-entry must not rebuild the actors"
+        assert len(registry.start_calls) == 1, "re-entry must not rebuild the actors"
         assert runner._session is session_after_first
 
     async def test_reentry_in_running_raises_phase_error(self) -> None:
@@ -314,9 +244,9 @@ class TestNoFrozenMirrors:
     """
 
     async def test_consumer_advanced_block_visible_through_every_reader(
-        self, stub_pipeline: type[_StubPipeline]
+        self, stub_pipeline: type[StubPipeline]
     ) -> None:
-        runner = _runner()
+        runner = _runner(pipeline_factory=stub_pipeline)
         await runner.start()
         session = runner._session
         assert session is not None
@@ -336,9 +266,9 @@ class TestNoFrozenMirrors:
         assert getattr(runner, "_sim_ctx", session.sim_ctx) is session.sim_ctx
 
     async def test_pipeline_attach_visible_through_the_owner(
-        self, stub_pipeline: type[_StubPipeline]
+        self, stub_pipeline: type[StubPipeline]
     ) -> None:
-        runner = _runner()
+        runner = _runner(pipeline_factory=stub_pipeline)
         await runner.start()
         session = runner._session
         assert session is not None
@@ -363,13 +293,23 @@ class TestNoFrozenMirrors:
         assert session.current_block == 105
 
 
-class TestPhaseGuardMatrix:
-    """The guard matrix, per phase: which lifecycle calls are legal.
+# The Python methods map onto the host's four session-phase operations.
+_RUST_OPERATION = {
+    "start": "start",
+    "run": "run",
+    "enqueue_path": "query",
+    "trigger_discovery": "query",
+    "shutdown": "shutdown",
+}
 
-    start(): NEW builds / STARTED no-op / RUNNING+CLOSED PhaseError.
-    run(): only STARTED. enqueue_path()/trigger_discovery(): only RUNNING
-    (and raise their documented RuntimeError there when no live pipeline
-    exists — injected/fake runs).
+
+class TestPhaseGuardMatrix:
+    """The guard matrix is the Rust host's session-phase table, not a Python one.
+
+    Every cell is read from ``apexbot._ffi.session_phase_next`` (the host's
+    ``SessionPhase`` table in ``strategy_host.rs``); the runner is then driven
+    to that phase and its lifecycle method must honor the host verdict. A
+    matrix change that lands in only one language cannot stay green.
     """
 
     @staticmethod
@@ -386,45 +326,48 @@ class TestPhaseGuardMatrix:
         await runner.shutdown()
         return runner
 
+    @pytest.mark.parametrize(
+        "method",
+        ["start", "run", "enqueue_path", "trigger_discovery", "shutdown"],
+    )
     @pytest.mark.parametrize("phase", list(_Phase))
-    async def test_start_guard(self, phase: _Phase) -> None:
+    async def test_runner_honors_the_rust_session_table(self, phase: _Phase, method: str) -> None:
+        expected = session_phase_next(phase.value, _RUST_OPERATION[method])
         runner = await self._drive_to(phase)
-        if phase is _Phase.NEW:
-            await runner.start()
-            assert runner._phase is _Phase.STARTED
-        elif phase is _Phase.STARTED:
-            assert await runner.start() is runner
+        call = {
+            "start": runner.start,
+            "run": runner.run,
+            "enqueue_path": lambda: runner.enqueue_path([], directions=None),
+            "trigger_discovery": runner.trigger_discovery,
+            "shutdown": runner.shutdown,
+        }[method]
+        if expected is None:
+            with pytest.raises(PhaseError):
+                await call()
+            assert runner._phase is phase, "a refused move leaves the phase untouched"
         else:
-            with pytest.raises(PhaseError, match="session can only start from New"):
-                await runner.start()
+            # A legal query still raises when no live pipeline exists
+            # (injected/fake runs) — that is past the phase gate.
+            with contextlib.suppress(RuntimeError):
+                await call()
+            assert runner._phase.value == expected
 
-    @pytest.mark.parametrize("phase", list(_Phase))
-    async def test_run_guard(self, phase: _Phase) -> None:
-        runner = await self._drive_to(phase)
-        if phase is _Phase.STARTED:
-            await runner.run()  # legal, and ends still RUNNING
-            assert runner._phase is _Phase.RUNNING
-        else:
-            with pytest.raises(PhaseError, match="run\\(\\) requires phase 'started'"):
-                await runner.run()
 
-    @pytest.mark.parametrize("phase", list(_Phase))
-    async def test_enqueue_path_guard(self, phase: _Phase) -> None:
-        runner = await self._drive_to(phase)
-        if phase is _Phase.RUNNING:
-            # Legal phase, but an injected/fake run has no live pipeline.
-            with pytest.raises(RuntimeError, match="no live registration pipeline"):
-                await runner.enqueue_path([], directions=None)
-        else:
-            with pytest.raises(PhaseError, match="enqueue_path\\(\\) needs 'running'"):
-                await runner.enqueue_path([], directions=None)
+class TestStopFunnel:
+    """Stop has ONE engine-level entrypoint for both Python entrances."""
 
-    @pytest.mark.parametrize("phase", list(_Phase))
-    async def test_trigger_discovery_guard(self, phase: _Phase) -> None:
-        runner = await self._drive_to(phase)
-        if phase is _Phase.RUNNING:
-            with pytest.raises(RuntimeError, match="no live registration pipeline"):
-                await runner.trigger_discovery()
-        else:
-            with pytest.raises(PhaseError, match="trigger_discovery\\(\\) needs 'running'"):
-                await runner.trigger_discovery()
+    async def test_shutdown_and_sigint_share_the_stop_entrypoint(self) -> None:
+        calls: list[str] = []
+        runner = _runner(
+            install_sigint=True,
+            stop_engine=lambda: calls.append("stop"),
+        )
+        await runner.start()
+
+        await runner.shutdown()
+        with pytest.raises(KeyboardInterrupt):
+            runner._handle_sigint(signal.SIGINT, None)
+
+        assert calls == ["stop", "stop"], (
+            "shutdown() and the SIGINT handler must both funnel through BotRunner._stop_engine"
+        )

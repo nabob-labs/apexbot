@@ -8,7 +8,7 @@ that enforces the phase ordering: subscribe→backfill→verify
 
 The full handshake is I/O-bound (live RPC/WS/DB), so these tests inject fakes
 for bot/engine_registry/async_w3 + the two module functions (path_builder,
-consumer) — the OLKZ3L ``engine=`` seam pattern scaled up. The production
+consumer) — the ``engine=`` seam pattern scaled up. The production
 path (all None) builds from cfg and calls the real functions; verified by the
 example running (the example IS the integration test).
 """
@@ -17,28 +17,42 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
+import logging
+import signal
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
+from apexbot.arbitrage.policy import NoOpPathPredicate
+from apexbot.exceptions import VerificationMismatchError, VerificationRpcError
+from apexbot.pathfinding import PoolKind
 from apexbot.runner import BotRunner
-from apexbot.runner.config import ArbitrageConfig
+from apexbot.runner._relay_posture import RelayPosture
+from apexbot.runner._run_ritual import RunRitual
+from apexbot.runner.bot_runner import InjectedActors, PhaseError, _Phase
+from apexbot.runner.build_paths import (
+    ConstructionContext,
+    PathRegistrationPipeline,
+)
+from apexbot.runner.config import ArbitrageConfig, RpcCascadeOverrides
+from tests.deadlock_guard import DEADLOCK_GUARD_S
+from tests.fakes.bot import FakeBot as _FakeBot
+from tests.fakes.engine import FakeEngine as _FakeEngine
+from tests.fakes.engine import FakeEngineRegistry as _FakeEngineRegistry
+from tests.helpers.boot_actors import inline_registration_scheduler
+from tests.helpers.identity_env import identity_env
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-@pytest.fixture(autouse=True)
-def _rpc_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set chain-1 RPC OS envvars for every test in this module.
-
-    The session tests inject fakes for bot/engine_registry/async_w3, so the RPC
-    URIs are never connected — they only need to be *present* on the config so
-    ``ArbitrageConfig.from_env`` does not raise ``RpcNotConfiguredError``. Keeping
-    them ``http://localhost:8545`` / ``ws://localhost:8546`` preserves the legacy
-    assertions in ``test_start_orchestrates_pre_resume_ritual``.
-    """
-    monkeypatch.setenv("APEXBOT_RPC_HTTP_CHAINID_1", "http://localhost:8545")
-    monkeypatch.setenv("APEXBOT_RPC_WS_CHAINID_1", "ws://localhost:8546")
+# The endpoint every test in this module resolves to. The session tests inject
+# fakes for bot/engine_registry/async_w3, so the URI is never connected — it
+# only has to be *present* so ``ArbitrageConfig.build`` answers. It arrives
+# through the explicit override layer, because the installed config reads the
+# environment at FFI module init, long before a test could set it.
+_NODE = "ws://localhost:8546"
 
 
 @pytest.fixture(autouse=True)
@@ -52,9 +66,8 @@ def _restore_sigint() -> None:
     assertions. This fixture restores ``SIG_DFL`` after each test unconditionally.
     """
     yield
-    import signal as _signal
 
-    _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
 def _cfg(**overrides) -> ArbitrageConfig:
@@ -62,116 +75,19 @@ def _cfg(**overrides) -> ArbitrageConfig:
         "OPERATOR_ADDRESS": "0x9C56a29c7231974c269E24F9FB3c29203039089E",
         "OPERATOR_PRIVATE_KEY": "0x" + "a" * 64,
         "EXECUTOR_CONTRACT_ADDRESS": "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5",
-        "INJECT_EXECUTOR_CODE": "0",
     }
     base.update(overrides)
-    return ArbitrageConfig.from_env(base, live=True, permutation=None)
-
-
-class _FakeEngine:
-    def __init__(self, events: list[str] | None = None) -> None:
-        self.resumed = False
-        self._events = events
-        self.stop_calls = 0
-        self.stop_raises: Exception | None = None
-
-    def resume(self) -> None:
-        self.resumed = True
-        if self._events is not None:
-            self._events.append("resume")
-
-    def stop(self) -> None:
-        self.stop_calls += 1
-        if self._events is not None:
-            self._events.append("stop")
-        if self.stop_raises is not None:
-            raise self.stop_raises
-
-    async def pump_finished_future(self) -> None:
-        # Injected engines have no real pump: satisfy the awaitable contract
-        # with a future that never resolves, so the watchdog stays parked
-        # until the session ends on its own (the real pre-finish shape).
-        await asyncio.Event().wait()
-
-    def last_processed_block(self) -> int | None:
-        return 12_345
-
-    def v2_pool_count(self) -> int:
-        return 0
-
-    def v3_pool_count(self) -> int:
-        return 0
-
-    def v4_pool_count(self) -> int:
-        return 0
-
-    def path_count(self) -> int:
-        return 0
-
-    async def block_stream(self):
-        # T7: the hot loop spawns a recurring-verify task consuming
-        # engine.block_stream(). Test engines never advance blocks, so yield
-        # nothing — the recurring verify task stays idle until cancelled.
-        return
-        yield  # pragma: no cover - makes this an async generator
-
-
-class _FakeEngineRegistry:
-    def __init__(self, *, backfill_target: int = 12_000, events: list[str] | None = None) -> None:
-        self.engine = _FakeEngine(events=events)
-        self.start_calls: list[dict] = []
-        self._backfill_target = backfill_target
-
-    def start(
-        self,
-        node_http,
-        node_ws,
-        *,
-        v3_snapshot,
-        v4_snapshot,
-        verify_state_view,
-    ) -> int:
-        self.start_calls.append({
-            "node_http": node_http,
-            "node_ws": node_ws,
-            "v3_snapshot": v3_snapshot,
-            "v4_snapshot": v4_snapshot,
-            "verify_state_view": verify_state_view,
-        })
-        return self._backfill_target
-
-
-class _FakeBot:
-    def __init__(
-        self,
-        events: list[str] | None = None,
-        blocks: list[dict[str, int]] | None = None,
-    ) -> None:
-        self.chain_id = 1
-        self.released = False
-        self._events = events
-        self._blocks = blocks or []
-        # Mimics the real Bot.block_stream() once-only receiver semantics
-        # (the block-clock pipe is coordinator-owned; the receiver is handed
-        # out exactly once).
-        self.block_stream_calls = 0
-
-    def release_python_state(self) -> None:
-        self.released = True
-        if self._events is not None:
-            self._events.append("release")
-
-    def block_stream(self):
-        self.block_stream_calls += 1
-        if self.block_stream_calls > 1:
-            msg = "block_stream() can only be called once"
-            raise RuntimeError(msg)
-        return _BlocksStream(list(self._blocks))
+    with identity_env(base):
+        return ArbitrageConfig.build(
+            live=True,
+            permutation=None,
+            rpc=RpcCascadeOverrides(chain_id=1, node=_NODE),
+        )
 
 
 class _RecordingPyBot:
     """A stand-in for the Rust ``Bot._py_bot`` whose ``close_snapshot_tx``
-    records invocation (and optionally trips the XEANMB canary RuntimeError,
+    records invocation (and optionally trips the canary RuntimeError,
     as the real one does when in-flight build workers hold an ``Arc`` clone)."""
 
     def __init__(
@@ -211,7 +127,7 @@ class _FakeEth:
 
 
 class _FakeAsyncW3:
-    """Fake ``AsyncAlloyProvider`` for BotRunner tests (PAGQCK).
+    """Fake ``AsyncAlloyProvider`` for BotRunner tests.
 
     The dispatch hot loop was routed off raw ``AsyncWeb3`` onto
     ``AsyncAlloyProvider`` — this fake exposes the SAME flat surface
@@ -253,28 +169,6 @@ def _noop_coro():
     return _n()
 
 
-class _BlocksStream:
-    """Async iterator over a fixed list of block dicts, then StopAsyncIteration.
-
-    Stand-in for the once-only `engine.block_stream()` receiver (mimics
-    `BlockStream.__anext__`).
-    """
-
-    def __init__(self, blocks: list[dict[str, int]]) -> None:
-        self._blocks = list(blocks)
-        self._i = 0
-
-    def __aiter__(self) -> _BlocksStream:
-        return self
-
-    async def __anext__(self) -> dict[str, int]:
-        if self._i >= len(self._blocks):
-            raise StopAsyncIteration
-        b = self._blocks[self._i]
-        self._i += 1
-        return b
-
-
 def _block_dict(number: int) -> dict[str, int]:
     return {
         "number": number,
@@ -309,28 +203,28 @@ class TestBotRunnerStart:
         bot = _FakeBot()
         engine_registry = _FakeEngineRegistry(backfill_target=12_000)
         async_w3 = _FakeAsyncW3()
-        v3_snap, v4_snap = object(), object()
-        snapshots = (v3_snap, v4_snap, None, None)
 
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=async_w3,
-            snapshots=snapshots,
-            path_builder=_Recorder(events, "path_builder"),
-            consumer=_Recorder(events, "consumer"),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=async_w3,
+                path_builder=_Recorder(events, "path_builder"),
+                consumer=_Recorder(events, "consumer"),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
 
         await session.start()
 
-        # engine_registry.start called with cfg's node URLs + the injected snapshots
+        # engine_registry.start called with cfg's node URLs
         assert len(engine_registry.start_calls) == 1
         call = engine_registry.start_calls[0]
-        assert call["node_http"] == "http://localhost:8545"
-        assert call["node_ws"] == "ws://localhost:8546"
-        assert call["v3_snapshot"] is v3_snap
-        assert call["v4_snapshot"] is v4_snap
+        assert call["node_http"] == _NODE
+        assert call["node_ws"] == _NODE
         # verify_state_view is the V4 state view constant (non-empty)
         assert call["verify_state_view"].startswith("0x")
 
@@ -347,12 +241,16 @@ class TestBotRunnerStart:
 
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=async_w3,
-            snapshots=(None, None, None, None),
-            path_builder=lambda **kw: _noop_coro(),
-            consumer=lambda **kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=async_w3,
+                path_builder=lambda **kw: _noop_coro(),
+                consumer=lambda **kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
@@ -365,16 +263,19 @@ class TestBotRunnerRun:
         bot = _FakeBot(events=events)
         engine_registry = _FakeEngineRegistry(backfill_target=12_000, events=events)
         async_w3 = _FakeAsyncW3()
-        v3_snap, v4_snap = object(), object()
 
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=async_w3,
-            snapshots=(v3_snap, v4_snap, None, None),
-            path_builder=_Recorder(events, "path_builder"),
-            consumer=_Recorder(events, "consumer"),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=async_w3,
+                path_builder=_Recorder(events, "path_builder"),
+                consumer=_Recorder(events, "consumer"),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         events.clear()  # only observe run()'s sequence
@@ -393,12 +294,16 @@ class TestBotRunnerRun:
 
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=async_w3,
-            snapshots=(None, None, None, None),
-            path_builder=lambda **kw: _noop_coro(),
-            consumer=lambda **kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=async_w3,
+                path_builder=lambda **kw: _noop_coro(),
+                consumer=lambda **kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         await session.run()
@@ -423,12 +328,16 @@ class TestBotRunnerRun:
 
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=async_w3,
-            snapshots=(None, None, None, None),
-            path_builder=raising_path_builder,
-            consumer=hanging_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=async_w3,
+                path_builder=raising_path_builder,
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
@@ -438,8 +347,134 @@ class TestBotRunnerRun:
                 await session.run()
 
         # the consumer task must have been cancelled by __aexit__
-        assert session._result_consumer_task is not None
-        assert session._result_consumer_task.cancelled()
+        assert session._session.result_consumer_task is not None
+        assert session._session.result_consumer_task.cancelled()
+
+
+class TestSessionPhaseMachine:
+    """The session lifecycle is a typed FSM: ``New -> Started -> Running ->
+    Closed``. Legality is delegated to the Rust host's ``SessionPhase``
+    table (``strategy_host.rs``, read through
+    ``apexbot._ffi.session_phase_next``) — the Python enum translates the
+    host's verdict into :class:`PhaseError` and never authors the matrix.
+    These tests pin the delegated verdicts so a host-table change surfaces
+    as a loud test failure, not silent drift.
+    """
+
+    @staticmethod
+    def _session(**actor_overrides) -> BotRunner:
+        actors: dict = {
+            "settlement_arm": True,
+            "bot": _FakeBot(),
+            "engine_registry": _FakeEngineRegistry(),
+            "async_w3": _FakeAsyncW3(),
+            "path_builder": lambda **_kw: _noop_coro(),
+            "consumer": lambda **_kw: _noop_coro(),
+            "relay_posture": RelayPosture(relay_urls=["http://offline-test.relay"]),
+            "scheduler": inline_registration_scheduler,
+        }
+        actors.update(actor_overrides)
+        return BotRunner(_cfg(), actors=InjectedActors(**actors))
+
+    async def test_happy_path_phase_progression(self) -> None:
+        session = self._session()
+        assert session._phase is _Phase.NEW
+
+        await session.start()
+        assert session._phase is _Phase.STARTED
+
+        await session.run()
+        assert session._phase is _Phase.RUNNING
+
+        await session.shutdown()
+        assert session._phase is _Phase.CLOSED
+
+    async def test_run_before_start_refused(self) -> None:
+        session = self._session()
+        with pytest.raises(PhaseError, match="requires phase 'started'"):
+            await session.run()
+        # The refusal leaves the phase untouched and the engine un-resumed.
+        assert session._phase is _Phase.NEW
+        assert session.engine_registry.engine.resumed is False
+
+    async def test_start_from_running_refused(self) -> None:
+        session = self._session()
+        await session.start()
+        await session.run()
+
+        with pytest.raises(PhaseError, match="running"):
+            await session.start()
+        assert session._phase is _Phase.RUNNING
+
+    async def test_start_from_closed_refused(self) -> None:
+        session = self._session()
+        await session.shutdown()
+
+        with pytest.raises(PhaseError, match="closed"):
+            await session.start()
+        assert session._phase is _Phase.CLOSED
+
+    async def test_query_before_running_refused(self) -> None:
+        session = self._session()
+        with pytest.raises(PhaseError, match="needs 'running'"):
+            await session.enqueue_path([])
+        with pytest.raises(PhaseError, match="needs 'running'"):
+            await session.trigger_discovery()
+        assert session._phase is _Phase.NEW
+
+    async def test_shutdown_legal_from_every_phase(self) -> None:
+        # The SIGINT teardown ordering depends on shutdown() being reachable
+        # at any lifecycle point; the host table admits it everywhere.
+        fresh = self._session()
+        await fresh.shutdown()
+        assert fresh._phase is _Phase.CLOSED
+
+        started = self._session()
+        await started.start()
+        await started.shutdown()
+        assert started._phase is _Phase.CLOSED
+
+        running = self._session()
+        await running.start()
+        await running.run()
+        await running.shutdown()
+        assert running._phase is _Phase.CLOSED
+
+    async def test_start_started_reentry_is_noop(self) -> None:
+        # Started re-entry is the deliberate idempotent no-op (Running/
+        # Closed re-entry raises — pinned above).
+        session = self._session()
+        first = await session.start()
+        engine_registry = session.engine_registry
+        assert engine_registry is not None
+
+        second = await session.start()
+
+        assert first is second is session
+        assert len(engine_registry.start_calls) == 1
+
+    def test_phase_table_mirrors_the_host_matrix(self) -> None:
+        # The full 4x4 delegated matrix (phase x operation), pinned directly
+        # against the Python enum's translation of the host verdicts.
+        assert _Phase.NEW.on_start() is _Phase.STARTED
+        assert _Phase.STARTED.on_start() is _Phase.STARTED
+        for phase in (_Phase.RUNNING, _Phase.CLOSED):
+            with pytest.raises(PhaseError, match="session can only start from New"):
+                phase.on_start()
+
+        assert _Phase.STARTED.on_run() is _Phase.RUNNING
+        for phase in (_Phase.NEW, _Phase.RUNNING, _Phase.CLOSED):
+            with pytest.raises(PhaseError, match="requires phase 'started'"):
+                phase.on_run()
+
+        assert _Phase.RUNNING.on_query("enqueue_path") is _Phase.RUNNING
+        for phase in (_Phase.NEW, _Phase.STARTED, _Phase.CLOSED):
+            with pytest.raises(PhaseError, match="needs 'running'"):
+                phase.on_query("enqueue_path")
+
+        # shutdown is total: every phase moves to Closed.
+        for phase in (_Phase.NEW, _Phase.STARTED, _Phase.RUNNING, _Phase.CLOSED):
+            assert phase.on_shutdown() is _Phase.CLOSED
 
 
 class TestBotRunnerRunBlockStreamAcquiredOnce:
@@ -450,8 +485,8 @@ class TestBotRunnerRunBlockStreamAcquiredOnce:
     The real `Bot.block_stream()` is once-only — a second call raises
     `RuntimeError("block_stream() can only be called once")`. This test uses
     a bot whose `block_stream()` raises on the second call (mimicking the
-    real once-only seam — the block-clock pipe is coordinator-owned, ergo
-    6VGMLY) and asserts the single consumer receives every block.
+    real once-only seam — the block-clock pipe is coordinator-owned) and asserts
+    the single consumer receives every block.
     """
 
     async def test_run_acquires_block_stream_once_for_single_consumer(
@@ -459,40 +494,11 @@ class TestBotRunnerRunBlockStreamAcquiredOnce:
     ) -> None:
         seen_by_consumer: list[int] = []
 
-        class _OnceOnlyEngine:
-            def __init__(self) -> None:
-                self.resumed = False
-
-            def resume(self) -> None:
-                self.resumed = True
-
-            def last_processed_block(self) -> int | None:
-                return 12_345
-
-            def v2_pool_count(self) -> int:
-                return 0
-
-            def v3_pool_count(self) -> int:
-                return 0
-
-            def v4_pool_count(self) -> int:
-                return 0
-
-            def path_count(self) -> int:
-                return 0
-
-            async def pump_finished_future(self) -> None:
-                # Once-only engine double: satisfy the awaitable contract with
-                # a future that never resolves.
-                await asyncio.Event().wait()
-
         class _Registry:
             def __init__(self) -> None:
-                self.engine = _OnceOnlyEngine()
+                self.engine = _FakeEngine()
 
-            def start(
-                self, node_http, node_ws, *, v3_snapshot, v4_snapshot, verify_state_view
-            ) -> int:
+            def start(self, node_http, node_ws, *, verify_state_view) -> int:
                 # No backfill target beyond current_block (12_345) — main-loop entry.
                 return 0
 
@@ -509,12 +515,16 @@ class TestBotRunnerRunBlockStreamAcquiredOnce:
         )
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=registry,  # type: ignore[arg-type]
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=recording_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=registry,  # type: ignore[arg-type]
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=recording_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         await session.run()
@@ -547,12 +557,16 @@ class TestBotRunnerShutdown:
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
@@ -570,12 +584,16 @@ class TestBotRunnerShutdown:
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
@@ -594,12 +612,16 @@ class TestBotRunnerShutdown:
         engine_registry.engine.stop_raises = RuntimeError("engine torn down")
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
@@ -616,12 +638,16 @@ class TestBotRunnerShutdown:
         # AttributeError). Let a Ctrl-C during startup still exit cleanly.
         session = BotRunner(
             _cfg(),
-            bot=None,
-            engine_registry=None,
-            async_w3=None,
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=None,
+                engine_registry=None,
+                async_w3=None,
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
 
         await session.shutdown()  # must not raise
@@ -641,19 +667,24 @@ class TestBotRunnerShutdown:
 
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=hanging_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
         async with session:
-            # run() will block on the hanging consumer; cancel it to exit the
-            # async-with cleanly so __aexit__ runs.
-            await asyncio.sleep(0.01)
+            # No run() call: __aexit__ must tear down cleanly from the
+            # started-only state (shutdown() + consumer-task cancel are
+            # no-op-safe there).
+            pass
 
         # shutdown() (→ engine.stop) ran during __aexit__, recording "stop"
         assert engine_registry.engine.stop_calls == 1
@@ -676,18 +707,21 @@ class TestBotRunnerSigintHandler:
     """
 
     async def test_install_binds_custom_handler_after_start(self) -> None:
-        import signal
 
         prev = signal.getsignal(signal.SIGINT)
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
             install_sigint=True,
         )
         await session.start()
@@ -697,25 +731,28 @@ class TestBotRunnerSigintHandler:
         assert bound != signal.SIG_DFL, "custom handler must replace the default"
 
     async def test_aexit_restores_previous_handler(self) -> None:
-        import signal
 
         baseline = signal.getsignal(signal.SIGINT)
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
             install_sigint=True,
         )
         await session.start()
         assert signal.getsignal(signal.SIGINT) is not baseline
 
         async with session:
-            await asyncio.sleep(0.01)
+            pass
 
         # __aexit__ restored the previous handler (whatever it was — typically
         # asyncio.run's Runner handler, not SIG_DFL).
@@ -724,18 +761,21 @@ class TestBotRunnerSigintHandler:
         )
 
     async def test_install_sigint_false_does_not_bind(self) -> None:
-        import signal
 
         baseline = signal.getsignal(signal.SIGINT)
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
             install_sigint=False,
         )
         await session.start()
@@ -750,17 +790,20 @@ class TestBotRunnerSigintHandler:
         # is killed the instant SIGINT arrives — not deferred until find_paths
         # yields. We invoke the handler directly (not via OS signal, which is
         # unsafe under pytest) — same callable Python would call.
-        import signal
 
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
             install_sigint=True,
         )
         await session.start()
@@ -783,48 +826,12 @@ class TestBotRunnerSigintHandler:
 class TestConstructionContext:
     """Sub-A seam: `ConstructionContext` bundles the registration-owned
     construction resources (Rust-build Bot entry + the three V3 trackers + a
-    retained DB read handle + chain_id + WETH) so a background registration
+    database path + chain_id + WETH) so a background registration
     task owns them out of run()'s main-loop trim."""
 
-    def test_for_bot_builds_trackers_weth_db_once(self) -> None:
-        from apexbot.runner._driver_constants import (
-            PANCAKESWAP_V3_MAINNET_FACTORY,
-            SUSHISWAP_V3_MAINNET_FACTORY,
-            UNISWAP_V3_MAINNET_FACTORY,
-            WETH_ADDRESS,
-        )
-        from apexbot.runner.build_paths import ConstructionContext
-
-        class _BuildBot:
-            def __init__(self) -> None:
-                self.chain_id = 1
-                self.db = object()
-                self.factory_addresses: list[str] = []
-                self.weth_addresses: list[str] = []
-
-            def add_tracker(self, _tracker_cls, *, factory_address, snapshot):
-                self.factory_addresses.append(factory_address)
-                return f"tracker:{factory_address}"
-
-            def build_erc20token(self, address: str):
-                self.weth_addresses.append(address)
-                return f"weth:{address}"
-
-        bot = _BuildBot()
-        ctx = ConstructionContext.for_bot(bot, v3_snapshot=None)
-
-        # All three V3 factories dispatched to the tracker builder.
-        assert sorted(bot.factory_addresses) == sorted([
-            UNISWAP_V3_MAINNET_FACTORY,
-            SUSHISWAP_V3_MAINNET_FACTORY,
-            PANCAKESWAP_V3_MAINNET_FACTORY,
-        ])
-        # Trackers + WETH + DB + chain_id all bundled into the single context.
-        assert ctx.chain_id == 1
-        assert ctx.db is bot.db
-        assert ctx.weth == f"weth:{WETH_ADDRESS}"
-        # One construction pass: exactly one WETH token requested.
-        assert bot.weth_addresses == [WETH_ADDRESS]
+    # (The ConstructionContext contract test moved to
+    # tests/arbitrage/test_pool_construction_route.py with the pool-construction
+    # card: the context holds resolved policy values, not trackers.)
 
     def test_run_passes_context_only_for_real_build_paths(self) -> None:
         """With an injected (fake) path_builder, run() must NOT build a
@@ -833,25 +840,31 @@ class TestConstructionContext:
         seen: dict = {}
 
         async def recording_path_builder(**kwargs):
-            await asyncio.sleep(0)
+            await asyncio.sleep(
+                0
+            )  # single yield: stands in for the real builder's first await (RPC verify)
             seen["kwargs"] = dict(kwargs)
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=recording_path_builder,
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=recording_path_builder,
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         asyncio.run(_drive_run(session))
 
         # Injected builder => run() must NOT construct a context, and must pass
         # context=None to the injected builder.
-        assert session._registration_context is None
-        assert "context" in seen["kwargs"]
-        assert seen["kwargs"]["context"] is None
+        assert session._session.registration_context is None
+        assert "options" in seen["kwargs"]
+        assert seen["kwargs"]["options"].context is None
         # The builder still receives the other construction kwargs.
         assert seen["kwargs"]["engine_registry"] is engine_registry
 
@@ -870,8 +883,6 @@ class TestSubBBackgroundRegistration:
     async def test_background_fatal_verification_fail_fast(self) -> None:
         """A fatal verification error in the background registration cancels the
         main-loop consumer and re-raises loudly (never silently swallowed)."""
-        from apexbot.exceptions import VerificationMismatchError
-
         engine_registry = _FakeEngineRegistry()
 
         async def hanging_consumer(**_kwargs):
@@ -880,19 +891,23 @@ class TestSubBBackgroundRegistration:
             await asyncio.Event().wait()
 
         async def raising_path_builder(**_kwargs):
-            await asyncio.sleep(0)
+            await asyncio.sleep(
+                0
+            )  # single yield: stands in for the real builder's pre-failure await
             boom = "tick data mismatch"
             raise VerificationMismatchError(boom)
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=raising_path_builder,
-            consumer=hanging_consumer,
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=raising_path_builder,
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
         )
         await session.start()
         with pytest.raises(VerificationMismatchError, match="tick data mismatch"):
@@ -900,8 +915,8 @@ class TestSubBBackgroundRegistration:
 
         # Fail-fast cancelled the main-loop consumer so the session can't keep
         # trading on unverified state.
-        assert session._result_consumer_task is not None
-        assert session._result_consumer_task.cancelled()
+        assert session._session.result_consumer_task is not None
+        assert session._session.result_consumer_task.cancelled()
 
     async def test_background_run_trims_after_completion(self) -> None:
         """The state-trim runs after the background registration completes, not
@@ -911,11 +926,12 @@ class TestSubBBackgroundRegistration:
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+            ),
         )
         session.bot = bot  # start()/run() resolve these; call the seam directly
         session.engine_registry = engine_registry
@@ -923,10 +939,12 @@ class TestSubBBackgroundRegistration:
         calls: list[object] = []
 
         async def recording_path_builder(**kwargs):
-            await asyncio.sleep(0)
-            calls.append(kwargs["context"])
+            await asyncio.sleep(
+                0
+            )  # single yield: stands in for the real builder's first await (RPC verify)
+            calls.append(kwargs["options"].context)
 
-        await session._run_registration_background(
+        await RunRitual(session)._run_registration_background(
             path_builder=recording_path_builder,
             registration_context=None,
             retry_policy=None,
@@ -937,28 +955,80 @@ class TestSubBBackgroundRegistration:
         assert bot.released is True
         assert session.bot is None
 
-    async def test_background_completion_closes_snapshot_tx(self) -> None:
-        """A *healthy* (non-cancelled) registration must still close the
-        snapshot read-tx after `build_paths` completes — the XEANMB canary stays
-        active in the normal path (WAL reclamation preserved)."""
-        calls: list[str] = []
-        bot = _FakeBot(events=calls)
-        bot._py_bot = _RecordingPyBot(calls)  # records `close_snapshot_tx`
+    async def test_trim_refused_while_registration_climbs(self) -> None:
+        """An outside caller may not trim while the background registration is
+        live and still climbing — the registration's ConstructionContext holds
+        the same registries the trim clears, and the refusal is side-effect free."""
+        bot = _FakeBot()
+        started = asyncio.Event()
+        climb = asyncio.Event()
+
+        async def blocking_path_builder(**_kwargs):
+            started.set()
+            await climb.wait()
+
+        async def hanging_consumer(**_kwargs):
+            await asyncio.Event().wait()
+
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=_FakeEngineRegistry(),
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=_FakeEngineRegistry(),
+                async_w3=_FakeAsyncW3(),
+                path_builder=blocking_path_builder,
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
+        )
+        await session.start()
+        run_task = asyncio.create_task(session.run())
+        try:
+            # Deadlock guard only — not an ordering assertion: `started` is
+            # the fake builder's own edge. The budget only turns "the
+            # registration never climbed" into a named failure.
+            await asyncio.wait_for(started.wait(), timeout=DEADLOCK_GUARD_S)
+            registration_task = session._session.registration_task
+            assert registration_task is not None
+            assert not registration_task.done()
+
+            with pytest.raises(RuntimeError, match="still climbing"):
+                session._trim_python_state()
+
+            # Refused before any mutation: nothing released, bot ref intact.
+            assert bot.released is False
+            assert session.bot is bot
+        finally:
+            run_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await run_task
+
+    async def test_background_completion_closes_snapshot_tx(self) -> None:
+        """A *healthy* (non-cancelled) registration must still close the
+        snapshot read-tx after `build_paths` completes — the canary stays
+        active in the normal path (WAL reclamation preserved)."""
+        calls: list[str] = []
+        # `_RecordingPyBot` records `close_snapshot_tx` on the shared event list.
+        bot = _FakeBot(events=calls, py_bot=_RecordingPyBot(calls))
+        session = BotRunner(
+            _cfg(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=_FakeEngineRegistry(),
+                async_w3=_FakeAsyncW3(),
+            ),
         )
         session.bot = bot
         session.engine_registry = _FakeEngineRegistry()
 
         async def noop_path_builder(**kwargs):
-            await asyncio.sleep(0)
+            await asyncio.sleep(
+                0
+            )  # single yield: stands in for the real builder's construction await
 
-        await session._run_registration_background(
+        await RunRitual(session)._run_registration_background(
             path_builder=noop_path_builder,
             registration_context=None,
             retry_policy=None,
@@ -976,37 +1046,43 @@ class TestSubBBackgroundRegistration:
         `Arc<SnapshotDb>`) onto a ThreadPoolExecutor; on cancel those worker
         threads may still hold their clones, so `close_snapshot_tx`'s
         `Arc::try_unwrap` canary false-positives and would raise
-        ``RuntimeError: SnapshotDb Arc still held`` during teardown (EZOKDR).
+        ``RuntimeError: SnapshotDb Arc still held`` during teardown.
         The cancel branch must instead drop the Arc naturally and stay quiet —
         the teardown stays clean and CancelledError propagates unadorned.
         """
         calls: list[str] = []
-        bot = _FakeBot(events=calls)
         # Simulate the in-flight-worker-clone scenario: the held `_py_bot`
         # would trip the canary if `close_snapshot_tx` were invoked mid-cancel.
-        bot._py_bot = _RecordingPyBot(calls, raise_on_close=True)
+        bot = _FakeBot(events=calls, py_bot=_RecordingPyBot(calls, raise_on_close=True))
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=_FakeEngineRegistry(),
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=_FakeEngineRegistry(),
+                async_w3=_FakeAsyncW3(),
+            ),
         )
         session.bot = bot
         session.engine_registry = _FakeEngineRegistry()
 
+        builder_started = asyncio.Event()
+
         async def hanging_path_builder(**kwargs):
+            builder_started.set()
             await asyncio.Event().wait()
 
         task = asyncio.create_task(
-            session._run_registration_background(
+            RunRitual(session)._run_registration_background(
                 path_builder=hanging_path_builder,
                 registration_context=None,
                 retry_policy=None,
             )
         )
-        await asyncio.sleep(0)  # let the builder start
+        # Deadlock guard only — not an ordering assertion: the fake builder
+        # sets `builder_started` before parking, and the cancel below is what
+        # the test asserts on.
+        await asyncio.wait_for(builder_started.wait(), timeout=DEADLOCK_GUARD_S)
         task.cancel()
         # The cancelled task re-raises CancelledError cleanly — the secondary
         # `close_snapshot_tx` RuntimeError must NOT surface in its place.
@@ -1031,7 +1107,7 @@ class TestSubCBgRegistrationConcurrency:
     draining RPC-verify awaits, a growing block stream, and a fatal
     registration error — and assert the hot loop keeps progressing throughout.
     The genuine tokio-runtime parallel registration + real-pump no-deadlock
-    belongs to the Sub-A2 Rust port / rolling smoke (U6TKNU)."""
+    belongs to the Sub-A2 Rust port / rolling smoke."""
 
     async def test_forever_registration_does_not_stall_main_loop(self) -> None:
         """Discovery that never exhausts must not stall the main loop / dispatch:
@@ -1046,23 +1122,27 @@ class TestSubCBgRegistrationConcurrency:
             while True:  # discovery never exhausts, but yields cooperatively
                 climbed = i
                 i += 1
-                await asyncio.sleep(0)
+                await asyncio.sleep(
+                    0
+                )  # yield stands in for the real builder's per-path construction await
 
         async def consumer(**_kwargs):
             # dispatch path — discrete work, then end the main loop
             for n in range(25):
                 dispatch_work.append(n)
-                await asyncio.sleep(0)
+                await asyncio.sleep(0)  # yield stands in for one dispatch hot-loop await
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=forever_path_builder,
-            consumer=consumer,
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=forever_path_builder,
+                consumer=consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
         )
         await session.start()
         await session.run()
@@ -1072,7 +1152,7 @@ class TestSubCBgRegistrationConcurrency:
         assert dispatch_work == list(range(25))
         assert climbed > 0, "registration must have actually climbed"
         # run()'s finally cancelled the still-climbing registration at teardown.
-        reg = session._registration_task
+        reg = session._session.registration_task
         assert reg is not None
         assert reg.cancelled()
 
@@ -1087,36 +1167,39 @@ class TestSubCBgRegistrationConcurrency:
             nonlocal verify_steps
             for _ in range(40):  # RPC-verify awaits (each a cooperative yield)
                 verify_steps += 1
-                await asyncio.sleep(0)
+                await asyncio.sleep(0)  # each yield stands in for one RPC-verify await
 
         async def consumer(**_kwargs):
             # hot loop does not depend on a 'final' discovery state: advance
             # dispatch while registration drains, then finish with it complete.
-            # (``session._registration_task`` is already set by the time this
+            # (``session._session.registration_task`` is already set by the time this
             # coroutine runs — run() creates the reg task before the main loop.)
             for n in range(10):
                 dispatch_work.append(n)
-                await asyncio.sleep(0)
-            registration_task = session._registration_task
+                await asyncio.sleep(0)  # yield stands in for one dispatch hot-loop await
+            registration_task = session._session.registration_task
             assert registration_task is not None
             await registration_task  # returns once the drain is done
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=draining_path_builder,
-            consumer=consumer,
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=draining_path_builder,
+                consumer=consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
         )
         await session.start()
         await session.run()
 
         assert verify_steps == 40, "registration must have drained all verifies"
+
         assert dispatch_work == list(range(10))
-        reg = session._registration_task
+        reg = session._session.registration_task
         # Clean, deadlock-free completion: registration finished without error.
         assert reg is not None
         assert reg.done()
@@ -1126,27 +1209,29 @@ class TestSubCBgRegistrationConcurrency:
         """A fatal registration transport error cancels the main loop and is
         delivered exactly once through the cross-task fail-fast channel — never
         swallowed, never re-raised twice."""
-        from apexbot.exceptions import VerificationRpcError
-
         engine_registry = _FakeEngineRegistry()
 
         async def hanging_consumer(**_kwargs):
             await asyncio.Event().wait()
 
         async def raising_path_builder(**_kwargs):
-            await asyncio.sleep(0)
+            await asyncio.sleep(
+                0
+            )  # single yield: stands in for the real builder's pre-failure await
             boom = "provider transport failure after bounded retry"
             raise VerificationRpcError(boom)
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=raising_path_builder,
-            consumer=hanging_consumer,
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=raising_path_builder,
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
         )
         await session.start()
         with pytest.raises(VerificationRpcError, match="provider transport"):
@@ -1154,9 +1239,9 @@ class TestSubCBgRegistrationConcurrency:
 
         # Fail-fast cancelled the hot loop and the fatal was surfaced exactly
         # once (retrieved from the task, not re-raised twice).
-        assert session._result_consumer_task is not None
-        assert session._result_consumer_task.cancelled()
-        reg = session._registration_task
+        assert session._session.result_consumer_task is not None
+        assert session._session.result_consumer_task.cancelled()
+        reg = session._session.registration_task
         assert reg is not None
         assert reg.done()
         assert isinstance(reg.exception(), VerificationRpcError)
@@ -1167,49 +1252,9 @@ class TestSubCBgRegistrationConcurrency:
         registration/main-loop concurrency contract remains)."""
         climbed = -1
 
-        class _Engine:
-            """Once-only block_stream + minimal engine surface."""
-
-            def __init__(self) -> None:
-                self.block_stream_calls = 0
-                self.resumed = False
-
-            def resume(self) -> None:
-                self.resumed = True
-
-            def last_processed_block(self) -> int | None:
-                return 12_345
-
-            def v2_pool_count(self) -> int:
-                return 0
-
-            def v3_pool_count(self) -> int:
-                return 0
-
-            def v4_pool_count(self) -> int:
-                return 0
-
-            def path_count(self) -> int:
-                return 0
-
-            async def pump_finished_future(self) -> None:
-                # Minimal engine double: satisfy the awaitable contract with a
-                # future that never resolves.
-                await asyncio.Event().wait()
-
-            def block_stream(self):
-                self.block_stream_calls += 1
-                if self.block_stream_calls > 1:
-                    boom = "block_stream() can only be called once"
-                    raise RuntimeError(boom)
-                # Every block divisible by RECURRING_VERIFY_INTERVAL (50).
-                return _BlocksStream(
-                    [_block_dict(500), _block_dict(550), _block_dict(600)],
-                )
-
         class _Registry:
             def __init__(self) -> None:
-                self.engine = _Engine()
+                self.engine = _FakeEngine()
 
             def start(self, *_a, **_kw) -> int:
                 return 0  # no backfill beyond current_block — main-loop entry
@@ -1220,25 +1265,31 @@ class TestSubCBgRegistrationConcurrency:
             while True:
                 climbed = i
                 i += 1
-                await asyncio.sleep(0)
+                await asyncio.sleep(
+                    0
+                )  # yield stands in for the real builder's per-path construction await
 
         async def recording_consumer(*, block_stream=None, **_kw) -> None:
             async for _b in block_stream:
-                await asyncio.sleep(0)
+                await asyncio.sleep(
+                    0
+                )  # yield stands in for the real consumer's per-block dispatch await
 
         registry = _Registry()
         # The main loop ends on the finite block stream — carried by the bot
-        # now (the block-clock pipe is coordinator-owned, ergo 6VGMLY).
+        # now (the block-clock pipe is coordinator-owned).
         bot = _FakeBot(blocks=[_block_dict(500)])
         session = BotRunner(
             _cfg(),
-            bot=bot,
-            engine_registry=registry,  # type: ignore[arg-type]
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=forever_path_builder,
-            consumer=recording_consumer,
-            background_registration=True,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot,
+                engine_registry=registry,  # type: ignore[arg-type]
+                async_w3=_FakeAsyncW3(),
+                path_builder=forever_path_builder,
+                consumer=recording_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
         )
         await session.start()
         await session.run()
@@ -1248,12 +1299,48 @@ class TestSubCBgRegistrationConcurrency:
         assert climbed > 0, "registration must have climbed concurrently with the main loop"
         # Main loop ended on the finite block stream; finally cancelled the
         # still-climbing registration.
-        assert session._registration_task is not None
-        assert session._registration_task.cancelled()
+        assert session._session.registration_task is not None
+        assert session._session.registration_task.cancelled()
 
 
-class Test6VZN7HOngoingDiscovery:
-    """6VZN7H: the run()-level wiring when discovery never "completes".
+@pytest.fixture
+def started_session():
+    """A started :class:`BotRunner` over the suite's offline injected-actor posture.
+
+    The engine registry + bot + async w3 fakes, the empty snapshot row, and
+    the offline relay are the standard offline session; each test supplies
+    only its path builder + consumer (and, when the scenario needs a distinct
+    bot or registry, those too). The test drives ``run()`` itself — including
+    the fail-fast case where ``run()`` must raise.
+
+    Returns:
+        An async callable that builds and starts a session; await its result.
+
+    """
+
+    async def _start(*, path_builder, consumer, bot=None, engine_registry=None) -> BotRunner:
+        session = BotRunner(
+            _cfg(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=bot if bot is not None else _FakeBot(),
+                engine_registry=(
+                    engine_registry if engine_registry is not None else _FakeEngineRegistry()
+                ),
+                async_w3=_FakeAsyncW3(),
+                path_builder=path_builder,
+                consumer=consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+            ),
+        )
+        await session.start()
+        return session
+
+    return _start
+
+
+class TestOngoingDiscovery:
+    """The run()-level wiring when discovery never "completes".
 
     The unbounded production discovery producer (``_discovery_producer_forever``
     re-sweeping the subgraph) was stripped back to a single discovery pass, so
@@ -1262,12 +1349,11 @@ class Test6VZN7HOngoingDiscovery:
     "registration completion", so the Sub-B state-trim runs when run() cancels
     the background task at shutdown — still exactly once and not mid-climb."""
 
-    async def test_forever_discovery_trims_state_on_shutdown(self) -> None:
+    async def test_forever_discovery_trims_state_on_shutdown(self, started_session) -> None:
         """With forever (never-returning) discovery there is no "registration
         completion", so the Sub-B state-trim runs when run() cancels the
         background task at shutdown instead — still exactly once and not
         mid-climb."""
-        engine_registry = _FakeEngineRegistry()
         bot = _FakeBot()
 
         async def forever_path_builder(**_kwargs):
@@ -1275,25 +1361,17 @@ class Test6VZN7HOngoingDiscovery:
 
         async def consumer(**_kwargs):
             for _ in range(3):
-                await asyncio.sleep(0)
+                await asyncio.sleep(0)  # each yield stands in for one hot-loop dispatch await
 
-        session = BotRunner(
-            _cfg(),
-            bot=bot,
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=forever_path_builder,
-            consumer=consumer,
-            background_registration=True,
+        session = await started_session(
+            path_builder=forever_path_builder, consumer=consumer, bot=bot
         )
-        await session.start()
         await session.run()
 
         # Main loop ended (finite consumer) → run()'s finally cancelled the
         # forever registration → trim ran on cancellation (shutdown-time).
         assert bot.released is True
-        reg = session._registration_task
+        reg = session._session.registration_task
         assert reg is not None
         assert reg.cancelled()
 
@@ -1325,20 +1403,15 @@ class _ScriptedReceipt:
         return True
 
 
-_POOL_ID_LOCK = threading.Lock()
-_POOL_IDS: dict[str, int] = {}
+@dataclass(frozen=True)
+class _PoolHandle:
+    """The Rust pool-handle slice the engine reads: the pool id."""
 
-
-def _pool_id_for(address: str) -> int:
-    """Deterministic fake pool ids keyed by address (the dedup key)."""
-    with _POOL_ID_LOCK:
-        if address not in _POOL_IDS:
-            _POOL_IDS[address] = len(_POOL_IDS) + 1
-        return _POOL_IDS[address]
+    pool_id: int
 
 
 class TestPathRegistrationPipeline:
-    """NWTUM3 S1: the reusable, pump-concurrent `PathRegistrationPipeline`.
+    """The reusable, pump-concurrent `PathRegistrationPipeline`.
 
     Covers the operator-facing surface that discovery previously ran inline:
     enqueue one specific path (`enqueue_path`), bounded on-demand discovery
@@ -1359,10 +1432,12 @@ class TestPathRegistrationPipeline:
         _fee_token1: int = 1
 
     class _FakeCtxBot:
-        def __init__(self) -> None:
+        def __init__(self, database_path: Path) -> None:
             self.chain_id = 1
-            self.db = object()
+            self.database_path = database_path
             self.receipts: list[object] = []
+            # Per-bot fake pool ids, keyed by address (the dedup key).
+            self._pool_ids: dict[str, int] = {}
 
         # PRG-5: the pipeline constructs ONLY over the fleet intake.
         def registration_fleet_hosted(self) -> bool:
@@ -1377,8 +1452,14 @@ class TestPathRegistrationPipeline:
             pool = TestPathRegistrationPipeline._FakePool(address)
             # Deterministic per-address engine key: the engine dedup keys on
             # the hop signature, so a repeat path must resolve the SAME id.
-            pool._py_pool = SimpleNamespace(pool_id=_pool_id_for(address))
+            pool._py_pool = _PoolHandle(pool_id=self._pool_id_for(address))
             return pool
+
+        def _pool_id_for(self, address: str) -> int:
+            """Deterministic fake pool ids keyed by address (the dedup key)."""
+            if address not in self._pool_ids:
+                self._pool_ids[address] = len(self._pool_ids) + 1
+            return self._pool_ids[address]
 
     class _FakeReg:
         def __init__(self) -> None:
@@ -1386,10 +1467,8 @@ class TestPathRegistrationPipeline:
             # PRG-4: the engine dedups by construction — first registration
             # of a signature is created, repeats answer the existing id.
             self._seen: set[object] = set()
-            # D7KMQO: the unit evaluates the path predicate before hop
+            # The unit evaluates the path predicate before hop
             # building (the operator surface's register_path pre-check).
-            from apexbot.arbitrage.policy import NoOpPathPredicate
-
             self.path_predicate = NoOpPathPredicate()
 
         def register_v2_pool(self, pool: object) -> None:
@@ -1409,19 +1488,13 @@ class TestPathRegistrationPipeline:
 
     @dataclass
     class _Step:
-        type: object
+        type: PoolKind
         address: str
         hash: object | None = None
 
     @staticmethod
-    def _make_pipeline(fail_on_register: Exception | None = None):
-        from apexbot.database.models.pools import UniswapV2PoolTableBase
-        from apexbot.runner.build_paths import (
-            ConstructionContext,
-            PathRegistrationPipeline,
-        )
-
-        bot = TestPathRegistrationPipeline._FakeCtxBot()
+    def _make_pipeline(database_path: Path, fail_on_register: Exception | None = None):
+        bot = TestPathRegistrationPipeline._FakeCtxBot(database_path=database_path)
 
         class _Reg(TestPathRegistrationPipeline._FakeReg):
             def register_crawl_path(self, engine_hops: object) -> tuple[int, bool]:
@@ -1434,59 +1507,73 @@ class TestPathRegistrationPipeline:
         ctx = ConstructionContext(
             bot=bot,
             chain_id=1,
-            db=bot.db,
-            uniswap_v3_tracker=object(),
-            sushiswap_v3_tracker=object(),
-            pancakeswap_v3_tracker=object(),
+            database_path=bot.database_path,
+            construction_route=SimpleNamespace(factories=(), generic=True),
             weth=weth,
         )
-        pipeline = PathRegistrationPipeline(context=ctx, engine_registry=reg)
-        # The pipeline retains its own context (NWTUM3 trimmed-state guarantee):
+        pipeline = PathRegistrationPipeline(
+            context=ctx, engine_registry=reg, max_paths=0, discovery_batch_size=1000
+        )
+        # The pipeline retains its own context(trimmed-state guarantee):
         # a call-site that drops run()'s bot (and even the local `ctx` ref)
         # still has everything construction needs.
         assert pipeline.constr_bot is bot
-        return pipeline, reg, UniswapV2PoolTableBase
+        return pipeline, reg, PoolKind.V2
 
-    async def test_enqueue_path_registers_single_path(self) -> None:
-        pipeline, reg, t_base = self._make_pipeline()
+    async def test_enqueue_path_registers_single_path(self, tmp_path: Path) -> None:
+        pipeline, reg, t_base = self._make_pipeline(tmp_path / "unused.db")
         step = self._Step(t_base, "0x" + "a" * 40)
         await pipeline.enqueue_path([step], directions=[True])
 
         # One explicit path registered through the shared consume body.
         assert pipeline.path_count == 1
         assert reg.register_path_calls == 1
-        # W73FVY: the pipeline dup memo answers the repeat (asserted by
+        # The pipeline dup memo answers the repeat (asserted by
         # test_enqueue_path_dedups_repeat); the engine registry stays the
         # source of truth behind it.
 
-    async def test_enqueue_path_dedups_repeat(self) -> None:
-        pipeline, reg, t_base = self._make_pipeline()
+    async def test_enqueue_path_dedups_repeat(self, tmp_path: Path) -> None:
+        pipeline, reg, t_base = self._make_pipeline(tmp_path / "unused.db")
         step = self._Step(t_base, "0x" + "b" * 40)
         await pipeline.enqueue_path([step], directions=[True])
         await pipeline.enqueue_path([step], directions=[True])
 
         # Second add of the identical (pools, directions) path is a duplicate,
         # not a second registration — the pipeline memo answers it BEFORE the
-        # verify/registration stage (W73FVY: behind the memo, every duplicate
+        # verify/registration stage (behind the memo, every duplicate
         # re-paid the verify choreography; the engine's own dedup remains the
         # source of truth for memo misses).
         assert pipeline.path_count == 1
         assert reg.register_path_calls == 1
         assert pipeline.dup_count == 1
 
-    async def test_trigger_discovery_bounded_feeds_shared_consume(self) -> None:
-        pipeline, _reg, _t_base = self._make_pipeline()
+    def test_pool_ids_resolve_identically_per_fresh_bot(self, tmp_path: Path) -> None:
+        """Ids are owned per bot instance: two fresh bots resolve the same
+        address sequence to the same ids, whatever ran before them."""
+        addresses = ["0x" + "b" * 40, "0x" + "c" * 40, "0x" + "b" * 40]
+        first_bot = self._FakeCtxBot(database_path=tmp_path / "unused.db")
+        second_bot = self._FakeCtxBot(database_path=tmp_path / "unused.db")
+        first = [first_bot._pool_id_for(a) for a in addresses]
+        second = [second_bot._pool_id_for(a) for a in addresses]
+        assert first == second == [1, 2, 1]
+
+    async def test_trigger_discovery_bounded_feeds_shared_consume(self, tmp_path: Path) -> None:
+        pipeline, _reg, _t_base = self._make_pipeline(tmp_path / "unused.db")
         consumed: list[object] = []
 
         async def counting_consume(item, directions=None):
-            await asyncio.sleep(0)
+            await asyncio.sleep(
+                0
+            )  # single yield: stands in for the real _consume's construction await
             consumed.append(item)
 
         pipeline._consume = counting_consume  # type: ignore[method-assign]
 
         async def sweep():
             for item in ["p0", "p1", "p2"]:  # type: ignore[list-item]
-                await asyncio.sleep(0)
+                await asyncio.sleep(
+                    0
+                )  # yield per item: stands in for the real sweep's per-item fetch await
                 yield item
 
         pipeline.discovery_sweep = sweep  # type: ignore[method-assign]
@@ -1496,11 +1583,9 @@ class TestPathRegistrationPipeline:
         assert n == 2
         assert consumed == ["p0", "p1"]
 
-    async def test_enqueue_path_preserves_fail_fast_tripwire(self) -> None:
-        from apexbot.exceptions import VerificationMismatchError
-
+    async def test_enqueue_path_preserves_fail_fast_tripwire(self, tmp_path: Path) -> None:
         pipeline, _reg, t_base = self._make_pipeline(
-            fail_on_register=VerificationMismatchError("boom")
+            tmp_path / "unused.db", fail_on_register=VerificationMismatchError("boom")
         )
         step = self._Step(t_base, "0x" + "c" * 40)
         # A fatal verification mismatch is NOT swallowed by enqueue_path — it
@@ -1508,8 +1593,10 @@ class TestPathRegistrationPipeline:
         with pytest.raises(VerificationMismatchError, match="boom"):
             await pipeline.enqueue_path([step], directions=[True])
 
-    async def test_forever_discovery_plus_mid_run_add_compose_without_stall(self) -> None:
-        """U6TKNU terminal composition: the unbounded forever discovery producer
+    async def test_forever_discovery_plus_mid_run_add_compose_without_stall(
+        self, tmp_path: Path
+    ) -> None:
+        """Terminal composition: the unbounded forever discovery producer
         and a mid-run operator path-add flow through the SAME live pipeline's
         `_consume` concurrently — the add registers while forever discovery
         keeps climbing, and neither stalls the other (cooperative scheduling
@@ -1519,35 +1606,51 @@ class TestPathRegistrationPipeline:
 
         A 1-hop V2 path with explicit `directions=[True]` is used so the add
         fully registers through the real `_consume` offline (no live RPC
-        token-direction resolution needed). Forever discovery yields deliberately
-        opaque path shapes (a step whose type is not a pool table class) that
-        `_consume` skips (counted as `skip_count`), exercising the pipeline body
-        + backpressure forever without live construction — and, crucially,
-        WITHOUT aborting the pipeline (a raw ``object()`` would make `_consume`
-        do `list(object())` → TypeError, masking the real composition).
+        token-direction resolution needed). Forever discovery yields typed V4
+        hops carrying no pool id — the pipeline's legitimate pre-RPC skip arm
+        (`V4_NO_HASH`, counted as `skip_count`) — exercising the pipeline body
+        + backpressure forever without live construction and WITHOUT aborting
+        the pipeline.
         """
-        pipeline, reg, t_base = self._make_pipeline()
+        pipeline, reg, t_base = self._make_pipeline(tmp_path / "unused.db")
         prior_skips = pipeline.skip_count
 
         async def forever_producer():
             i = 0
             while True:
-                # Opaque path shape `_consume` skips (step type = `object`, not
-                # a V2/V3/V4 pool table class) — exercises the pipeline body +
-                # backpressure forever, and safe (no list(object()) TypeError).
+                # A TYPED V4 hop carrying no pool id: the pipeline's legitimate
+                # pre-RPC skip arm (V4_NO_HASH) — exercises the pipeline body
+                # + backpressure forever, counted, never aborting the unit.
                 i += 1
-                await asyncio.sleep(0)
-                yield [self._Step(type=object, address="0x" + f"{i:x}" * 40)]
+                await asyncio.sleep(
+                    0
+                )  # yield per item: stands in for the real discovery sweep's per-path await
+                yield [self._Step(type=PoolKind.V4, address="0x" + f"{i:x}" * 40)]
 
         # Run the unbounded discovery producer through the crawl as a
         # background task (never returns). PRG-5: the bounded producer/consumer
         # queue retired — the crawl is bounded-window submission over the
         # fleet intake (the scripted receipts self-resolve inline).
+        # Deterministic readiness: signal when the FIRST unit outcome is folded.
+        # run_registration (PRG-5) submits discovery units directly through the
+        # fleet intake and folds outcomes via `absorb_outcome` — it never
+        # dispatches through `_consume`, so a `_consume` wrapper would never
+        # fire from the crawl.
+        first_consume = asyncio.Event()
+        real_absorb = pipeline.absorb_outcome
+
+        def absorb_and_signal(outcome):
+            real_absorb(outcome)
+            first_consume.set()
+
+        pipeline.absorb_outcome = absorb_and_signal  # type: ignore[method-assign]
+
         reg_task = asyncio.create_task(pipeline.run_registration(producer=forever_producer()))
         try:
-            # Let forever discovery climb a few cooperative steps.
-            for _ in range(5):
-                await asyncio.sleep(0)
+            # Deadlock guard only — not an ordering assertion: `first_consume`
+            # is set by the pipeline's own first folded unit outcome. The budget
+            # only turns "the crawl never folded a unit" into a named failure.
+            await asyncio.wait_for(first_consume.wait(), timeout=DEADLOCK_GUARD_S)
 
             # MID-RUN add: a concrete 1-hop V2 path through the SAME `_consume`,
             # while forever discovery is still climbing in the background task.
@@ -1572,23 +1675,21 @@ class TestPathRegistrationPipeline:
                 await reg_task
 
     async def test_periodic_progress_surfaces_skip_reasons_below_1000(
-        self, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path
     ) -> None:
-        """INN6TK observability: the registration counters + a top skip-reason
+        """Observability: the registration counters + a top skip-reason
         breakdown must be visible even when ``path_count < 1000``. The legacy
         ``[build_paths] Progress`` line only fires at ``path_count % 1000 == 0``,
-        so a discovery-heavy crawl that registers few paths (INN6TK: 12M
+        so a discovery-heavy crawl that registers few paths (12M
         discovered, <1000 registered) never prints it and the skip/dup/reject
         reasons stay invisible. The new time-based summary must surface them.
         """
-        import logging
-
-        pipeline, _reg, _t_base = self._make_pipeline()
+        pipeline, _reg, _t_base = self._make_pipeline(tmp_path / "unused.db")
         # Simulate a crawl that is skipping almost everything well below the
         # 1000-registration print threshold.
-        pipeline._record_skip("build-v3:ConnectionError")
-        pipeline._record_skip("build-v3:ConnectionError")
-        pipeline._record_skip("direction-fail")
+        pipeline.record_skip("build-v3:ConnectionError")
+        pipeline.record_skip("build-v3:ConnectionError")
+        pipeline.record_skip("direction-fail")
         pipeline.path_count = 7
         pipeline.skip_count = 3
 
@@ -1605,7 +1706,7 @@ class TestPathRegistrationPipeline:
 
 
 class TestSessionOperatorSurface:
-    """NWTUM3: the programmatic add-a-path-at-any-time surface exposed on the
+    """The programmatic add-a-path-at-any-time surface exposed on the
     session (`BotRunner.enqueue_path` / `trigger_discovery`), which routes
     into the long-lived `PathRegistrationPipeline`. These inject a fake pipeline
     (consistent with the suite's fake-injection pattern); the pipeline-level
@@ -1618,16 +1719,20 @@ class TestSessionOperatorSurface:
         engine_registry = _FakeEngineRegistry()
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=lambda **_kw: _noop_coro(),
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=lambda **_kw: _noop_coro(),
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         await session.run()
-        # FJA2Z7: the pipeline lives on the session owner (None for fake runs).
+        # The pipeline lives on the session owner (None for fake runs).
         assert session._session is not None
         assert session._session.registration_pipeline is None
         with pytest.raises(RuntimeError, match="no live registration pipeline"):
@@ -1666,20 +1771,24 @@ class TestSessionOperatorSurface:
                     # the hot loop keeps solving previously-added hops.
                     await session.enqueue_path(["hop-a", "hop-b"], directions=[True, False])
                     await session.trigger_discovery(bound=3)
-                await asyncio.sleep(0)
+                await asyncio.sleep(0)  # yield stands in for one dispatch hot-loop await
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         # A live (fake) pipeline is reachable on the running session —
-        # attached through the owner's mutator (FJA2Z7).
+        # attached through the owner's mutator.
         assert session._session is not None
         session._session.attach_registration_pipeline(fake_pipeline)
         await session.run()
@@ -1698,7 +1807,7 @@ class TestPumpFinishedWatchdog:
 
     The watchdog awaits the engine's real completion future — no poll, no
     injected-engine bypass. Test doubles satisfy the same awaitable contract:
-    ``_FakeEngine.pump_finished_future`` never resolves (a live fake pump),
+    ``_FakeEngine.session_end_future`` never resolves (a live fake pump),
     while a finishing/panicking engine resolves it.
     """
 
@@ -1709,9 +1818,13 @@ class TestPumpFinishedWatchdog:
             def __init__(self) -> None:
                 super().__init__()
                 self.pump_ended = asyncio.Event()
+                self.watchdog_parked = asyncio.Event()
 
-            async def pump_finished_future(self) -> None:
+            async def session_end_future(self) -> str:
+                # The watchdog awaiting this future IS the readiness signal.
+                self.watchdog_parked.set()
                 await self.pump_ended.wait()
+                return "PumpFinished"
 
         finishing = _FinishingEngine()
         engine_registry.engine = finishing
@@ -1727,19 +1840,22 @@ class TestPumpFinishedWatchdog:
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=hanging_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
 
         async def _end_pump_soon() -> None:
-            # Let run() start the consumer + watchdog, then signal the pump end.
-            for _ in range(5):
-                await asyncio.sleep(0)
+            # Fire only once run()'s watchdog is parked on the pump-end future.
+            await finishing.watchdog_parked.wait()
             finishing.pump_ended.set()
 
         fire = asyncio.create_task(_end_pump_soon())
@@ -1758,11 +1874,13 @@ class TestPumpFinishedWatchdog:
         engine_registry = _FakeEngineRegistry()
 
         class _PanickedEngine(_FakeEngine):
-            async def pump_finished_future(self) -> None:
+            async def session_end_future(self) -> str:
                 # A panicked pump task drops its completion sender; a real
-                # awaitable resolves after a beat (it does not raise).
+                # awaitable resolves after a beat (it does not raise). These
+                # yields stand in for that pending window before resolution.
                 for _ in range(3):
                     await asyncio.sleep(0)
+                return "PumpFinished"
 
         engine_registry.engine = _PanickedEngine()
 
@@ -1780,12 +1898,16 @@ class TestPumpFinishedWatchdog:
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=engine_registry,
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=hanging_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=engine_registry,
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         async with session:
@@ -1794,29 +1916,47 @@ class TestPumpFinishedWatchdog:
         assert consumer_exited.is_set(), "panicked pump must cancel the consumer"
         assert cancel_count == 1, "the consumer is cancelled exactly once"
 
-    async def test_watchdog_parks_on_injected_engine_future(self) -> None:
-        # Injected engines satisfy the real awaitable contract: a future that
-        # never resolves. The watchdog stays parked (does not trip) while the
-        # consumer is alive — the pre-finish consumer shape.
+    async def test_watchdog_parks_while_pump_is_live_and_resolves_at_pump_finish(self) -> None:
+        # Injected engines satisfy the real awaitable contract: a completion
+        # future the fake pump owns as a gate. The test drives both sides of
+        # the ordering: parked while the gate is closed, resolved once it
+        # opens — turn boundaries, not a wall-clock window.
+        fake_engine = _FakeEngine()
+
         async def hanging_consumer(**kwargs):
             await asyncio.Event().wait()
 
         session = BotRunner(
             _cfg(),
-            bot=_FakeBot(),
-            engine_registry=_FakeEngineRegistry(),
-            async_w3=_FakeAsyncW3(),
-            snapshots=(None, None, None, None),
-            path_builder=lambda **_kw: _noop_coro(),
-            consumer=hanging_consumer,
+            actors=InjectedActors(
+                settlement_arm=True,
+                bot=_FakeBot(),
+                engine_registry=_FakeEngineRegistry(engine=fake_engine),
+                async_w3=_FakeAsyncW3(),
+                path_builder=lambda **_kw: _noop_coro(),
+                consumer=hanging_consumer,
+                relay_posture=RelayPosture(relay_urls=["http://offline-test.relay"]),
+                scheduler=inline_registration_scheduler,
+            ),
         )
         await session.start()
         async with session:
             watchdog = asyncio.create_task(session._pump_finished_watchdog())
             try:
-                _done, pending = await asyncio.wait({watchdog}, timeout=0.1)
-                assert watchdog in pending, "a fake live pump must park the watchdog"
-                assert not watchdog.done()
+                # Gate closed (pump live): the completion surface cannot
+                # resolve. Two yields let the watchdog reach its session-end
+                # await; the parked assertion is then ordering, not a duration.
+                await asyncio.sleep(0)  # yield: start the watchdog task
+                await asyncio.sleep(0)  # yield: reach the session-end await
+                assert not watchdog.done(), "a live pump must park the watchdog"
+
+                # The pump finishes: the gate opens, so the watchdog's
+                # completion future resolves and the watchdog with it.
+                fake_engine.finish_pump()
+
+                # Deadlock guard only — not an ordering assertion.
+                done, _pending = await asyncio.wait({watchdog}, timeout=DEADLOCK_GUARD_S)
+                assert watchdog in done, "the watchdog must resolve when the pump-finish gate opens"
             finally:
                 watchdog.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

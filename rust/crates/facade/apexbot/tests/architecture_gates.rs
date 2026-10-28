@@ -1,0 +1,2638 @@
+//! Architecture invariant gates.
+//!
+//! The `check-*` invariant scans are cargo tests on the umbrella crate: the
+//! crate list derives from `cargo metadata`, the scans run under every
+//! `cargo test` track, and the justfile recipes are thin aliases
+//! (ADR-043 §10-style precedent:
+//! `apexbot-python/tests/gil_state_write_concurrency.rs`).
+
+#![expect(clippy::expect_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn workspace_root() -> PathBuf {
+    // The role directory adds one level above the former flat crate layout.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .expect("manifest dir has rust/ ancestor")
+        .to_path_buf()
+}
+
+fn repo_root() -> PathBuf {
+    workspace_root()
+        .parent()
+        .expect("rust/ has a repo parent")
+        .to_path_buf()
+}
+
+fn manifest_flag() -> PathBuf {
+    workspace_root().join("Cargo.toml")
+}
+
+/// One `cargo tree` spawn covering every named member, resolved at the
+/// workspace manifest.
+fn batched_cargo_tree(members: &[String]) -> String {
+    let mut command = Command::new("cargo");
+    command
+        .arg("tree")
+        .arg("--manifest-path")
+        .arg(manifest_flag());
+    for member in members {
+        command.arg("-p").arg(member);
+    }
+    let out = command.output().expect("cargo tree spawn");
+    assert!(
+        out.status.success(),
+        "cargo tree for {members:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("cargo tree output is utf8")
+}
+
+/// `cargo tree` of `member` resolved at the workspace manifest (default features).
+fn cargo_tree_of(member: &str) -> String {
+    let out = Command::new("cargo")
+        .arg("tree")
+        .arg("--manifest-path")
+        .arg(manifest_flag())
+        .arg("-p")
+        .arg(member)
+        .output()
+        .expect("cargo tree spawn");
+    assert!(
+        out.status.success(),
+        "cargo tree -p {member} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("cargo tree output is utf8")
+}
+
+fn workspace_packages() -> Vec<(String, String)> {
+    let out = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(manifest_flag())
+        .arg("--no-deps")
+        .output()
+        .expect("cargo metadata spawn");
+    assert!(out.status.success(), "cargo metadata failed");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("cargo metadata json");
+    v["packages"]
+        .as_array()
+        .expect("packages array")
+        .iter()
+        .map(|package| {
+            (
+                package["name"].as_str().expect("package name").to_owned(),
+                package["manifest_path"]
+                    .as_str()
+                    .expect("package manifest path")
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Workspace member names whose crate name starts with `apexbot`.
+fn core_member_names() -> Vec<String> {
+    workspace_packages()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("apexbot"))
+        .collect()
+}
+
+/// Walk `dir` recursively, calling `f` on every `*.rs` file path + content.
+fn for_each_rust_source(dir: &Path, f: &mut dyn FnMut(&Path, &str)) {
+    for entry in std::fs::read_dir(dir).expect("read_dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        let ft = entry.file_type().expect("file type");
+        if ft.is_dir() {
+            for_each_rust_source(&path, f);
+        } else if ft.is_file() && path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).expect("read rust source");
+            f(&path, &text);
+        }
+    }
+}
+
+/// Every `` Python|Python's `symbol` [noun] <verb> `` occurrence in a comment
+/// line, as `(symbol, following_lowercase_noun, next_word)`.
+///
+/// Returned ungated so the CALLER decides: the same phrase is a definition in
+/// one sentence and a parity note in another, and which one it is depends on
+/// the verb, not the phrase.
+fn python_phrases(line: &str) -> Vec<(String, String, String)> {
+    let bytes: Vec<char> = line.chars().collect();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if index + 6 > bytes.len() || !bytes[index..].starts_with(&['P', 'y', 't', 'h', 'o', 'n']) {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 6;
+        if bytes.get(cursor) == Some(&'\'') {
+            cursor += 1;
+            if bytes.get(cursor) == Some(&'s') {
+                cursor += 1;
+            }
+        }
+        if bytes.get(cursor) != Some(&' ') {
+            index += 1;
+            continue;
+        }
+        while bytes.get(cursor) == Some(&' ') {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&'`') {
+            index += 1;
+            continue;
+        }
+        let symbol_start = cursor + 1;
+        let Some(symbol_end) = bytes[symbol_start..].iter().position(|c| *c == '`') else {
+            index += 1;
+            continue;
+        };
+        let symbol: String = bytes[symbol_start..symbol_start + symbol_end]
+            .iter()
+            .collect();
+        cursor = symbol_start + symbol_end + 1;
+
+        // An optional lowercase noun travels with the phrase ("the Python
+        // `X` enum uses"); it is part of what names the symbol, so the test
+        // artifact exemption can see it.
+        let mut look = cursor;
+        while look < bytes.len() && bytes[look] == ' ' {
+            look += 1;
+        }
+        let noun_start = look;
+        while look < bytes.len() && bytes[look].is_ascii_lowercase() {
+            look += 1;
+        }
+        let noun: String = bytes[noun_start..look].iter().collect();
+
+        // The next word is the verb, when the phrase names the agent.
+        while look < bytes.len() && bytes[look] == ' ' {
+            look += 1;
+        }
+        let verb_start = look;
+        while look < bytes.len() && (bytes[look].is_ascii_alphanumeric() || bytes[look] == '_') {
+            look += 1;
+        }
+        let verb: String = bytes[verb_start..look].iter().collect();
+        found.push((symbol, noun, verb));
+        index = cursor;
+    }
+    found
+}
+
+#[test]
+fn workspace_membership_is_exact_and_role_grouped() {
+    const EXPECTED_NAMES: [&str; 35] = [
+        "apexbot",
+        "apexbot-aave",
+        "apexbot-abi",
+        "apexbot-arbitrage",
+        "apexbot-batch-executor",
+        "apexbot-bot",
+        "apexbot-cli",
+        "apexbot-cli-core",
+        "apexbot-config",
+        "apexbot-core",
+        "apexbot-db",
+        "apexbot-decoders",
+        "apexbot-eventhub",
+        "apexbot-execution",
+        "apexbot-execution-sample",
+        "apexbot-executor",
+        "apexbot-fork",
+        "apexbot-ingestion",
+        "apexbot-math",
+        "apexbot-order-index",
+        "apexbot-pathfinding",
+        "apexbot-pool-updater",
+        "apexbot-pools",
+        "apexbot-price",
+        "apexbot-rpc",
+        "apexbot-runs",
+        "apexbot-settlement-bot-example",
+        "apexbot-simulation",
+        "apexbot-strategy",
+        "apexbot-stubgen",
+        "apexbot-submission",
+        "apexbot-substrate",
+        "apexbot-uniswap",
+        "apexbot-workers",
+        "apexbot_rs",
+    ];
+    const ROLES: [&str; 5] = ["facade", "foundation", "engine", "integrations", "shells"];
+
+    let mut packages = workspace_packages();
+    packages.sort();
+    let names: Vec<&str> = packages.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names, EXPECTED_NAMES,
+        "workspace package identities changed"
+    );
+    assert!(
+        !names.contains(&"apexbot-solvers"),
+        "`apexbot-solvers` was dissolved (ADR-073 amendment A5) and must not reappear"
+    );
+
+    let crates_root = workspace_root().join("crates");
+    for (_, manifest) in &packages {
+        let path = Path::new(manifest);
+        if path.starts_with(&crates_root) {
+            let relative = path.strip_prefix(&crates_root).expect("role-grouped crate");
+            let mut components = relative.components();
+            let role = components.next().expect("role component").as_os_str();
+            assert!(
+                ROLES.iter().any(|candidate| role == *candidate),
+                "crate escaped the explicit role directories: {}",
+                path.display()
+            );
+        } else {
+            // Non-role packages live in one of the two tool/sample homes;
+            // membership itself stays pinned by the exact EXPECTED_NAMES list.
+            let examples_root = workspace_root().join("examples");
+            let tools_root = workspace_root().join("tools");
+            assert!(
+                path.starts_with(&examples_root) || path.starts_with(&tools_root),
+                "non-role package escaped the examples or tools directories: {}",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn cli_shell_names_only_allowlisted_externals() {
+    // ADR-051 D2: the argv facade may name workspace members + the small
+    // argv/sink plumbing allowlist (reads the manifest's dep tables).
+    let manifest = workspace_root().join("crates/shells/apexbot-cli/Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).expect("read cli manifest");
+    let allow = [
+        "clap",
+        "indicatif",
+        "tokio",
+        "tracing",
+        "tracing-subscriber",
+    ];
+    let mut offenders = Vec::new();
+    let mut in_deps = false;
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if matches!(
+            t,
+            "[dependencies]" | "[build-dependencies]" | "[dev-dependencies]"
+        ) {
+            in_deps = true;
+            continue;
+        }
+        if t.starts_with('[') {
+            in_deps = false;
+            continue;
+        }
+        if !in_deps || t.starts_with('#') || t.is_empty() {
+            continue;
+        }
+        let Some((name, _)) = t.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || t.contains("workspace") && t.contains("true") {
+            continue;
+        }
+        if !allow.contains(&name) {
+            offenders.push(format!("{}: {name}", i + 1));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "apexbot-cli may list only workspace members + argv/sink plumbing; offenders: {offenders:?}"
+    );
+}
+
+#[test]
+fn facade_solvers_reexport_reaches_pools_solve() {
+    // ADR-073 amendment A5 dissolved the `apexbot-solvers` crate; the facade
+    // re-export name `apexbot::solvers` must stay wired to
+    // `apexbot_pools::solve`. `type_name` reports the type's canonical
+    // definition path, so equality proves the re-export resolves to the
+    // re-homed module rather than some other item.
+    assert_eq!(
+        std::any::type_name::<apexbot::solvers::runtime::SolveRuntimeConfig>(),
+        "apexbot_pools::solve::runtime::SolveRuntimeConfig",
+        "the `apexbot::solvers` re-export must resolve to `apexbot_pools::solve`"
+    );
+}
+
+#[test]
+fn core_crates_are_pyo3_free_under_default_features() {
+    // The pyo3-free charter (AGENTS.md). The binding crate `apexbot_rs` is the
+    // ONLY member that
+    // may touch pyo3 — it is the PyO3 wrapper layer.
+    let mut violations = Vec::new();
+    let members: Vec<String> = core_member_names()
+        .into_iter()
+        .filter(|name| name != "apexbot_rs") // the PyO3 binding layer, pyo3 by construction
+        .collect();
+    assert!(
+        members.len() >= 20,
+        "member census drifted suspiciously low: {} members",
+        members.len()
+    );
+    // One spawn settles a clean census: feature unification across the
+    // selected members can only ADD edges, so a batch without a `pyo3 v` line
+    // proves every member's default-features closure pyo3-free. A dirty batch
+    // pays the per-member attribution loop — the only exact semantics, since
+    // any workspace-wide resolution (metadata included) false-flags everyone:
+    // the binding layer enables a `pyo3` feature on every core crate.
+    if batched_cargo_tree(&members)
+        .lines()
+        .any(|l| l.contains("pyo3 v"))
+    {
+        for member in &members {
+            if cargo_tree_of(member).lines().any(|l| l.contains("pyo3 v")) {
+                violations.push(member.clone());
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "core crates pulling pyo3 under default features: {violations:?}"
+    );
+}
+
+#[test]
+fn cli_core_is_clap_and_indicatif_free() {
+    // ADR-051 D2: the argv facade owns clap + indicatif; the semantics crate
+    // never touches them.
+    let tree = cargo_tree_of("apexbot-cli-core");
+    for offender in ["clap", "clap_derive", "clap_builder", "indicatif"] {
+        let bad = tree
+            .lines()
+            .filter(|l| {
+                l.trim_start_matches(|c: char| !c.is_ascii_alphanumeric()) == offender
+                    || l.starts_with(&format!("{offender} v"))
+                    || l.contains(&format!(" {offender} v")) && !l.contains("apexbot")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            bad.is_empty(),
+            "apexbot-cli-core pulls {offender}: {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn one_engine_impl_block() {
+    // exactly one `impl ArbitrageEngine` block, in arb_engine/mod.rs.
+    let bot_src = workspace_root().join("crates/engine/apexbot-bot/src");
+    let mut hits: Vec<(String, usize)> = Vec::new();
+    for_each_rust_source(&bot_src, &mut |path, text| {
+        let clean_path = path.display().to_string().replace('\\', "/");
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if t.starts_with("impl ArbitrageEngine") && t.ends_with('{') {
+                hits.push((clean_path.clone(), i + 1));
+            }
+        }
+    });
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly 1 impl ArbitrageEngine block; found {hits:?}"
+    );
+    assert!(
+        hits[0].0.ends_with("arb_engine/mod.rs"),
+        "the sole engine impl block must live in arb_engine/mod.rs; found {}",
+        hits[0].0
+    );
+
+    // The Python wrapper may name the compat pyclass string exactly once.
+    let py_src = workspace_root().join("crates/shells/apexbot-python/src");
+    let mut py_hits: Vec<String> = Vec::new();
+    for_each_rust_source(&py_src, &mut |path, text| {
+        if text.contains("ArbitrageEngine") {
+            for line in text.lines().filter(|l| l.contains("ArbitrageEngine")) {
+                py_hits.push(format!("{}: {}", path.display(), line.trim()));
+            }
+        }
+    });
+    assert_eq!(
+        py_hits.len(),
+        1,
+        "apexbot-python must name ArbitrageEngine only as the pyclass compat string; found {py_hits:?}"
+    );
+    assert!(
+        py_hits[0].contains("name = \"ArbitrageEngine\","),
+        "the single mention must be the pyclass name string; got {}",
+        py_hits[0]
+    );
+}
+
+#[test]
+fn no_inner_allow_attributes() {
+    // `#![allow]` inner attributes are forbidden; reasoned outer #[allow]/#[expect]
+    // is the sanctioned form.
+    let mut violations = Vec::new();
+    for_each_rust_source(&workspace_root().join("crates"), &mut |path, text| {
+        for (i, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("#![allow(") {
+                violations.push(format!("{}:{}", path.display(), i + 1));
+            }
+        }
+    });
+    assert!(
+        violations.is_empty(),
+        "inner #![allow] forbidden (use #[expect] or a reasoned outer #[allow]): {violations:?}"
+    );
+}
+
+#[test]
+fn cmd_executor_cutover_symbols_are_absent_from_strategy_callers() {
+    let strategy_root = workspace_root().join("crates/engine/apexbot-strategy");
+    let retired_symbols = [
+        "compose_candidate",
+        "build_candidate_calldata",
+        "ComposeReject",
+    ];
+    let mut violations = Vec::new();
+
+    for directory in ["src", "tests"] {
+        for_each_rust_source(&strategy_root.join(directory), &mut |path, text| {
+            for (line_number, line) in text.lines().enumerate() {
+                for symbol in retired_symbols {
+                    if line.contains(symbol) {
+                        violations.push(format!(
+                            "{}:{}: {symbol}",
+                            path.display(),
+                            line_number + 1
+                        ));
+                    }
+                }
+            }
+        });
+    }
+
+    assert!(
+        violations.is_empty(),
+        "retired cmd_executor cutover symbols remain in canonical strategy callers/tests: {violations:?}"
+    );
+}
+
+#[test]
+fn no_alembic_references() {
+    // ADR-052 D6: the in-tree Alembic chain is retired; no Python file may
+    // reference it.
+    let src = repo_root().join("src/apexbot");
+    assert!(
+        !src.join("migrations").exists(),
+        "src/apexbot/migrations still exists (retired per ADR-052 D6)"
+    );
+    let mut violations = Vec::new();
+    let mut walk = Vec::new();
+    walk.push(src);
+    while let Some(dir) = walk.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir src") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let ft = entry.file_type().expect("file type");
+            if ft.is_dir() {
+                walk.push(path);
+            } else if ft.is_file() && path.extension().is_some_and(|e| e == "py") {
+                let text = std::fs::read_to_string(&path).expect("read python source");
+                for (i, line) in text.lines().enumerate() {
+                    if line.to_ascii_lowercase().contains("alembic") {
+                        violations.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Alembic references remain in src/**/*.py (retired per ADR-052 D6): {violations:?}"
+    );
+}
+/// The body of the first `header` block in `text` — the lines up to the brace
+/// that closes it, matched by DEPTH so a nested block cannot end it early —
+/// or `None` when the header is absent.
+fn block_body(text: &str, header: &str) -> Option<String> {
+    let mut body = String::new();
+    let mut inside = false;
+    let mut depth = 0_usize;
+    for line in text.lines() {
+        if !inside {
+            if line.trim() == header {
+                // The header line is the opening brace; start counting there so
+                // a body line that holds no brace is not mistaken for the end.
+                inside = true;
+                depth = 1;
+            }
+            continue;
+        }
+        for ch in line.split("//").next().unwrap_or_default().chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            return Some(body);
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    None
+}
+
+/// The declared field names of a struct body, in declaration order.
+fn field_names(body: &str) -> Vec<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
+        .collect()
+}
+
+/// Every `impl` block in `text`, as `(header, body)`.
+///
+/// Located by brace depth rather than by a hand-listed set of headers: a fixed
+/// list silently skips any `impl` it did not name, and a scanner that cannot
+/// see a block cannot report the policy inside it. Comment-only lines
+/// contribute no depth (no doc comment in the scanned file holds a brace).
+fn impl_blocks(text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let header = lines[index].trim();
+        if !(header.starts_with("impl ") && header.ends_with('{')) {
+            index += 1;
+            continue;
+        }
+        let mut depth = 1_usize;
+        let mut body = String::new();
+        index += 1;
+        while index < lines.len() && depth > 0 {
+            for ch in lines[index].split("//").next().unwrap_or_default().chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            body.push_str(lines[index]);
+            body.push('\n');
+            index += 1;
+        }
+        blocks.push((header.to_owned(), body));
+    }
+    blocks
+}
+
+#[test]
+fn one_path_identity_owner_is_declared_once() {
+    // A DECLARATION census, not a wiring check: a session can reach canonical
+    // path identity only through one owner type, one adapter implementation,
+    // and one dedup index, because a second of any of them is a second
+    // path-id space. That the live owner is actually BOUND at the production
+    // boot is a behavioral fact, not a textual one, and it is proved by
+    // booting the real composition (apexbot-bot's `EngineDriver`-backed
+    // session-path tests assert `has_path_owner` without hand-installing).
+    let crates_root = workspace_root().join("crates");
+    let mut object_defs: Vec<String> = Vec::new();
+    let mut adapter_impls: Vec<String> = Vec::new();
+    let mut signature_indexes: Vec<String> = Vec::new();
+    for_each_rust_source(&crates_root, &mut |path, text| {
+        let clean = path.display().to_string().replace('\\', "/");
+        for (line_number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "pub struct PathObject {" {
+                object_defs.push(format!("{clean}:{}", line_number + 1));
+            }
+            if trimmed.starts_with("impl PathObjectAdapter for ") {
+                adapter_impls.push(format!("{clean}:{}", line_number + 1));
+            }
+            // The field DECLARATION, not the constructor initializer: the
+            // type is spelled out only where the index is declared.
+            if trimmed.starts_with("path_signatures: HashMap<") {
+                signature_indexes.push(format!("{clean}:{}", line_number + 1));
+            }
+        }
+    });
+    assert_eq!(
+        object_defs.len(),
+        1,
+        "the canonical path object must be declared exactly once; found {object_defs:?}"
+    );
+    assert!(
+        object_defs[0].contains("apexbot-substrate/src/session_registry/path.rs"),
+        "the canonical path object belongs to the session registry; found {}",
+        object_defs[0]
+    );
+    assert_eq!(
+        adapter_impls.len(),
+        1,
+        "the path-object adapter must be implemented exactly once; found {adapter_impls:?}"
+    );
+    assert!(
+        adapter_impls[0].contains("arb_engine/path_objects.rs"),
+        "the adapter belongs to the path-identity owner; found {}",
+        adapter_impls[0]
+    );
+    assert_eq!(
+        signature_indexes.len(),
+        1,
+        "the path-signature dedup index must be declared exactly once; found {signature_indexes:?}"
+    );
+    assert!(
+        signature_indexes[0].contains("arb_engine/path_registry.rs"),
+        "the path-signature dedup index belongs to the engine's path registry; found {}",
+        signature_indexes[0]
+    );
+}
+
+#[test]
+fn the_session_registers_no_path_store_of_its_own() {
+    // The session registry reaches path identity through the adapter, so the
+    // module that DEFINES the canonical path object must hold no collection
+    // at all: a map keyed by hop signature here would be the second store
+    // that can disagree with the engine's PathRegistry about which route is
+    // which. (The pool/token kinds legitimately keep maps in
+    // `session_registry.rs` itself; only the path module must be collection-free.)
+    let path_module =
+        workspace_root().join("crates/foundation/apexbot-substrate/src/session_registry/path.rs");
+    let text = std::fs::read_to_string(&path_module).expect("read the path module");
+    let mut offenders = Vec::new();
+    for (line_number, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        for collection in ["DashMap<", "HashMap<", "BTreeMap<", "HashSet<", "BTreeSet<"] {
+            if trimmed.contains(collection) {
+                offenders.push(format!(
+                    "{}:{line_number}: {collection}",
+                    path_module.display()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the canonical path module must hold no collection (it is reached, not stored): {offenders:?}"
+    );
+
+    // And the registry itself stores the owner as a handle, not a map of paths.
+    let registry = std::fs::read_to_string(
+        workspace_root().join("crates/foundation/apexbot-substrate/src/session_registry/mod.rs"),
+    )
+    .expect("read the session registry");
+    let struct_body = block_body(&registry, "pub struct SessionObjectRegistry {")
+        .expect("the session registry struct");
+    let path_fields: Vec<String> = field_names(&struct_body)
+        .into_iter()
+        .filter(|name| name.contains("path"))
+        .collect();
+    assert_eq!(
+        path_fields,
+        vec![String::from("paths")],
+        "the registry's only path member is the owner handle"
+    );
+    assert!(
+        struct_body.contains("OnceLock<Arc<dyn PathObjectAdapter>>"),
+        "the path owner is a once-installed handle; got {struct_body}"
+    );
+}
+
+#[test]
+fn the_canonical_path_object_carries_no_strategy_policy() {
+    // Identity only: chain, the hop signature, and the owner's id. Solver
+    // choice, dispatch priority, submission posture, and admission rules are
+    // derived per strategy, so a field here would hand one arm's policy to
+    // every other arm that trades the same route.
+    let path_module =
+        workspace_root().join("crates/foundation/apexbot-substrate/src/session_registry/path.rs");
+    let text = std::fs::read_to_string(&path_module).expect("read the path module");
+    let struct_body =
+        block_body(&text, "pub struct PathObject {").expect("the canonical path object");
+    assert_eq!(
+        field_names(&struct_body),
+        vec!["chain_id", "identity", "path_id"],
+        "the canonical path object declares identity fields only"
+    );
+
+    // The same rule for the WHOLE read surface, which is every `impl` block in
+    // the module: a named subset would leave an accessor nobody listed free to
+    // hand out one arm's policy, and the subset a gate names is exactly the
+    // coverage it is credited with. The scan reaches all of them, and the
+    // count assertion below fails rather than passing vacuously if the
+    // extractor ever stops finding blocks.
+    let policy_tokens = [
+        "solver",
+        "dispatch",
+        "priority",
+        "submission",
+        "submit",
+        "bid",
+        "budget",
+        "relay",
+        "nonce",
+        "retry",
+        "admission",
+    ];
+    let blocks = impl_blocks(&text);
+    let declared = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("impl "))
+        .count();
+    assert_eq!(
+        blocks.len(),
+        declared,
+        "every `impl` in the path module must be scanned, or this gate is not the coverage it claims"
+    );
+    assert!(
+        !blocks.is_empty(),
+        "the path module has impl blocks; a scan that found none proves nothing"
+    );
+    let mut offenders = Vec::new();
+    for (header, accessor) in &blocks {
+        for (line_number, line) in accessor.lines().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("pub") {
+                continue;
+            }
+            for token in policy_tokens {
+                if trimmed.contains(token) {
+                    offenders.push(format!("{header} +{line_number}: {trimmed}"));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the canonical path surface must not expose strategy policy: {offenders:?}"
+    );
+}
+
+/// The position seam has exactly ONE observer implementation, and it lives in
+/// the lending integration.
+///
+/// A second implementation is a second answer for one identity from two
+/// sources, which is the drift the session registry exists to remove — the
+/// same reasoning as the single path-identity owner. The census is a
+/// DECLARATION check over the shipped sources; a test double under a `tests`
+/// path is not a second reader, and a session actually reaching this observer is
+/// behavioral and is proved where a consumer installs it.
+#[test]
+fn one_position_observer_implementation_is_declared_once() {
+    let crates_root = workspace_root().join("crates");
+    let mut impls: Vec<String> = Vec::new();
+    for_each_rust_source(&crates_root, &mut |path, text| {
+        let clean = path.display().to_string().replace('\\', "/");
+        if clean.contains("/tests/") || clean.ends_with("/tests.rs") {
+            return;
+        }
+        for (line_number, line) in text.lines().enumerate() {
+            if line.trim().starts_with("impl PositionObserver for ") {
+                impls.push(format!("{clean}:{}", line_number + 1));
+            }
+        }
+    });
+    assert_eq!(
+        impls.len(),
+        1,
+        "the position observer must be implemented exactly once; found {impls:?}"
+    );
+    assert!(
+        impls[0].contains("integrations/apexbot-aave/src/positions.rs"),
+        "the observer belongs to the lending integration that owns the domain; found {}",
+        impls[0]
+    );
+}
+
+/// Neither the seam's own module nor the session's position surface holds a
+/// collection.
+///
+/// A position is a perishable READ, so a map here would be a cache the session
+/// never asked for: it would hide freshness from a strategy about to act on a
+/// position, and a failed read would have a remembered value to fall back on —
+/// the two failures the seam exists to prevent. (The pool/token kinds
+/// legitimately keep maps in `session_registry.rs` itself; only the position
+/// modules must be collection-free.)
+#[test]
+fn the_session_registers_no_position_store_of_its_own() {
+    let modules = [
+        workspace_root().join("crates/foundation/apexbot-core/src/session_positions.rs"),
+        workspace_root()
+            .join("crates/foundation/apexbot-substrate/src/session_registry/position.rs"),
+    ];
+    let mut offenders = Vec::new();
+    for module in &modules {
+        let read_error = format!("read {}", module.display());
+        let text = std::fs::read_to_string(module).expect(&read_error);
+        for (line_number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            for collection in ["DashMap<", "HashMap<", "BTreeMap<", "HashSet<", "BTreeSet<"] {
+                if trimmed.contains(collection) {
+                    offenders.push(format!("{}:{line_number}: {collection}", module.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the position seam must stay collection-free: {offenders:?}"
+    );
+}
+
+/// The seam adds NO dependency edge between a lending integration and the
+/// engine, in either direction.
+///
+/// Both edges are wrong for a different reason: an integration that depends on
+/// the engine inverts the layering, and an engine that depends on an integration
+/// makes the core own a domain it does not have. The seam therefore sits in the
+/// layer both already share, and this gate is what keeps a future "just add the
+/// dep" from quietly restoring either edge.
+#[test]
+fn the_position_seam_adds_no_lending_edge_to_the_engine_or_the_core() {
+    let mut offenders = Vec::new();
+    for (crate_dir, forbidden) in [
+        ("foundation/apexbot-core", "apexbot-aave"),
+        ("engine/apexbot-bot", "apexbot-aave"),
+        ("engine/apexbot-strategy", "apexbot-aave"),
+    ] {
+        let manifest = workspace_root()
+            .join("crates")
+            .join(crate_dir)
+            .join("Cargo.toml");
+        let read_error = format!("read {}", manifest.display());
+        let text = std::fs::read_to_string(&manifest).expect(&read_error);
+        if text.contains(forbidden) {
+            offenders.push(format!("{crate_dir} -> {forbidden}"));
+        }
+    }
+    // And the other direction: the lending integration may not reach the engine.
+    let aave_manifest = workspace_root().join("crates/integrations/apexbot-aave/Cargo.toml");
+    let aave_read_error = format!("read {}", aave_manifest.display());
+    let aave_text = std::fs::read_to_string(&aave_manifest).expect(&aave_read_error);
+    if aave_text.contains("apexbot-bot") {
+        offenders.push(String::from("apexbot-aave -> apexbot-bot"));
+    }
+    assert!(
+        offenders.is_empty(),
+        "the position seam must not add a dependency edge to a lending integration: {offenders:?}"
+    );
+}
+
+/// The layer the seam sits in is one BOTH sides already depend on — the property
+/// that lets the integration implement the observer and the session hold a
+/// handle to it with no new edge at all.
+///
+/// If either manifest stops naming `apexbot-core`, the seam is unreachable from
+/// that side and the "no new edge" claim above is no longer what holds it up.
+#[test]
+fn the_position_seam_sits_in_the_layer_both_sides_depend_on() {
+    for crate_dir in [
+        "integrations/apexbot-aave",
+        "engine/apexbot-bot",
+        "foundation/apexbot-core",
+    ] {
+        let manifest = workspace_root()
+            .join("crates")
+            .join(crate_dir)
+            .join("Cargo.toml");
+        let read_error = format!("read {}", manifest.display());
+        let text = std::fs::read_to_string(&manifest).expect(&read_error);
+        if crate_dir != "foundation/apexbot-core" {
+            assert!(
+                text.contains("apexbot-core"),
+                "{crate_dir} must already depend on apexbot-core, or the position seam needs a new edge"
+            );
+        }
+    }
+    let seam = workspace_root().join("crates/foundation/apexbot-core/src/session_positions.rs");
+    assert!(
+        seam.exists(),
+        "the position seam must be declared in apexbot-core, the layer both sides share"
+    );
+}
+/// A core-crate PUBLIC item may not define its own contract by pointing at a
+/// Python-side symbol, and this gate polices the narrowest decidable form of
+/// that: a doc comment attached to a `pub` item in which a Python-qualified
+/// symbol is the semantic AGENT of a definitional verb ("the 1-based wire code
+/// the Python `PoolProbe` enum uses"), so the core value's meaning is whatever
+/// the Python side happens to say.
+///
+/// The existing pyo3-free gate polices the IMPORT, which is why a reverted
+/// `PoolFamily::probe_wire_code` carrying the doc "The 1-based wire code the
+/// Python `PoolProbe` enum uses" passed it: nothing wrote `use pyo3`.
+///
+/// Why this is not a ban on the word "Python": the core docs are full of
+/// legitimate mentions, and they use Python as a PARITY TARGET ("mirrors the
+/// Python oracle"), never as the DEFINITION. A word ban would report ~331
+/// pre-existing sites. The discriminator here is the GRAMMATICAL ROLE of the
+/// Python phrase, and it is deliberately the decidable subset of the real
+/// rule, not the whole of it:
+///
+///   - the item is `pub` (a private helper's comment is nobody's contract);
+///   - the Python phrase is `Python`/`Python's` + a backticked symbol;
+///   - the symbol is not a TEST artifact — a Python test suite is a witness
+///     that a value agrees, never the definition of one, and this exemption is
+///     load-bearing rather than cosmetic: `apexbot-aave/src/analysis.rs` reads
+///     "tolerance the Python `test_core.py` suite uses", which is
+///     grammatically indistinguishable from the rejected probe and entirely
+///     legitimate;
+///   - the next word is a definitional verb, i.e. the Python symbol is the one
+///     doing the defining.
+///
+/// KNOWN LIMIT, stated rather than papered over: this catches the definitional
+/// shape only. A core comment that defines a value by a Python symbol without
+/// one of these verbs ("mirrors the Python `X` numbering", "as in the Python
+/// `X`") still passes, as does a contract-source comment on a non-`pub` item.
+/// The full rule is a judgment about which entity holds a definition, and no
+/// purely lexical gate can decide it without failing the same-shaped
+/// legitimate comments above — the alternative measured here was a call-graph
+/// rule (no public core API used only by the binding shell), which fails on 48
+/// pre-existing legitimate APIs. Treat this as a real subset of coverage, not
+/// the whole class.
+/// In the RUST CORE, a map keyed by one of the session's four canonical
+/// identity types lives in the session registry and NOWHERE ELSE.
+///
+/// SCOPE, stated because the name used to hide it: this gate is Rust-only. It
+/// walks `for_each_rust_source` over `rust/crates`, so it says nothing about
+/// the Python side, where address-keyed dedup state actually still lives in
+/// this repo. The Python surface is policed by review plus the removal of the
+/// maps that were authority; the maps that remain there are memos and caches
+/// that cannot mint identity (ADR-064 accounts for all five, and
+/// `retired_python_dedup_maps_do_not_reappear` holds the narrow decidable
+/// part).
+///
+/// Identity types are the one key the registry owns outright: a second map
+/// keyed by `PoolIdentity`, `TokenIdentity`, `PathIdentity`, or
+/// `PositionIdentity` is a second answer to "is this the same object?" — a
+/// second id space — which is the exact failure the registry exists to remove,
+/// and it is invisible to a type system because the two maps have the same key
+/// type. All FOUR are listed, not the two this gate shipped with: a list that
+/// omits a kind is not a weaker rule, it is a hole, and the path and position
+/// kinds were unproved until a probe outside the registry showed the gate
+/// passing a second path store.
+///
+/// The rule is deliberately scoped to the registry's OWN identity types rather
+/// than to address-keyed maps generally. An address-keyed map is not
+/// automatically a shadow identity: the core holds 48 pre-existing ones that
+/// are caches, ledgers, and indices with a different lifetime (executor
+/// encoders, the grammar ledger, the connector index, pool-ingress tick maps,
+/// the sim anchor). A gate that flagged all of them would be reporting the
+/// codebase rather than this rule. A map keyed by the registry's identity
+/// types, by contrast, is unambiguously a claim about session object identity,
+/// and there are none outside the registry today.
+#[test]
+fn no_second_map_in_the_rust_core_is_keyed_by_a_session_identity_type() {
+    let identity_keys = [
+        "PoolIdentity",
+        "TokenIdentity",
+        "PathIdentity",
+        "PositionIdentity",
+    ];
+    let collections = [
+        "DashMap<",
+        "HashMap<",
+        "BTreeMap<",
+        "HashSet<",
+        "BTreeSet<",
+        "RwLock<HashMap<",
+        "Mutex<HashMap<",
+    ];
+    let registry_module = "apexbot-substrate/src/session_registry";
+
+    let mut violations = Vec::new();
+    let crates_root = workspace_root().join("crates");
+    for_each_rust_source(&crates_root, &mut |path, text| {
+        let clean = path.display().to_string().replace('\\', "/");
+        if clean.contains("/tests/") || clean.contains("/benches/") {
+            return;
+        }
+        for (line_number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let Some(collection) = collections.iter().find(|c| trimmed.contains(**c)) else {
+                continue;
+            };
+            // The KEY type is the first generic argument, not any type in the
+            // line: `HashMap<u64, (V3PoolIdentity, V3PoolState)>` is keyed by a
+            // pool ID whose VALUE mentions an identity, and matching the whole
+            // line flags that unrelated type.
+            let after = &trimmed[trimmed
+                .find(collection)
+                .map_or(0, |i| i + collection.len() - 1)..];
+            let Some(key_type) = after
+                .trim_start()
+                .trim_start_matches('<')
+                .split(',')
+                .next()
+                .map(|k| k.trim().trim_start_matches('&').trim_start_matches('*'))
+            else {
+                continue;
+            };
+            // The FINAL path segment names the type, so a fully-qualified key
+            // (`HashMap<crate::substrate::session_registry::PathIdentity, u8>`)
+            // is caught too. Comparing the whole key type missed exactly that
+            // spelling, which is the spelling an out-of-registry caller reaches
+            // for when the registry is not in scope unqualified — so the gate
+            // would still have passed the probe written to prove it.
+            let named = key_type.rsplit("::").next().unwrap_or(key_type);
+            if !identity_keys
+                .iter()
+                .any(|k| named == *k || key_type.starts_with(&format!("{k}::")))
+            {
+                continue;
+            }
+            // The registry's own tables are the sanctioned home.
+            if clean.contains(registry_module) {
+                continue;
+            }
+            violations.push(format!("{clean}:{}: {trimmed}", line_number + 1));
+        }
+    });
+    assert!(
+        violations.is_empty(),
+        "only the session registry may key a map by a session identity type: {violations:?}"
+    );
+}
+
+/// The five Python dedup maps this cutover deleted must not come back.
+///
+/// The Rust sibling gate above is Rust-only — it walks `*.rs` — and the Python
+/// side is where address-keyed dedup state actually still lives in this repo,
+/// so the task's "no new private dedup map outside the session registry"
+/// criterion has no automated half on that side. A general Python text gate
+/// cannot decide the real rule (a map that CANNOT mint identity is legitimate,
+/// and there are five), but THIS subset is decidable and false-positive-free:
+/// these five names were the maps that WERE authority, they were removed
+/// because get-or-create replaced them, and no future change may legitimately
+/// reintroduce any of them. Rejecting a name that must never return is not a
+/// judgment call, so there is nothing here to tune.
+///
+/// KNOWN LIMIT, not papered over: this forbids the five RETIRED names, not
+/// dedup maps in general. A new Python map under a fresh name, or an
+/// address-keyed memo of registry-issued handles, is still not caught here —
+/// see ADR-064 for the five maps that legitimately remain and why none of them
+/// can mint identity. The Python surface beyond these names is policed by
+/// review, which is a weaker instrument than a gate and is recorded as such.
+///
+/// Deliberately scoped to `src/apexbot/`, not `tests/`: the regression tests
+/// that PROVE the removal still name these identifiers in prose (they have to,
+/// to document what is gone), and a test witness is not a second owner.
+#[test]
+fn retired_python_dedup_maps_do_not_reappear() {
+    let retired = [
+        "_v2_keys",
+        "_v3_keys",
+        "_v4_keys",
+        "_v3_inflight",
+        "_v4_inflight",
+    ];
+
+    let src = repo_root().join("src/apexbot");
+
+    assert!(
+        src.exists(),
+        "the Python source root moved; this gate's walk would vacuously pass"
+    );
+
+    let mut violations = Vec::new();
+    let mut walk = vec![src];
+    while let Some(dir) = walk.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir src/apexbot") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let ft = entry.file_type().expect("file type");
+            if ft.is_dir() {
+                walk.push(path);
+            } else if ft.is_file() && path.extension().is_some_and(|e| e == "py") {
+                let text = std::fs::read_to_string(&path).expect("read python source");
+                for (line_number, line) in text.lines().enumerate() {
+                    for name in retired {
+                        if line.contains(name) {
+                            violations.push(format!(
+                                "{}:{}: {name}",
+                                path.display(),
+                                line_number + 1
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "retired Python dedup maps must not reappear under src/apexbot (ADR-064): {violations:?}"
+    );
+}
+
+#[test]
+fn core_public_docs_do_not_define_contracts_through_python_symbols() {
+    const DEFINITIONAL_VERBS: [&str; 14] = [
+        "uses",
+        "define",
+        "defines",
+        "means",
+        "determines",
+        "enumerates",
+        "numbers",
+        "indexes",
+        "expects",
+        "requires",
+        "produces",
+        "assigns",
+        "encodes",
+        "corresponds",
+    ];
+    // A Python test file witnesses that a core value agrees; it never defines
+    // one. See the note on `analysis.rs` above.
+    const TEST_ARTIFACT_MARKERS: [&str; 6] = ["test_", "_test", "conftest", ".py", "spec", "test"];
+
+    let mut violations = Vec::new();
+    for role in ["foundation", "engine", "integrations", "facade"] {
+        let dir = workspace_root().join("crates").join(role);
+        for_each_rust_source(&dir, &mut |path, text| {
+            let clean = path.display().to_string().replace('\\', "/");
+            if clean.contains("/tests/") || clean.contains("/benches/") {
+                return;
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim();
+                if !(trimmed.starts_with("///") || trimmed.starts_with("//!")) {
+                    continue;
+                }
+                // Only a `pub` item publishes a contract. Skip past the
+                // remaining doc lines, attributes, and blanks to reach it.
+                let mut next = index + 1;
+                while let Some(candidate) = lines.get(next) {
+                    let t = candidate.trim();
+                    let continues = t.is_empty()
+                        || t.starts_with("#[")
+                        || t.starts_with("//")
+                        || t.starts_with("#!");
+                    if !continues {
+                        break;
+                    }
+                    next += 1;
+                }
+                let Some(item) = lines.get(next) else {
+                    continue;
+                };
+                if !item.trim_start().starts_with("pub ") {
+                    continue;
+                }
+                for (symbol, noun, after_verb) in python_phrases(trimmed) {
+                    if TEST_ARTIFACT_MARKERS
+                        .iter()
+                        .any(|marker| symbol.contains(marker) || noun.contains(marker))
+                    {
+                        continue;
+                    }
+                    if DEFINITIONAL_VERBS.contains(&after_verb.as_str()) {
+                        violations.push(format!(
+                            "{clean}:{}: the Python `{symbol}` is the agent of `{after_verb}`",
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        });
+    }
+    assert!(
+        violations.is_empty(),
+        "a core public item must not define its contract through a Python-side symbol: {violations:?}"
+    );
+}
+
+/// Whether `byte` can be part of a Rust identifier.
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// `text` with every comment body, string literal, and char literal blanked to
+/// spaces, byte-for-byte, so brace/paren/comma shapes can be counted without
+/// tripping on a `)` inside a comment or a `,` inside a string. Byte length and
+/// line structure are preserved, so an index or a line number taken from the
+/// result still names the ORIGINAL text.
+fn mask_strings_and_comments(text: &str) -> String {
+    let bytes = text.as_bytes().to_vec();
+    let mut out = bytes.clone();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 1_u32;
+            out[i] = b' ';
+            out[i + 1] = b' ';
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    out[i] = b' ';
+                    out[i + 1] = b' ';
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] != b'\n' {
+                    out[i] = b' ';
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // A raw string \`r"..."\` / \`r#"..."#\` (also under a \`b\` prefix).
+        if let Some(next) = mask_raw_string(&bytes, &mut out, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            out[i] = b' ';
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    out[i] = b' ';
+                    i += 1;
+                    if i < bytes.len() {
+                        if bytes[i] != b'\n' {
+                            out[i] = b' ';
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+                if bytes[i] != b'\n' {
+                    out[i] = b' ';
+                }
+                i += 1;
+            }
+            if i < bytes.len() {
+                out[i] = b' ';
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\\') {
+                out[i] = b' ';
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    if bytes[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    out[i] = b' ';
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes.get(i + 1) != Some(&b'\'') && bytes.get(i + 2) == Some(&b'\'') {
+                out[i] = b' ';
+                out[i + 1] = b' ';
+                out[i + 2] = b' ';
+                i += 3;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // Every masked byte is an ASCII space and multibyte sequences are blanked
+    // whole, so the result is valid UTF-8 whenever the input was.
+    String::from_utf8(out).expect("masked source stays utf8")
+}
+
+/// Blank a raw string opening at \`start\` (a \`r"\` or \`r#".."#\` opener, optionally
+/// after a \`b\` prefix) and return the index just past it; \`None\` when no raw
+/// string starts there, so the caller keeps scanning.
+fn mask_raw_string(bytes: &[u8], out: &mut [u8], start: usize) -> Option<usize> {
+    if bytes[start] != b'r' {
+        return None;
+    }
+    let prefixed =
+        start > 0 && bytes[start - 1] == b'b' && (start == 1 || !is_ident_byte(bytes[start - 2]));
+    if start != 0 && is_ident_byte(bytes[start - 1]) && !prefixed {
+        return None;
+    }
+    let mut j = start + 1;
+    let mut hashes = 0_usize;
+    while bytes.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start;
+    while i <= j {
+        out[i] = b' ';
+        i += 1;
+    }
+    i = j + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let mut closing = 0_usize;
+            while closing < hashes && bytes.get(i + 1 + closing) == Some(&b'#') {
+                closing += 1;
+            }
+            if closing == hashes {
+                for _ in 0..=hashes {
+                    if i < bytes.len() {
+                        out[i] = b' ';
+                        i += 1;
+                    }
+                }
+                return Some(i);
+            }
+        }
+        if bytes[i] != b'\n' {
+            out[i] = b' ';
+        }
+        i += 1;
+    }
+    Some(i)
+}
+
+/// The 1-based, half-open `[start, end)` line ranges of every item carrying a
+/// `#[cfg(test)]` attribute. Test bodies are excluded by ATTRIBUTE rather than
+/// by path: an inline `#[cfg(test)] mod tests { .. }` in a shipped `src/` file
+/// is a test all the same, and a scan that cannot see the attribute reports its
+/// fixtures as production code.
+fn cfg_test_regions(text: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut regions = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].trim().starts_with("#[cfg(test)]") {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut cursor = index + 1;
+        while cursor < lines.len() {
+            let trimmed = lines[cursor].trim();
+            if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//") {
+                cursor += 1;
+                continue;
+            }
+            break;
+        }
+        let mut depth = 0_i64;
+        let mut opened = false;
+        while cursor < lines.len() {
+            let code = lines[cursor].split("//").next().unwrap_or_default();
+            for ch in code.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if opened && depth <= 0 {
+                break;
+            }
+            if !opened && code.contains(';') {
+                break;
+            }
+            cursor += 1;
+        }
+        regions.push((start, cursor + 2));
+        index = cursor + 1;
+    }
+    regions
+}
+
+/// The `(open, close)` byte indices of every `timeout(` call's parentheses in
+/// `masked` (already comment/string-blanked, so no string can forge a paren).
+/// `open` is the index of the `(` itself.
+fn timeout_call_spans(masked: &str) -> Vec<(usize, usize)> {
+    let bytes = masked.as_bytes();
+    let needle = b"timeout";
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+        let mut j = i + needle.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if before_ok && j < bytes.len() && bytes[j] == b'(' {
+            if let Some(close) = matching_paren(bytes, j) {
+                spans.push((j, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        i += needle.len();
+    }
+    spans
+}
+
+/// The index of the `)` matching the `(` at `open`, by depth.
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0_i64;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split `inner` at its TOP-LEVEL commas, so a comma nested in a call or a
+/// closure stays with its argument. `inner` is masked, so no string or comment
+/// comma is split on.
+fn split_top_level(inner: &str) -> Vec<String> {
+    let bytes = inner.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0_i64;
+    let mut last = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(inner[last..i].to_owned());
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(inner[last..].to_owned());
+    parts
+}
+
+/// A production `timeout(..)` may not wrap a data-carrying send or a
+/// non-resumable write.
+///
+/// The cancelling-async-rust material's select-loops case study (RFD 400) is
+/// the canonical failure: `timeout(Duration, tx.send(value))` reads as a
+/// deadline on a send, but it is a deadline on a FUTURE, and when the timeout
+/// fires the future is dropped mid-await — the value moved into `send` is lost
+/// and the caller cannot tell a cancelled delivery from a delivered one. The
+/// same shape over `AsyncWriteExt::write_all` is worse: bytes already accepted
+/// by the peer vanish from the caller's view while the error says only "timed
+/// out", so a retry can silently duplicate a partial frame.
+///
+/// A deadline belongs on the OPERATION boundary — a resumable write that keeps
+/// its own progress, a send whose cancellation the caller observes — never on
+/// the future that carries the value. The decidable subset this gate polices is
+/// the lexical shape: a `timeout(` call whose SECOND argument (everything after
+/// the first top-level comma) mentions `.send(` or `.write_all(`.
+///
+/// KNOWN LIMIT, stated rather than papered over: this is a TEXT approximation.
+/// A send hidden behind a helper (`timeout(d, deliver(value))` where `deliver`
+/// owns the channel) is not caught, and a `.send(` in the FIRST argument is
+/// missed by construction; neither shape exists in the tree today. It is a
+/// tripwire for the reintroduction of the direct form, not a proof of absence
+/// for the whole class.
+#[test]
+fn no_timeout_wrapped_value_sends_or_write_all() {
+    // The one production site that legitimately matches, named file+line with
+    // its reason, rather than loosening the pattern.
+    // Anchored on the enclosing call's source text, NOT a line number: doc
+    // comments (like the # Cancel safety sections) shift lines without changing
+    // the code, and a line-anchored entry silently goes stale - exactly the
+    // drift that broke the first full-workspace run of this gate.
+    const ALLOWED: [(&str, &str, &str); 1] = [(
+        "shells/apexbot-cli-core/src/operator.rs",
+        "timeout(remaining, stream.write_all(line.as_bytes()))",
+        "exchange_within spends one shared deadline across connect/write/flush/read on a request line; the request is a single logical message, so a timeout abandons no partial frame the caller could resume, and the error it raises is the exchange's terminal failure",
+    )];
+
+    let crates_root = workspace_root().join("crates");
+    let mut violations: Vec<String> = Vec::new();
+    for_each_rust_source(&crates_root, &mut |path, text| {
+        // The allowlist anchors on source text, so the actual (unmasked)
+        // lines are needed alongside the masked scan text.
+        let source_lines: Vec<&str> = text.lines().collect();
+        let clean = path.display().to_string().replace('\\', "/");
+        // Production source only: a test, bench, or example may legitimately
+        // drive a cancelled send to prove cancellation behavior.
+        if clean.contains("/tests/") || clean.contains("/benches/") || clean.contains("/examples/")
+        {
+            return;
+        }
+        let masked = mask_strings_and_comments(text);
+        let test_regions = cfg_test_regions(text);
+        for (open, close) in timeout_call_spans(&masked) {
+            let line = masked[..open].matches('\n').count() + 1;
+            if test_regions
+                .iter()
+                .any(|(start, end)| line >= *start && line < *end)
+            {
+                continue;
+            }
+            let args = split_top_level(&masked[open + 1..close]);
+            if args.len() < 2 {
+                continue;
+            }
+            let tail = args[1..].join(",");
+            let pattern = if tail.contains(".send(") {
+                "a data-carrying send"
+            } else if tail.contains(".write_all(") {
+                "a non-resumable write_all"
+            } else {
+                continue;
+            };
+            if ALLOWED.iter().any(|(file, anchor, _)| {
+                clean.ends_with(file)
+                    && source_lines
+                        .get(line.saturating_sub(1))
+                        .is_some_and(|src| src.contains(anchor))
+            }) {
+                continue;
+            }
+            violations.push(format!("{clean}:{line}: timeout(..) wraps {pattern}"));
+        }
+    });
+    assert!(
+        violations.is_empty(),
+        "a timeout may not wrap a data-carrying send or a non-resumable write (RFD 400 select-loops case study; see the note on this gate): {violations:?}"
+    );
+}
+
+/// Config-holder accessor spellings a static initializer may read.
+///
+/// `holder::config(` / `holder::config_arc(` match every DIRECT path
+/// (`::apexbot_config::holder::config(`, `apexbot_config::holder::config_arc(`,
+/// or a `use apexbot_config::holder;` alias). `stance::config(` is the
+/// apexbot-substrate delegate that forwards to `holder::config()` — the ONE
+/// transitive accessor deliberately followed (documented in the census).
+const CONFIG_HOLDER_READ_TOKENS: [&str; 3] =
+    ["holder::config(", "holder::config_arc(", "stance::config("];
+
+/// Process-once guard type names. A `static` declared with one of these is a
+/// candidate; only the ones whose initialization path reads the holder are hits.
+const PROCESS_ONCE_GUARD_TYPES: [&str; 4] = ["OnceLock", "LazyLock", "OnceCell", "Once"];
+
+/// One candidate `static` item: its name, its 1-based declaration line, and the
+/// concatenated text of every initializer reachable by name in its file — the
+/// declaration's own `= <init>;` plus the argument of any
+/// `<name>.get_or_init(..)` / `.set(..)` / `.lazy(..)` call.
+struct StaticCandidate {
+    name: String,
+    line: usize,
+    init: String,
+}
+
+/// The first index at or after `from` where `needle` appears at top-level
+/// nesting (outside any `()`/`[]`/`{}`). `masked` must already be
+/// string/comment-blanked (see [`mask_strings_and_comments`]) so no literal can
+/// forge a delimiter.
+fn top_level_byte(masked: &str, from: usize, needle: u8) -> Option<usize> {
+    let bytes = masked.as_bytes();
+    let mut depth = 0_i64;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            byte if byte == needle && depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Advance `j` past ASCII whitespace.
+fn skip_ws(bytes: &[u8], mut j: usize) -> usize {
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    j
+}
+
+/// Every `static NAME: <once-guard-type> = <init>;` candidate in `masked`, with
+/// the name-associated initializer text gathered as described on
+/// [`StaticCandidate`].
+fn process_once_static_candidates(masked: &str) -> Vec<StaticCandidate> {
+    let bytes = masked.as_bytes();
+    let needle = b"static";
+    let mut candidates = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        // `&'static` is a lifetime reference, not a static item, and the
+        // keyword must not be the tail of a longer identifier.
+        if i > 0 && (is_ident_byte(bytes[i - 1]) || bytes[i - 1] == b'\'') {
+            i += needle.len();
+            continue;
+        }
+        let mut j = skip_ws(bytes, i + needle.len());
+        // `static mut NAME` — skip the mutability keyword.
+        if masked[j..].starts_with("mut")
+            && !bytes.get(j + 3).is_some_and(|byte| is_ident_byte(*byte))
+        {
+            j = skip_ws(bytes, j + 3);
+        }
+        let name_start = j;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        if name_start == j {
+            i += needle.len();
+            continue;
+        }
+        let name = masked[name_start..j].to_owned();
+        j = skip_ws(bytes, j);
+        if bytes.get(j) != Some(&b':') {
+            i += needle.len();
+            continue;
+        }
+        let colon = j;
+        let Some(eq) = top_level_byte(masked, colon + 1, b'=') else {
+            i += needle.len();
+            continue;
+        };
+        let type_text = &masked[colon + 1..eq];
+        if !PROCESS_ONCE_GUARD_TYPES
+            .iter()
+            .any(|guard| type_text.contains(guard))
+        {
+            i += needle.len();
+            continue;
+        }
+
+        let mut init = String::new();
+        let decl_end = top_level_byte(masked, eq + 1, b';').unwrap_or(bytes.len());
+        init.push_str(&masked[eq + 1..decl_end]);
+        for call in ["get_or_init(", "set(", "lazy("] {
+            let mut k = 0;
+            while let Some(rel) = masked[k..].find(&name) {
+                let at = k + rel;
+                k = at + name.len();
+                // `name` must be a whole identifier, not a prefix/suffix of a
+                // longer one, and the method call may be split across lines
+                // (`NAME\n    .get_or_init(..)`), so whitespace around the
+                // `.` is allowed.
+                if at > 0 && is_ident_byte(bytes[at - 1]) {
+                    continue;
+                }
+                let after = at + name.len();
+                if bytes.get(after).is_some_and(|byte| is_ident_byte(*byte)) {
+                    continue;
+                }
+                let dot = skip_ws(bytes, after);
+                if bytes.get(dot) != Some(&b'.') {
+                    continue;
+                }
+                let call_start = skip_ws(bytes, dot + 1);
+                if !masked[call_start..].starts_with(call) {
+                    continue;
+                }
+                let open = call_start + call.len() - 1;
+                if let Some(close) = matching_paren(bytes, open) {
+                    init.push('\n');
+                    init.push_str(&masked[open + 1..close]);
+                    k = close + 1;
+                }
+            }
+        }
+
+        let line = masked[..i].matches('\n').count() + 1;
+        candidates.push(StaticCandidate { name, line, init });
+        i += needle.len();
+    }
+    candidates
+}
+
+/// Ratchet for the config-holder test seam (chunk SERRGX): every process-once
+/// static whose initialization path reads the config holder must be classified
+/// in `tests/config_derived_statics_census.txt`.
+///
+/// The SERRGX call-site audit made the seam safe but lives only in a result
+/// doc — a SNAPSHOT, not a ratchet. A `OnceLock`/`LazyLock` initialized from
+/// the holder freezes a snapshot; a `reinstall_for_tests` leaves it
+/// stale-able. This gate makes the audit durable: a NEW config-derived
+/// process-once static fails until it is classified (per-read | republishable |
+/// process-lifetime) with a justification.
+///
+/// KNOWN LIMIT, stated rather than papered over: this is a lexical DIRECT-SCAN.
+/// It follows the direct holder accessors plus the one `stance::config()`
+/// delegate hop, and the name-associated `get_or_init`/`set`/`lazy` argument,
+/// but it does NOT follow a helper fn (e.g. `runtime::RUNTIME` ->
+/// `build_runtime()` -> `ambient_io_worker_count()`) nor the leak-on-publish
+/// `RwLock` slots. The census records those blind spots by name. It is a
+/// tripwire for the reintroduction of the direct form, not a proof of absence
+/// for the whole class.
+#[test]
+fn config_derived_statics_are_classified() {
+    use std::collections::BTreeMap;
+
+    let census_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/config_derived_statics_census.txt");
+    let census_text = std::fs::read_to_string(&census_path)
+        .expect("read tests/config_derived_statics_census.txt");
+    let mut census: BTreeMap<String, String> = BTreeMap::new();
+    for (index, raw) in census_text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let key = fields.next().unwrap_or_default().to_owned();
+        let class = fields.next().unwrap_or_default();
+        assert!(
+            key.contains(':'),
+            "census {}:{}: key {key:?} must be `<repo-relative-path>:<STATIC_NAME>`",
+            census_path.display(),
+            index + 1
+        );
+        assert!(
+            matches!(class, "per-read" | "republishable" | "process-lifetime"),
+            "census {}:{}: class {class:?} must be one of per-read | republishable | process-lifetime",
+            census_path.display(),
+            index + 1
+        );
+        census.insert(key, class.to_owned());
+    }
+
+    let root = repo_root();
+    let crates_root = workspace_root().join("crates");
+    let mut hits: BTreeMap<String, usize> = BTreeMap::new();
+    for_each_rust_source(&crates_root, &mut |path, text| {
+        let clean = path.display().to_string().replace('\\', "/");
+        // Production source only: a test, bench, or example may legitimately
+        // hold a test-scoped once-static.
+        if clean.contains("/tests/") || clean.contains("/benches/") || clean.contains("/examples/")
+        {
+            return;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        let masked = mask_strings_and_comments(text);
+        let test_regions = cfg_test_regions(text);
+        for candidate in process_once_static_candidates(&masked) {
+            if test_regions
+                .iter()
+                .any(|(start, end)| candidate.line >= *start && candidate.line < *end)
+            {
+                continue;
+            }
+            if CONFIG_HOLDER_READ_TOKENS
+                .iter()
+                .any(|token| candidate.init.contains(token))
+            {
+                hits.insert(format!("{rel}:{}", candidate.name), candidate.line);
+            }
+        }
+    });
+
+    let unclassified: Vec<String> = hits
+        .keys()
+        .filter(|key| !census.contains_key(*key))
+        .cloned()
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "config-derived process-once static(s) not classified in {}:\n  {}\n\
+         A process-once static initialized from the config holder freezes a \
+         snapshot, so a `reinstall_for_tests` leaves it stale-able. Classify it \
+         (per-read | republishable | process-lifetime) with a one-line \
+         justification, or stop deriving it from the holder.",
+        census_path.display(),
+        unclassified.join("\n  ")
+    );
+
+    let stale: Vec<String> = census
+        .keys()
+        .filter(|key| !hits.contains_key(*key))
+        .cloned()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "stale config-derived-static census entr(ies) in {} (no matching hit; \
+         shrink the census in the same change):\n  {}",
+        census_path.display(),
+        stale.join("\n  ")
+    );
+}
+
+/// ADR-070: the writer fence. `apexbot-db`'s write substrate (the `writer`
+/// feature: the `write/` module, `open_for_writes`, `open_in_memory_for_writes`)
+/// is enabled ONLY by the updater shells; every other crate opens the DB
+/// read-only. A production `src` source in any other crate that names a
+/// write-capable constructor is a fence breach — the source-level gate the
+/// cargo feature alone cannot enforce, because workspace feature unification
+/// re-enables `writer` through a shared updater dependency.
+#[test]
+fn only_the_updater_shells_open_the_db_for_writes() {
+    const WRITER_OWNERS: [&str; 5] = [
+        "apexbot-db",
+        "apexbot-aave",
+        "apexbot-pool-updater",
+        "apexbot-cli-core",
+        "apexbot_rs",
+    ];
+    let forbidden = ["open_for_writes", "open_in_memory_for_writes"];
+    let mut violations = Vec::new();
+    for (name, manifest_path) in workspace_packages() {
+        if !name.starts_with("apexbot") || WRITER_OWNERS.contains(&name.as_str()) {
+            continue;
+        }
+        let Some(crate_dir) = Path::new(&manifest_path).parent() else {
+            continue;
+        };
+        let src = crate_dir.join("src");
+        if !src.exists() {
+            continue;
+        }
+        for_each_rust_source(&src, &mut |path, text| {
+            let clean = path.display().to_string().replace('\\', "/");
+            // Test modules (a `tests.rs` file or a `src/**/tests/` directory)
+            // may exercise the writer; the fence is on production sources.
+            if clean.ends_with("/tests.rs") || clean.contains("/tests/") {
+                return;
+            }
+            let test_regions = cfg_test_regions(text);
+            for (index, line) in text.lines().enumerate() {
+                let line_number = index + 1;
+                if test_regions
+                    .iter()
+                    .any(|(start, end)| line_number >= *start && line_number < *end)
+                {
+                    continue;
+                }
+                for symbol in forbidden {
+                    if line.contains(symbol) {
+                        violations.push(format!("{}:{line_number}: {symbol}", path.display()));
+                    }
+                }
+            }
+        });
+    }
+    assert!(
+        violations.is_empty(),
+        "ADR-070 writer fence breach: a non-updater crate's production source \
+         references a write-capable constructor: {violations:?}"
+    );
+}
+
+/// ADR-070 binding #2b: schema init accepts only (path, flags) — no
+/// data-bearing parameter. `ensure_schema_at_open` and `heal_database` are the
+/// two entry points that build/repair the schema; the DDL is the embedded
+/// constant and the heal reads the file it is handed, so neither may grow a
+/// bytes/rows/schema-content argument. A TEXT gate on the parameter types.
+#[test]
+fn schema_init_functions_accept_only_path_and_flags() {
+    let db_src = workspace_root().join("crates/foundation/apexbot-db/src");
+    let cases = [
+        ("migrate.rs", "ensure_schema_at_open"),
+        ("heal.rs", "heal_database"),
+    ];
+    let allowed = ["&Path", "bool", "F"];
+    let mut violations = Vec::new();
+    for (file, function) in cases {
+        let path = db_src.join(file);
+        let text = std::fs::read_to_string(&path).expect("read schema-init source");
+        for ty in param_types_of(&text, function) {
+            if !allowed.contains(&ty.as_str()) {
+                violations.push(format!("{file}: {function} parameter type {ty:?}"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "ADR-070 binding #2b breach: schema init grew a data-bearing parameter: {violations:?}"
+    );
+}
+
+/// The declared parameter types of `fn <name>` in `text` (masked, so a
+/// parenthesized default or a comment cannot confuse the scan).
+fn param_types_of(text: &str, function: &str) -> Vec<String> {
+    let masked = mask_strings_and_comments(text);
+    let bytes = masked.as_bytes();
+    let needle = format!("fn {function}");
+    let start = masked.find(&needle).expect("function present");
+    let open = start + masked[start..].find('(').expect("parameter list");
+    let close = matching_paren(bytes, open).expect("matching paren");
+    let inner = &masked[open + 1..close];
+    split_top_level(inner)
+        .into_iter()
+        .filter(|param| !param.trim().is_empty())
+        .map(|param| {
+            param
+                .split_once(':')
+                .expect("parameter has a type")
+                .1
+                .trim()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// ADR-084 D1: the capability catalog is authoritative and mechanically
+/// pinned. `docs/capabilities.md` must name every publishable crate at least
+/// once, every home path must resolve against the module tree, every umbrella
+/// alias must land on a catalogged crate, and the console rows must carry the
+/// consumer (v) task.
+#[test]
+fn capability_catalog_covers_every_public_crate() {
+    let catalog_path = repo_root().join("docs/capabilities.md");
+    let catalog = std::fs::read_to_string(&catalog_path).expect("read docs/capabilities.md");
+
+    // Parse catalog table rows (skip header and separator lines).
+    let rows: Vec<Vec<String>> = catalog
+        .lines()
+        .filter(|line| line.trim_start().starts_with("| **"))
+        .map(catalog_cells)
+        .collect();
+    assert!(
+        rows.len() >= 30,
+        "capability catalog lost rows: {}",
+        rows.len()
+    );
+
+    // Publishable workspace members (publish != []).
+    let (publishable, manifest_of) = publishable_members();
+    assert!(!publishable.is_empty(), "cargo metadata found no members");
+
+    // Homes named by the catalog.
+    let mut catalogged = std::collections::BTreeSet::<String>::default();
+    for row in &rows {
+        assert!(row.len() >= 6, "catalog row malformed: {row:?}");
+        for token in backtick_spans(&row[1]) {
+            if !token.starts_with("apexbot") {
+                continue;
+            }
+            let mut parts = token.split("::");
+            let crate_name = parts.next().expect("crate token");
+            let package_name = crate_name.replace('_', "-");
+            assert!(
+                publishable.contains(&package_name),
+                "catalog home {crate_name:?} is not a publishable workspace member"
+            );
+            let modules: Vec<&str> = parts.collect();
+            if !modules.is_empty() {
+                let src = Path::new(manifest_of.get(&package_name).expect("manifest"))
+                    .parent()
+                    .expect("manifest parent")
+                    .join("src");
+                resolve_module_path(&src, &modules, &token);
+            }
+            catalogged.insert(package_name);
+        }
+    }
+
+    // Every publishable crate appears at least once.
+    let uncovered: Vec<&String> = publishable.difference(&catalogged).collect();
+    assert!(
+        uncovered.is_empty(),
+        "publishable crates missing from docs/capabilities.md: {uncovered:?} \
+         (add a catalog row or make the crate unpublishable)"
+    );
+
+    // Every umbrella alias lands on a catalogged crate, and the catalog's
+    // stated alias count matches the facade (the umbrella row is the map).
+    let facade_lib =
+        std::fs::read_to_string(workspace_root().join("crates/facade/apexbot/src/lib.rs"))
+            .expect("read facade lib.rs");
+    assert_umbrella_aliases_catalogged(&facade_lib, &catalogged);
+
+    // The console rows carry consumer (v).
+    for row in &rows {
+        let console_row = backtick_spans(&row[1])
+            .iter()
+            .any(|t| t.starts_with("apexbot_cli"));
+        if console_row {
+            assert!(
+                row[4].contains("(v)"),
+                "console catalog row lost consumer (v): {row:?}"
+            );
+        }
+    }
+}
+
+/// Split a markdown table row into cells (leading empty cell dropped).
+fn catalog_cells(line: &str) -> Vec<String> {
+    line.split('|')
+        .map(str::trim)
+        .map(str::to_owned)
+        .skip(1)
+        .collect()
+}
+
+/// Backtick-delimited spans in `s` (the odd-indexed segments of a split on
+/// the backtick character).
+fn backtick_spans(s: &str) -> Vec<String> {
+    s.split('`')
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .map(|(_, span)| span.to_owned())
+        .collect()
+}
+
+/// Every segment of `modules` must be a declared `pub mod` or a real file
+/// under `src` — the catalog may not name a path that does not compile.
+fn resolve_module_path(src: &Path, modules: &[&str], token: &str) {
+    let mut dir = src.to_path_buf();
+    for segment in modules {
+        let file = dir.join(format!("{segment}.rs"));
+        let nested = dir.join(segment).join("mod.rs");
+        let declared = file.exists()
+            || nested.exists()
+            || mod_declared_in(&dir.join("lib.rs"), segment)
+            || mod_declared_in(&dir.join("mod.rs"), segment);
+        assert!(
+            declared,
+            "catalog home {token:?}: segment {segment:?} does not resolve under {}",
+            src.display()
+        );
+        dir = dir.join(segment);
+    }
+}
+
+fn mod_declared_in(file: &Path, segment: &str) -> bool {
+    match std::fs::read_to_string(file) {
+        Ok(text) => text.lines().any(|line| {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub mod ") else {
+                return false;
+            };
+            let name = rest.trim_end_matches([';', '{']).trim();
+            name == segment
+        }),
+        Err(_) => false,
+    }
+}
+
+/// Publishable workspace members (`publish != []`) with their manifest paths.
+fn publishable_members() -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut publishable = std::collections::BTreeSet::<String>::default();
+    let mut manifest_of = std::collections::BTreeMap::<String, String>::default();
+    let out = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(manifest_flag())
+        .arg("--no-deps")
+        .output()
+        .expect("cargo metadata spawn");
+    assert!(out.status.success(), "cargo metadata failed");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("cargo metadata json");
+    for package in v["packages"].as_array().expect("packages array") {
+        let name = package["name"].as_str().expect("name").to_owned();
+        if package["publish"].as_array().is_some() {
+            continue; // publish = [] -> unpublishable
+        }
+        publishable.insert(name.clone());
+        manifest_of.insert(
+            name,
+            package["manifest_path"]
+                .as_str()
+                .expect("manifest")
+                .to_owned(),
+        );
+    }
+    (publishable, manifest_of)
+}
+
+/// Every umbrella alias lands on a catalogged crate, and the catalog's stated
+/// alias count matches the facade (the umbrella row is the capability map).
+fn assert_umbrella_aliases_catalogged(
+    facade_lib: &str,
+    catalogged: &std::collections::BTreeSet<String>,
+) {
+    let alias_count = facade_lib
+        .lines()
+        .filter(|line| line.trim().starts_with("pub use apexbot"))
+        .count();
+    assert_eq!(
+        alias_count, 49,
+        "the umbrella alias count moved; update the catalog row that states it"
+    );
+    for line in facade_lib.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub use apexbot") else {
+            continue;
+        };
+        let end = rest
+            .find("::")
+            .or_else(|| rest.find(" as "))
+            .expect("alias target");
+        let target = format!("apexbot{}", &rest[..end]).replace('_', "-");
+        assert!(
+            catalogged.contains(&target),
+            "umbrella alias target {target:?} has no docs/capabilities.md row"
+        );
+    }
+}
+
+/// Expand charter rules into per-crate (crate, forbidden prefixes) pairs.
+fn expand_charter_rules(
+    rules: &[(Vec<String>, Vec<String>, Vec<String>)],
+    members: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut checks: Vec<(String, Vec<String>)> = Vec::new();
+    for (targets, prefixes, except) in rules {
+        if targets.len() == 1 && targets[0] == "*" {
+            for member in members {
+                if except.contains(member) {
+                    continue;
+                }
+                checks.push((member.clone(), prefixes.clone()));
+            }
+        } else {
+            for target in targets {
+                assert!(
+                    members.contains(target),
+                    "charter rule names non-member crate {target:?}"
+                );
+                checks.push((target.clone(), prefixes.clone()));
+            }
+        }
+    }
+    checks
+}
+
+/// ADR-084 D3: the dependency charter is the published contract. Every rule
+/// in `dependency_charter.txt` is asserted over `cargo tree -p X -e normal`
+/// at single-package, default-feature resolution.
+#[test]
+fn dependency_charter_is_respected() {
+    let charter_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dependency_charter.txt");
+    let charter = std::fs::read_to_string(&charter_path).expect("read dependency_charter.txt");
+
+    // Publishable workspace members.
+    let out = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(manifest_flag())
+        .arg("--no-deps")
+        .output()
+        .expect("cargo metadata spawn");
+    assert!(out.status.success(), "cargo metadata failed");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("cargo metadata json");
+    let members: Vec<String> = v["packages"]
+        .as_array()
+        .expect("packages array")
+        .iter()
+        .filter(|package| package["publish"].as_array().is_none())
+        .filter_map(|package| package["name"].as_str())
+        .map(str::to_owned)
+        .collect();
+    assert!(!members.is_empty(), "no publishable members found");
+
+    // Parse rules.
+    let mut rules: Vec<(Vec<String>, Vec<String>, Vec<String>)> = Vec::new();
+    for line in charter.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (head, except) = match line.split_once(';') {
+            Some((head, except)) => (
+                head,
+                except
+                    .trim()
+                    .strip_prefix("except")
+                    .expect("except clause")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+            ),
+            None => (line, Vec::new()),
+        };
+        let (targets, prefixes) = head
+            .split_once(':')
+            .expect("charter rule needs `<targets> : <prefixes>`");
+        let targets = targets
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let prefixes = prefixes
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            !targets.is_empty() && !prefixes.is_empty(),
+            "empty rule: {line}"
+        );
+        rules.push((targets, prefixes, except));
+    }
+    assert!(!rules.is_empty(), "dependency charter lost its rules");
+
+    // Expand rules into (crate, forbidden prefixes) pairs.
+    let checks = expand_charter_rules(&rules, &members);
+    assert!(
+        checks.len() >= 30,
+        "charter coverage collapsed: {} checks",
+        checks.len()
+    );
+
+    let mut violations: Vec<String> = Vec::new();
+    for (crate_name, prefixes) in &checks {
+        let tree = cargo_tree_of(crate_name);
+        for line in tree.lines().skip(1) {
+            // Strip the tree glyphs, then take `<name>` from `<name> v<version>`.
+            // Unicode box-drawing glyphs (`│ ├── └ ─`), not ASCII, prefix
+            // every non-root tree line.
+            let entry = line
+                .trim_start_matches([' ', '│', '├', '└', '─', '|', '`', '+', '-', '\\'])
+                .trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let name = entry.split(" v").next().unwrap_or(entry).trim();
+            if name.is_empty() {
+                continue;
+            }
+            for prefix in prefixes {
+                if name.starts_with(prefix.as_str()) {
+                    violations.push(format!("{crate_name}: {name} (prefix {prefix})"));
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "dependency charter violations (ADR-084 D3): {violations:#?}"
+    );
+}
+
+/// ADR-084 D4: capability layers, honestly named — edge direction is enforced
+/// over the `role_edge_direction_census.txt` allowlist, which can only shrink.
+#[test]
+fn role_edge_direction_is_enforced() {
+    let census_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/role_edge_direction_census.txt");
+    let census =
+        std::fs::read_to_string(&census_path).expect("read role_edge_direction_census.txt");
+    let allowed: std::collections::BTreeSet<String> = census
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            line.split(" :")
+                .next()
+                .expect("allowlist row")
+                .trim()
+                .to_owned()
+        })
+        .collect();
+
+    let out = Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--manifest-path")
+        .arg(manifest_flag())
+        .arg("--no-deps")
+        .output()
+        .expect("cargo metadata spawn");
+    assert!(out.status.success(), "cargo metadata failed");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("cargo metadata json");
+
+    // Role rank per member: foundation=0 < engine=1 < integrations=2.
+    // shells/facade compose and stay unranked.
+    let rank = |role: &str| match role {
+        "foundation" => Some(0u8),
+        "engine" => Some(1),
+        "integrations" => Some(2),
+        _ => None,
+    };
+    let mut role_of = std::collections::BTreeMap::<String, String>::default();
+    let mut deps_of = std::collections::BTreeMap::<String, Vec<String>>::default();
+    for package in v["packages"].as_array().expect("packages array") {
+        let name = package["name"].as_str().expect("name").to_owned();
+        let manifest = package["manifest_path"].as_str().expect("manifest");
+        let crates_marker = format!("{}/crates/", workspace_root().display());
+        if let Some(rest) = manifest.strip_prefix(&crates_marker) {
+            role_of.insert(
+                name.clone(),
+                rest.split('/').next().expect("role").to_owned(),
+            );
+        }
+        let deps: Vec<String> = package["dependencies"]
+            .as_array()
+            .expect("dependencies array")
+            .iter()
+            .filter(|d| d["kind"].as_str().is_none())
+            .filter_map(|d| d["name"].as_str())
+            .filter(|n| n.starts_with("apexbot"))
+            .map(str::to_owned)
+            .collect();
+        deps_of.insert(name, deps);
+    }
+    assert!(role_of.len() >= 30, "role map collapsed: {}", role_of.len());
+
+    let mut violations: Vec<String> = Vec::new();
+    for (dependent, role) in &role_of {
+        let Some(dependent_rank) = rank(role) else {
+            continue;
+        };
+        for dep in &deps_of[dependent] {
+            let Some(dep_role) = role_of.get(dep) else {
+                continue;
+            };
+            let Some(dep_rank) = rank(dep_role) else {
+                continue;
+            };
+            if dep_rank <= dependent_rank {
+                continue;
+            }
+            let edge = format!("{dependent} -> {dep}");
+            if !allowed.contains(&edge) {
+                violations.push(format!(
+                    "{edge} ({dependent}:{role} depends on {dep}:{dep_role})"
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "upward role edges outside the census (ADR-084 D4,          role_edge_direction_census.txt): {violations:#?}"
+    );
+}
+
+/// ADR-084 D2/W2: the solve door census is the external naming surface. No
+/// crate outside `apexbot-pools` may name a solve-tree module that is not in
+/// `solve_door_census.txt` (or a `pools::affected_keys` path — the module
+/// moved to the pools root as `affected`).
+#[test]
+fn solve_door_census_is_the_external_surface() {
+    let census = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/solve_door_census.txt"),
+    )
+    .expect("read solve_door_census.txt");
+    let allowed: std::collections::BTreeSet<String> = census
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        allowed.contains("apexbot_pools::solve"),
+        "solve door census lost its root door"
+    );
+
+    // Every `apexbot_pools::solve::<segment>` (and the retired
+    // `affected_keys`) path named outside the pools crate, collected from
+    // source with an anchored scan — the same command family the census was
+    // generated from, over the union of fully-qualified and bare-import
+    // (`use apexbot_pools::solve;` + `solve::…`) reference forms.
+    let mut files = Vec::new();
+    for root in ["crates", "../examples"] {
+        collect_rust_sources(&workspace_root().join(root), &mut files);
+    }
+    let mut offenders: Vec<String> = Vec::new();
+    for file in &files {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        if file.to_string_lossy().contains("apexbot-pools")
+            || file.file_name().and_then(|n| n.to_str()) == Some("architecture_gates.rs")
+        {
+            continue;
+        }
+        for (offset, _) in text.match_indices("solve::") {
+            // The path segment before `solve::` decides the form: a
+            // `apexbot_pools::` prefix is fully qualified; a start-of-path
+            // segment is a bare import — considered only when the file
+            // imports the solve door.
+            let prefix_start = text[..offset]
+                .rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
+                .map_or(0, |i| i + 1);
+            let prefix = &text[prefix_start..offset];
+            let qualified_form = prefix == "apexbot_pools::";
+            let bare_form = prefix.is_empty() && text.contains("use apexbot_pools::solve");
+            if !qualified_form && !bare_form {
+                continue;
+            }
+            let segments: Vec<&str> = text[offset..]
+                .trim_start_matches("solve::")
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|s| !s.is_empty())
+                .collect();
+            let Some(first) = segments.first() else {
+                continue;
+            };
+            // Retired module names must never reappear in external naming.
+            let retired = [
+                "mixed",
+                "profit_envelope",
+                "affected_keys",
+                "capture_fixture",
+            ];
+            if retired.contains(first) {
+                offenders.push(format!(
+                    "{}: retired solve path segment `{first}`",
+                    file.display()
+                ));
+                continue;
+            }
+            if qualified_form {
+                // The physical `pub mod` tree beneath the solve door. A named
+                // segment must be a census row's module (or a retired name,
+                // caught above); anything else is a door item at the root
+                // door, which the census closes over by construction.
+                const SOLVE_SUBMODULES: [&str; 10] = [
+                    "basket",
+                    "concentrated_liquidity",
+                    "fixtures",
+                    "gate",
+                    "mixed",
+                    "mobius_int",
+                    "mobius_int_exact",
+                    "mobius_shifted_piece",
+                    "profit_envelope",
+                    "runtime",
+                ];
+                if SOLVE_SUBMODULES.contains(first) {
+                    let path = format!("apexbot_pools::solve::{first}");
+                    if !allowed.contains(&path) {
+                        offenders.push(format!(
+                            "{}: solve path outside the census: {path}",
+                            file.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "external solve-tree naming outside the census (ADR-084 D2): {offenders:#?}"
+    );
+}
+
+/// Collect `.rs` files under `dir` (bounded: the workspace source tree).
+fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_sources(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// ADR-084 W5 phase 0: the `apexbot-pools` root surface is pinned by
+/// `pools_root_surface_census.txt` (review-required diff). A module added,
+/// removed, or re-homed at the pools root must review the snapshot in the
+/// same change; the root `pub` item count is asserted so untracked surface
+/// growth fails loudly.
+#[test]
+fn pools_root_surface_is_pinned() {
+    // The root `pub` item count is part of the pin. ONE const: the count and
+    // the failure message derive from it, so a snapshot bump is one edit.
+    const POOLS_ROOT_PUB_ITEMS: usize = 680;
+    let census = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pools_root_surface_census.txt"),
+    )
+    .expect("read pools_root_surface_census.txt");
+
+    // Pinned modules -> target capability rows.
+    let mut pinned = std::collections::BTreeMap::<String, String>::default();
+    for line in census.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (module, target) = line
+            .split_once(' ')
+            .expect("census row format: `<module> <target>`");
+        pinned.insert(module.to_owned(), target.to_owned());
+    }
+    assert_eq!(
+        pinned.len(),
+        4,
+        "the pools root surface moved off 4 capability modules; review the W5 snapshot"
+    );
+
+    // Live root modules.
+    let lib = std::fs::read_to_string(
+        workspace_root().join("crates/foundation/apexbot-pools/src/lib.rs"),
+    )
+    .expect("read pools lib.rs");
+    let mut live = std::collections::BTreeSet::<String>::default();
+    for line in lib.lines() {
+        if let Some(module) = line.trim().strip_prefix("pub mod ") {
+            live.insert(module.trim_end_matches(';').trim().to_owned());
+        }
+    }
+    assert_eq!(
+        live.len(),
+        pinned.len(),
+        "pools root `pub mod` count changed (live {live:?} vs pinned);          review tests/pools_root_surface_census.txt"
+    );
+    for module in &live {
+        assert!(
+            pinned.contains_key(module),
+            "pools root module {module:?} is not in the W5a snapshot; review the census"
+        );
+    }
+
+    let item_count =
+        count_pub_items(&workspace_root().join("crates/foundation/apexbot-pools/src"));
+    assert_eq!(
+        item_count, POOLS_ROOT_PUB_ITEMS,
+        "pools root `pub` item count moved from the pinned snapshot ({POOLS_ROOT_PUB_ITEMS});          review tests/pools_root_surface_census.txt before growing the surface"
+    );
+}
+
+/// Count `pub` declarations in every `.rs` file under `dir` (the plan's
+/// appendix census regex).
+fn count_pub_items(dir: &Path) -> usize {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    for line in text.lines() {
+                        let line = line.trim_start();
+                        if line.starts_with("pub ")
+                            && [
+                                "fn ", "struct ", "enum ", "trait ", "mod ", "const ", "type ",
+                                "use ",
+                            ]
+                            .iter()
+                            .any(|kw| line[4..].starts_with(kw))
+                        {
+                            total += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    total
+}

@@ -1,0 +1,112 @@
+[package]
+name = "apexbot-submission"
+description = "Pure-Rust EIP-1559 transaction signing + fee finalization — operator-key holding LocalSigner + TxEnvelope/Typed2718 type-2 encoding."
+keywords = ["mev", "eip-1559", "signing", "transactions"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+alloy = { version = "^2.5", features = ["full", "signer-local", "network"] }
+# The relay POSTs (flashbots-compatible eth_sendBundle over HTTPS). Ordered
+# fan-out lives in relay.rs; rustls matches the bot crate's reqwest pinned
+# feature set (# no default-tls native openssl).
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+apexbot-core.workspace = true
+# The per-process event hub: the backrun driver registers the MEVBlocker feed's
+# PendingTx drop-oldest ring on it (Phase B1).
+apexbot-eventhub.workspace = true
+# The typed config schema + 12-factor loader: the hosted boot sources every
+# migrated knob from the loaded `BotConfig` (a backrun facet +
+# logging artifacts) and resolves the chain-node join through the shared
+# `APEXBOT_RPC_HTTP_CHAINID_<id>`/`APEXBOT_DB_PATH` resolvers.
+apexbot-config.workspace = true
+# T4 economics metrics record through the bot crate's instruments module —
+# one-way (bot never depends on submission); default builds get the inert
+# stub twin so this adds no metrics code without the `otel` feature.
+apexbot-bot.workspace = true
+apexbot-substrate.workspace = true
+# `AlloyProvider` (the typed `eth_sendRawTransaction`/`eth_feeHistory`/
+# `eth_createAccessList` surfaces the N6 submit orchestration consumes —
+# typed, with no `make_request` escape hatch).
+apexbot-rpc.workspace = true
+# Per-session run artifacts: the driver's stdout fmt sink and the default
+# JSONL trace path. The `tracing` feature supplies the MakeWriter bridge.
+apexbot-runs = { workspace = true, features = ["tracing"] }
+# The frame pipeline: frame-replay seam + journal-pool extraction
+# (apexbot-simulation) over the bot crate's workspace/planning scope.
+apexbot-simulation.workspace = true
+# The zero-warmup `WarmupSlots` the frame-replay handle's override set rides.
+apexbot-executor.workspace = true
+# The journal extractor's descriptor-map type (`extract_pool_post_states`).
+hashbrown.workspace = true
+# Slot layouts (V2 reserves slot, CL slot0/tick layouts) + `ConcentratedLiquiditySlotLayout`.
+apexbot-pools.workspace = true
+# `WarmCodeCacheInner::shared_default()` returns a parking_lot RwLock.
+parking_lot = "^0.13" 
+apexbot-decoders.workspace = true
+# The DB-backed connector index reads the
+# workspace DB once at startup.
+apexbot-db.workspace = true
+
+# V3 pool CREATE2 resolution (the router wire never names the pool).
+apexbot-uniswap.workspace = true
+thiserror = { version = "^2.0" }
+# OTel tier-1 spans: plain `tracing` spans - the
+# process-wide subscriber (apexbot-bot/apexbot-python) exports them;
+# no OTel dependency here (core-crate rule).
+tracing = { version = "^0.1" }
+# Console subscriber for process entrypoints (observe-mode visibility; the
+# OTel layering is the bot crates job).
+tracing-subscriber = { version = "^0.3", default-features = false, features = ["std", "registry", "fmt", "env-filter"
+, "time"
+] }
+# Async runtime for the dispatcher's `active_tasks` `JoinSet` (auto-discards
+# completed tasks) + the by-reference `current_block` `Mutex<u64>` clock read
+# across consumer/monitor task boundaries (ADR-005 standalone core).
+tokio = { version = "^1.54", features = ["rt", "sync", "time", "macros"] }
+
+# The anchored touched-set discovery walker: the frame pipeline's cycle
+# finder runs the shared pathfinding DFS over the connector index's edge set.
+apexbot-pathfinding.workspace = true
+
+# Gated (not default) so pure-Rust consumers build without pulling pyo3.
+# Enables `impl From<apexbot_submission::SubmissionError> for pyo3::PyErr` so
+# the `apexbot-python` binding layer can `?`-propagate signing/fee errors as a
+# `PyErr` (mirrors `apexbot-core`/`apexbot-price`'s `pyo3` feature).
+pyo3 = { version = "^0.30", features = ["abi3-py312", "serde"], optional = true }
+
+# Backrun bundle submission: WS relay to searchers.mevblocker.io.
+serde_json = { version = "^1.0" }
+futures-util = { version = "^0.3", default-features = false, features = ["async-await", "std"] }
+tokio-tungstenite = { version = "^0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# `test-utils` gates `AlloyProvider::from_provider` (the mock-transport
+# constructor) so the §4.2 wire-shape tests can drive the submit orchestration
+# without a live RPC. Production builds (the umbrella, the cdylib) never
+# enable this feature.
+apexbot-rpc = { workspace = true, features = ["test-utils"] }
+# The frame-pipeline fixture test hand-builds `ReplayOutcome` journals
+# (revm state) to drive replay→extract→admit→solve end-to-end offline.
+revm = { version = "^43.0", default-features = false, features = ["std"] }
+# The registry-resolver fixture seeds a throwaway connector DB on disk (the
+# resolver opens the path, so an in-memory handle cannot stand in).
+tempfile = { version = "^3.27" }
+serde_json = { version = "^1.0" }
+futures-util = { version = "^0.3", default-features = false, features = ["async-await", "std"] }
+tokio-tungstenite = { version = "^0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+proptest = "^1.12"
+
+[features]
+default = []
+# Enables `impl From<SubmissionError> for pyo3::PyErr`. Enabled by the
+# `apexbot-python` binding crate; never enabled by the umbrella.
+pyo3 = ["dep:pyo3"]

@@ -1,0 +1,28 @@
+[package]
+name = "apexbot-stubgen"
+description = "ADR-066 D1/D2: generates the committed `src/apexbot/_ffi/` stub tree from the introspection chunks embedded in a cdylib built with the binding layer's `experimental-inspect` feature. Invoked by `just gen-stubs`."
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+# The typed config projection's declaration tables: `config_schema!` emits
+# SCHEMA (every key with its kind) and SECTION_PATHS from the same arms as the
+# runtime machinery in the binding layer, and the generator splices the typed
+# `__getattr__` overload face from them (ADR-066 D3; see src/config_projection.rs).
+apexbot-config = { workspace = true }
+# Tracks the workspace `pyo3` pin in lockstep (ADR-066): a pyo3 bump implies a
+# generator bump and a fresh stub diff.
+pyo3-introspection = "0.30.1"
+# The manifest-vs-runtime gate reads the cdylib's symbol table from the same
+# object-file parse pyo3-introspection performs for its chunks; the version
+# range matches so both parses share one binary parser.
+goblin = ">=0.9, <0.11"

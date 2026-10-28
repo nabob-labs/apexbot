@@ -23,16 +23,10 @@ import pytest
 from apexbot._ffi import Bot
 from apexbot.arbitrage.engine_registry import ArbitrageEngine, EngineRegistry
 from apexbot.constants import ZERO_ADDRESS
-from apexbot.database.models import Erc20TokenTable, UniswapV2PoolTable
-from apexbot.database.models.base import ExchangeTable
-from apexbot.database.operations import (
-    create_new_sqlite_database,
-    get_scoped_sqlite_session,
-)
-from apexbot.database.session_manager import DatabaseSessionManager
-from apexbot.pathfinding import find_paths_async
+from apexbot.pathfinding import PathfindingRequest, PoolKind, find_paths_async
 from apexbot.runner.build_paths import resolve_directions
 from apexbot.types.chain import ChainId
+from tests.helpers.database import seed_v2_topology
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v2_pool_factory import make_v2_pool
 
@@ -61,59 +55,20 @@ _RESERVES: dict[str, tuple[int, int]] = {
 }
 
 
-def _build_file_db(db_path: pathlib.Path) -> DatabaseSessionManager:
+def _build_file_db(db_path: pathlib.Path) -> pathlib.Path:
     """Seed a file-backed temp SQLite with two V2 pools forming a WETH-A-WETH cycle.
 
     Same pattern as tests/pathfinding/test_permutation_filter_min_depth.py.
     """
-    create_new_sqlite_database(db_path)
-    scoped = get_scoped_sqlite_session(database_path=db_path)
-
-    session = scoped()
-    try:
-        exchange = ExchangeTable(
-            chain_id=CHAIN,
-            name="test",
-            active=True,
-            factory=ZERO_ADDRESS,
-        )
-        session.add(exchange)
-        session.flush()
-
-        weth = Erc20TokenTable(chain=CHAIN, address=WETH_ADDR, symbol="WETH")
-        token_a = Erc20TokenTable(chain=CHAIN, address=TOKEN_A_ADDR, symbol="A")
-        session.add_all([weth, token_a])
-        session.flush()
-
-        session.add(
-            UniswapV2PoolTable(
-                address=POOL_A_ADDR,
-                chain=CHAIN,
-                token0_id=weth.id,
-                token1_id=token_a.id,
-                exchange_id=exchange.id,
-                fee_token0=3,
-                fee_token1=3,
-                fee_denominator=1000,
-            )
-        )
-        session.add(
-            UniswapV2PoolTable(
-                address=POOL_B_ADDR,
-                chain=CHAIN,
-                token0_id=token_a.id,
-                token1_id=weth.id,
-                exchange_id=exchange.id,
-                fee_token0=3,
-                fee_token1=3,
-                fee_denominator=1000,
-            )
-        )
-        session.commit()
-    finally:
-        session.close()
-
-    return DatabaseSessionManager(scoped)
+    seed_v2_topology(
+        db_path,
+        [
+            (POOL_A_ADDR, WETH_ADDR, TOKEN_A_ADDR),
+            (POOL_B_ADDR, TOKEN_A_ADDR, WETH_ADDR),
+        ],
+        chain_id=CHAIN,
+    )
+    return db_path
 
 
 @pytest.fixture
@@ -155,16 +110,18 @@ async def test_synthetic_v2_round_trip_registers_and_eager_solves(db) -> None:
         POOL_B_ADDR: (token_a, weth),
     }
 
-    # Discover the WETH→A→WETH 2-hop cycle from the in-memory DB.
+    # Discover the WETH→A→WETH 2-hop cycle from the file-backed DB.
     discovered = [
         path
         async for path in find_paths_async(
-            db=db,
-            chain_id=CHAIN,
-            start_tokens=[WETH_ADDR],
-            end_tokens=[WETH_ADDR],
-            max_depth=2,
-            pool_types=[UniswapV2PoolTable],
+            request=PathfindingRequest(
+                database_path=db,
+                chain_id=CHAIN,
+                start_tokens=[WETH_ADDR],
+                end_tokens=[WETH_ADDR],
+                max_depth=2,
+                pool_types=[PoolKind.V2],
+            )
         )
     ]
     assert discovered, "pathfinder found no WETH-A-WETH cycle in the seeded DB"
@@ -202,7 +159,7 @@ async def test_synthetic_v2_round_trip_registers_and_eager_solves(db) -> None:
             )
 
     # The engine adopts the shared core (ADR-006 D1). The synthetic test's job
-    # is registration/solve, not the bot= production path (covered by VQURUB's
+    # is registration/solve, not the bot= production path (covered by the
     # FakeBot test) — use the engine seam directly with a bare shared Bot.
     registry = EngineRegistry(
         bot=None,

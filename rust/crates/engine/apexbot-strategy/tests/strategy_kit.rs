@@ -1,0 +1,96 @@
+//! ADR-061 D3 declared==wired pin: every plane strategy's kit-cell
+//! declaration must match what the kit actually composes.
+//!
+//! The declaration lives in `apexbot_strategy::strategy_kit::STRATEGY_CELLS`;
+//! this test is the mechanical enforcement. A flipped declaration must fail
+//! one of these asserts.
+
+#![expect(clippy::expect_used)]
+
+use std::sync::Arc;
+
+use apexbot_strategy::strategy_kit::{declared_cells, StrategyCell, StrategyKit, STRATEGY_CELLS};
+use apexbot_strategy::StrategyName;
+use apexbot_substrate::connector_index::V2ConnectorIndex;
+use apexbot_substrate::pool_ingress::VerifyLevel;
+use apexbot_substrate::RouteRegistry;
+
+fn registry() -> Arc<RouteRegistry> {
+    Arc::new(RouteRegistry::new(V2ConnectorIndex::default()))
+}
+
+#[test]
+fn every_plane_strategy_has_exactly_one_declaration_row() {
+    for name in StrategyName::ALL {
+        let rows: Vec<_> = STRATEGY_CELLS.iter().filter(|(n, _)| *n == name).collect();
+        assert_eq!(rows.len(), 1, "{} must have exactly one row", name.as_str());
+
+        let declared = rows[0].1;
+        assert_eq!(declared_cells(name), Some(declared));
+
+        let mut seen = Vec::new();
+        for cell in declared {
+            assert!(
+                !seen.contains(cell),
+                "{}: duplicate {} cell",
+                name.as_str(),
+                cell.label()
+            );
+            seen.push(*cell);
+        }
+    }
+}
+
+#[test]
+fn declared_rows_match_the_kit_composition() {
+    // The kit's struct shape is the composition it can carry; a new shared
+    // capability edits the struct and the backrun rows in one diff.
+    assert_eq!(
+        StrategyKit::COMPOSED_CELLS,
+        [StrategyCell::Provision, StrategyCell::Discovery]
+    );
+    for name in [StrategyName::MevblockerBackrun, StrategyName::TxpoolBackrun] {
+        assert_eq!(
+            declared_cells(name).expect("row"),
+            &StrategyKit::COMPOSED_CELLS[..],
+            "{} must declare exactly the kit's composition",
+            name.as_str()
+        );
+    }
+    // Settlement is the pump self-driving special case (the settlement
+    // ledger): it resolves no kit.
+    assert!(
+        declared_cells(StrategyName::Settlement)
+            .expect("row")
+            .is_empty(),
+        "settlement composes no kit cell"
+    );
+}
+
+#[test]
+fn cell_vocabulary_is_exactly_the_live_cells() {
+    // The kit's vocabulary is extracted by subtraction: a slot with a
+    // consumer stays out, so the closed set is exactly what the kit wires.
+    assert_eq!(
+        StrategyCell::ALL,
+        [StrategyCell::Provision, StrategyCell::Discovery],
+        "the cell vocabulary is closed and live-only"
+    );
+}
+
+#[test]
+fn resolved_kit_cells_track_the_wired_handles() {
+    let db_only = StrategyKit::resolve(None, None, None, VerifyLevel::default(), None);
+    assert_eq!(db_only.cells(), vec![StrategyCell::Provision]);
+    assert!(db_only.dfs().is_none());
+    assert!(db_only.registry().is_none());
+
+    let discovered =
+        StrategyKit::resolve(Some(registry()), None, None, VerifyLevel::default(), None);
+    assert_eq!(
+        discovered.cells(),
+        vec![StrategyCell::Provision, StrategyCell::Discovery]
+    );
+    assert!(discovered.dfs().is_some());
+    assert!(discovered.registry().is_some());
+}

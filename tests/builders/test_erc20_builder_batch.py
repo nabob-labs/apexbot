@@ -1,4 +1,4 @@
-"""CDJEPJ-2: Erc20Builder.build_many batches per-pool token metadata reads.
+"""Erc20Builder.build_many batches per-pool token metadata reads.
 
 `_build_v4_managed` used to call `_erc20_builder.build(currency0)` then
 `_erc20_builder.build(currency1)` — two SERIAL network `fetch_erc20_metadata`
@@ -6,7 +6,7 @@ round-trips (each 3 eth_calls on a metadata miss). `build_many` collapses the
 network-missing set into ONE `io.fetch_erc20_metadata_batch([a, b])` Multicall3
 `aggregate3` eth_call.
 
-RED: before CDJEPJ-2 there was no `build_many` (and two separate
+Previously there was no `build_many` (and two separate
 `fetch_erc20_metadata` reads); GREEN: one `fetch_erc20_metadata_batch` call.
 """
 
@@ -17,7 +17,6 @@ import json
 from apexbot._ffi import Bot
 from apexbot._ffi.provider import AlloyProvider as RustAlloyProvider
 from apexbot.builders.erc20_builder import Erc20Builder
-from apexbot.database.session_manager import DatabaseSessionManager
 from apexbot.registry import TokenRegistry
 
 TOKEN_A = "0x00000000000000000000000000000000000000A1"
@@ -64,10 +63,9 @@ class _RecFakeIo:
 def test_build_many_issues_single_batched_fetch() -> None:
     """Two DB/registry-missing tokens resolve via ONE batched metadata fetch."""
     py_bot = Bot(chain_id=1)
-    fake_db = object.__new__(DatabaseSessionManager)
-    tokens = TokenRegistry()
+    tokens = TokenRegistry(py_bot=py_bot)
     io = _RecFakeIo()
-    erc20 = Erc20Builder(default_chain_id=1, db=fake_db, tokens=tokens, py_bot=py_bot)
+    erc20 = Erc20Builder(default_chain_id=1, tokens=tokens, py_bot=py_bot)
 
     t_a, t_b = erc20.build_many([TOKEN_A, TOKEN_B], chain_id=1, silent=True, io=io)
 
@@ -100,10 +98,9 @@ def test_build_many_falls_back_per_token_for_none_meta() -> None:
         })
     )
     py_bot.attach_construction_io(provider, None)
-    fake_db = object.__new__(DatabaseSessionManager)
-    tokens = TokenRegistry()
+    tokens = TokenRegistry(py_bot=py_bot)
     io = _RecFakeIo()
-    erc20 = Erc20Builder(default_chain_id=1, db=fake_db, tokens=tokens, py_bot=py_bot)
+    erc20 = Erc20Builder(default_chain_id=1, tokens=tokens, py_bot=py_bot)
 
     # Patch the batch to return None for the second token (simulating a revert
     # / decode failure in the multicall for TOKEN_B).

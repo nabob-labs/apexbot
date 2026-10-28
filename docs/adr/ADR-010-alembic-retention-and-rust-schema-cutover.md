@@ -1,10 +1,17 @@
 # ADR-010: Alembic Retention Through 0.6.x and Rust Schema Cutover
 
-**Status: accepted.** The schema-cutover mechanism is to be built and made
-opt-in during the 0.6.x point releases (epic `2Z3Y46`); retiring the Alembic
-dependency and the legacy conversion is gated to a **0.7** release.
-
-**Partially superseded: the 0.6.x retention posture was retired 2026-09-15 by [ADR-052](ADR-052-db-auto-upgrade-alembic-retirement.md)**
+**Status: superseded — executed ahead of schedule by [ADR-052](ADR-052-db-auto-upgrade-alembic-retirement.md).**
+The retention posture this ADR established (Alembic retained through 0.6.x,
+retirement gated to a 0.7 release) was retired 2026-09-15, and the retirement
+then executed **while the tree was still on 0.6.x**. Every item on the
+"Forbidden-until-0.7 kill list" below has already been deleted:
+`src/apexbot/migrations/`, the `alembic`/`sqlalchemy` dependencies,
+`DatabaseSessionManager`, the SQLAlchemy models package (CPBCNS),
+`ALEMBIC_HEAD`, and the `alembic_version` branch of `ensure_schema`. **The
+kill list is void** — do not preserve, restore, or gate work on anything it
+names. This file is retained as the provenance record of the cutover design;
+the live schema story (heal-at-open, `RUST_SCHEMA_VERSION` forward steps) is
+ADR-052.
 
 ## Context
 
@@ -113,14 +120,18 @@ list (below). The retirement:
   dependencies from `pyproject.toml`;
 - deletes `src/apexbot/migrations/`;
 - removes the `ALEMBIC_HEAD` constant in
-  `rust/crates/apexbot-db/src/schema.rs` and the `alembic_version`-reading
+  `rust/crates/foundation/apexbot-db/src/schema.rs` and the `alembic_version`-reading
   branch of `ensure_schema`;
 - removes the `database upgrade` Alembic fall-back path (the
   `DatabaseSchemaStale` → `alembic.command.upgrade` shell);
 - decides whether `ApexbotDb::open` auto-converts a stale-but-recognized
   legacy shape or refuses (resolved at 0.7 design time).
 
-## Forbidden-until-0.7 kill list
+## Forbidden-until-0.7 kill list — VOID
+
+> **This list is void (see Status above).** Every item below has already been
+> deleted under ADR-052's retirement sweep. It is retained verbatim only as a
+> record of what the retention posture once protected; it constrains nothing.
 
 No change before the 0.7 retirement task (`JFFQV2`) may delete or stub any of:
 
@@ -128,9 +139,9 @@ No change before the 0.7 retirement task (`JFFQV2`) may delete or stub any of:
 - the `alembic` and `sqlalchemy` entries in `pyproject.toml`;
 - `DatabaseSessionManager` and the SQLAlchemy `src/apexbot/database/models/`
   package;
-- the `ALEMBIC_HEAD` constant in `rust/crates/apexbot-db/src/schema.rs`;
+- the `ALEMBIC_HEAD` constant in `rust/crates/foundation/apexbot-db/src/schema.rs`;
 - the `alembic_version`-reading branch of
-  `rust/crates/apexbot-db/src/migrate.rs::ensure_schema`;
+  `rust/crates/foundation/apexbot-db/src/migrate.rs::ensure_schema`;
 - the `PRAGMA query_only=on` setting on the `AlembicCurrent` path in
   `ApexbotDb::open`.
 
@@ -194,7 +205,7 @@ retirement task's exclusive responsibility.
 - **`docs/adr/ADR-003-botcore-state-layer.md`** — `Bot` as the single Rust
   state owner; schema ownership is the persistence half of the same
   principle.
-- **`rust/crates/apexbot-db/src/migrate.rs`** — `ensure_schema` and the
+- **`rust/crates/foundation/apexbot-db/src/migrate.rs`** — `ensure_schema` and the
   state machine this ADR extends; the doc comment there already names the
   hybrid period as a "HARD REQUIREMENT."
 - **Epic `2Z3Y46`** (its `.ergo/plan-cli-db-migration.md` plan file has since been removed) — the task graph that

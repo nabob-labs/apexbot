@@ -1,12 +1,11 @@
-"""Tracer-bullet tests for BotIo (ADR-005 slice 14a).
+"""Tracer-bullet tests for BotIo.
 
 `BotIo` is the Rust `#[pyclass]` I/O façade that builders receive in place
 of the Python `SyncPoolIO` adapter. It holds a Python provider (the
-`AlloyProvider` the `Bot` was constructed with) + an optional DB handle, and
+`AlloyProvider` the `Bot` was constructed with) + an optional file-backed DB path, and
 exposes the 3-method RPC-primitive surface still on `BotIo`
 (`get_block_number`, `get_code`, `get_balance`) by delegating to the held
-provider (the raw `call`/`get_block`/`get_block_timestamp` primitives retired
-with LWKLMP-S5).
+provider (the raw `call`/`get_block`/`get_block_timestamp` primitives)
 
 These tests pin the *seam* -- that delegating through the Rust pyclass yields
 the same observable result as calling the provider directly. They do NOT yet
@@ -18,11 +17,12 @@ from __future__ import annotations
 
 import pytest
 
-from apexbot._ffi import BotIo
+from apexbot._ffi import BalancerFamily, BotIo
 from apexbot._ffi.provider import AlloyProvider as RustAlloyProvider
 from apexbot.abi import encode as abi_encode
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.crypto import function_selector
+from apexbot.types.pool_type import PoolProbe
 from apexbot.utils.bytes import to_bytes
 
 # A minimal real offline provider (recorded JSON, no RPC) for tests that need a
@@ -37,8 +37,12 @@ def _min_offline_provider() -> RustAlloyProvider:
     return RustAlloyProvider.offline_from_json_string(_MIN_OFFLINE_JSON)
 
 
-class _FakeDb:
-    """A ``DatabaseSessionManager``-shaped double (cannot be called; presence only)."""
+def test_bot_io_uses_path_only_db_contract() -> None:
+    io = BotIo(provider=_min_offline_provider())
+
+    assert not hasattr(io, "db")
+    with pytest.raises(TypeError, match="db"):
+        BotIo(provider=_min_offline_provider(), db=object())
 
 
 # The 7-method `PoolIO` delegation seam is exercised natively against a
@@ -46,14 +50,6 @@ class _FakeDb:
 # former `_FakeProvider`-based delegation tests (get_block_number / call /
 # get_code / get_balance returning arbitrary canned values) are collapsed
 # there, per O3.
-
-
-def test_pybot_io_holds_optional_db_handle():
-    """BotIo stores the DB handle and exposes it back (held, not called yet)."""
-    db = _FakeDb()
-    io = BotIo(provider=_min_offline_provider(), db=db)
-    # The held handle round-trips through the pyclass.
-    assert io.db is db
 
 
 @pytest.mark.parametrize(
@@ -68,23 +64,22 @@ def test_pybot_io_satisfies_pool_io_protocol(method: str):
     """BotIo exposes the surviving 3-method PoolIO surface (runtime check).
 
     The raw `call`/`call_raw`/`get_block`/`get_block_timestamp` primitives were
-    retired with LWKLMP-S5 (no live `src/` caller); the remaining primitives
+    retired (no live `src/` caller); the remaining primitives
     are checked here.
     """
     io = BotIo(provider=_min_offline_provider())
     assert hasattr(io, method), f"BotIo missing PoolIO method {method!r}"
 
 
-# === I/O choreography methods (slice 14b) ===
+# === I/O choreography methods ===
 #
-# `fetch_factory_address` is the first choreography method moved into `BotIo`:
-# the multi-step (encode `factory()` selector -> `eth_call` -> ABI-decode `address`
-# -> EIP-55 checksum), previously `fetch_factory_from_chain` in
-# `type_resolution.py`, now reachable as a single Rust-owned method. The RPC
-# primitive (`call`) still delegates to the held provider (the native-alloy
-# swap is a later slice); the *choreography* -- the orchestration of those 4
-# steps -- now lives in Rust, satisfying slice 14's "methods for the builder
-# I/O choreography … moved here, called from Python via BotIo".
+# `fetch_factory_address` is the first Rust-owned choreography method on `BotIo`:
+# the multi-step (encode `factory()` selector -> `eth_call` -> ABI-decode
+# `address` -> EIP-55 checksum) work that `fetch_factory_from_chain` in
+# `type_resolution.py` would otherwise do in Python, now reachable as a single
+# method. The RPC primitive (`call`) still delegates to the held provider; the
+# *choreography* -- the orchestration of those 4 steps -- lives in Rust, so
+# builders call one method from Python via `BotIo`.
 
 
 class _FactoryCallProvider:
@@ -111,12 +106,9 @@ class _Erc20MetadataProvider:
 
     def __init__(self, *, name: str, symbol: str, decimals: int) -> None:
         self._responses: dict[bytes, bytes] = {
-            # keccak256("name()")[..4] = 0x06fdde03
-            bytes.fromhex("06fdde03"): abi_encode(types=["string"], args=[name]),
-            # keccak256("symbol()")[..4] = 0x95d89b41
-            bytes.fromhex("95d89b41"): abi_encode(types=["string"], args=[symbol]),
-            # keccak256("decimals()")[..4] = 0x313ce567
-            bytes.fromhex("313ce567"): abi_encode(types=["uint256"], args=[decimals]),
+            function_selector("name()"): abi_encode(types=["string"], args=[name]),
+            function_selector("symbol()"): abi_encode(types=["string"], args=[symbol]),
+            function_selector("decimals()"): abi_encode(types=["uint256"], args=[decimals]),
         }
         self.calls: list[bytes] = []  # data received
 
@@ -149,14 +141,10 @@ class _V2PoolProvider:
     ) -> None:
         # Selectors for the 4 reads this provider answers.
         self._responses: dict[bytes, bytes] = {
-            # keccak256("factory()")[..4] = 0xc45a0155
-            bytes.fromhex("c45a0155"): abi_encode(types=["address"], args=[factory]),
-            # keccak256("token0()")[..4] = 0x0dfe1681
-            bytes.fromhex("0dfe1681"): abi_encode(types=["address"], args=[token0]),
-            # keccak256("token1()")[..4] = 0xd21220a7
-            bytes.fromhex("d21220a7"): abi_encode(types=["address"], args=[token1]),
-            # keccak256("getReserves()")[..4] = 0x0902f1ac
-            bytes.fromhex("0902f1ac"): abi_encode(
+            function_selector("factory()"): abi_encode(types=["address"], args=[factory]),
+            function_selector("token0()"): abi_encode(types=["address"], args=[token0]),
+            function_selector("token1()"): abi_encode(types=["address"], args=[token1]),
+            function_selector("getReserves()"): abi_encode(
                 types=["uint112", "uint112", "uint32"], args=[reserves0, reserves1, 0]
             ),
         }
@@ -188,21 +176,16 @@ class _V3PoolProvider:
         liquidity: int,
     ) -> None:
         self._responses: dict[bytes, bytes] = {
-            # factory() / token0() / token1() selectors (same as V2).
-            bytes.fromhex("c45a0155"): abi_encode(types=["address"], args=[factory]),
-            bytes.fromhex("0dfe1681"): abi_encode(types=["address"], args=[token0]),
-            bytes.fromhex("d21220a7"): abi_encode(types=["address"], args=[token1]),
-            # keccak256("fee()")[..4] = 0xddca3f43
-            bytes.fromhex("ddca3f43"): abi_encode(types=["uint24"], args=[fee]),
-            # keccak256("tickSpacing()")[..4] = 0xd0c93a7c
-            bytes.fromhex("d0c93a7c"): abi_encode(types=["int24"], args=[tick_spacing]),
-            # keccak256("slot0()")[..4] = 0x3850c7bd
-            bytes.fromhex("3850c7bd"): abi_encode(
+            function_selector("factory()"): abi_encode(types=["address"], args=[factory]),
+            function_selector("token0()"): abi_encode(types=["address"], args=[token0]),
+            function_selector("token1()"): abi_encode(types=["address"], args=[token1]),
+            function_selector("fee()"): abi_encode(types=["uint24"], args=[fee]),
+            function_selector("tickSpacing()"): abi_encode(types=["int24"], args=[tick_spacing]),
+            function_selector("slot0()"): abi_encode(
                 types=["uint160", "int24", "uint16", "uint16", "uint16", "uint8", "bool"],
                 args=[sqrt_price_x96, tick, 0, 0, 0, 0, False],
             ),
-            # keccak256("liquidity()")[..4] = 0x1a686502
-            bytes.fromhex("1a686502"): abi_encode(types=["uint128"], args=[liquidity]),
+            function_selector("liquidity()"): abi_encode(types=["uint128"], args=[liquidity]),
         }
         self.calls: list[bytes] = []
 
@@ -244,17 +227,28 @@ class _StringFieldProvider:
         return to_bytes(self._response)
 
 
-def _probe_offline_provider(succeed: set[str]) -> RustAlloyProvider:
-    """An `OfflineProvider` cassette answering only the given selector hexes.
+def _probe_offline_provider(
+    succeed: set[str],
+    *,
+    coins_answers: bool = False,
+) -> RustAlloyProvider:
+    """An `OfflineProvider` cassette modelling a probe contract.
 
-    Calls not recorded surface as `RpcError` (non-revert), which the probe's
-    fire-and-forget dispatch treats as "reverted" → tries the next probe. No
-    Python double (O3).
+    Every identity selector is recorded explicitly: a `None` value (the
+    recorded-revert shape, mirroring a live selector-absent revert) unless it
+    is named in `succeed`. `coins(0)` needs its index word in the calldata, so
+    it is keyed by full calldata and recorded as a revert unless
+    `coins_answers`. No Python double (O3).
     """
     import json
 
     pool_addr = "aa" * 20
-    calls = {f"0x{pool_addr}:0x{sel}": "00" * 32 for sel in succeed}
+    calls: dict[str, str | None] = {f"0x{pool_addr}:0x{sel}": None for sel in _PROBE_SELECTORS}
+    for sel in succeed:
+        calls[f"0x{pool_addr}:0x{sel}"] = "00" * 32
+    calls[f"0x{pool_addr}:0x{_COINS_UINT_CALLDATA}"] = (
+        "00" * 12 + "11" * 20 if coins_answers else None
+    )
     return RustAlloyProvider.offline_from_json_string(
         json.dumps({
             "chain_id": 1,
@@ -271,41 +265,53 @@ _GET_RESERVES = function_selector("getReserves()").hex()
 _GET_POOL_ID = function_selector("getPoolId()").hex()
 _GET_NORMALIZED_WEIGHTS = function_selector("getNormalizedWeights()").hex()
 
+_PROBE_SELECTORS = (_SLOT0, _GET_RESERVES, _GET_POOL_ID, _GET_NORMALIZED_WEIGHTS)
+# coins(uint256) with index 0 — the ABI decoder rejects a bare selector.
+_COINS_UINT_CALLDATA = (function_selector("coins(uint256)") + (0).to_bytes(32, "big")).hex()
+
 
 def test_pybot_io_probe_pool_type_returns_slot0_for_v3():
-    """When slot0() succeeds, probe returns 'slot0'."""
+    """When slot0() succeeds, probe returns the V3 probe code."""
     io = BotIo(provider=_probe_offline_provider({_SLOT0}))
-    assert io.probe_pool_type("0x" + "aa" * 20) == "slot0"
+    assert io.probe_pool_type("0x" + "aa" * 20) == PoolProbe.V3
 
 
 def test_pybot_io_probe_pool_type_returns_getreserves_for_v2():
-    """When slot0() reverts but getReserves() succeeds, probe returns 'getReserves'."""
+    """When slot0() reverts but getReserves() succeeds, probe returns the V2 code."""
     io = BotIo(provider=_probe_offline_provider({_GET_RESERVES}))
-    assert io.probe_pool_type("0x" + "aa" * 20) == "getReserves"
+    assert io.probe_pool_type("0x" + "aa" * 20) == PoolProbe.V2
 
 
 def test_pybot_io_probe_pool_type_returns_balancer_weighted():
-    """When getPoolId() + getNormalizedWeights() succeed, probe returns 'balancer_weighted'."""
+    """When getPoolId() + getNormalizedWeights() succeed, probe returns the weighted code."""
     io = BotIo(provider=_probe_offline_provider({_GET_POOL_ID, _GET_NORMALIZED_WEIGHTS}))
-    assert io.probe_pool_type("0x" + "aa" * 20) == "balancer_weighted"
+    assert io.probe_pool_type("0x" + "aa" * 20) == PoolProbe.BALANCER_WEIGHTED
 
 
 def test_pybot_io_probe_pool_type_returns_balancer_stable():
-    """When getPoolId() succeeds but getNormalizedWeights() reverts, probe returns 'balancer_stable'."""
+    """getPoolId() succeeds, getNormalizedWeights() reverts → stable code."""
     io = BotIo(provider=_probe_offline_provider({_GET_POOL_ID}))
-    assert io.probe_pool_type("0x" + "aa" * 20) == "balancer_stable"
+    assert io.probe_pool_type("0x" + "aa" * 20) == PoolProbe.BALANCER_STABLE
 
 
-def test_pybot_io_probe_pool_type_returns_stableswap_fallback():
-    """When all probes revert, probe returns 'stableswap' (Curve fallback)."""
+def test_pybot_io_probe_pool_type_raises_for_unknown_identity():
+    """When no identity selector answers, probe raises (never a Curve tag)."""
     io = BotIo(provider=_probe_offline_provider(set()))
-    assert io.probe_pool_type("0x" + "aa" * 20) == "stableswap"
+    with pytest.raises(ValueError, match="unknown pool identity"):
+        io.probe_pool_type("0x" + "aa" * 20)
 
 
-# === V3 tick bitmap + tick data RPCs (slice 14j) ===
+def test_pybot_io_probe_pool_type_returns_stableswap_when_coins_answers():
+    """coins(uint256) answering with an address → the positive Curve tag."""
+    io = BotIo(provider=_probe_offline_provider(set(), coins_answers=True))
+    assert io.probe_pool_type("0x" + "aa" * 20) == PoolProbe.STABLESWAP
+
+
+# === V3 tick bitmap + tick data RPCs ===
 #
-# `fetch_tick_bitmap` and `fetch_tick_data` move the two parameterized-call
-# sub-choreographies from `_fetch_v3` (tick_data_fetcher.py) into Rust.
+# `fetch_tick_bitmap` and `fetch_tick_data` own the two parameterized-call
+# sub-choreographies that `_fetch_v3` (tick_data_fetcher.py) would otherwise
+# run in Python.
 # New pattern: signed-integer argument encoding (int16 for word_position,
 # int24 for tick). The bitmap iteration + dict-building stays Python-side.
 
@@ -382,25 +388,30 @@ class _BalancerOfflineProbeProvider:
 
 
 def test_pybot_io_probe_balancer_pool_type_returns_weighted():
-    """When getNormalizedWeights() succeeds, probe returns 'weighted'."""
+    """When getNormalizedWeights() succeeds, probe answers Weighted."""
     pool_addr = "aa" * 20
     weights = [5 * 10**17, 5 * 10**17]
     encoded = abi_encode(types=["uint256[]"], args=[weights]).hex()
     provider = _BalancerOfflineProbeProvider.build(
         pool_addr, weights_success=encoded, amp_success=None
     )
-    assert BotIo(provider=provider).probe_balancer_pool_type("0x" + pool_addr) == "weighted"
+    assert (
+        BotIo(provider=provider).probe_balancer_pool_type("0x" + pool_addr)
+        is BalancerFamily.Weighted
+    )
 
 
 def test_pybot_io_probe_balancer_pool_type_returns_stable():
     """When getNormalizedWeights() reverts but getAmplificationParameter()
-    succeeds, probe returns 'stable'."""
+    succeeds, probe answers Stable."""
     pool_addr = "aa" * 20
     amp_payload = abi_encode(types=["uint256", "bool", "uint256"], args=[2_000, False, 1000]).hex()
     provider = _BalancerOfflineProbeProvider.build(
         pool_addr, weights_success=None, amp_success=amp_payload
     )
-    assert BotIo(provider=provider).probe_balancer_pool_type("0x" + pool_addr) == "stable"
+    assert (
+        BotIo(provider=provider).probe_balancer_pool_type("0x" + pool_addr) is BalancerFamily.Stable
+    )
 
 
 def test_pybot_io_probe_balancer_pool_type_raises_when_neither_works():
@@ -413,9 +424,9 @@ def test_pybot_io_probe_balancer_pool_type_raises_when_neither_works():
         BotIo(provider=provider).probe_balancer_pool_type("0x" + pool_addr)
 
 
-# === V4 slot0 + liquidity RPCs (slice 14o) ===
+# === V4 slot0 + liquidity RPCs ===
 #
-# `fetch_v4_slot0_liquidity` mirrors `fetch_v3_slot0_liquidity` (14f) but for
+# `fetch_v4_slot0_liquidity` mirrors `fetch_v3_slot0_liquidity` but for
 # V4 pools. V4 queries `getSlot0(bytes32)` + `getLiquidity(bytes32)` on a
 # state-view contract, passing `pool_id` as a bytes32 arg.
 

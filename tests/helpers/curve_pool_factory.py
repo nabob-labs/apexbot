@@ -1,30 +1,34 @@
 """Factory helpers for I/O-free Curve StableSwap pool construction in tests.
 
-Mirrors ``tests/helpers/v3_pool_factory.py`` and ``v4_pool_factory.py``
-(ADR-005 slice 11b): every direct ``CurveStableswapPool(...)`` construction in
-the test suite routes through ``make_curve_pool`` so the ``LiquidityPool``
+Mirrors ``tests/helpers/v3_pool_factory.py`` and ``v4_pool_factory.py``:
+every direct ``CurveStableswapPool(...)`` construction in
+the test suite routes through ``make_curve_pool`` so the ``Pool``
 handle is wired through ``Bot::register_curve_pool`` → ``get_pool`` →
 companion, matching the ``Bot.build_pool()`` flow (ADR-005).
 
-Each call creates its own short-lived ``Bot`` (the returned handle holds an
-``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``) — so
-each test pool is fully isolated (no shared mutable state across tests).
+Each call mints a FRESH ``Bot`` (via ``new_pool_bot``) so every built pool is
+isolated. The register entry is get-or-register — a same address + same
+family + same identity build answers the EXISTING handle — while a genuine
+conflict (a different family, or a mismatched identity = wire drift) still
+refuses loudly. Pools are MUTABLE, so isolation is the default; a caller that
+WANTS to share one bot passes ``py_bot=`` explicitly.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from apexbot._ffi import Bot
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.curve.curve_stableswap_liquidity_pool import CurveStableswapPool
 from apexbot.curve.math import derive_rate_and_precision_multipliers
-from apexbot.curve.strategies import PoolStrategies
+from apexbot.curve.stableswap_pool_state import PoolStrategies
+from tests.helpers.pool_bot import new_pool_bot
 
 if TYPE_CHECKING:
+    from apexbot._ffi import Bot
     from apexbot.curve.curve_stableswap_liquidity_pool import CurveDataProvider
     from apexbot.erc20.erc20 import Erc20Token
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.aliases import BlockNumber
 
 
@@ -32,10 +36,9 @@ def _strategies_to_rust_enums(strategies: PoolStrategies) -> tuple[int, int, int
     """Map ``PoolStrategies`` enums → the ``u8`` discriminants Rust stores.
 
     The Rust core (``register_curve_pool``) carries the variant enums as
-    opaque ``u8`` for the future Rust ``get_dy`` (ADR-005 slice 11c). `auto()`
-    enums are 1-based; ``.value`` is forwarded verbatim. Not consumed in
-    slice 11b (the companion keeps its own ``PoolStrategies`` for the Python
-    calc path).
+    opaque ``u8`` for the Rust ``get_dy``. `auto()` enums are 1-based;
+    ``.value`` is forwarded verbatim. The companion keeps its own
+    ``PoolStrategies`` for the Python calc path.
     """
     return (
         strategies.swap_style.value,
@@ -76,14 +79,15 @@ def make_curve_pool(
     py_bot: Bot | None = None,
     pool_class: type[CurveStableswapPool] = CurveStableswapPool,
 ) -> CurveStableswapPool:
-    """Construct an I/O-free Curve companion over a fresh ``LiquidityPool`` handle.
+    """Construct an I/O-free Curve companion over a fresh ``Pool`` handle.
 
-    Registers the pool in a short-lived ``Bot`` (the returned handle holds an
-    ``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``) —
-    so each test pool is fully isolated (no shared mutable state across tests).
-    The token companions passed in may live in a different ``Bot`` (their own
-    ``make_erc20`` ``Bot``); that's fine — the pool reads balances from its
-    own ``Bot`` and token metadata from the token handle, independently.
+    Mints a fresh ``Bot`` unless ``py_bot`` is injected, so each pool is
+    isolated. Registration is get-or-register (a same-identity re-build
+    answers the EXISTING handle); a caller that wants to share one bot passes
+    ``py_bot=``. The token companions passed in may live in a different
+    ``Bot`` (their own ``make_erc20`` ``Bot``); that's fine — the pool reads
+    balances from its own ``Bot`` and token metadata from the token handle,
+    independently.
 
     ``Bot.build_pool()`` is the production path (registers in the session's
     shared ``_py_bot``); this helper is the test-only equivalent.
@@ -99,7 +103,7 @@ def make_curve_pool(
     address_checksum = get_checksum_address(address)
     state_block_int = state_block if state_block is not None else 0
 
-    bot = py_bot if py_bot is not None else Bot()
+    bot = py_bot if py_bot is not None else new_pool_bot()
 
     rate_multipliers, precision_mults = derive_rate_and_precision_multipliers(
         [token.decimals for token in tokens],
@@ -164,10 +168,10 @@ def make_curve_pool(
         metapool_underlying_style=resolved_strategies.metapool_underlying_style.value,
         data_provider=data_provider,
     )
-    handle: LiquidityPool | None = bot.get_pool(pool_id)
+    handle: Pool | None = bot.get_pool(pool_id)
     assert handle is not None, "register_curve_pool returned a pool_id with no handle"
 
-    return pool_class._from_py_pool(handle)
+    return pool_class.from_handle(handle)
 
 
 __all__ = [

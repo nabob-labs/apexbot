@@ -1,0 +1,20 @@
+[package]
+name = "apexbot-eventhub"
+description = "Per-process event hub: transport-pure event vocabulary plus named overflow policies for intake fan-out."
+keywords = ["mev", "event", "hub", "fanout"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5" }
+parking_lot = { version = "^0.13" }
+serde_json = { version = "^1.0" }
+thiserror = { version = "^2.0" }
+tokio = { version = "^1.54", features = ["sync", "macros", "rt"] }

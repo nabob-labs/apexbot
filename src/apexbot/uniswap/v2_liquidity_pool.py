@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from apexbot.aerodrome.math import (
     calc_exact_in_stable_camelot as _rs_calc_exact_in_stable_camelot,
@@ -12,20 +12,23 @@ from apexbot.aerodrome.math import (
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.erc20 import Erc20Token
 from apexbot.exceptions import ApexbotValueError
-from apexbot.exceptions.pool import ExternalUpdateError, NoPoolStateAvailable
+from apexbot.exceptions.pool import (
+    InvalidSwapInputAmount,
+    LiquidityPoolError,
+)
 from apexbot.types.abstract import AbstractLiquidityPool
+from apexbot.uniswap import SwapRefusalKind, SwapRefused, swap_refusal_to_error
 from apexbot.uniswap.v2_pool_calc import UniswapV2PoolCalc
 from apexbot.uniswap.v2_pool_state import V2PoolState
 from apexbot.uniswap.v2_types import (
-    UniswapV2PoolExternalUpdate,
     UniswapV2PoolSimulationResult,
     UniswapV2PoolState,
 )
 
 if TYPE_CHECKING:
-    from apexbot._ffi import ChecksummedAddress
-    from apexbot.types import DexIdentity, LiquidityPool
+    from apexbot.types import DexIdentity, Pool
     from apexbot.types.aliases import BlockNumber
+    from apexbot.types.chain import ChecksummedAddress
 
 
 class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
@@ -33,21 +36,21 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
 
     variant: ClassVar[str | None] = None
 
-    # Camelot solidly-stable strategy (ADR-005 slice 7 step 4a fold). The
-    # companion sets these as INSTANCE attrs off the `LiquidityPool` handle's
-    # `V2PoolDescriptor` (see `_from_py_pool`) — `stable_swap` selects the
+    # Camelot solidly-stable strategy. The
+    # companion sets these as INSTANCE attrs off the `Pool` handle's
+    # `V2PoolDescriptor` (see `from_handle`) — `stable_swap` selects the
     # stable calc branch for Camelot stable pools; False
     # otherwise. ``fee_denominator`` carries Camelot's integer fee scaling
     # (used by the stable math); None for non-Camelot V2 (volatile calc ignores
     # it). The class-level defaults are the read path ONLY for instances that
-    # bypassed `_from_py_pool` (none — the construction guard blocks `__init__`).
+    # bypassed `from_handle` (none — the construction guard blocks `__init__`).
     stable_swap: bool = False
     fee_denominator: int | None = None
 
-    # Instance attributes set in `_from_py_pool` (the only construction seam —
+    # Instance attributes set in `from_handle` (the only construction seam —
     # `__init__` raises). Declared at class scope so the type checker tracks
     # them without inline annotations on the classmethod body
-    _py_pool: LiquidityPool
+    _py_pool: Pool
     dex: DexIdentity
     address: ChecksummedAddress
     factory: ChecksummedAddress
@@ -65,15 +68,15 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
         """Direct construction is forbidden.
 
         ``UniswapV2Pool`` is a Python companion over a Rust-owned
-        ``LiquidityPool`` handle. The handle can only be produced by
+        ``Pool`` handle. The handle can only be produced by
         registering a pool in a ``Bot`` — there is no way for a caller to
         hand-build one. Use the registered entry points instead:
 
         - Production: ``Bot.build_pool(address)``
         - Tests: ``make_v2_pool(...)``
 
-        Both register the pool in Rust, obtain the ``LiquidityPool``
-        handle, and wrap it via :meth:`_from_py_pool` (mirroring Polars'
+        Both register the pool in Rust, obtain the ``Pool``
+        handle, and wrap it via :meth:`from_handle` (mirroring Polars'
         ``_from_pydf`` seam).
 
         Raises:
@@ -84,13 +87,13 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
             f"{type(self).__name__} cannot be constructed directly. "
             "Use Bot.build_pool(address) (production) or make_v2_pool(...) "
             "(tests) to register the pool in Rust and obtain the "
-            "LiquidityPool handle to wrap."
+            "Pool handle to wrap."
         )
         raise TypeError(msg)
 
     @classmethod
-    def _from_py_pool(cls, py_pool: LiquidityPool) -> Self:
-        """Wrap a Rust-owned ``LiquidityPool`` handle as a Python companion.
+    def from_handle(cls, py_pool: Pool) -> Self:
+        """Wrap a Rust-owned ``Pool`` handle as a Python companion.
 
         Internal seam (ADR-005, Polars-style ``_from_pydf`` pattern). The
         handle is self-describing: every identity field (address, factory,
@@ -130,15 +133,15 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
         # later crash with a confusing ``ZeroDivisionError`` on
         # ``Fraction(denom - gamma, denom)`` when ``fee_tokenN`` yields ``(0, 0)``.
         # Fail fast with a clear message instead — the uniform precondition
-        # check every ``_from_py_pool`` seam uses (``pool_family`` dispatches on
+        # check every ``from_handle`` seam uses (``pool_family`` dispatches on
         # the ``PoolEntry`` variant directly, so it is correct for every
         # registered family; the V2-only ``variant`` getter returns ``""`` for
         # non-V2 and can't serve as a cross-family guard).
         if py_pool.pool_family != "v2":
             msg = (
-                "LiquidityPool handle is not a V2-family pool "
+                "Pool handle is not a V2-family pool "
                 f"(got pool_family {py_pool.pool_family!r}); "
-                "UniswapV2Pool._from_py_pool requires a handle registered via "
+                "UniswapV2Pool.from_handle requires a handle registered via "
                 "register_v2_pool"
             )
             raise ApexbotValueError(message=msg)
@@ -149,7 +152,7 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
         dex = py_pool.dex
         if dex is None:  # pragma: no cover
             msg = (
-                "LiquidityPool handle has no DexIdentity preset; the pool "
+                "Pool handle has no DexIdentity preset; the pool "
                 "must be registered with a variant via register_v2_pool"
             )
             raise ApexbotValueError(message=msg)
@@ -168,8 +171,8 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
                 "(ADR-006): get_token0/get_token1 returned None"
             )
             raise ApexbotValueError(message=msg)
-        self._token0 = Erc20Token._from_py_token(py_token0)  # ruff:ignore[private-member-access]
-        self._token1 = Erc20Token._from_py_token(py_token1)  # ruff:ignore[private-member-access]
+        self._token0 = Erc20Token.from_handle(py_token0)
+        self._token1 = Erc20Token.from_handle(py_token1)
 
         self.address = get_checksum_address(py_pool.address)
         self.factory = get_checksum_address(py_pool.factory)
@@ -222,7 +225,7 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
             The block number of the most recent state update (from Rust).
 
         """
-        return self._py_pool.update_block
+        return self._py_pool.reserve_pair().update_block
 
     @property
     def reserves_token0(self) -> int:
@@ -258,75 +261,20 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
                 V2 state to snapshot).
 
         """
-        snapshot = self._py_pool.snapshot()
-        if snapshot is None:
+        try:
+            view = self._py_pool.reserve_pair()
+        except ValueError as exc:
             msg = "No V2 pool state available (pool not registered in Rust)"
-            raise ApexbotValueError(message=msg)
-        reserve0, reserve1, block = snapshot
-        return self.PoolState.__value__(
-            address=self.address,
-            reserves_token0=reserve0,
-            reserves_token1=reserve1,
-            block=block,
+            raise ApexbotValueError(message=msg) from exc
+        return cast(
+            "UniswapV2PoolState",
+            self.PoolState.__value__(
+                address=self.address,
+                reserves_token0=view.reserve0,
+                reserves_token1=view.reserve1,
+                block=view.update_block,
+            ),
         )
-
-    def external_update(
-        self,
-        update: UniswapV2PoolExternalUpdate,
-    ) -> None:
-        """External update.
-
-        Raises:
-            ExternalUpdateError: If the update is for a past block.
-
-        """
-        if update.block_number < self.update_block:
-            raise ExternalUpdateError(
-                message=f"Rejected update for block {update.block_number} in the past, current update block is {self.update_block}",  # ruff:ignore[line-too-long]
-            )
-
-        self._py_pool.sync_reserves(
-            reserve0=update.reserves_token0,
-            reserve1=update.reserves_token1,
-            block_number=update.block_number,
-        )
-
-    def discard_states_before_block(self, block: BlockNumber) -> None:
-        """Discard cached V2 reorg journal deltas earlier than the given block.
-
-        Delegates to ``LiquidityPool.discard_before_block`` (Rust pops
-        journal deltas strictly earlier than the target, keeping the genesis
-        delta + everything at/after the target). The current state is
-        unchanged when the target is at/after the newest delta.
-
-        Raises:
-            NoPoolStateAvailable: If the target is past the newest delta
-                (would remove every known state).
-
-        """
-        try:
-            self._py_pool.discard_before_block(block)
-        except ValueError as e:
-            raise NoPoolStateAvailable(block=block) from e
-
-    def restore_state_before_block(self, block: BlockNumber) -> None:
-        """Restore the V2 pool to the landed-at state just before the target block.
-
-        Delegates to ``LiquidityPool.restore_before_block`` (Rust pops
-        journal deltas at/after the target + reverse-applies them, writing
-        back the pre-target reserves in one write guard). The journal's
-        ``update_block`` lands at the oldest popped delta's block (the target
-        convention); the restored reserves are the pre-target state.
-
-        Raises:
-            NoPoolStateAvailable: If no state exists prior to the target
-                block (the target is at or before the registration block).
-
-        """
-        try:
-            self._py_pool.restore_before_block(block)
-        except ValueError as e:
-            raise NoPoolStateAvailable(block=block) from e
 
     def simulate_exact_input_swap(
         self,
@@ -341,32 +289,79 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
 
         Raises:
             ApexbotValueError: If token_in is unknown.
+            InvalidSwapInputAmount: If token_in_quantity is not positive.
+            swap_refusal_to_error: Renders a refusal that is not a
+                swap-geometry verdict — the walk entered an unfetched word
+                and the on-demand fetch failed (MissingLiquidityData).
+            LiquidityPoolError: If the swap cannot compute against the pool state.
 
         """
         if token_in not in self.tokens:
             raise ApexbotValueError(message="token_in is unknown.")
 
-        # One atomic snapshot drives the whole simulation: calc + final_state
-        # both read `state.reserves_*`, so a Rust-side sync_reserves (pump)
-        # can't interleave between the calc and the delta computation.
+        if token_in_quantity <= 0:  # pragma: no cover
+            raise InvalidSwapInputAmount
+
+        # One atomic snapshot drives the whole simulation: the read's deltas
+        # and its end reserves both come from the swap-simulation door over
+        # `state`, so a Rust-side sync_reserves (pump) can't interleave.
         state = override_state if override_state is not None else self.state
         zero_for_one = token_in == self._token0
-        token_out_quantity = self.calculate_tokens_out_from_tokens_in(
-            token_in=token_in,
-            token_in_quantity=token_in_quantity,
-            override_state=state,
-        )
-        token0_delta = -token_out_quantity if zero_for_one is False else token_in_quantity
-        token1_delta = -token_out_quantity if zero_for_one is True else token_in_quantity
+        if self.stable_swap:
+            # A Camelot-stable read refuses at the door (its arm needs the
+            # `10**decimals` scales the V2 registration identity does not
+            # carry), so this family keeps its Solidly leaf and its end state is
+            # the same override reserves advanced by the deltas that leaf
+            # produced.
+            token_out_quantity = self.calculate_tokens_out_from_tokens_in(
+                token_in=token_in,
+                token_in_quantity=token_in_quantity,
+                override_state=state,
+            )
+            token0_delta = -token_out_quantity if zero_for_one is False else token_in_quantity
+            token1_delta = -token_out_quantity if zero_for_one is True else token_in_quantity
+            return UniswapV2PoolSimulationResult(
+                amount0_delta=token0_delta,
+                amount1_delta=token1_delta,
+                initial_state=state,
+                final_state=dataclasses.replace(
+                    state,
+                    reserves_token0=state.reserves_token0 + token0_delta,
+                    reserves_token1=state.reserves_token1 + token1_delta,
+                    block=self.update_block if override_state is not None else None,
+                ),
+            )
 
+        # The typed read (ADR-037/t2): a refusal is the overdraw verdict —
+        # the requested input is not computable against those reserves.
+        try:
+            read = self._py_pool.simulate(
+                zero_for_one=zero_for_one,
+                amount_specified=-token_in_quantity,
+                block=self.update_block,
+                override_state=state,
+            )
+        except SwapRefused as exc:
+            if exc.args[0] is not SwapRefusalKind.NotComputable:
+                # An infrastructure failure (an unfetchable word), not a
+                # swap-geometry verdict — render it honestly.
+                raise swap_refusal_to_error(exc) from exc
+            raise LiquidityPoolError(
+                message=(
+                    f"Input amount ({token_in_quantity}) overflows "
+                    "uint256 swap math (on-chain revert)"
+                ),
+            ) from exc
+        assert read.reserves_token0 is not None  # pragma: no cover — reserve-pair arm asserted
+        assert read.reserves_token1 is not None  # pragma: no cover — reserve-pair arm asserted
         return UniswapV2PoolSimulationResult(
-            amount0_delta=token0_delta,
-            amount1_delta=token1_delta,
+            amount0_delta=int(read.amount0_delta),
+            amount1_delta=int(read.amount1_delta),
             initial_state=state,
             final_state=dataclasses.replace(
                 state,
-                reserves_token0=state.reserves_token0 + token0_delta,
-                reserves_token1=state.reserves_token1 + token1_delta,
+                reserves_token0=read.reserves_token0,
+                reserves_token1=read.reserves_token1,
                 block=self.update_block if override_state is not None else None,
             ),
         )
@@ -384,30 +379,51 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
 
         Raises:
             ApexbotValueError: If token_out is unknown.
+            InvalidSwapInputAmount: If token_out_quantity is not positive.
+            swap_refusal_to_error: Renders a refusal that is not a
+                swap-geometry verdict — the walk entered an unfetched word
+                and the on-demand fetch failed (MissingLiquidityData).
+            LiquidityPoolError: If the requested output exceeds the pool reserves.
 
         """
         if token_out not in self.tokens:
             raise ApexbotValueError(message="token_out is unknown.")
 
+        if token_out_quantity <= 0:  # pragma: no cover
+            raise InvalidSwapInputAmount
+
+        # See `simulate_exact_input_swap`: one snapshot, one door read, and the
+        # end state is the read's own post-swap reserves.
         state = override_state if override_state is not None else self.state
         zero_for_one = token_out == self._token1
-
-        token_in_quantity = self.calculate_tokens_in_from_tokens_out(
-            token_out=token_out,
-            token_out_quantity=token_out_quantity,
-            override_state=state,
-        )
-        token0_delta = token_in_quantity if zero_for_one is True else -token_out_quantity
-        token1_delta = token_in_quantity if zero_for_one is False else -token_out_quantity
-
+        # The typed read (ADR-037/t2): a refusal is the overdraw verdict —
+        # the requested output exceeds the pool's reserves.
+        try:
+            read = self._py_pool.simulate(
+                zero_for_one=zero_for_one,
+                amount_specified=token_out_quantity,
+                block=self.update_block,
+                override_state=state,
+            )
+        except SwapRefused as exc:
+            if exc.args[0] is not SwapRefusalKind.NotComputable:
+                # An infrastructure failure (an unfetchable word), not a
+                # swap-geometry verdict — render it honestly.
+                raise swap_refusal_to_error(exc) from exc
+            reserves_out = state.reserves_token1 if zero_for_one else state.reserves_token0
+            raise LiquidityPoolError(
+                message=f"Requested amount out ({token_out_quantity}) >= pool reserves ({reserves_out})",  # ruff:ignore[line-too-long]
+            ) from exc
+        assert read.reserves_token0 is not None  # pragma: no cover — reserve-pair arm asserted
+        assert read.reserves_token1 is not None  # pragma: no cover — reserve-pair arm asserted
         return UniswapV2PoolSimulationResult(
-            amount0_delta=token0_delta,
-            amount1_delta=token1_delta,
+            amount0_delta=int(read.amount0_delta),
+            amount1_delta=int(read.amount1_delta),
             initial_state=state,
             final_state=dataclasses.replace(
                 state,
-                reserves_token0=state.reserves_token0 + token0_delta,
-                reserves_token1=state.reserves_token1 + token1_delta,
+                reserves_token0=read.reserves_token0,
+                reserves_token1=read.reserves_token1,
                 block=self.update_block if override_state is not None else None,
             ),
         )
@@ -420,10 +436,10 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
     ) -> int:
         """Calculate the expected token OUTPUT for a target INPUT at current reserves.
 
-        Strategy dispatch (ADR-005 slice 7 step 4a fold): Camelot stable pools
+        Strategy dispatch: Camelot stable pools
         (``stable_swap=True``) use the solidly-stable invariant with Camelot's
         k/get_y; all other V2 pools fall through to ``super()`` — the
-        ``UniswapV2PoolCalc`` Rust-delegation path (slice 5) is unperturbed for
+        ``UniswapV2PoolCalc`` Rust-delegation path is unperturbed for
         the volatile majority.
 
         Returns:
@@ -452,7 +468,7 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
 
         Routes through the Rust ``apexbot-solidly-math`` core
         (``solidly_calc_exact_in_stable_camelot``), which bakes in Camelot's
-        ``k_camelot``/``get_y_camelot`` variant (ADR-005 slice 7).
+        ``k_camelot``/``get_y_camelot`` variant.
 
         ``fee_tokenN`` is the FEE ``Fraction`` (e.g. ``Fraction(3, 1000)``).
 
@@ -473,13 +489,16 @@ class UniswapV2Pool(V2PoolState, UniswapV2PoolCalc, AbstractLiquidityPool):
             reserves_token0 = self.reserves_token0
             reserves_token1 = self.reserves_token1
 
-        return _rs_calc_exact_in_stable_camelot(
-            token_in_quantity,
-            token_in_index,
-            reserves_token0,
-            reserves_token1,
-            precision_multiplier_token0,
-            precision_multiplier_token1,
-            fee.numerator,
-            fee.denominator,
+        return cast(
+            "int",
+            _rs_calc_exact_in_stable_camelot(
+                token_in_quantity,
+                token_in_index,
+                reserves_token0,
+                reserves_token1,
+                precision_multiplier_token0,
+                precision_multiplier_token1,
+                fee.numerator,
+                fee.denominator,
+            ),
         )

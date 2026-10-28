@@ -4,71 +4,166 @@ Private leaf module (underscore name): pure renderers over dispatch
 outcomes and engine failure records. The dispatch path
 (:mod:`~apexbot.runner._dispatch`) imports :func:`_dump_failure_fixture`,
 :func:`_render_profit_logs`, and :func:`_render_sim_failures`; outside
-that, only tests import this module. Nothing here touches the Rust core.
+that, only tests import this module. Nothing here calls the Rust core — the
+single FFI-typed import is ``PoolKind`` (type identity only, for the hop
+family taxonomy).
 
-Carved out of ``dispatch.py`` / ``config.py`` by epic Y7PA5A (task
-34XJ6C) so that ``apexbot.runner`` presents one face: the driver
-cockpit.
-
+The sim-failure tripwire reads its armed state and ignore set as values the
+caller resolved, never the process verdict: the arm/disarm decision is the
+driver's, made once at the construction boundary and handed down.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
-import os
 import sys
 from typing import TYPE_CHECKING, Any
 
 from apexbot.logging import logger as bot_logger
-from apexbot.runner._driver_constants import _SIM_FAIL_RENDER_CAP
+from apexbot.pathfinding import FAMILY_TAG_TO_POOL_KIND, POOL_KIND_TAG, PoolKind
 
 if TYPE_CHECKING:
+    from apexbot.diagnostics import FailureAction
     from apexbot.dispatch import Dispatcher, DispatchOutcome
     from apexbot.runner._dispatch import MergedOutcome
+
+# Cap on per-batch `[sim-fail]` lines emitted by the renderer. A thin-margin
+# revert storm can otherwise flood the log during a stalled head.
+_SIM_FAIL_RENDER_CAP = 25
+
+# Sentinel for `hop_fields`' strict-read mode (distinct from any field value,
+# including None).
+_UNSET: Any = object()
+
+# The hop ``family`` wire string → the FFI PoolKind taxonomy (the V2/V3/V4
+# axis — NOT the PoolFamily invariant axis). minted from the core's exported
+# tag list (apexbot.pathfinding) rather than re-declared: the ONE conversion
+# for the render seam; consumers compare members.
+_FAMILY_TO_POOL_KIND = FAMILY_TAG_TO_POOL_KIND
+
+# Render labels for PoolKind members (the pyclass str() spells "PoolKind.V2";
+# the operator-facing lines keep the bare version spelling). Also minted.
+_POOL_KIND_LABEL = POOL_KIND_TAG
+
+
+def _family_label(family: Any) -> str:
+    """Render one HopFields family: the PoolKind label, or the lenient default.
+
+    Returns:
+        The PoolKind label for a taxonomy member, else the ``str()`` of the
+        value.
+
+    """
+    if isinstance(family, PoolKind):
+        return _POOL_KIND_LABEL[family]
+    return str(family)
+
 
 # A sim-dispatch outcome handed to the renderers: the FFI batch outcome or
 # MergedOutcome (the payload-stitched adapter — structurally identical view).
 type _SimOutcome = DispatchOutcome | MergedOutcome
 
 
-def _hop_display_addr(hop: dict[str, Any]) -> str:
-    """Return a short display address for logging (WEFVGE: plain-dict hop)."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class HopFields:
+    """The typed view of one plain-dict hop (the ``outcome.path_infos`` shape).
 
-    family = hop["family"]
+    The ONE home for the family-conditional field names: V2/V3 hops carry
+    ``pool_address``/``token0_address``/``token1_address``, V4 hops carry
+    ``pool_id_hex``/``currency0_address``/``currency1_address`` (plus the
+    pool manager + tick spacing) — the render consumers read the named
+    fields instead of re-branching on the dict keys.
+    """
 
-    if family in {"V2", "V3"}:
-        return hop["pool_address"]
+    family: PoolKind | Any
+    # V2/V3 pool_address | V4 pool_id_hex.
+    pool_ref: str
+    # token0_address | currency0_address.
+    token0: str
+    # token1_address | currency1_address.
+    token1: str
+    fee: int
+    zfo: bool
+    # V4-only fields (None on the V2/V3 variants).
+    pool_manager: str | None = None
+    tick_spacing: int | None = None
 
-    return hop["pool_id_hex"]
+
+def hop_fields(hop: dict[str, Any], *, default: Any = _UNSET) -> HopFields:
+    """Read one plain-dict hop into the typed :class:`HopFields` view.
+
+    The wire ``family`` string converts to the FFI PoolKind taxonomy at this
+    ONE point; consumers compare members. With ``default`` the read is lenient
+    (``dict.get`` semantics, every field falling back to that value) — the
+    failure-fixture dump renders malformed hops instead of raising on them.
+
+    Returns:
+        The typed hop-fields view.
+
+    Raises:
+        ValueError: On a family string outside the PoolKind taxonomy in strict
+            mode — an unknown render-seam family is loud, never silently
+            branched.
+
+    """
+
+    def get(key: str) -> Any:
+        return hop[key] if default is _UNSET else hop.get(key, default)
+
+    family = get("family")
+    kind = _FAMILY_TO_POOL_KIND.get(family) if isinstance(family, str) else None
+    if kind is None:
+        if default is _UNSET:
+            msg = f"Unsupported hop family: {family!r}"
+            raise ValueError(msg)
+        # Lenient read (the failure-fixture dump): an unknown family keeps the
+        # caller's default and takes the V4-field branch, as before.
+        kind = family
+
+    if isinstance(kind, PoolKind) and kind in {PoolKind.V2, PoolKind.V3}:
+        return HopFields(
+            family=kind,
+            pool_ref=get("pool_address"),
+            token0=get("token0_address"),
+            token1=get("token1_address"),
+            fee=get("fee"),
+            zfo=get("zfo"),
+        )
+
+    return HopFields(
+        family=kind,
+        pool_ref=get("pool_id_hex"),
+        token0=get("currency0_address"),
+        token1=get("currency1_address"),
+        fee=get("fee"),
+        zfo=get("zfo"),
+        pool_manager=get("pool_manager_address"),
+        tick_spacing=get("tick_spacing"),
+    )
 
 
 def _hop_token_summary(hops: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> str:
     """One-line summary of hop input→output tokens for sim-fail diagnostics.
 
+    Reads plain dicts (the ``outcome.path_infos`` render shape).
 
-    WEFVGE: reads plain dicts (the ``outcome.path_infos`` render shape).
+    Returns:
+        The space-joined per-hop token summaries.
 
     """
-
     parts: list[str] = []
 
     for h in hops:
-        family = h["family"]
+        hf = hop_fields(h)
 
-        if family in {"V2", "V3"}:
-            t0, t1 = h["token0_address"], h["token1_address"]
-
-        else:
-            t0, t1 = h["currency0_address"], h["currency1_address"]
-
-        parts.append(f"{t0}→{t1}{'↗' if h['zfo'] else '↘'}")
+        parts.append(f"{hf.token0}→{hf.token1}{'↗' if hf.zfo else '↘'}")
 
     return " ".join(parts)
 
 
 def _render_sim_summary(outcome: _SimOutcome) -> None:
     """Render the ``[sim]`` line from ``DispatchOutcome`` fields (D4 stay-Python).
-
 
     Ports the prior ``[sim] N candidates: X ok (Y profitable, Z below
 
@@ -77,7 +172,6 @@ def _render_sim_summary(outcome: _SimOutcome) -> None:
     suppressed/thin/divergent drops when non-zero.
 
     """
-
     profitable = outcome.gas_profitable
 
     best_net = max((c.net_profit for c in profitable), default=0)
@@ -119,7 +213,6 @@ def _render_sim_summary(outcome: _SimOutcome) -> None:
 
 def _render_profit_logs(outcome: _SimOutcome) -> None:
     """Render the ``[profit]`` per-path hop-detail log (D4 stay-Python)."""
-
     for cand in outcome.gas_profitable:
         path_info = outcome.path_infos.get(cand.path_id)
 
@@ -127,28 +220,21 @@ def _render_profit_logs(outcome: _SimOutcome) -> None:
 
         if path_info is not None:
             for i, h in enumerate(path_info["hops"]):
-                family = h["family"]
+                hf = hop_fields(h)
 
-                if family == "V2":
+                if hf.family == PoolKind.V4:
                     hop_details.append(
-                        f"  hop[{i}] V2 addr={h['pool_address']} "
-                        f"t0={h['token0_address']} t1={h['token1_address']} "
-                        f"fee={h['fee']} zfo={h['zfo']}",
+                        f"  hop[{i}] V4 pm={hf.pool_manager} "
+                        f"pid={hf.pool_ref} "
+                        f"c0={hf.token0} c1={hf.token1} "
+                        f"fee={hf.fee} ts={hf.tick_spacing} zfo={hf.zfo}",
                     )
 
-                elif family == "V3":
+                else:
                     hop_details.append(
-                        f"  hop[{i}] V3 addr={h['pool_address']} "
-                        f"t0={h['token0_address']} t1={h['token1_address']} "
-                        f"fee={h['fee']} zfo={h['zfo']}",
-                    )
-
-                elif family == "V4":
-                    hop_details.append(
-                        f"  hop[{i}] V4 pm={h['pool_manager_address']} "
-                        f"pid={h['pool_id_hex']} "
-                        f"c0={h['currency0_address']} c1={h['currency1_address']} "
-                        f"fee={h['fee']} ts={h['tick_spacing']} zfo={h['zfo']}",
+                        f"  hop[{i}] {_family_label(hf.family)} addr={hf.pool_ref} "
+                        f"t0={hf.token0} t1={hf.token1} "
+                        f"fee={hf.fee} zfo={hf.zfo}",
                     )
 
         hops_str = "\n".join(hop_details)
@@ -167,8 +253,7 @@ def _dump_failure_fixture(
     path_info: dict[str, Any] | None,
     current_block: int,
 ) -> None:
-    """Dump the full hop detail for a failing candidate — the W2UWZO trap."""
-
+    """Dump the full hop detail for a failing candidate — the sim-failure trap."""
     path_id = rec["path_id"]
 
     captured = rec.get("captured_swaps") or []
@@ -197,29 +282,20 @@ def _dump_failure_fixture(
     )
 
     for i, h in enumerate(hops):
-        family = h.get("family")
+        hf = hop_fields(h, default="?")
 
-        if family in {"V2", "V3"}:
-            addr = h.get("pool_address")
-
-            t0, t1 = h.get("token0_address", "?"), h.get("token1_address", "?")
-
+        if isinstance(hf.family, PoolKind) and hf.family in {PoolKind.V2, PoolKind.V3}:
             bot_logger.error(
-                f"[sim-fixture] hop[{i}] {family} pool={addr} "
-                f"t0={t0} t1={t1} fee={h.get('fee')} zfo={h.get('zfo')}",
+                f"[sim-fixture] hop[{i}] {_family_label(hf.family)} pool={hf.pool_ref} "
+                f"t0={hf.token0} t1={hf.token1} fee={hf.fee} zfo={hf.zfo}",
             )
 
         else:  # V4
-            pm = h.get("pool_manager_address", "?")
-
-            pid = h.get("pool_id_hex", "?")
-
-            c0, c1 = h.get("currency0_address", "?"), h.get("currency1_address", "?")
-
             bot_logger.error(
-                f"[sim-fixture] hop[{i}] V4 pool_manager={pm} pool_id={pid} "
-                f"c0={c0} c1={c1} fee={h.get('fee')} "
-                f"tick_spacing={h.get('tick_spacing')} zfo={h.get('zfo')}",
+                f"[sim-fixture] hop[{i}] V4 pool_manager={hf.pool_manager} "
+                f"pool_id={hf.pool_ref} "
+                f"c0={hf.token0} c1={hf.token1} fee={hf.fee} "
+                f"tick_spacing={hf.tick_spacing} zfo={hf.zfo}",
             )
 
     for j, s in enumerate(captured):
@@ -231,180 +307,189 @@ def _dump_failure_fixture(
         )
 
 
-def _render_sim_failures(outcome: _SimOutcome, *, current_block: int) -> None:
-    """Render one ``[sim-fail]`` + one ``[sim-diag]`` line per reverted / failed
+def _render_sim_failures(
+    outcome: _SimOutcome,
+    *,
+    current_block: int,
+    sim_exit_on_fail: bool,
+    exit_ignore_buckets: str,
+    sim_failure_action: FailureAction | None = None,
+) -> None:
+    """Render one ``[sim-fail]`` + one ``[sim-diag]`` line per reverted or failed candidate (D3).
 
-    candidate (D3 + AM5AJW). Capped at :data:`_SIM_FAIL_RENDER_CAP` records.
+    Capped at :data:`_SIM_FAIL_RENDER_CAP` records.
 
+    ``sim_exit_on_fail`` and ``exit_ignore_buckets`` are the resolved
+    ``simulation.*`` values the caller threads down: the tripwire never reads
+    the process verdict, so the arm/disarm decision is a value at the
+    consumption boundary rather than an ambient reach. ``sim_failure_action``
+    is the resolved ``sim_failure`` bucket action handed down the same way;
+    ``None`` (production) consults the Rust policy matrix at trap time.
 
-    If ``APEXBOT_SIM_EXIT_ON_FAIL=1`` is set, dump the full hop-detail for the
-
-    FIRST failing record then ``sys.exit(3)`` — a trap for capturing a mainnet
-
-    fixture to pin a RED byte-exact calc test (ergo W2UWZO).
-
+    When the operator has armed the sim-failure trap
+    (``simulation.sim_exit_on_fail``), dump the full hop-detail for the FIRST
+    failing record and then follow the ``sim_failure`` bucket's action —
+    ``sys.exit(3)`` under an ``exit`` policy. The trap exists to capture a
+    mainnet fixture to pin a byte-exact calc test.
     """
-
     failures = outcome.failures
-
     if not failures:
         return
 
     cap = _SIM_FAIL_RENDER_CAP
-
     path_infos = outcome.path_infos
-
     for rec in failures[:cap]:
-        path_id = rec["path_id"]
+        _render_one_failure(rec, path_infos, current_block)
 
-        bucket = rec["bucket"]
-
-        fail_idx = rec["fail_index"]
-
-        revert_hex = rec["revert_data"]
-
-        path_info = path_infos.get(path_id)
-
-        path_type = path_info["path_type"] if path_info is not None else "?"
-
-        hops = (
-            _hop_token_summary(path_info["hops"])
-            if path_info is not None
-            else "(path_info missing)"
-        )
-
-        rf = rec.get("reverting_frame")
-
-        swaps = rec.get("captured_swaps") or []
-
-        if rf is not None:
-            revert_line = (
-                f"revert@depth={rf['depth']} target={rf['target']} "
-                f"sel={rf['selector']} label={rf['label']} kind={rf.get('outcome_kind')} "
-                f"gas={rf.get('gas_used')} "
-                f"swaps_before={len(swaps)} revert={rf['revert_data']}"
-            )
-
-        else:
-            revert_line = f"fail_idx={fail_idx} revert={revert_hex}"
-
-        bot_logger.info(
-            f"[sim-fail] path={path_id} type={path_type} bucket={bucket} {revert_line} hops={hops}",
-        )
-
-        ct = rec.get("call_trace") or []
-
-        if ct:
-            # 2026-08-22 audit: per-failure detail rides at debug; the [sim-fail]
-            # bucket summary above is the operator-grade line.
-            bot_logger.debug(f"[sim-trace] path={path_id} frames={';'.join(str(x) for x in ct)}")
-
-        weth_before = rec.get("weth_before")
-
-        weth_after = rec.get("weth_after")
-
-        if weth_before is not None and weth_after is not None:
-            eb, ea = rec.get("eth_before") or 0, rec.get("eth_after") or 0
-
-            fb, fa = rec.get("erc6909_before") or 0, rec.get("erc6909_after") or 0
-
-            d_w, d_e, d_f = weth_after - weth_before, ea - eb, fa - fb
-
-            bot_logger.debug(
-                f"[sim-bals] path={path_id} weth {weth_before}->{weth_after} (d={d_w:+d}) "
-                f"| eth {eb}->{ea} (d={d_e:+d}) | erc6909 {fb}->{fa} (d={d_f:+d}) "
-                f"| combined d={d_w + d_e + d_f:+d}"
-            )
-
-        if rec.get("log_full_count") is not None:
-            n_swap = len(rec.get("captured_swaps") or [])
-
-            n_rev = len(rec.get("reverted_swaps") or [])
-
-            bot_logger.debug(
-                f"[sim-logfull] path={path_id} log_full={rec.get('log_full_count')} "
-                f"captured={n_swap} reverted={n_rev} "
-                "(dropped if log_full>captured+reverted)"
-            )
-
-        rs = rec.get("reverted_swaps") or []
-
-        if rs:
-            brief = ";".join(
-                f"{s.get('family')}:{str(s.get('emitter'))[0:10]}:a0={s.get('amount0')}:a1={s.get('amount1')}"
-                for s in rs
-            )
-
-            bot_logger.debug(f"[sim-revswaps] path={path_id} n={len(rs)} {brief}")
-
-        bot_logger.debug(
-            format_sim_diag_line(
-                rec,
-                path_id=path_id,
-                path_type=path_type,
-                solve_block=current_block,
-                block=current_block,
-                age=0,
-            )
-        )
-
-    if os.environ.get("APEXBOT_SIM_EXIT_ON_FAIL", "1") == "1":
-        # Fail HARD and LOUD: ANY un-ignored failure bucket halts the bot
-
-        # (ADR-021 / ergo W2UWZO — detect/classify/stop loudly, never mask).
-
-        # There is NO default ignore set; the operator OPT-IN dumbs the tripwire
-
-        # down per-bucket via APEXBOT_SIM_EXIT_IGNORE_BUCKETS.
-
-        ignore = {
-            b.strip()
-            for b in os.environ.get("APEXBOT_SIM_EXIT_IGNORE_BUCKETS", "").split(",")
-            if b.strip()
-        }
-
-        trap_failures = [f for f in failures if f.get("bucket") not in ignore]
-
-        if trap_failures:
-            first = trap_failures[0]
-
-            _dump_failure_fixture(first, path_infos.get(first["path_id"]), current_block)
-
-            # ADR-040: the PER-BUCKET policy decides what happens next — the
-            # Rust core owns the closed bucket matrix (single source of truth);
-            # Python only consults it. A sim failure's effective action is the
-            # `sim_failure` bucket's (reason sub-split lands at the sim seam).
-            from apexbot.diagnostics import failure_action as _policy
-
-            action = _policy("sim_failure", None)
-            if action == "exit":
-                bot_logger.error(
-                    f"[sim-trap] exiting on first sim failure at block={current_block} "
-                    f"(failure_policy sim_failure bucket action=exit) "
-                    f"— see [sim-fixture] above",
-                )
-
-                for h in bot_logger.handlers:
-                    h.flush()
-
-                sys.exit(3)
-            else:
-                bot_logger.error(
-                    f"[sim-trap] {len(trap_failures)} sim failure(s) at block={current_block} "
-                    f"(failure_policy sim_failure action={action}) — continuing; "
-                    f"failures surface via OTel (apexbot.errors{{kind=sim_failure}}). "
-                    f"See [sim-fixture] above.",
-                )
+    _enforce_sim_failure_policy(
+        failures,
+        path_infos,
+        current_block,
+        sim_exit_on_fail=sim_exit_on_fail,
+        exit_ignore_buckets=exit_ignore_buckets,
+        sim_failure_action=sim_failure_action,
+    )
 
     overflow = len(failures) - cap
-
     if overflow > 0:
         bot_logger.info(f"[sim-fail] … (+{overflow} more)")
 
 
+def _render_one_failure(
+    rec: dict[str, Any],
+    path_infos: dict[int, dict[str, Any]],
+    current_block: int,
+) -> None:
+    """Render the always-on ``[sim-fail]`` + ``[sim-diag]`` pair for one record."""
+    path_id = rec["path_id"]
+    bucket = rec["bucket"]
+    fail_idx = rec["fail_index"]
+    revert_hex = rec["revert_data"]
+    path_info = path_infos.get(path_id)
+    path_type = path_info["path_type"] if path_info is not None else "?"
+    hops = _hop_token_summary(path_info["hops"]) if path_info is not None else "(path_info missing)"
+    rf = rec.get("reverting_frame")
+    swaps = rec.get("captured_swaps") or []
+    if rf is not None:
+        revert_line = (
+            f"revert@depth={rf['depth']} target={rf['target']} "
+            f"sel={rf['selector']} label={rf['label']} kind={rf.get('outcome_kind')} "
+            f"gas={rf.get('gas_used')} "
+            f"swaps_before={len(swaps)} revert={rf['revert_data']}"
+        )
+    else:
+        revert_line = f"fail_idx={fail_idx} revert={revert_hex}"
+    bot_logger.info(
+        f"[sim-fail] path={path_id} type={path_type} bucket={bucket} {revert_line} hops={hops}",
+    )
+    _render_failure_debug(rec, path_id)
+    bot_logger.debug(
+        format_sim_diag_line(
+            rec,
+            path_id=path_id,
+            path_type=path_type,
+            window=SimDiagWindow(solve_block=current_block, block=current_block, age=0),
+        )
+    )
+
+
+def _render_failure_debug(rec: dict[str, Any], path_id: int) -> None:
+    """Render the per-failure debug detail lines (trace, balances, swap counts)."""
+    ct = rec.get("call_trace") or []
+    if ct:
+        # 2026-08-22 audit: per-failure detail rides at debug; the [sim-fail]
+        # bucket summary above is the operator-grade line.
+        bot_logger.debug(f"[sim-trace] path={path_id} frames={';'.join(str(x) for x in ct)}")
+
+    weth_before = rec.get("weth_before")
+    weth_after = rec.get("weth_after")
+    if weth_before is not None and weth_after is not None:
+        eb, ea = rec.get("eth_before") or 0, rec.get("eth_after") or 0
+        fb, fa = rec.get("erc6909_before") or 0, rec.get("erc6909_after") or 0
+        d_w, d_e, d_f = weth_after - weth_before, ea - eb, fa - fb
+        bot_logger.debug(
+            f"[sim-bals] path={path_id} weth {weth_before}->{weth_after} (d={d_w:+d}) "
+            f"| eth {eb}->{ea} (d={d_e:+d}) | erc6909 {fb}->{fa} (d={d_f:+d}) "
+            f"| combined d={d_w + d_e + d_f:+d}"
+        )
+
+    if rec.get("log_full_count") is not None:
+        n_swap = len(rec.get("captured_swaps") or [])
+        n_rev = len(rec.get("reverted_swaps") or [])
+        bot_logger.debug(
+            f"[sim-logfull] path={path_id} log_full={rec.get('log_full_count')} "
+            f"captured={n_swap} reverted={n_rev} "
+            "(dropped if log_full>captured+reverted)"
+        )
+
+    _render_reverted_swaps(rec, path_id)
+
+
+def _render_reverted_swaps(rec: dict[str, Any], path_id: int) -> None:
+    """Render the debug line naming swaps reverted within the simulation."""
+    rs = rec.get("reverted_swaps") or []
+    if not rs:
+        return
+    brief = ";".join(
+        f"{s.get('family')}:{str(s.get('emitter'))[0:10]}:a0={s.get('amount0')}:a1={s.get('amount1')}"
+        for s in rs
+    )
+    bot_logger.debug(f"[sim-revswaps] path={path_id} n={len(rs)} {brief}")
+
+
+def _enforce_sim_failure_policy(  # ruff:ignore[too-many-arguments]
+    failures: list[dict[str, Any]],
+    path_infos: dict[int, dict[str, Any]],
+    current_block: int,
+    *,
+    sim_exit_on_fail: bool,
+    exit_ignore_buckets: str,
+    sim_failure_action: FailureAction | None = None,
+) -> None:
+    """Apply the sim-failure tripwire over one failure batch."""
+    if not sim_exit_on_fail:
+        return
+    # Fail HARD and LOUD: ANY un-ignored failure bucket reaches the bot's
+    # stop decision below (ADR-021 — detect/classify/stop loudly, never mask).
+    # There is NO default ignore set; the operator OPT-IN dumbs the tripwire
+    # down per-bucket through the declared `simulation.exit_ignore_buckets`
+    # key, so the file layer narrows the trap as readily as the environment.
+    ignore = {bucket.strip() for bucket in exit_ignore_buckets.split(",") if bucket.strip()}
+    trap_failures = [f for f in failures if f.get("bucket") not in ignore]
+    if not trap_failures:
+        return
+    first = trap_failures[0]
+    _dump_failure_fixture(first, path_infos.get(first["path_id"]), current_block)
+    # ADR-040: the PER-BUCKET policy decides what happens next — the
+    # Rust core owns the closed bucket matrix (single source of truth);
+    # Python only consults it. A sim failure's effective action is the
+    # `sim_failure` bucket's (reason sub-split lands at the sim seam).
+    from apexbot.diagnostics import FailureAction
+    from apexbot.diagnostics import failure_action as _policy
+
+    # The resolved action rides the injection seam when the caller handed it
+    # down; the default consults the Rust policy matrix at trap time.
+    action = sim_failure_action if sim_failure_action is not None else _policy("sim_failure", None)
+    if action == FailureAction.EXIT:
+        bot_logger.error(
+            f"[sim-trap] exiting on first sim failure at block={current_block} "
+            f"(failure_policy sim_failure bucket action=exit) "
+            f"— see [sim-fixture] above",
+        )
+        for h in bot_logger.handlers:
+            h.flush()
+        sys.exit(3)
+    else:
+        bot_logger.error(
+            f"[sim-trap] {len(trap_failures)} sim failure(s) at block={current_block} "
+            f"(failure_policy sim_failure action={action}) — continuing; "
+            f"failures surface via OTel (apexbot.errors{{kind=sim_failure}}). "
+            f"See [sim-fixture] above.",
+        )
+
+
 def _render_fot_tokens(dispatcher: Dispatcher, current_block: int) -> None:
     """Render one ``[fot]`` line per confirmed fee-on-transfer token."""
-
     fot_tokens = dispatcher.fot_tokens(current_block)
 
     for token in fot_tokens:
@@ -417,19 +502,16 @@ def _render_fot_tokens(dispatcher: Dispatcher, current_block: int) -> None:
 def format_failure_breakdown(buckets: dict[str, int]) -> str:
     """Render a ``name=count`` breakdown, highest count first (name breaks ties).
 
-
     Returns ``""`` for an empty tally so the caller can skip the suffix when no
 
     failures were classified.
 
 
     Returns:
-
         ``"name=count name=count…"`` ordered by descending count, or ``""``.
 
 
     """
-
     if not buckets:
         return ""
 
@@ -441,19 +523,25 @@ def format_failure_breakdown(buckets: dict[str, int]) -> str:
 # Basis points denominator (10_000 = 100%).
 
 
+@dataclasses.dataclass(frozen=True)
+class SimDiagWindow:
+    """Block-clock context for a ``[sim-diag]`` line."""
+
+    solve_block: int
+    block: int
+    age: int
+
+
 def format_sim_diag_line(
     failure: dict[str, object],
     *,
     path_id: int,
     path_type: str,
-    solve_block: int,
-    block: int,
-    age: int,
+    window: SimDiagWindow,
 ) -> str:
     """Render one always-on ``[sim-diag]`` JSON line per reverted candidate.
 
-
-    Ergo epic 63I7WJ (task AM5AJW): re-pointed at the inspector's captured
+    Compares the inspector's captured
 
     swap amounts (the ACTUAL amounts the in-process EVM emitted) vs the
 
@@ -490,18 +578,16 @@ def format_sim_diag_line(
 
 
     Returns:
-
         The full ``[sim-diag] ``-prefixed JSON line string.
 
 
     """
-
     payload = {
         "path_id": path_id,
         "path_type": path_type,
-        "solve_block": solve_block,
-        "block": block,
-        "age": age,
+        "solve_block": window.solve_block,
+        "block": window.block,
+        "age": window.age,
         "revert_info": failure.get("bucket", "") or "",
         "optimal_input": failure.get("optimal_input"),
         "hop_outputs": failure.get("hop_outputs", []),

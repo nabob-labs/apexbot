@@ -25,22 +25,27 @@ topology** — and its Slice 4 implemented what the IESD3L task body called "Opt
 
 So the construction shape — the thing IESD3L was framed as needing to decide — is already the
 B2 pattern the task body recommended. B1 (return the raw `PyPool` handle) would break every
-library caller of `AbstractLiquidityPool` (`uniswap/trackers.py`, `curve/trackers.py`,
-`examples/eth_backrun_*.py`); B3 (delete the `PoolRegistry`, make `BotState` the registry) is a
-larger-blast-radius cleanup that is not needed for correctness. The only actually-open gap is the
-**missing unregister half** of the seam, which surfaced concretely as a failing test:
+library caller of `AbstractLiquidityPool` (`examples/eth_backrun_*.py`); B3 (delete the
+`PoolRegistry`, make `BotState` the registry) is a larger-blast-radius cleanup that is not needed
+for correctness. The only actually-open gap is the **missing unregister half** of the seam, which
+surfaced concretely as a failing test. The by-tokens construction path derives the CREATE2 address
+from the token pair, removes the pool, and rebuilds it through `Bot.build_pool`:
 
 `tests/uniswap/test_uniswap_trackers.py::test_pool_remove_and_recreate` does:
 
 ```python
-uniswap_v2_pool_tracker.remove(pool_address=new_v2_weth_wbtc_lp.address)
-bot.pools.remove(pool_address=new_v2_weth_wbtc_lp.address, chain_id=1)   # Python-only removal
-super_new_v2_weth_wbtc_lp = uniswap_v2_pool_tracker.get_pool_from_tokens(...)  # re-build
+pool_address = generate_v2_pool_address(
+    deployer_address=deployer_address,
+    token_addresses=(weth_address, wbtc_address),
+    init_hash=pool_init_hash,
+)
+bot.pools.remove(pool_address=pool_address, chain_id=1)   # Python-only removal
+super_new_v2_weth_wbtc_lp = bot.build_pool(pool_address)  # re-build
 ```
 
 `PoolRegistry.remove` (`src/apexbot/registry/pool.py:156`) deletes only the Python wrapper.
 `BotState` retains the entry in `pool_addresses: HashMap<Address, u64>` and `pools: HashMap<u64,
-PoolEntry>` (`rust/crates/apexbot-bot/src/bot_core/mod.rs:225-227`), because `BotState` has
+PoolEntry>` (`rust/crates/engine/apexbot-bot/src/bot_core/mod.rs:225-227`), because `BotState` has
 `register_v2/v3/v4_pool` but **no `unregister`**. Re-`build_pool` calls `register_v2_pool` again
 and panics: `pyo3_runtime.PanicException: pool already registered` (the `assert!` at
 `bot_core/mod.rs:285` and `:348`). Confirmed pre-existing at clean HEAD; the two halves of the
@@ -132,7 +137,7 @@ Disposal rules:
   retired ids are never scanned).
 
 The `v3_buffer` / `v4_buffer` are `LiquidityEventBuffer<K, U>`
-(`rust/crates/apexbot-bot/src/optimizers/liquidity_event_buffer.rs`). It exposes
+(`rust/crates/engine/apexbot-bot/src/optimizers/liquidity_event_buffer.rs`). It exposes
 `buffer_backfill`/`buffer_pump`/`drain_backfill`/`drain_pump`/`event_count`/`flush`/`expire` but
 **no per-key discard**. U3 adds one: `discard_for(&mut self, key: &K)` — drops all buffered
 events for a single key (used by unregister). It is the symmetric inverse of `buffer_pump(key, …)`

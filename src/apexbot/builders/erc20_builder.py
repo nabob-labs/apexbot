@@ -3,43 +3,50 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING
+import dataclasses
+from typing import TYPE_CHECKING, cast
 
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.erc20 import EtherPlaceholder
 from apexbot.erc20.erc20 import Erc20Token
-from apexbot.exceptions.base import ApexbotValueError
+from apexbot.exceptions import ApexbotValueError, PoolRegistrationError
 from apexbot.logging import logger
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from apexbot._ffi import Bot, BotIo
-    from apexbot.database import Erc20TokenRow
-    from apexbot.database.session_manager import DatabaseSessionManager
+    from apexbot.db import Erc20TokenRow
     from apexbot.registry import TokenRegistry
     from apexbot.types.aliases import ChainId
     from apexbot.types.rpc_types import BlockIdentifier
 
 
-class Erc20Builder:
-    """Builds Erc20Token instances from DB lookups and RPC calls.
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class _TokenMetadata:
+    """On-chain metadata resolved for a token."""
 
-    Owns the full I/O choreography: check registry → check DB → fetch
-    from chain → construct token → register.
+    name: str
+    symbol: str
+    decimals: int
+
+
+class Erc20Builder:
+    """Builds Erc20Token instances from Rust-backed metadata and RPC calls.
+
+    Owns the companion I/O choreography: check the registry → ask the Rust
+    construction core for metadata → wrap and register the token.
     """
 
     def __init__(
         self,
         *,
         default_chain_id: ChainId | None = None,
-        db: DatabaseSessionManager,
         tokens: TokenRegistry,
         py_bot: Bot,
     ) -> None:
         """Initialize the instance."""
         self._default_chain_id = default_chain_id
-        self._db = db
         self._tokens = tokens
         self._py_bot = py_bot
 
@@ -54,14 +61,13 @@ class Erc20Builder:
         """Construct an ERC-20 token, delegating metadata resolution to the Rust core.
 
         The DB-first + on-chain resolution, write-back and `BotState`
-        registration are Rust-owned (VK3YDM-S2): `Bot.build_erc20_token`
+        registration are Rust-owned: `Bot.build_erc20_token`
         runs `build_erc20_metadata` over the attached `ConstructionIo`. This
         Python shell keeps only the *companion* concerns: the `TokenRegistry`
-        idempotent short-circuit (35NMBX Guard 1), the `EtherPlaceholder`
-        special case, and the `Erc20Token._from_py_token` display wrapper.
+        idempotent short-circuit, the `EtherPlaceholder`
+        special case, and the `Erc20Token.from_handle` display wrapper.
         The `io` argument is a retained compat shim (ignored — the Bot owns
-        the `ConstructionIo`); it is stripped when `BotIo` retires
-        (VK3YDM-S5).
+        the `ConstructionIo`); it is stripped when `BotIo` retires.
 
         Returns:
             The computed value.
@@ -101,7 +107,7 @@ class Erc20Builder:
                 18,
                 chain_id,
             )
-            token: Erc20Token = EtherPlaceholder._from_py_token(py_token)  # ruff:ignore[private-member-access]
+            token: Erc20Token = EtherPlaceholder.from_handle(py_token)
             token = self._tokens.get_or_add(
                 token_address=token.address, chain_id=chain_id, token=token
             )
@@ -109,7 +115,7 @@ class Erc20Builder:
                 logger.info(f"• {token.symbol} ({token.name})")
             return token
 
-        # DB-first + on-chain + write-back + register: Rust-owned (VK3YDM-S2).
+        # DB-first + on-chain + write-back + register: Rust-owned.
         # `Bot.build_erc20_token` resolves name/symbol/decimals (DB row -> on-
         # chain batched read -> alternate-prototype fallback -> UNKNOWN, with a
         # blank-row write-back) and registers into the shared Rust
@@ -117,17 +123,22 @@ class Erc20Builder:
         # `ConstructionIo`. Returns a thin `Erc20Token` handle.
         try:
             py_token = self._py_bot.build_erc20_token(address, chain_id)
-        except RuntimeError as exc:
-            # Preserve the documented ApexbotValueError contract: the binding
-            # flattens core build failures to RuntimeError (map_builder_err),
-            # so re-raise as ApexbotValueError, stripping the binding's
-            # "pool build decode failure: " prefix.
-            raise ApexbotValueError(
-                message=str(exc).removeprefix("pool build decode failure: ")
-            ) from exc
-        token = Erc20Token._from_py_token(py_token)  # ruff:ignore[private-member-access]
+        except (PoolRegistrationError, RuntimeError) as exc:
+            # Preserve the documented ApexbotValueError contract. The binding
+            # raises the typed build-failure taxonomy for a build that fails
+            # before admission — `PoolBuildRpcError` (the read failed) and
+            # `PoolBuildDecodeError` (the read answered an impossible value) —
+            # and every arm hangs off `PoolRegistrationError`, so catching the
+            # parent is what keeps this call's contract whole. That parent is a
+            # ValueError, not a RuntimeError, so a RuntimeError-only arm let a
+            # typed refusal escape. RuntimeError stays as the belt-and-braces
+            # arm for the still-flattened DB refusal and any plain seam
+            # failure; `__cause__` carries the typed refusal for a caller that
+            # classifies by type instead of message.
+            raise ApexbotValueError(message=_build_failure_message(exc)) from exc
+        token = Erc20Token.from_handle(py_token)
 
-        # Register idempotently (35NMBX Guard 1): a concurrent worker may have
+        # Register idempotently: a concurrent worker may have
         # built + registered this same token first; use the canonical instance
         # so a path sharing it is not lossily skipped.
         token = self._tokens.get_or_add(token_address=token.address, chain_id=chain_id, token=token)
@@ -140,9 +151,7 @@ class Erc20Builder:
     def _register_from_metadata(
         self,
         address: str,
-        name: str,
-        symbol: str,
-        decimals: int,
+        metadata: _TokenMetadata,
         *,
         chain_id: ChainId,
         silent: bool,
@@ -150,11 +159,13 @@ class Erc20Builder:
         """Register a token in the Rust BotState + Python registry from metadata.
 
         Returns:
-            The canonical token instance (35NMBX Guard 1 ``get_or_add`` path).
+            The canonical token instance (the ``get_or_add`` path).
 
         """
-        py_token = self._py_bot.register_token(address, name, symbol, decimals, chain_id)
-        token = Erc20Token._from_py_token(py_token)  # ruff:ignore[private-member-access]
+        py_token = self._py_bot.register_token(
+            address, metadata.name, metadata.symbol, metadata.decimals, chain_id
+        )
+        token = Erc20Token.from_handle(py_token)
         token = self._tokens.get_or_add(token_address=token.address, chain_id=chain_id, token=token)
         if not silent:
             logger.info(f"• {token.symbol} ({token.name})")
@@ -170,7 +181,7 @@ class Erc20Builder:
     ) -> list[Erc20Token]:
         """Build MANY tokens, batching metadata reads into ONE Multicall3 read.
 
-        CDJEPJ-2: preserves :meth:`build`'s per-token semantics — registry fast
+        Preserves :meth:`build`'s per-token semantics — registry fast
         path, Ether placeholder, DB lookup, alternate-prototype fallback — but
         when 2+ tokens need a network metadata fetch it issues ONE
         ``io.fetch_erc20_metadata_batch([...])`` instead of N separate
@@ -207,9 +218,7 @@ class Erc20Builder:
                 resolved.append(
                     self._register_from_metadata(
                         address,
-                        "Ether Placeholder",
-                        "ETH",
-                        18,
+                        _TokenMetadata(name="Ether Placeholder", symbol="ETH", decimals=18),
                         chain_id=chain_id,
                         silent=silent,
                     )
@@ -228,9 +237,11 @@ class Erc20Builder:
                 resolved.append(
                     self._register_from_metadata(
                         address,
-                        str(token_from_db.name),
-                        str(token_from_db.symbol),
-                        int(token_from_db.decimals),
+                        _TokenMetadata(
+                            name=str(token_from_db.name),
+                            symbol=str(token_from_db.symbol),
+                            decimals=int(token_from_db.decimals),
+                        ),
                         chain_id=chain_id,
                         silent=silent,
                     )
@@ -266,7 +277,10 @@ class Erc20Builder:
                                 decimals=decimals,
                             )
                     resolved[idx] = self._register_from_metadata(
-                        address, name, symbol, int(decimals), chain_id=chain_id, silent=silent
+                        address,
+                        _TokenMetadata(name=name, symbol=symbol, decimals=int(decimals)),
+                        chain_id=chain_id,
+                        silent=silent,
                     )
 
         return [t for t in resolved if t is not None]
@@ -295,12 +309,12 @@ class Erc20Builder:
         if (balance := token.get_cached_balance(address, block_number)) is not None:
             return balance
 
-        # ADR-005 slice 14d: delegate the balanceOf choreography to Rust
-        # (BotIo is the only executor; the Python parity-gate fallback is retired).
+        # Delegate the balanceOf choreography to Rust (BotIo is the only
+        # executor; the Python parity-gate fallback is retired).
         balance = io.fetch_token_balance(token.address, address, block=block_number)
 
         token.set_cached_balance(address, block_number, balance)
-        return balance
+        return cast("int", balance)
 
     def get_token_approval(  # ruff:ignore[no-self-use]
         self,
@@ -328,11 +342,11 @@ class Erc20Builder:
         if (approval := token.get_cached_approval(block_number, owner, spender)) is not None:
             return approval
 
-        # ADR-005 slice 14d: same delegation seam as `get_token_balance`.
+        # Same delegation seam as `get_token_balance`.
         approval = io.fetch_token_allowance(token.address, owner, spender, block=block_number)
 
         token.set_cached_approval(block_number, owner, spender, approval)
-        return approval
+        return cast("int", approval)
 
     def get_token_total_supply(  # ruff:ignore[no-self-use]
         self,
@@ -356,7 +370,7 @@ class Erc20Builder:
         if (total_supply := token.get_cached_total_supply(block_number)) is not None:
             return total_supply
 
-        # ADR-005 slice 14d: same delegation seam as `get_token_balance`.
+        # Same delegation seam as `get_token_balance`.
         total_supply = int(io.fetch_token_total_supply(token.address, block=block_number))
 
         token.set_cached_total_supply(block_number, total_supply)
@@ -380,7 +394,32 @@ class Erc20Builder:
         assert io is not None
 
         block_number = _resolve_block_number(io, block_identifier)
-        return io.get_balance(address, block=block_number)
+        return cast("int", io.get_balance(address, block=block_number))
+
+
+# --- Build-failure message rendering ---
+
+# The seam renders a build refusal as "pool build <arm>: <reason>". The two
+# I/O arms' reason is the whole caller-facing message, so their prefix is
+# stripped here; the DB arm keeps its historical text unchanged.
+_BUILD_FAILURE_PREFIXES = (
+    "pool build decode failure: ",
+    "pool build RPC error: ",
+)
+
+
+def _build_failure_message(exc: BaseException) -> str:
+    """Render a build refusal without the seam's I/O-arm prefix.
+
+    Returns:
+        The rendered message.
+
+    """
+    message = str(exc)
+    for prefix in _BUILD_FAILURE_PREFIXES:
+        if message.startswith(prefix):
+            return message.removeprefix(prefix)
+    return message
 
 
 # --- Package-level helpers (BotIo equivalents of Erc20Token.fetch_*) ---
@@ -394,8 +433,8 @@ def _resolve_block_number(io: BotIo, block_identifier: BlockIdentifier | None) -
 
     """
     if block_identifier is None:
-        return io.get_block_number()
+        return cast("int", io.get_block_number())
     if isinstance(block_identifier, int):
         return block_identifier
     # For string identifiers like 'latest', 'earliest', 'pending'
-    return io.get_block_number()
+    return cast("int", io.get_block_number())

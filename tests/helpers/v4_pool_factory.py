@@ -1,9 +1,9 @@
-"""I/O-free `UniswapV4Pool` construction helper for tests (ADR-005 slice 9b).
+"""I/O-free `UniswapV4Pool` construction helper for tests.
 
 Mirror of `make_v3_pool` — registers the V4 pool in Rust (Bot) and wraps the
-returned `LiquidityPool` handle in the V4 companion. The companion owns NO
+returned `Pool` handle in the V4 companion. The companion owns NO
 mutable state (Rust is the source of truth); it carries the V4 identity
-(pool_id, pool_manager, pool_key, hook_address, fees) + the `LiquidityPool`
+(pool_id, pool_manager, pool_key, hook_address, fees) + the `Pool`
 handle. Construct via this helper; do NOT call `UniswapV4Pool(...)` directly in
 tests (the constructor takes a handle, not scalars).
 """
@@ -12,20 +12,23 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from apexbot._ffi import Bot
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.constants import ZERO_ADDRESS
 from apexbot.uniswap.concentrated.types import LiquidityAtTick
 from apexbot.uniswap.v4_liquidity_pool import ProtocolFee, UniswapV4Pool
+from tests.helpers.pool_bot import new_pool_bot
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from apexbot._ffi import Bot
     from apexbot.erc20 import Erc20Token
 
-# No shared Bot — V4 tests frequently reuse the same pool_id (V4 pool_id is
-# derived from the pool_key, so tests sharing a pool_key collide on a shared
-# bot's `(pool_manager, pool_id)` registry). Each `make_v4_pool` call gets a
-# fresh bot (the token objects are independent Python wrappers; their Rust bot
-# membership doesn't matter for pool registration, which takes addresses).
+# V4 registration is get-or-register on the `(pool_manager, pool_id)` pair: a
+# same-key + same-currencies build answers the EXISTING handle, while a genuine
+# conflict (same pair, different currencies) still refuses loudly. Pools are
+# MUTABLE, so each call mints a FRESH `Bot` (via `new_pool_bot`) by default;
+# a caller that wants to share one bot passes `py_bot=` explicitly.
 
 
 def make_v4_pool(
@@ -45,7 +48,7 @@ def make_v4_pool(
     protocol_fee_one_for_zero: int,
     lp_fee: int,
     tick_data: dict[int, Any] | None = None,
-    tick_bitmap: dict[int, Any] | None = None,
+    known_bitmap_words: Iterable[int] | None = None,
     state_block: int | None = None,
     py_bot: Bot | None = None,
     coverage: str | None = None,
@@ -63,9 +66,19 @@ def make_v4_pool(
     Rust coverage flag (it is set at registration), so the sparse contract
     must be established at construction.
 
-    Returns the V4 companion over the `LiquidityPool` handle.
+    ``known_bitmap_words`` forwards to ``register_v4_pool`` (the V4 twin of the
+    V3 argument): the tick-bitmap WORD positions a caller already checked
+    on-chain, recorded as checked for a Sparse pool and ignored for a Tracked
+    one.
+
+    Mints a fresh ``Bot`` unless ``py_bot`` is injected, so each pool is
+    isolated; registration is get-or-register (a same-key + same-currency
+    re-build answers the EXISTING handle). A caller that wants to share one
+    bot passes ``py_bot=``.
+
+    Returns the V4 companion over the `Pool` handle.
     """
-    bot = py_bot or Bot()
+    bot = py_bot if py_bot is not None else new_pool_bot()
     blk = state_block if state_block is not None else 0
 
     # ADR-006 rolling-start race closure: seed tick_data INLINE in
@@ -99,7 +112,7 @@ def make_v4_pool(
         fee=fee,
         tick_spacing=tick_spacing,
         # The REAL hook address — registered in the pool key in full so the
-        # identity round-trips keccak(abi.encode(pool_key)) (MTMPQB).
+        # identity round-trips keccak(abi.encode(pool_key)).
         hook_address=hook_address,
         sqrt_price_x96=sqrt_price_x96,
         liquidity=liquidity,
@@ -108,6 +121,7 @@ def make_v4_pool(
         tick_data=register_rows,
         coverage=coverage,
         tick_data_fetcher=tick_data_fetcher,
+        known_bitmap_words=(list(known_bitmap_words) if known_bitmap_words is not None else None),
     )
     handle = bot.get_pool(pool_id_int)
 
@@ -118,7 +132,7 @@ def make_v4_pool(
     for tok in (token0, token1):
         if bot.get_token(tok.address) is None:
             bot.register_token(tok.address, tok.name, tok.symbol, tok.decimals, tok.chain_id)
-    pool = UniswapV4Pool._from_py_pool(handle)
+    pool = UniswapV4Pool.from_handle(handle)
     # Builder-supplied values the seam defaults; override from test args.
     pool._state_view_address = (
         get_checksum_address(state_view_address) if state_view_address else ZERO_ADDRESS
@@ -128,9 +142,9 @@ def make_v4_pool(
         one_for_zero=protocol_fee_one_for_zero,
     )
     pool.lp_fee = lp_fee
-    # ``tick_bitmap`` keys are recorded Rust-side as checked words at the
-    # construction seed (T1 3WTDFK — the companion override is retired);
-    # nothing to overlay here.
+    # The retired ``tick_bitmap`` value arg is gone; the checked words are
+    # recorded Rust-side from the seeded tick rows (the companion override is
+    # retired) — nothing to overlay here.
     return pool
 
 

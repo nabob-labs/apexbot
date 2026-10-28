@@ -1,4 +1,4 @@
-"""Operator command channel: JSON-lines over a Unix domain socket (NWTUM3).
+"""Operator command channel: JSON-lines over a Unix domain socket.
 
 Lets an operator steer a live bot without touching its process. The host bot
 runs an :class:`OperatorServer` (an asyncio task) bound to a Unix domain
@@ -36,15 +36,15 @@ Response lines::
     #   the six cordon_* values + "posture"
     {"ok": false, "error": "..."}
 
-The server maps a ``family`` string to the pool-table base class the
-registration pipeline classifies steps with, so no Python class object crosses
-the wire. The handler (supplied by the host) turns an ``(op, payload)`` pair
+The server maps a ``family`` string to the typed Rust-backed pool family the
+registration pipeline consumes, so no Python class object crosses the wire. The
+handler (supplied by the host) turns an ``(op, payload)`` pair
 into a response dict; the server guards the wire (JSON decode, op dispatch,
 exception -> ``{"ok": false}``) so a malformed or failing command never crashes
 the host.
 
-The fleet-posture ops (`set_fleet_posture` / `get_fleet_posture`,
-JCI2FW Part B) re-tune the LIVE cordon thresholds of the process posture
+The fleet-posture ops (`set_fleet_posture` / `get_fleet_posture`)
+re-tune the LIVE cordon thresholds of the process posture
 owner through the `apexbot.fleet` mirror home; :func:`handle_fleet_posture_op`
 is the host-side helper both the runner's handler and the tests route them
 through. Validation of the six values lives ONCE in the Rust core
@@ -63,28 +63,21 @@ discover replies after the bounded sweep is consumed).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from apexbot.database.models.pools import (
-    UniswapV2PoolTableBase,
-    UniswapV3PoolTableBase,
-    UniswapV4PoolTableBase,
-)
+from apexbot import fleet
 from apexbot.logging import logger
+from apexbot.pathfinding import FAMILY_TAG_TO_POOL_KIND, POOL_FAMILY_TAGS, PoolKind
+from apexbot.utils.tasks import cancel_and_reap
 
-#: Map a wire ``family`` string to the pool-table base class the registration
-#: pipeline classifies `step.type` with (V2/V3/V4) -- the single source so the
-#: operator wire cannot name a table class directly.
-_FAMILY_TO_TABLE: dict[str, type] = {
-    "V2": UniswapV2PoolTableBase,
-    "V3": UniswapV3PoolTableBase,
-    "V4": UniswapV4PoolTableBase,
-}
+#: Map the public wire labels to the typed pool families used by pathfinding.
+#: minted from the core's exported tag list (apexbot.pathfinding) — never
+#: re-declared here.
+_FAMILY_TO_POOL_KIND = FAMILY_TAG_TO_POOL_KIND
 
 #: Handler signature: ``async def (op: str, payload: dict) -> dict`` returning a
 #: response with ``detail`` (ok) or ``error`` (failure).
@@ -96,13 +89,13 @@ class StepSpec:
     """A hop descriptor in the discovery-item shape the pipeline consumes.
 
     Attributes:
-        type: The pool-table base class for the hop's family (V2/V3/V4).
+        type: The typed pool family for the hop (V2/V3/V4).
         address: The pool address (``0x`` + 40 hex).
-        hash: The V4 pool id (``0x`` + 64 hex) when ``type`` is V4.
+        hash: The V4 pool id (``0x`` + 64 hex) when ``type`` is ``PoolKind.V4``.
 
     """
 
-    type: type
+    type: PoolKind
     address: str
     hash: object | None = None
 
@@ -114,22 +107,25 @@ def step_from_wire(step: dict[str, Any]) -> StepSpec:
         step: ``{"family": "V2|V3|V4", "address": "0x..", "hash": "0x.."?}``.
 
     Returns:
-        A :class:`StepSpec` mapping ``family`` to its pool-table base class.
+        A :class:`StepSpec` mapping ``family`` to its typed pool kind.
 
     Raises:
         ValueError: if ``family`` is not V2/V3/V4 or ``address`` is absent.
 
     """
     family = step.get("family")
-    table = _FAMILY_TO_TABLE.get(family)  # type: ignore[arg-type]
-    if table is None:
-        msg = f"unknown pool family {family!r} (expected V2|V3|V4)"
+    pool_kind = _FAMILY_TO_POOL_KIND.get(family)  # type: ignore[arg-type]
+    if pool_kind is None:
+        # The expected set is the core's minted tag list, so the refusal names
+        # the taxonomy the core actually declares.
+        expected = "|".join(POOL_FAMILY_TAGS)
+        msg = f"unknown pool family {family!r} (expected {expected})"
         raise ValueError(msg)
     address = step.get("address")
     if not address:
         msg = f"{family} step is missing an address"
         raise ValueError(msg)
-    return StepSpec(type=table, address=address, hash=step.get("hash"))
+    return StepSpec(type=pool_kind, address=address, hash=step.get("hash"))
 
 
 #: The six fleet-posture threshold key names `set_fleet_posture` accepts
@@ -171,8 +167,6 @@ def handle_fleet_posture_op(op: str, payload: dict[str, Any]) -> dict[str, Any]:
         refused patch (the typed ``PostureRetuneError`` surfaces verbatim).
 
     """
-    from apexbot import fleet  # lazy: the home mints on the first fleet-posture op
-
     if op == "get_fleet_posture":
         return {"effective": fleet.current_posture()}
     if op == "set_fleet_posture":
@@ -257,7 +251,7 @@ def _decode_request(line: bytes) -> tuple[str, dict[str, Any]]:
 
 
 class OperatorServer:
-    """A Unix-domain-socket command server for a live bot (NWTUM3).
+    """A Unix-domain-socket command server for a live bot.
 
     Run :meth:`serve` as an asyncio task (e.g. a background task on the
     registration loop). It accepts one or more concurrent client connections,
@@ -293,7 +287,8 @@ class OperatorServer:
         self._socket_path = socket_path
         self._request_timeout = request_timeout
         self._server: asyncio.AbstractServer | None = None
-        self._serving: asyncio.Future[None] | None = None
+        self._serving: asyncio.Task[None] | None = None
+        self._ready = asyncio.Event()
 
     async def serve(self) -> None:
         """Start the socket server and accept connections until closed.
@@ -305,9 +300,19 @@ class OperatorServer:
         loop).
         """
         self._server = await asyncio.start_unix_server(self._on_client, self._socket_path)
+        self._ready.set()  # socket is bound + listening: readiness signal
         self._serving = asyncio.ensure_future(self._server.serve_forever())
         async with self._server:
             await self._serving
+
+    async def wait_ready(self, timeout_s: float = 5.0) -> None:
+        """Wait until :meth:`serve` has bound the socket and is listening.
+
+        Args:
+            timeout_s: seconds to wait before raising :class:`TimeoutError`.
+
+        """
+        await asyncio.wait_for(self._ready.wait(), timeout_s)
 
     async def _handle_line(self, line: bytes) -> dict[str, Any]:
         """Decode + dispatch one request line to the wrapped handler.
@@ -375,9 +380,7 @@ class OperatorServer:
         cancelled by the host, or is running on another thread's event loop.
         """
         if self._serving is not None and not self._serving.done():
-            self._serving.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._serving
+            await cancel_and_reap(self._serving)
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()

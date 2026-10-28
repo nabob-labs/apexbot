@@ -1,0 +1,38 @@
+//! Pins the `apexbot-strategy` re-export surface: every capability seam a
+//! strategy composes must be nameable through the crate root.
+
+use apexbot_strategy::backrun_driver::{AnyRequestTransport, NodeCapability};
+use apexbot_strategy::{
+    AssessRule, ComposeError, ComposerInputs, DiscoveryHandles, ExecutionAdapter, ExecutionResult,
+    FeePolicy, PayloadComposer, ProbeSpecs, ProvisionCell, SkipReason, SolveResult, StrategyCell,
+    StrategyKit, SubmissionTarget, SubmitCandidate, SubmitOutcome,
+};
+
+#[test]
+fn capability_seams_are_reexported() {
+    let seams = [
+        std::any::type_name::<ProbeSpecs>(),
+        std::any::type_name::<AssessRule>(),
+        std::any::type_name::<FeePolicy>(),
+        std::any::type_name::<ExecutionResult>(),
+        std::any::type_name::<ComposerInputs<'static>>(),
+        std::any::type_name::<SolveResult>(),
+        std::any::type_name::<ComposeError>(),
+        std::any::type_name::<SubmitCandidate>(),
+        std::any::type_name::<StrategyKit>(),
+        std::any::type_name::<StrategyCell>(),
+        std::any::type_name::<ProvisionCell>(),
+        std::any::type_name::<DiscoveryHandles>(),
+        std::any::type_name::<SubmissionTarget>(),
+        std::any::type_name::<SubmitOutcome>(),
+        std::any::type_name::<SkipReason>(),
+        std::any::type_name::<&dyn ExecutionAdapter>(),
+        std::any::type_name::<&dyn PayloadComposer>(),
+        std::any::type_name::<&dyn NodeCapability>(),
+        std::any::type_name::<AnyRequestTransport>(),
+    ];
+    assert!(
+        seams.iter().all(|name| name.contains("apexbot_")),
+        "unexpected seam type path: {seams:?}"
+    );
+}

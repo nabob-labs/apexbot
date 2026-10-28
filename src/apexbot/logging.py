@@ -9,8 +9,10 @@ This module owns two concerns:
 Rust ``tracing`` events — and ``log::`` records, bridged into ``tracing`` by
 ``tracing_log::LogTracer`` — are forwarded to Python ``logging`` by the
 ``PythonLogLayer`` installed by ``init_logging_subscriber`` in
-``rust/crates/apexbot-python/src/python_log_layer.rs`` during ``apexbot_rs``
-module init. The layer derives each record's Python logger name from the Rust
+``rust/crates/shells/apexbot-python/src/python_log_layer.rs`` during the explicit
+``driver_boot()`` call (module init registers symbols only, and ``Bot``
+triggers the boot at construction). The layer derives each record's Python
+logger name from the Rust
 target (``::`` → ``.``): an event for ``apexbot_bot::bot_core::block_pump``
 lands on the Python logger ``apexbot_bot.bot_core.block_pump``.
 
@@ -27,15 +29,20 @@ The fix lives here, in the base config that runs at ``import apexbot`` time —
 operation runs, never during import). Configuring the crate-root loggers up
 front at the lowered level makes forwarded records visible with no caller
 wiring. The Rust-side ``tracing`` ``EnvFilter`` (``RUST_LOG``) is the first
-gate; Python ``logging`` is the second.
+gate; Python ``logging`` is the second. The level that base config installs is
+decided by :func:`base_log_level` when :func:`apply_base_log_level` runs, not
+frozen into a module constant, so the import installs the process default and
+a later caller can install another.
 """
 
 import atexit
+import io
 import logging
 import logging.handlers
 import os
 import queue
 import sys
+from typing import Any, TextIO, cast
 
 """
 Create a global logger instance.
@@ -44,13 +51,6 @@ Create a global logger instance.
 logger = logging.getLogger(__name__)
 logger.propagate = False
 
-# Check APEXBOT_DEBUG environment variable for debug mode
-if os.environ.get("APEXBOT_DEBUG", "").lower() in {"1", "true", "yes"}:
-    _LOG_LEVEL = logging.DEBUG
-else:
-    _LOG_LEVEL = logging.INFO
-
-logger.setLevel(_LOG_LEVEL)
 
 # The real stdout writer — owned SOLELY by the ``QueueListener`` thread below
 # (never attached directly to any logger). When stdout is piped (e.g. the
@@ -69,7 +69,52 @@ logger.setLevel(_LOG_LEVEL)
 # slow ``os.write`` blocks only the listener thread whose sole job is
 # writing). See ``tests/test_rust_logging_bridge.py`` (the
 # ``QueueHandler-not-StreamHandler`` + listener-drains guards).
-_STDOUT_HANDLER = logging.StreamHandler(sys.stdout)
+class _LiveStdoutStreamHandler(logging.StreamHandler[TextIO]):
+    """The console writer — resolves ``sys.stdout`` at emit time, never pins it.
+
+    A pinned stream is a pytest-teardown hazard: this module is imported while
+    pytest's global capture owns ``sys.stdout`` (an ``EncodedFile`` over a temp
+    file), and pytest closes that object when the capture tears down (each
+    xdist worker's session end). Any record the ``QueueListener`` flushes after
+    that dies in ``StreamHandler.emit`` with ``ValueError: I/O operation on
+    closed file`` — ``Handler.handleError`` prints the ``--- Logging error ---``
+    block straight to the real stderr and swallows it, so the suite stays green
+    while the console pipeline is broken (observed at the tail of ``just
+    test-python``). Resolving at emit time lands each record in whatever stream
+    is CURRENT: pytest's open capture during the session (visible in a failing
+    test's captured output), the real stdout after teardown.
+
+    The single-writer/GIL rationale of the queue pair below is unchanged: this
+    remains the one stream writer, owned by the listener thread.
+    """
+
+    def __init__(self) -> None:
+        # ``StreamHandler.__init__`` assigns ``self.stream``, which a
+        # property-only subclass cannot accept — ``logging._StderrHandler`` is
+        # the stdlib precedent for exactly this shape.
+        logging.Handler.__init__(self)
+
+    # ``StreamHandler`` declares ``stream`` as a writable attribute assigned in
+    # its ``__init__``; emit-time resolution needs a read-only property. This
+    # mirrors stdlib ``logging._StderrHandler``, which overrides the same
+    # attribute with a property — ty cannot model the stdlib's own shape.
+    @property
+    def stream(self) -> TextIO:  # ty: ignore[invalid-property-type-override]
+        current = sys.stdout
+        if current is not None and not current.closed:
+            return cast("TextIO", current)
+        # The active stdout is closed (post-teardown) or None (pythonw /
+        # interpreter shutdown): fall back to the process original so the
+        # record stays visible rather than erroring. When even that is gone,
+        # hand back a throwaway sink — a dropped tail record beats a
+        # ``--- Logging error ---`` spray from a dying interpreter.
+        for candidate in (sys.__stdout__, sys.stderr):
+            if candidate is not None and not candidate.closed:
+                return cast("TextIO", candidate)
+        return io.StringIO()
+
+
+_STDOUT_HANDLER = _LiveStdoutStreamHandler()
 
 #: The closed target domains (ADR-043 §3). A Rust record's logger name is its
 #: target with `::` dotted (`apexbot::solver` → `apexbot.solver`), so the
@@ -130,9 +175,8 @@ _STDOUT_HANDLER.setFormatter(_AreaFormatter())
 # ``Condition``, no notifier thread) — ``put_nowait`` is a few microseconds and never
 # blocks. ``respect_handler_level=True`` so the listener still honors each
 # destination handler's level (mirrors direct-emit semantics).
-_LOG_QUEUE: queue.SimpleQueue = queue.SimpleQueue()
+_LOG_QUEUE: queue.SimpleQueue[Any] = queue.SimpleQueue()
 _QUEUED_HANDLER = logging.handlers.QueueHandler(_LOG_QUEUE)
-_QUEUED_HANDLER.setLevel(_LOG_LEVEL)
 _LOG_LISTENER = logging.handlers.QueueListener(
     _LOG_QUEUE,
     _STDOUT_HANDLER,
@@ -158,7 +202,7 @@ logger.addHandler(_QUEUED_HANDLER)
 RUST_BRIDGE_LOGGER_NAMES = (
     "apexbot_bot",
     "apexbot_core",
-    # The PyO3 binding crate lives in ``crates/apexbot-python/`` but its
+    # The PyO3 binding crate lives in ``crates/shells/apexbot-python/`` but its
     # Cargo ``name`` is ``apexbot_rs`` (set in its ``Cargo.toml``), so every
     # bare ``log::info!`` in that crate (``verify.rs``, ``register.rs``,
     # ``json.rs``) emits under ``apexbot_rs::...`` → Python logger
@@ -170,12 +214,27 @@ RUST_BRIDGE_LOGGER_NAMES = (
     "apexbot_decoders",
     "apexbot_uniswap",
     # The in-process sim engine + the settlement-arbitrage strategy. The divergence probe
-    # (``[sim-divergence]``, ergo task 4C33DP / epic TR6GWT) + the bridge-probe
+    # (``[sim-divergence]``) + the bridge-probe
     # (``[bridge-probe]``) emit events from these crates; without configuring
     # the crate-root here their records are dropped at the Python logger-level
     # gate before reaching a handler (silent even with the env var on).
     "apexbot_simulation",
     "apexbot_arbitrage",
+    # The in-process backrun strategy driver (tx 0x3dcfe follow-up): the
+    # frame-decision INFO line (``apexbot_strategy.backrun_driver.driver_loop``)
+    # and the connector-index boot line dropped at this gate before the
+    # crate root was configured here.
+    "apexbot_strategy",
+    # The third-party alloy umbrella (alloy_pubsub::service reconnect WARNs,
+    # alloy-provider transport ERRORs). The console EnvFilter already caps
+    # alloy at WARN (its INFO/DEBUG are throttled — see the Rust
+    # logging_parity pins), so only genuine failures cross here. Without this
+    # root the records fall through to stdlib ``lastResort`` and print RAW on
+    # stderr with no format and no capture safety — the vector behind the
+    # raw ``Reconnection attempt …`` lines at the tail of a pytest run whose
+    # leaked pubsub task outlived the session. Queueing them gives the same
+    # single-writer capture-safe path every other bridged record takes.
+    "alloy",
 )
 
 #: The Python package-tree root whose descendants include Python-side modules
@@ -184,7 +243,7 @@ RUST_BRIDGE_LOGGER_NAMES = (
 #: from the ``apexbot`` package logger — a SIBLING of ``apexbot.logging``
 #: (which has ``propagate = False``), not an ancestor — so without configuring
 #: the ``apexbot`` root here their INFO records fall through to the stdlib
-#: root (WARNING, no handler) and are dropped. S2 (GTOD23-PB24RX) surfaced this:
+#: root (WARNING, no handler) and are dropped. This failure was observed live:
 #: the recurring verifier ran and detected drift but its ``[verify] (recurring)``
 #: lines never reached stdout, and 0 ``(recurring)`` hits appeared across all 27
 #: permutation runs. Configuring the ``apexbot`` package root with the same
@@ -200,7 +259,6 @@ PY_PACKAGE_ROOT_LOGGER_NAMES = ("apexbot",)
 # apexbot format).
 for _name in RUST_BRIDGE_LOGGER_NAMES:
     _rust_logger = logging.getLogger(_name)
-    _rust_logger.setLevel(_LOG_LEVEL)
     _rust_logger.addHandler(_QUEUED_HANDLER)
     _rust_logger.propagate = False
 
@@ -213,7 +271,6 @@ for _name in RUST_BRIDGE_LOGGER_NAMES:
 # configuring the shared parent does NOT duplicate its records.
 for _name in PY_PACKAGE_ROOT_LOGGER_NAMES:
     _pkg_logger = logging.getLogger(_name)
-    _pkg_logger.setLevel(_LOG_LEVEL)
     _pkg_logger.addHandler(_QUEUED_HANDLER)
     _pkg_logger.propagate = False
 
@@ -223,12 +280,51 @@ def set_log_level(level: int) -> None:
 
     Mirrors the historical conftest behaviour of bumping the package logger to
     ``DEBUG`` for the test run, extended to cover the Rust bridge loggers so
-    Rust ``debug!`` records are not left behind by the crate-root level set at
+    Rust ``debug!`` records are not left behind by the base level applied at
     import. Lowering the level here is effective because no Rust path logs at
-    import time.
+    import time. The queued handler keeps whatever level the base config gave
+    it (see :func:`apply_base_log_level`); only the knob path lowers that too.
     """
     logger.setLevel(level)
     for name in RUST_BRIDGE_LOGGER_NAMES:
         logging.getLogger(name).setLevel(level)
     for name in PY_PACKAGE_ROOT_LOGGER_NAMES:
         logging.getLogger(name).setLevel(level)
+
+
+def base_log_level() -> int:
+    """Resolve the console level this process asks for, when it is asked for.
+
+    ``APEXBOT_DEBUG`` is a logging-plumbing signal, the same class as
+    ``RUST_LOG``: it says where records go, not how the bot is configured. It
+    used to be read into a module constant, which left the level decided
+    before any caller could speak and no way to change it afterwards; reading
+    it here makes the answer belong to whoever applies the level.
+
+    Returns:
+        ``logging.DEBUG`` when the knob is set to a true word, else
+        ``logging.INFO``.
+
+    """
+    if os.environ.get("APEXBOT_DEBUG", "").lower() in {"1", "true", "yes"}:
+        return logging.DEBUG
+    return logging.INFO
+
+
+def apply_base_log_level() -> None:
+    """Install the ``APEXBOT_DEBUG``-derived level on every apexbot logger.
+
+    Runs once at import -- before any Rust record can exist, since ``log::``
+    fires at pump/verify/register time and never during import -- and again
+    for any caller that changes the environment afterwards. The queued
+    handler's level moves with the loggers': it is the ceiling every record
+    passes on its way to the listener, so a logger-only level would leave the
+    import-time ceiling standing and the knob a no-op for the records it
+    names.
+    """
+    level = base_log_level()
+    _QUEUED_HANDLER.setLevel(level)
+    set_log_level(level)
+
+
+apply_base_log_level()

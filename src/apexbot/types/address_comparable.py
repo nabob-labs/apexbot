@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from apexbot.utils.bytes import to_0x_hex
 
 if TYPE_CHECKING:
-    from apexbot._ffi import ChecksummedAddress
+    from apexbot.types.chain import ChecksummedAddress
 
 
 class AddressComparable:

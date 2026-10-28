@@ -14,22 +14,15 @@ instead of calling ``engine.register_v2_pool``).
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 
 import pytest
 
 from apexbot._ffi import Bot
 from apexbot.arbitrage.engine_registry import ArbitrageEngine, EngineRegistry
 from apexbot.exceptions import VerificationRpcError
+from tests.fakes.bot import FakeBot as _FakeBot
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v3_pool_factory import make_v3_pool
-
-
-@dataclasses.dataclass
-class _FakeBot:
-    """Minimal Bot double exposing ``_py_bot`` for the production path."""
-
-    _py_bot: Bot
 
 
 def _build_shared_v3_pool(py_bot: Bot) -> object:
@@ -73,13 +66,15 @@ def test_register_v3_pool_resolves_shared_state_key_without_re_registering() -> 
     """
     py_bot = Bot()
     pool = _build_shared_v3_pool(py_bot)
-    bot = _FakeBot(py_bot)
+    bot = _FakeBot(py_bot=py_bot)
     registry = EngineRegistry(bot=bot)
 
     key = asyncio.run(registry.register_v3_pool(pool))
 
     assert key == pool._py_pool.pool_id
-    assert registry._v3_keys[pool.address] == key
+    # The identity is answered by the shared core on demand — the registry
+    # keeps no address → id map of its own.
+    assert registry.engine.pool_id_for_pool("v3", pool.address) == key
 
 
 def test_register_tracked_v3_pool_without_provider_fails_fast() -> None:
@@ -92,13 +87,13 @@ def test_register_tracked_v3_pool_without_provider_fails_fast() -> None:
     The drain invariant this test historically pinned (buffered backfill events
     drained onto the snapshot seed — the perm-V2-V2-V3 class, incl. the tick's
     removal when a Burn zeroes its liquidity) moved core-side with the
-    registration-lifecycle (IKGQ6F / ADR-022 D1) and is now asserted by the
+    registration-lifecycle (ADR-022 D1) and is now asserted by the
     Rust unit test `bot_core::registration_lifecycle::tests::
     tracked_v3_lifecycle_drains_buffered_backfill`.
     """
     py_bot = Bot()
     engine = ArbitrageEngine(py_bot=py_bot)
-    bot = _FakeBot(py_bot)
+    bot = _FakeBot(py_bot=py_bot)
     registry = EngineRegistry(bot=bot, engine=engine)
 
     address = "0x11b815efB8f58119D17b5fc9880b1e1a29B7dC33"

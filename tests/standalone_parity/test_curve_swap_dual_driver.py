@@ -2,7 +2,7 @@
 
 The behavioral companion to the Rust `parity_curve_swap.rs` test. Proves the
 **same** canonical Curve fixture driven through the **Python consumer**
-(`apexbot.curve.dy.calculate_dy`, the PyO3 seam) produces the **same** `dy`
+(`apexbot._ffi.curve_dy.calculate_dy`, the PyO3 seam) produces the **same** `dy`
 as the **Rust consumer** (`apexbot_curve_math::calculate_dy` directly).
 Divergence = a lossy FFI seam on the Curve swap-arg extraction (the
 `DyCalculationInputs` builder).
@@ -12,7 +12,7 @@ invariant is a Newton solve), so — like V3/V4 — the oracle is the recorded
 constant in the shared fixture; the Python and Rust sides independently
 re-derive it from the same inputs.
 
-## The shared contract (HRT356 — single source of truth)
+## The shared contract
 
 The fixture + expected outputs are loaded from the SHARED file
 `tests/standalone_parity/fixtures/curve_swap.json`, which the Rust parity test
@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from apexbot.curve.dy import DyCalculationInputs, calculate_dy
+from apexbot._ffi.curve_dy import DyCalculationInputs, calculate_dy
 
 _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "curve_swap.json"
 _FIXTURE = json.loads(_FIXTURE_PATH.read_text())

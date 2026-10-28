@@ -16,6 +16,7 @@ Supported families: Uniswap v2, v3 and v4.
 
 from __future__ import annotations
 
+import gzip
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -24,6 +25,9 @@ from typing import TYPE_CHECKING, Any
 
 from apexbot._ffi import Bot
 from tests.helpers.erc20_factory import make_erc20
+from tests.helpers.v2_pool_factory import make_v2_pool
+from tests.helpers.v3_pool_factory import make_v3_pool
+from tests.helpers.v4_pool_factory import make_v4_pool
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -74,19 +78,11 @@ def _tick_data_dict(tick_data: dict[int, Any] | None) -> dict[str, Any]:
     return out
 
 
-def _tick_bitmap_dict(tick_bitmap: dict[int, Any] | None) -> dict[str, Any]:
-    out: dict[str, Any] = {}
+def _tick_bitmap_words(tick_bitmap: object | None) -> list[str]:
+    """Serialize the known bitmap WORD positions (keys only — no VALUES)."""
     if not tick_bitmap:
-        return out
-    for word, info in tick_bitmap.items():
-        if isinstance(info, dict):
-            out[str(int(word))] = {
-                "bitmap": int(info["bitmap"]),
-                "block": int(info.get("block", 0)),
-            }
-        else:
-            out[str(int(word))] = {"bitmap": int(info.bitmap), "block": int(info.block)}
-    return out
+        return []
+    return sorted(str(int(word)) for word in tick_bitmap)  # type: ignore[union-attr]
 
 
 def _family_of(pool: Any) -> str:
@@ -132,7 +128,7 @@ def extract_pool_state(pool: Any, *, block: int) -> dict[str, Any]:
             "tick": int(pool.tick),
             "liquidity": int(pool.liquidity),
             "tick_data": _tick_data_dict(getattr(pool, "tick_data", None)),
-            "tick_bitmap": _tick_bitmap_dict(getattr(pool, "tick_bitmap", None)),
+            "tick_bitmap": _tick_bitmap_words(getattr(pool, "tick_bitmap", None)),
         }
 
     # v4
@@ -152,7 +148,7 @@ def extract_pool_state(pool: Any, *, block: int) -> dict[str, Any]:
         "protocol_fee_one_for_zero": int(getattr(pool, "protocol_fee_one_for_zero", 0)),
         "lp_fee": int(getattr(pool, "lp_fee", 0)),
         "tick_data": _tick_data_dict(getattr(pool, "tick_data", None)),
-        "tick_bitmap": _tick_bitmap_dict(getattr(pool, "tick_bitmap", None)),
+        "tick_bitmap": _tick_bitmap_words(getattr(pool, "tick_bitmap", None)),
     }
 
 
@@ -179,8 +175,6 @@ def reconstruct_pool(state: dict[str, Any]) -> Any:
     token1 = _make_token(state["tokens"][1])
 
     if family == "v2":
-        from tests.helpers.v2_pool_factory import make_v2_pool
-
         return make_v2_pool(
             state["address"],
             token0=token0,
@@ -196,9 +190,7 @@ def reconstruct_pool(state: dict[str, Any]) -> Any:
         )
 
     if family == "v3":
-        from tests.helpers.v3_pool_factory import make_v3_pool
-
-        pool = make_v3_pool(
+        return make_v3_pool(
             state["address"],
             token0=token0,
             token1=token1,
@@ -210,26 +202,13 @@ def reconstruct_pool(state: dict[str, Any]) -> Any:
             liquidity=state["liquidity"],
             state_block=block,
             tick_data=state.get("tick_data"),
+            # The recorded WORD positions ride in as registration-seeded
+            # checked words, so swap simulation can tell where liquidity ends
+            # (swap-for-all / IncompleteSwap) — fork parity (T1).
+            known_bitmap_words=[int(word) for word in state.get("tick_bitmap") or []],
         )
-        # ``make_v3_pool`` seeds tick_data but not the checked words, so
-        # swap simulation can't tell where liquidity ends (swap-for-all /
-        # IncompleteSwap). ``update_tick_data`` replays the recorded words
-        # (Sparse pools record them as checked words in Rust — the bitmap
-        # itself derives from the tick rows), restoring fork parity (T1
-        # 3WTDFK: the companion override is retired).
-        tick_data = state.get("tick_data")
-        tick_bitmap = state.get("tick_bitmap")
-        if tick_bitmap or tick_data:
-            pool.update_tick_data(
-                tick_bitmap={int(word): info for word, info in (tick_bitmap or {}).items()},
-                tick_data=({int(t): v for t, v in tick_data.items()} if tick_data else {}),
-                block=block,
-            )
-        return pool
 
     if family == "v4":
-        from tests.helpers.v4_pool_factory import make_v4_pool
-
         # make_v4_pool expects ``{tick: (gross, net, block)}`` tuples, not the
         # plain-dict form we persist.
         tick_data = state.get("tick_data")
@@ -258,7 +237,7 @@ def reconstruct_pool(state: dict[str, Any]) -> Any:
             protocol_fee_one_for_zero=state.get("protocol_fee_one_for_zero", 0),
             lp_fee=state.get("lp_fee", 0),
             tick_data=v4_tick_data,
-            tick_bitmap=state.get("tick_bitmap"),
+            known_bitmap_words=[int(word) for word in state.get("tick_bitmap") or []],
             state_block=block,
         )
 
@@ -267,20 +246,31 @@ def reconstruct_pool(state: dict[str, Any]) -> Any:
 
 
 def record_pool(pool: Any, path: Path, *, block: int) -> dict[str, Any]:
-    """Persist a live pool's constructor inputs to a JSON golden file."""
+    """Persist a live pool's constructor inputs to a JSON golden file.
+
+    ``.gz``-suffixed paths are written gzip-compressed (full-range tick maps
+    are large); the loader is transparent to the suffix.
+    """
     state = extract_pool_state(pool, block=block)
     payload = {
         "recorded_at": datetime.now(UTC).isoformat(timespec="seconds"),
         **state,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    if path.suffix == ".gz":
+        path.write_bytes(gzip.compress(text.encode("utf-8")))
+    else:
+        path.write_text(text, encoding="utf-8")
     return state
 
 
 def load_pool(path: Path, *, chain_id: int, block: int) -> Any:
     """Read a recorded-pool golden file and rebuild the I/O-free pool."""
-    state = json.loads(path.read_text(encoding="utf-8"))
+    if path.suffix == ".gz":
+        state = json.loads(gzip.decompress(path.read_bytes()))
+    else:
+        state = json.loads(path.read_text(encoding="utf-8"))
     if state.get("chain_id") != chain_id:
         msg = _CHAIN_MISMATCH_MSG.format(
             path=path,

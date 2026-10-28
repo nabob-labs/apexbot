@@ -1,5 +1,6 @@
 """Balancer V2 weighted and stable pools with swap encoding."""
 
+from apexbot._ffi import BalancerFamily
 from apexbot.balancer.pools import BalancerV2Pool
 from apexbot.balancer.stable_pools import INVARIANT_V1, INVARIANT_V2, BalancerV2StablePool
 from apexbot.balancer.types import (
@@ -10,6 +11,7 @@ from apexbot.balancer.types import (
 __all__ = [
     "INVARIANT_V1",
     "INVARIANT_V2",
+    "BalancerFamily",
     "BalancerV2Pool",
     "BalancerV2StablePool",
     "BalancerV2StablePoolExternalUpdate",

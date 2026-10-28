@@ -20,7 +20,7 @@ Two later decisions drained the bus of its consumers:
   inline by the pump. The bus's only non-test consumer path — the engine subscriber —
   disappeared.
 - The surviving consumers were the in-tree test fakes and an uncalled Python bridge
-  (CONTEXT.md recorded the `_ffi.subscriber` submodule as "0 production callers;
+  (GLOSSARY.md recorded the `_ffi.subscriber` submodule as "0 production callers;
   test-only"). No production consumer ever appeared.
 
 The dead seam was not free. On **every applied forward log** the hot path carried a
@@ -104,7 +104,7 @@ for retired modules.
 - No Python-visible API change for users: the deleted bridge was an un-homed
   `_ffi.subscriber` with no companion home and no production callers.
 - Hard cutover; the build receipt was verified after the Rust edits (`5aace566a`).
-- The retired names and the rename are recorded in CONTEXT.md's retired-name
+- The retired names and the rename are recorded in GLOSSARY.md's retired-name
   discipline.
 
 ## Related
@@ -118,4 +118,9 @@ for retired modules.
   retire-by-vocabulary call follows.
 - The `no-pyo3-in-cores` scan — the live-invariant scan the settled policy contrasts
   against.
+- **ADR-055** (pending-transaction strategy seams) — Phase B schedules a scoped
+  `EventHub` (pending-tx/newHeads intake with subscription fan-out to registered
+  strategies). This is NOT the retired bus resurrected: intake-scoped, typed at the
+  subscription site, no generic broadcast surface for cores. The D4 retirement
+  stands.
 - Ergo epic `Y4VMWH` (candidate #3); parent `MROOY7`.

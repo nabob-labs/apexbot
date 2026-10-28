@@ -1,3 +1,4 @@
+import eth_abi
 import pytest
 
 from apexbot.calculations import next_base_fee
@@ -40,16 +41,15 @@ def test_extract_argument_types_from_function_prototype():
 def test_encode_function_calldata():
     assert (
         encode_function_calldata(function_prototype="factory()", function_arguments=[])
-        == to_bytes("0xc45a01550ceb4bc5c6b2e6f722b5033a03078f9bd6673457375ba94c26ac1cf0")[:4]
+        == keccak256(b"factory()")[:4]
     )
+    recipient = "0xA69babEF1cA67A37Ffaf7a485DfFF3382056e78C"
+    amount = 26535330612692929974
     assert encode_function_calldata(
         function_prototype="transfer(address,uint256)",
-        function_arguments=[
-            "0xA69babEF1cA67A37Ffaf7a485DfFF3382056e78C",
-            26535330612692929974,
-        ],
-    ) == to_bytes(
-        "0xa9059cbb000000000000000000000000a69babef1ca67a37ffaf7a485dfff3382056e78c00000000000000000000000000000000000000000000000170406e9a1f1c4db6",
+        function_arguments=[recipient, amount],
+    ) == keccak256(b"transfer(address,uint256)")[:4] + eth_abi.encode(
+        ["address", "uint256"], [recipient, amount]
     )
 
 
@@ -137,21 +137,23 @@ def test_converting_block_identifier_to_int(fork_mainnet_full: AnvilFork):
     """Check that every supported block-identifier input converts to a block number"""
     provider = fork_mainnet_full.provider
 
-    # Known string literals
+    # Known string literals. The BlockTag ladder's contract is exactly three
+    # tags (earliest/latest/pending); 'safe'/'finalized' are not members and
+    # are refused loudly by the identifier surface.
     latest_block = get_number_for_block_identifier("latest", provider)
     earliest_block = get_number_for_block_identifier("earliest", provider)
     pending_block = get_number_for_block_identifier("pending", provider)
-    safe_block = get_number_for_block_identifier("safe", provider)
-    finalized_block = get_number_for_block_identifier("finalized", provider)
 
     assert BlockNumber.__value__ is int
     assert isinstance(latest_block, BlockNumber.__value__)
     assert isinstance(earliest_block, BlockNumber.__value__)
     assert isinstance(pending_block, BlockNumber.__value__)
-    assert isinstance(safe_block, BlockNumber.__value__)
-    assert isinstance(finalized_block, BlockNumber.__value__)
 
-    assert latest_block != earliest_block != pending_block != safe_block != finalized_block
+    assert latest_block != earliest_block != pending_block
+
+    for unsupported in ("safe", "finalized"):
+        with pytest.raises(ApexbotValueError):
+            get_number_for_block_identifier(unsupported, provider)
 
     # BlockNumber
     assert isinstance(

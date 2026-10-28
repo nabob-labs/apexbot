@@ -5,7 +5,6 @@ import pytest
 from apexbot._ffi import Bot as _Engine
 from apexbot.bot import Bot
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.config import DatabaseSettings, ApexbotConfig
 from apexbot.erc20.erc20 import Erc20Token
 from apexbot.exceptions import ApexbotValueError
 from apexbot.provider import OfflineProvider
@@ -24,13 +23,8 @@ _PY_BOT = _Engine()
 
 def _offline_bot() -> Bot:
     """A single-chain Bot with a no-op offline provider (registry tests need no network)."""
-    config = ApexbotConfig(
-        database=DatabaseSettings(path=Path(":memory:")),
-        rpc={},
-        default_chain_id=1,
-    )
     provider = OfflineProvider(chain_id=1, blocks={"1": {"timestamp": 0, "calls": {}, "code": {}}})
-    return Bot(config, provider=provider)
+    return Bot(chain_id=1, database=":memory:", provider=provider)
 
 
 def _recorded_pool() -> UniswapV2Pool:
@@ -50,11 +44,11 @@ def _weth_token() -> Erc20Token:
 
 
 def test_distinct_registry_instances():
-    pool_registry = PoolRegistry()
-    token_registry = TokenRegistry()
+    pool_registry = PoolRegistry(py_bot=_Engine(chain_id=1))
+    token_registry = TokenRegistry(py_bot=_Engine(chain_id=1))
 
-    new_pool_registry = PoolRegistry()
-    new_token_registry = TokenRegistry()
+    new_pool_registry = PoolRegistry(py_bot=_Engine(chain_id=1))
+    new_token_registry = TokenRegistry(py_bot=_Engine(chain_id=1))
 
     assert new_pool_registry is not pool_registry
     assert new_token_registry is not token_registry
@@ -113,7 +107,7 @@ def test_v4_pool_add_and_removal():
     chain_id = 1
     pool_id = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 
-    managed_pool_registry = ManagedPoolRegistry()
+    managed_pool_registry = ManagedPoolRegistry(py_bot=_Engine(chain_id=1))
 
     # Add the V4 pool to the managed pool registry
     managed_pool_registry.add(

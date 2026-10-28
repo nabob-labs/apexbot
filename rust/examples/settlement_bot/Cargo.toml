@@ -4,6 +4,7 @@ description = "Rust-owned settlement-arbitrage bot — the external consumer's p
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
@@ -16,12 +17,12 @@ workspace = true
 # config.toml cascade layers [rpc]/[ws]/[database]). If a core capability is
 # needed, it must become reachable through `apexbot` — the compile error IS
 # the gap-discovery mechanism (see the parity ledger).
-apexbot = { path = "../../crates/apexbot", features = ["otel"] }
+apexbot = { workspace = true, features = ["otel"] }
 # `alloy` is required for the U256/Address/Bytes value types the public
 # `apexbot::arbitrage` fee seam and `apexbot::submission` seams name in
 # their signatures (a `cargo add apexbot` consumer naming those seams needs
 # it too). Nothing here bypasses a apexbot surface.
-alloy = { version = "^2.4", features = ["full"] }
+alloy = { version = "^2.5", features = ["full"] }
 toml = "^1"
 # serde_json is the driver-local JSON codec for the operator Unix-socket
 # channel (the Rust twin of Python's stdlib json). Like toml it is a
@@ -33,8 +34,8 @@ serde_json = "^1"
 # Unix socket, "signal" the inert operator mode's Ctrl-C exit. The umbrella
 # already depends on tokio; this is the pure-Rust consumer owning its own
 # task/claim primitives — NOT a core capability lifted into the example.
-tokio = { version = "^1.53", features = ["rt-multi-thread", "time", "macros", "sync", "net", "signal"] }
-# Telemetry boot wiring (Gap G6 / ergo ZOBXVC). The driver composes its
+tokio = { version = "^1.54", features = ["rt-multi-thread", "time", "macros", "sync", "net", "signal"] }
+# Telemetry boot wiring (Gap G6). The driver composes its
 # console subscriber + optional OTel layer from the core `apexbot::bot::otel`
 # / `apexbot::bot::metrics` surfaces, exactly as `apexbot-python` composes
 # its own registry. `tracing` is required because the `op_info!`/`op_warn!`
@@ -43,8 +44,24 @@ tokio = { version = "^1.53", features = ["rt-multi-thread", "time", "macros", "s
 # the core optional deps pin.
 tracing = "^0.1"
 tracing-subscriber = { version = "^0.3", default-features = false, features = ["std", "registry", "fmt", "env-filter", "time"] }
+apexbot-eventhub.workspace = true
+
+[features]
+# Drain-path profiling opt-in: forwards the umbrella's `hotpath` passthrough
+# so this driver's build compiles the pump's hotpath instrumentation and the
+# pump-lifetime guard in `BlockPump::run_with_stream`
+# (apexbot-bot/src/profiling.rs) flushes a report at pump exit. Default OFF:
+# without the feature the `#[hotpath::measure]` spans are no-op stubs and the
+# guard refuses, so default builds are behavior-identical. The guard itself
+# stays env-gated (`APEXBOT_HOTPATH=1`); the report knobs
+# (HOTPATH_OUTPUT_FORMAT/HOTPATH_OUTPUT_PATH/HOTPATH_REPORT) live in
+# apexbot-bot/src/profiling.rs. No example-side guard is constructed here ON
+# PURPOSE: the pump owns the process's single HotpathGuard, and building a
+# second live one panics (hotpath 0.28.5) — a guard held across
+# `EngineDriver::resume` would abort the driven run it is meant to measure.
+hotpath = ["apexbot/hotpath"]
 
 [dev-dependencies]
 # start_paused + tokio::time::advance give the session-watch tests a
 # controlled clock instead of real sleeps ("test-util" enables paused time).
-tokio = { version = "^1.53", features = ["test-util"] }
+tokio = { version = "^1.54", features = ["test-util"] }

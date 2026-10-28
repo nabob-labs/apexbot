@@ -57,7 +57,7 @@ replaces per-era mechanisms with one host.
 
 ### 1. One fleet host in a new crate: `apexbot-workers`
 
-A new standalone crate `rust/crates/apexbot-workers` owns the fleet host, the
+A new standalone crate `rust/crates/engine/apexbot-workers` owns the fleet host, the
 `WorkerRole` state machine, and the budget authority. It depends on
 `apexbot-core` (cgroup detection) and *nothing engine-specific*; `apexbot-bot`
 plugs roles in as closures/tasks. It must be lower in the dependency graph

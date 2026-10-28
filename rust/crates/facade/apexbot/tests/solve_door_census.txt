@@ -1,0 +1,23 @@
+# ADR-084 D2/W2 — the solve door census: the external naming surface of the
+# `apexbot-pools` solve tree. Generated from an anchored `rg` of every
+# external reference (the W2 census), closed under D2(a) (a type in a public
+# field of a door item is a door item) and pinned by
+# `architecture_gates.rs::solve_door_census_is_the_external_surface`.
+#
+# Regenerate: re-run the census command from
+# docs/architecture/capability-restructure-plan.md §2 against the post-W2
+# module tree (`gate`, `concentrated_liquidity`, `runtime`, `basket`,
+# `fixtures` + the root door; `affected` moved to the pools root) and record
+# the distinct paths here.
+#
+# Format: one allowed external path per line; `#` comments; blank lines
+# ignored. A path is the module prefix an external crate may name — the
+# gate fails on any `apexbot_pools::solve::<other>` or
+# `apexbot_pools::affected_keys` reference.
+apexbot_pools::solve
+apexbot_pools::solve::basket
+apexbot_pools::solve::concentrated_liquidity
+apexbot_pools::solve::fixtures
+apexbot_pools::solve::gate
+apexbot_pools::solve::runtime
+apexbot_pools::affected

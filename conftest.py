@@ -8,6 +8,8 @@ relative to its path. It is picked up because pyproject.toml includes
 "README.md" in testpaths.
 """
 
+import functools
+import pathlib
 from collections.abc import Iterable
 
 import pytest
@@ -18,6 +20,14 @@ from sybil.parsers.markdown.codeblock import PythonCodeBlockParser
 from sybil.parsers.markdown.lexers import DirectiveInHTMLCommentLexer
 from sybil.parsers.markdown.skip import SkipParser
 
+# The pin MUST precede the first apexbot import: the FFI module init resolves
+# the typed config from the process layers (first-wins), and the engine boot
+# re-resolves those layers at every construction — see tests/suite_env.py.
+# The unsorted physical order is the point, hence the I001 ignore.
+import tests.suite_env  # ruff:ignore[I001, F401]  # import-side-effect pin
+
+from apexbot.bot import _bot as _bot_module
+from apexbot.provider import OfflineProvider
 from tests.offline import is_offline
 
 
@@ -77,6 +87,33 @@ pytest_collect_file = Sybil(
 
 _EXPECTED_LINE_PARTS = 2
 
+_LIVE_RPC_START = "<!-- live-rpc: start"
+_LIVE_RPC_END = "<!-- live-rpc: end"
+
+
+def _live_rpc_line_spans(readme_text: str) -> list[tuple[int, int]]:
+    """The line spans (inclusive) of the README's ``live-rpc`` blocks.
+
+    Every leg inside such a block talks to a live archive node, so it belongs to
+    the on-demand tier, not the offline gate (ADR-074: `test` / pre-push / CI run
+    `-m 'not online_rpc'`, and `just test-fork` runs `-m online_rpc`).
+
+    Returns:
+
+        One ``(first_line, last_line)`` pair per block, 1-indexed.
+
+    """
+    spans: list[tuple[int, int]] = []
+    first: int | None = None
+    for number, line in enumerate(readme_text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith(_LIVE_RPC_START):
+            first = number
+        elif stripped.startswith(_LIVE_RPC_END) and first is not None:
+            spans.append((first, number))
+            first = None
+    return spans
+
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -116,8 +153,70 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
     readme_items.sort(key=readme_sort_key)
 
+    # A README block inside a `live-rpc` span talks to a live archive node, so it
+    # joins the on-demand tier instead of the offline gate. The span map comes
+    # from the document itself, so a new live-RPC example is covered by the
+    # directive, not by remembering to add a marker.
+    live_rpc_spans = _live_rpc_line_spans(
+        (pathlib.Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+    )
+
+    def in_live_rpc_block(item: pytest.Item) -> bool:
+        line = readme_sort_key(item)
+        return any(first <= line <= last for first, last in live_rpc_spans)
+
     for index, item in enumerate(readme_items):
         item.add_marker(pytest.mark.order(index))
-        item.add_marker(pytest.mark.xdist_group("readme_sybil"))
+        if in_live_rpc_block(item):
+            item.add_marker(pytest.mark.online_rpc)
 
     items[:] = readme_items + other_items
+
+
+# --- README offline replay ---------------------------------------------------
+#
+# The README's Bot examples run against a recorded chain cassette instead of a
+# live archive node, so the suite is hermetic and offline (no RPC, no developer
+# DB): every `eth_call`/`eth_getCode`/`eth_getBlockByNumber` the examples issue
+# is replayed from `tests/fixtures/chain_data/1/readme_examples.json` through the
+# `Bot(provider=...)` injection seam. The visible README code is unchanged — it
+# still reads `apexbot.Bot(chain_id=1, node=RPC_URL, ...)`; only the DI seam
+# `get_provider_from_config` is redirected, for README items only.
+#
+# Regenerate the cassette with `just record-readme-cassette`; gate it with
+# `just check-readme-cassette`. See `scripts/record_readme_cassette.py`.
+_README_CASSETTE = (
+    pathlib.Path(__file__).resolve().parent / "tests/fixtures/chain_data/1/readme_examples.json"
+)
+
+
+# The provider factory is redirected for the duration of a README item and
+# restored in teardown (Sybil items do not run conftest autouse fixtures, so the
+# bind is done from the runtest hooks). `pytest.MonkeyPatch` owns the
+# save/restore, so there is no module-level mutable state.
+@functools.lru_cache(maxsize=1)
+def _readme_offline_provider() -> OfflineProvider:
+    """The cassette-backed provider, built once and reused across README items."""
+    return OfflineProvider.from_json_file(_README_CASSETTE)
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Bind the recorded cassette provider for README items (no-op elsewhere)."""
+    if "README.md" not in item.nodeid or not _README_CASSETTE.is_file():
+        return
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        _bot_module,
+        "get_provider_from_config",
+        lambda **_kwargs: _readme_offline_provider(),
+    )
+    item._readme_monkeypatch = monkeypatch  # type: ignore[attr-defined]
+
+
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:  # noqa: ARG001
+    """Restore the configured provider factory after a README item."""
+    monkeypatch = getattr(item, "_readme_monkeypatch", None)
+    if monkeypatch is not None:
+        monkeypatch.undo()
+        item._readme_monkeypatch = None  # type: ignore[attr-defined]

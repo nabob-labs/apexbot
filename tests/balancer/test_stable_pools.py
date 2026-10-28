@@ -52,6 +52,7 @@ from apexbot.checksum_cache import get_checksum_address
 from apexbot.exceptions import ContractLogicError
 from apexbot.fork import AnvilFork
 from tests.helpers.contract_compat import ContractCompat
+from tests.sweep_pin import SWEEP_FORK_BLOCK, SweepPinHygiene
 
 pytestmark = pytest.mark.online_rpc
 
@@ -318,6 +319,12 @@ def _compute_given_out(
 # ---------- Test classes ----------
 
 
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
+class TestPinnedForkHygiene(SweepPinHygiene):
+    """The pin is part of the expected value; assert it instead of assuming it."""
+
+
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
 class TestMetaStablePoolSwaps:
     """Test swap calculations against BalancerQueries for MetaStablePools.
 
@@ -903,6 +910,7 @@ def _compute_composable_given_out(
     return numerator // denominator + (1 if numerator % denominator > 0 else 0)
 
 
+@pytest.mark.parametrize("fork_mainnet_archive", [SWEEP_FORK_BLOCK], indirect=True)
 class TestComposableStablePoolSwaps:
     """Test swap calculations against BalancerQueries for ComposableStablePools.
 

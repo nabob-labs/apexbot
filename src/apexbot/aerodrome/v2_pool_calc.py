@@ -11,8 +11,9 @@ Two calculation strategies:
 
 from __future__ import annotations
 
+import dataclasses
 from fractions import Fraction
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from apexbot.aerodrome.math import (
     calc_exact_in_stable_solidly as _rs_calc_exact_in_stable_solidly,
@@ -29,10 +30,50 @@ from apexbot.exceptions.pool import (
     InvalidSwapInputAmount,
     LiquidityPoolError,
 )
+from apexbot.uniswap import SwapRefusalKind, SwapRefused, swap_refusal_to_error
 
 if TYPE_CHECKING:
     from apexbot.aerodrome.types import AerodromeV2PoolState
     from apexbot.erc20 import Erc20Token
+    from apexbot.types import Pool
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class _ExactInRequest:
+    """Resolved context shared by the volatile and stable exact-in leaves.
+
+    The volatile leaf reads only the constant-product fields; the stable-only
+    context travels with the request so the bound
+    ``_calc_tokens_out_from_tokens_in`` seam has one uniform shape.
+    """
+
+    amount_in: int
+    token_in: Literal[0, 1]
+    reserves0: int
+    reserves1: int
+    decimals0: int
+    decimals1: int
+    fee: Fraction
+
+
+@dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
+class _ExactOutRequest:
+    """Resolved context shared by the volatile and stable exact-out leaves.
+
+    The volatile leaf reads only the constant-product fields; the stable-only
+    context travels with the request so the bound
+    ``_calc_tokens_in_from_tokens_out`` seam has one uniform shape.
+    """
+
+    token_out_quantity: int
+    reserves_in: int
+    reserves_out: int
+    fee: Fraction
+    reserves_0: int
+    reserves_1: int
+    decimals_0: int
+    decimals_1: int
+    token_in: Literal[0, 1]
 
 
 class AerodromeV2PoolCalc:
@@ -51,13 +92,35 @@ class AerodromeV2PoolCalc:
     _token1: Erc20Token
     _fee: Fraction
 
-    # Attributes provided by the concrete pool class in the MRO
-    reserves_token0: int
-    reserves_token1: int
-    state: AerodromeV2PoolState
+    # Read-only views provided by the concrete pool class in the MRO (see
+    # UniswapV2PoolCalc for the rationale).
+    @property
+    def reserves_token0(self) -> int:
+        """Current token0 reserve (concrete pool provides)."""
+        raise NotImplementedError
+
+    @property
+    def reserves_token1(self) -> int:
+        """Current token1 reserve (concrete pool provides)."""
+        raise NotImplementedError
+
+    @property
+    def state(self) -> AerodromeV2PoolState:
+        """The pool's current state (concrete pool provides)."""
+        raise NotImplementedError
+
     tokens: tuple[Erc20Token, Erc20Token]
 
-    def _wire_stable_calculations(self, *, stable: bool) -> None:
+    @property
+    def update_block(self) -> int:
+        """Block of the last state update (concrete pool provides)."""
+        raise NotImplementedError
+
+    # Pool handle (set by the concrete AerodromeV2Pool companion in the MRO).
+    # The volatile override read routes through it.
+    _py_pool: Pool
+
+    def _wire_calculations(self, *, stable: bool) -> None:
         """Wire calculation functions based on the stable flag.
 
         Called by the pool's __init__ after setting self._stable.
@@ -65,8 +128,10 @@ class AerodromeV2PoolCalc:
         self._stable_calc_mode = stable
         if stable:
             self._calc_tokens_in_from_tokens_out = self._calc_tokens_in_stable
+            self._calc_tokens_out_from_tokens_in = self._calc_tokens_out_stable
         else:
             self._calc_tokens_in_from_tokens_out = self._calc_tokens_in_volatile
+            self._calc_tokens_out_from_tokens_in = self._calc_tokens_out_volatile
 
     def calculate_tokens_in_from_tokens_out(
         self,
@@ -88,6 +153,10 @@ class AerodromeV2PoolCalc:
         if token_out_quantity <= 0:  # pragma: no cover
             raise InvalidSwapInputAmount
 
+        # The exact-output read has no door arm for this family (the
+        # reserve-pair Aerodrome design answers exact-input only), so the
+        # registered and the override path both resolve the reserves here and
+        # call the wired Rust leaf.
         if token_out == self._token1:
             reserves_in = (
                 override_state.reserves_token0
@@ -132,15 +201,17 @@ class AerodromeV2PoolCalc:
         decimals_1 = 10**self._token1.decimals
 
         return self._calc_tokens_in_from_tokens_out(
-            token_out_quantity=token_out_quantity,
-            reserves_in=reserves_in,
-            reserves_out=reserves_out,
-            fee=self._fee,
-            reserves_0=reserves_0,
-            reserves_1=reserves_1,
-            decimals_0=decimals_0,
-            decimals_1=decimals_1,
-            token_in=token_in,
+            ctx=_ExactOutRequest(
+                token_out_quantity=token_out_quantity,
+                reserves_in=reserves_in,
+                reserves_out=reserves_out,
+                fee=self._fee,
+                reserves_0=reserves_0,
+                reserves_1=reserves_1,
+                decimals_0=decimals_0,
+                decimals_1=decimals_1,
+                token_in=token_in,
+            ),
         )
 
     def calculate_tokens_out_from_tokens_in(
@@ -157,6 +228,9 @@ class AerodromeV2PoolCalc:
         Raises:
             ApexbotValueError: See function documentation.
             InvalidSwapInputAmount: See function documentation.
+            LiquidityPoolError: See function documentation.
+            swap_refusal_to_error: See function documentation — renders a
+                refusal that is not a swap-geometry verdict.
 
         """
         if token_in not in self.tokens:  # pragma: no cover
@@ -165,6 +239,35 @@ class AerodromeV2PoolCalc:
         if token_in_quantity <= 0:  # pragma: no cover
             raise InvalidSwapInputAmount
 
+        token_in_dir: Literal[0, 1] = 0 if token_in == self._token0 else 1
+
+        if override_state is not None and not self._stable_calc_mode:
+            # Volatile override read: the constant-product read runs core-side
+            # through the swap-simulation door over the override reserves (the
+            # fee is borrowed from the registration, never re-sent). The stable
+            # arm below keeps the Solidly leaf — the door refuses a `stable`
+            # identity, since the Solidly family's read arm owns that invariant.
+            # The typed read (ADR-037/t2): a refusal is the overflow verdict.
+            try:
+                read = self._py_pool.simulate(
+                    zero_for_one=token_in_dir == 0,
+                    amount_specified=-token_in_quantity,
+                    block=self.update_block,
+                    override_state=override_state,
+                )
+            except SwapRefused as exc:
+                if exc.args[0] is not SwapRefusalKind.NotComputable:
+                    # An infrastructure failure (an unfetchable word), not a
+                    # swap-geometry verdict — render it honestly.
+                    raise swap_refusal_to_error(exc) from exc
+                raise LiquidityPoolError(
+                    message=(
+                        f"Input amount ({token_in_quantity}) overflows "
+                        "uint256 swap math (on-chain revert)"
+                    ),
+                ) from exc
+            return -int(read.amount1_delta if token_in_dir == 0 else read.amount0_delta)
+
         reserves_0 = (
             override_state.reserves_token0 if override_state is not None else self.reserves_token0
         )
@@ -172,22 +275,17 @@ class AerodromeV2PoolCalc:
             override_state.reserves_token1 if override_state is not None else self.reserves_token1
         )
 
-        token_in_dir: Literal[0, 1] = 0 if token_in == self._token0 else 1
-
-        common_kwargs = {
-            "amount_in": token_in_quantity,
-            "token_in": token_in_dir,
-            "reserves0": reserves_0,
-            "reserves1": reserves_1,
-            "fee": self._fee,
-        }
-        if self._stable_calc_mode:
-            return self._calc_tokens_out_stable(
-                **common_kwargs,
+        return self._calc_tokens_out_from_tokens_in(
+            ctx=_ExactInRequest(
+                amount_in=token_in_quantity,
+                token_in=token_in_dir,
+                reserves0=reserves_0,
+                reserves1=reserves_1,
                 decimals0=10**self._token0.decimals,
                 decimals1=10**self._token1.decimals,
-            )
-        return self._calc_tokens_out_volatile(**common_kwargs)
+                fee=self._fee,
+            ),
+        )
 
     def get_absolute_price(
         self,
@@ -260,98 +358,68 @@ class AerodromeV2PoolCalc:
     # ── Private: calculation strategy methods ──
 
     @staticmethod
-    def _calc_tokens_out_volatile(
-        *,
-        amount_in: int,
-        token_in: Literal[0, 1],
-        reserves0: int,
-        reserves1: int,
-        fee: Fraction,
-    ) -> int:
+    def _calc_tokens_out_volatile(*, ctx: _ExactInRequest) -> int:
         """Volatile (constant-product) exact-in calculation.
 
         Returns:
             The computed integer value.
 
         """
-        return _rs_calc_exact_in_volatile(
-            amount_in,
-            token_in,
-            reserves0,
-            reserves1,
-            fee.numerator,
-            fee.denominator,
+        return cast(
+            "int",
+            _rs_calc_exact_in_volatile(
+                ctx.amount_in,
+                ctx.token_in,
+                ctx.reserves0,
+                ctx.reserves1,
+                ctx.fee.numerator,
+                ctx.fee.denominator,
+            ),
         )
 
     @staticmethod
-    def _calc_tokens_out_stable(
-        *,
-        amount_in: int,
-        token_in: Literal[0, 1],
-        reserves0: int,
-        reserves1: int,
-        decimals0: int,
-        decimals1: int,
-        fee: Fraction,
-    ) -> int:
+    def _calc_tokens_out_stable(*, ctx: _ExactInRequest) -> int:
         """Stable (Solidly invariant) exact-in calculation.
 
         Returns:
             The computed integer value.
 
         """
-        return _rs_calc_exact_in_stable_solidly(
-            amount_in,
-            token_in,
-            reserves0,
-            reserves1,
-            decimals0,
-            decimals1,
-            fee.numerator,
-            fee.denominator,
+        return cast(
+            "int",
+            _rs_calc_exact_in_stable_solidly(
+                ctx.amount_in,
+                ctx.token_in,
+                ctx.reserves0,
+                ctx.reserves1,
+                ctx.decimals0,
+                ctx.decimals1,
+                ctx.fee.numerator,
+                ctx.fee.denominator,
+            ),
         )
 
     @staticmethod
-    def _calc_tokens_in_volatile(
-        *,
-        token_out_quantity: int,
-        reserves_in: int,
-        reserves_out: int,
-        fee: Fraction,
-        # Stable-only context (ignored by the volatile path).
-        reserves_0: int,  # ruff:ignore[unused-static-method-argument]
-        reserves_1: int,  # ruff:ignore[unused-static-method-argument]
-        decimals_0: int,  # ruff:ignore[unused-static-method-argument]
-        decimals_1: int,  # ruff:ignore[unused-static-method-argument]
-        token_in: Literal[0, 1],  # ruff:ignore[unused-static-method-argument]
-    ) -> int:
+    def _calc_tokens_in_volatile(*, ctx: _ExactOutRequest) -> int:
         """Volatile (constant-product) exact-out calculation.
 
         Returns:
             The computed integer value.
 
         """
-        return _rs_calc_exact_out_volatile(
-            reserves_in,
-            reserves_out,
-            token_out_quantity,
-            fee.numerator,
-            fee.denominator,
+        return cast(
+            "int",
+            _rs_calc_exact_out_volatile(
+                ctx.reserves_in,
+                ctx.reserves_out,
+                ctx.token_out_quantity,
+                ctx.fee.numerator,
+                ctx.fee.denominator,
+            ),
         )
 
     @staticmethod
-    def _calc_tokens_in_stable(
-        *,
-        token_out_quantity: int,
-        reserves_in: int,  # ruff:ignore[unused-static-method-argument]
-        reserves_out: int,  # ruff:ignore[unused-static-method-argument]
-        fee: Fraction,
-        reserves_0: int,
-        reserves_1: int,
-        decimals_0: int,
-        decimals_1: int,
-        token_in: Literal[0, 1],
-    ) -> int:
+    def _calc_tokens_in_stable(*, ctx: _ExactOutRequest) -> int:
         """Stable (Solidly invariant) exact-out calculation.
 
         Delegates to the Rust ``calc_exact_out_stable_solidly`` leaf — the
@@ -364,13 +432,16 @@ class AerodromeV2PoolCalc:
             The computed integer value.
 
         """
-        return _rs_calc_exact_out_stable_solidly(
-            token_out_quantity,
-            token_in,
-            reserves_0,
-            reserves_1,
-            decimals_0,
-            decimals_1,
-            fee.numerator,
-            fee.denominator,
+        return cast(
+            "int",
+            _rs_calc_exact_out_stable_solidly(
+                ctx.token_out_quantity,
+                ctx.token_in,
+                ctx.reserves_0,
+                ctx.reserves_1,
+                ctx.decimals_0,
+                ctx.decimals_1,
+                ctx.fee.numerator,
+                ctx.fee.denominator,
+            ),
         )

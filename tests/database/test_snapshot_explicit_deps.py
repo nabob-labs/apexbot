@@ -1,91 +1,72 @@
-"""Tests for snapshot explicit-dependency injection.
-
-Verifies that DatabaseSnapshot accepts explicit dependencies
-instead of importing module-level singletons.
-"""
+"""Tests for path-explicit Rust-backed database snapshots."""
 
 import pathlib
-from unittest.mock import MagicMock
 
-from apexbot.database.models.base import ExchangeTable
-from apexbot.database.operations import create_new_sqlite_database, get_scoped_sqlite_session
-from apexbot.database.session_manager import DatabaseSessionManager
+import pytest
+
+from apexbot.db import (
+    db_upgrade_database,
+    db_set_exchange_last_update_block,
+    db_upsert_exchange,
+)
 from apexbot.uniswap.v3_snapshot import DatabaseSnapshot as V3DatabaseSnapshot
 from apexbot.uniswap.v4_snapshot import DatabaseSnapshot as V4DatabaseSnapshot
 
 
-class TestV3DatabaseSnapshotExplicitDeps:
-    """V3 DatabaseSnapshot accepts explicit db and database_path."""
+def _create_database_with_exchange(db_path: pathlib.Path) -> None:
+    db_upgrade_database(str(db_path))
+    exchange = db_upsert_exchange(
+        database_path=str(db_path),
+        chain_id=1,
+        name="uniswap_v3",
+        factory="0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        deployer=None,
+    )
+    db_set_exchange_last_update_block(
+        database_path=str(db_path),
+        chain_id=1,
+        exchange_id=exchange.id,
+        block=18_000_000,
+    )
 
-    def test_init_with_explicit_db_and_path(self, tmp_path: pathlib.Path) -> None:
-        """DatabaseSnapshot no longer falls back to config/db_session globals."""
-        fake_session = MagicMock()
-        db = DatabaseSessionManager.__new__(DatabaseSessionManager)
-        db._session = fake_session
 
+class TestV3DatabaseSnapshotExplicitPath:
+    def test_constructor_retains_explicit_path(self, tmp_path: pathlib.Path) -> None:
         db_path = tmp_path / "test.db"
 
-        snapshot = V3DatabaseSnapshot(
-            chain_id=1,
-            db=db,
-            database_path=db_path,
-        )
+        snapshot = V3DatabaseSnapshot(chain_id=1, database_path=db_path)
 
-        assert snapshot.session is db
         assert snapshot.database_path == db_path
         assert snapshot.chain_id == 1
+        assert not hasattr(snapshot, "session")
 
-    def test_get_newest_block_uses_self_session(self, tmp_path: pathlib.Path) -> None:
-        """get_newest_block reads via the Rust seam from the file DB.
-
-        The snapshot is no longer SQLAlchemy-backed for reads; this constructs
-        a real Alembic-stamped file DB, inserts an exchange via the ORM session,
-        then asserts the Rust-backed `get_newest_block` reads it.
-        """
+    def test_context_manager_releases_rust_handle(self, tmp_path: pathlib.Path) -> None:
         db_path = tmp_path / "test.db"
-        create_new_sqlite_database(db_path)
-        scoped = get_scoped_sqlite_session(db_path)
+        _create_database_with_exchange(db_path)
 
-        with scoped() as s:
-            exchange = ExchangeTable(
-                chain_id=1,
-                name="uniswap_v3",
-                last_update_block=18_000_000,
-                active=True,
-                factory="0x1F98431c8aD98523631AE4a59f267346ea31F984",
-            )
-            s.add(exchange)
-            s.commit()
+        snapshot = V3DatabaseSnapshot(chain_id=1, database_path=db_path)
+        with snapshot as entered:
+            assert entered is snapshot
+            assert entered.get_newest_block() == 18_000_000
 
-        db = DatabaseSessionManager(scoped)
+        with pytest.raises(RuntimeError, match="closed"):
+            snapshot.get_newest_block()
+        snapshot.close()
 
-        snapshot = V3DatabaseSnapshot(
-            chain_id=1,
-            db=db,
-            database_path=db_path,
-        )
+    def test_get_newest_block_reads_via_rust_seam(self, tmp_path: pathlib.Path) -> None:
+        db_path = tmp_path / "test.db"
+        _create_database_with_exchange(db_path)
 
-        assert snapshot.get_newest_block() == 18_000_000
-
-        db.dispose()
+        with V3DatabaseSnapshot(chain_id=1, database_path=db_path) as snapshot:
+            assert snapshot.get_newest_block() == 18_000_000
 
 
-class TestV4DatabaseSnapshotExplicitDeps:
-    """V4 DatabaseSnapshot accepts explicit db and database_path."""
-
-    def test_init_with_explicit_db_and_path(self, tmp_path: pathlib.Path) -> None:
-        fake_session = MagicMock()
-        db = DatabaseSessionManager.__new__(DatabaseSessionManager)
-        db._session = fake_session
-
+class TestV4DatabaseSnapshotExplicitPath:
+    def test_constructor_retains_explicit_path(self, tmp_path: pathlib.Path) -> None:
         db_path = tmp_path / "test.db"
 
-        snapshot = V4DatabaseSnapshot(
-            chain_id=1,
-            db=db,
-            database_path=db_path,
-        )
+        snapshot = V4DatabaseSnapshot(chain_id=1, database_path=db_path)
 
-        assert snapshot.session is db
         assert snapshot.database_path == db_path
         assert snapshot.chain_id == 1
+        assert not hasattr(snapshot, "session")

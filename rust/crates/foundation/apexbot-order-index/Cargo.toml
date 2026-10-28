@@ -1,0 +1,35 @@
+[package]
+name = "apexbot-order-index"
+description = "Convex-hull / upper-envelope order index for ranking path results by net profit under a variable gas price."
+keywords = ["mev", "arbitrage", "optimization", "evm"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["envelope"]
+# The convex-hull EnvelopeIndex (production impl). With this off, only the
+# brute-force `ScanTopK` baseline is compiled.
+envelope = []
+
+[dependencies]
+alloy-primitives = { version = "^1.7", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest = "^1.12"
+
+[[example]]
+name = "scale_demo"
+path = "examples/scale_demo.rs"
+required-features = ["envelope"]
+
+[[example]]
+name = "bench_strategies"
+path = "examples/bench_strategies.rs"
+required-features = ["envelope"]

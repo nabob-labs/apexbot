@@ -1,5 +1,5 @@
 //! Operator command channel: JSON-lines over a Unix domain socket — parity
-//! ledger row 20 (ergo `KPLWUM`, Gap G5).
+//! ledger row 20 (Gap G5).
 //!
 //! Mirrors `src/apexbot/operator/operator_channel.py` (the `OperatorServer`
 //! wire guard + `step_from_wire` + `handle_fleet_posture_op`), driven by the
@@ -22,7 +22,7 @@
 //!     {"ok": false, "error": "..."}
 //!
 //! The fleet-posture ops route through the `apexbot::workers::posture`
-//! umbrella surface (`process()` / `PosturePolicyPatch` / `PosturePolicy`) —
+//! umbrella surface (`process_owner()` / `PosturePolicyPatch` / `PosturePolicy`) —
 //! the same process owner the Python `apexbot._ffi.fleet` mirror mints, so
 //! the reach claim is proven by construction (row 20 is DRIVER-POLICY, not a
 //! new gap). The host is the driver-local transport: `add_path`/`discover`
@@ -47,7 +47,7 @@ use tokio::task::JoinHandle;
 use crate::discovery::{build_graph, BatchedPathFinder, BuiltGraph, DiscoveryParams, PoolNode};
 use crate::pipeline::RegistrationPipeline;
 use crate::policy::PathPolicy;
-use crate::retry::RetryPolicy;
+use apexbot::bot_core::verification_retry::RetryPolicy;
 
 /// Default per-request read timeout (mirrors `OperatorServer`'s
 /// `request_timeout` default).
@@ -166,15 +166,10 @@ pub struct PipelinePathOps {
 
 impl PipelinePathOps {
     /// Build the sink from the boot discovery rows + driver policy.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "linear projection of the boot discovery/policy state into the operator sink"
-    )]
     #[must_use]
     pub fn new(
         rows: &[DiscoveryPoolRow],
         requested_kinds: &[PoolKind],
-        allowed: &std::collections::BTreeSet<String>,
         params: &DiscoveryParams,
         policy: PathPolicy,
         retry_policy: RetryPolicy,
@@ -182,7 +177,7 @@ impl PipelinePathOps {
         weth: String,
     ) -> Self {
         Self {
-            graph: build_graph(rows, requested_kinds, Some(allowed)),
+            graph: build_graph(rows, requested_kinds, None),
             params: params.clone(),
             pipeline: Mutex::new(RegistrationPipeline::new(policy, retry_policy)),
             input_token,
@@ -425,7 +420,7 @@ fn effective_json(policy: PosturePolicy, posture: FleetPosture) -> String {
 /// Handle the two fleet-posture ops through `apexbot::workers::posture`
 /// (mirrors `handle_fleet_posture_op`).
 fn handle_fleet_posture(op: &str, payload: &Value) -> Result<HandlerResponse, String> {
-    let owner = apexbot::workers::posture::process();
+    let owner = apexbot::workers::posture::process_owner();
     if op == "get_fleet_posture" {
         return Ok(HandlerResponse {
             detail: String::new(),

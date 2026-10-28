@@ -1,0 +1,124 @@
+//! # `apexbot-db` — `SQLite` persistence substrate for the apexbot Rust core
+//!
+//! A pyo3-free read handle over a apexbot `SQLite` DB, with a Rust-owned
+//! schema gate. Owns connection/pool management, the schema DDL (the Rust
+//! schema head), typed row structs for every table, low-level read row
+//! functions, and the migration runner that opens an existing legacy
+//! `alembic_version`-marked `SQLite` DB by auto-healing it to Rust ownership.
+//!
+//! # Open path
+//!
+//! [`ApexbotDb::open`] sets `PRAGMA journal_mode=WAL; busy_timeout=5000;
+//! synchronous=NORMAL;` (matching the Python open path — Phase 0),
+//! runs the schema gate + ADR-052 D1 heal-at-open + the ADR-052 D2 forward
+//! version-lock (`migrate::ensure_schema_at_open`) — a legacy DB carrying the
+//! `alembic_version` marker table is healed out-of-place to `RustOwned` unless
+//! An explicit `auto_heal = false` pins the pre-D1 posture, a fresh standalone file
+//! gets the embedded DDL, an unrecognized file refuses, a Rust-owned DB behind
+//! the binary applies its pending steps, and a DB ahead of the binary refuses
+//! with `DbError::SchemaAhead` — then sets `PRAGMA query_only=on;`: the
+//! load-bearing guarantee that the returned Rust **reader** cannot mutate the
+//! DB (binding #2). The heal runs at BOTH read and write opens (one rule for
+//! all opens).
+//!
+//! # The `VARCHAR(78)` ↔ `U256` boundary
+//!
+//! Every EVM big-int column is stored as a `VARCHAR(78)` decimal string
+//! (mirrors Python's `IntMappedToString` `TypeDecorator`) and decoded to
+//! [`alloy::primitives::U256`] at the row boundary via
+//! `U256::from_str_radix(s, 10)` (see [`rows::decode`]). Zero schema change
+//! vs. the Alembic head; the round-trip is lossless across the full 32-byte
+//! EVM range.
+//!
+//! # Design references
+//!
+//! # The writer fence (ADR-070)
+//!
+//! The write substrate (the `write` module + the write-capable constructors
+//! `open_for_writes` / `open_in_memory_for_writes`) is
+//! compiled ONLY under the `writer` feature. A bot/engine crate opens the DB
+//! read-only ([`connection::ApexbotDb::open`], `PRAGMA query_only=on`) and
+//! never enables the feature, so the write fns do not exist in its build; the
+//! updater shells are the sole writers. `cfg(any(test, feature = "writer"))`
+//! keeps this crate's own unit tests exercising the writer.
+
+pub mod aave;
+pub mod connection;
+pub mod digest;
+pub mod discovery;
+pub mod discovery_read;
+pub mod error;
+pub mod heal;
+pub mod liquidity_updater;
+pub mod migrate;
+pub mod migrations;
+pub mod ops;
+pub mod pathfinding;
+pub(crate) mod pragma;
+pub mod read;
+pub mod rows;
+pub mod schema;
+pub mod snapshot;
+pub mod snapshot_db;
+pub mod species;
+/// The statement-ledger + canonical DB-dump golden machinery (ADR-068 D3).
+/// Test/bench-only: compiled ONLY under the `sql-ledger` feature (default
+/// OFF) — see [`sql_ledger`] for the structural zero-overhead argument.
+#[cfg(feature = "sql-ledger")]
+pub mod sql_ledger;
+/// The write substrate (ADR-070): compiled only when the `writer` feature is
+/// enabled (the updater shells) or for this crate's own tests. Bot/engine
+/// crates never enable it, so the write fns are absent from their builds.
+#[cfg(any(test, feature = "writer"))]
+pub mod write;
+
+pub use aave::{
+    AaveCollateralPositionRecord, AaveDebtPositionRecord, AaveGhoAsset, AaveUserRecord,
+};
+pub use connection::ApexbotDb;
+/// Re-export the concentrated-liquidity-math in-memory tick type
+/// (`liquidity_gross: U128`, `liquidity_net: I256`) the liquidity updater
+/// applies against — aliased so it doesn't collide with the snapshot batch-read
+/// `U256` flavor above. This is the field type of `ComputedLiquidityUpdate`.
+pub use apexbot_math::concentrated_liquidity::liquidity_mapping::LiquidityAtTick as ApplyLiquidityAtTick;
+/// The canonical pool-family taxonomy (`apexbot-pathfinding`'s graph
+/// discriminant), re-exported because this crate's schema gate, species
+/// manifest, and row types all project through it: a DB consumer resolves the
+/// same vocabulary without a direct dependency on the zero-dependency leaf.
+pub use apexbot_pathfinding::PoolKind;
+pub use digest::{
+    aave_market_digest, aave_market_digest_for, parse_completed_market_manifest,
+    render_completed_market_manifest, CompletedMarketDrive, CompletedMarketManifest, MarketDigest,
+    MarketFacts, TableDigest, MARKET_DIGEST_SERIALIZATION, MARKET_DIGEST_TABLES,
+};
+pub use discovery::{V2PoolRowInput, V3PoolRowInput, V4PoolRowInput};
+pub use discovery_read::{
+    fetch_discovery_rows_on_conn, fetch_v4_discovery_rows_on_conn, DiscoveryPoolRow,
+    DiscoveryV2Row, DiscoveryV3Row, DiscoveryV4Row,
+};
+pub use error::DbError;
+pub use heal::{heal_database, HealReport};
+pub use liquidity_updater::{
+    derive_liquidity_delta_from_computed, BlockLog, ComputedLiquidityUpdate, LiquidityDelta,
+    LiquidityUpdateEvent, PoolUpdateState,
+};
+pub use migrate::SchemaState;
+pub use migrations::{apply_rust_migrations, MigrationOutcome, MigrationStep, RUST_MIGRATIONS};
+pub use ops::{
+    backup_database, compact_database, convert_alembic_to_rust_owned, create_new_database,
+    inspect_schema_state, upgrade_database, UpgradeOutcome,
+};
+pub use pathfinding::{PathEdge, PathGraphData};
+pub use read::{ExchangeFamily, GraphEdition};
+pub use rows::{
+    LfjPoolRow, LiquidityPoolRow, LiquidityPositionRow, ManagedLiquidityPoolRow,
+    ManagedPoolLiquidityPositionRow, PoolKindRow, PoolManagerRow, V2PoolRow, V3PoolRow, V4PoolRow,
+};
+pub use snapshot::{LiquidityAtTick, LiquidityMap, PoolKey};
+pub use species::{ChainIdentifiers, Family, Manifest, ManifestError, SlotLayout, Species};
+#[cfg(any(test, feature = "writer"))]
+pub use write::{
+    decode_reserve_configuration_bitmap, AssetRow, ReserveConfiguration, ScaledTokenPosition,
+};
+#[cfg(any(test, feature = "writer"))]
+pub use write::{AaveMarketPurgeCount, DebtPositionRefreshContext};

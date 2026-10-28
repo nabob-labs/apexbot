@@ -1,4 +1,4 @@
-"""Operator command channel (NWTUM3): wire round-trip, family mapping, errors.
+"""Operator command channel: wire round-trip, family mapping, errors.
 
 Covers :mod:`apexbot.operator.operator_channel` — the Unix-domain-socket
 JSON-lines channel an operator uses to add a path / trigger discovery on a live
@@ -13,17 +13,14 @@ import json
 
 import pytest
 
-from apexbot.database.models.pools import (
-    UniswapV2PoolTableBase,
-    UniswapV3PoolTableBase,
-    UniswapV4PoolTableBase,
-)
+from apexbot.pathfinding import PoolKind
 from apexbot.operator.operator_channel import (
     OperatorServer,
     send_command,
     step_from_wire,
     wrap_handler,
 )
+from tests.deadlock_guard import DEADLOCK_GUARD_S
 
 
 def _stub_handler(*, fail_on=None):
@@ -47,11 +44,12 @@ def _stub_handler(*, fail_on=None):
 
 
 def test_step_from_wire_maps_families_and_rejects_bad_input() -> None:
-    """Family strings map to the right pool-table base classes; bad input raises."""
-    assert step_from_wire({"family": "V2", "address": "0xaa"}).type is UniswapV2PoolTableBase
-    assert step_from_wire({"family": "V3", "address": "0xaa"}).type is UniswapV3PoolTableBase
+    """Family strings map to typed pool kinds; identities remain byte-stable."""
+    assert step_from_wire({"family": "V2", "address": "0xaa"}).type is PoolKind.V2
+    assert step_from_wire({"family": "V3", "address": "0xaa"}).type is PoolKind.V3
     v4 = step_from_wire({"family": "V4", "address": "0x00", "hash": "0x" + "a" * 64})
-    assert v4.type is UniswapV4PoolTableBase
+    assert v4.type is PoolKind.V4
+    assert v4.address == "0x00"
     assert v4.hash == "0x" + "a" * 64
 
     with pytest.raises(ValueError, match="unknown pool family"):
@@ -75,11 +73,7 @@ async def test_add_path_and_discover_round_trip(tmp_path) -> None:
     server = OperatorServer(handler, socket_path=socket_path)
     task = asyncio.create_task(server.serve())
     try:
-        # brief yield so the server binds the socket
-        for _ in range(50):
-            if _socket_bound(socket_path):
-                break
-            await asyncio.sleep(0.01)
+        await server.wait_ready()
 
         resp = await send_command(
             socket_path,
@@ -113,6 +107,37 @@ async def test_add_path_and_discover_round_trip(tmp_path) -> None:
         await server.close()
 
 
+async def test_serve_parks_until_closed(tmp_path) -> None:
+    """serve() itself must park: it runs forever (cancellable), so the serve
+    task stays pending while the server is up and completes only once close()
+    tears down serve_forever — a caller that ``create_task(serve())`` gets a
+    task that lives for the bot's lifetime, not one that returns instantly.
+    """
+    handler, _ = _stub_handler()
+    socket_path = str(tmp_path / "bot.sock")
+    server = OperatorServer(handler, socket_path=socket_path)
+    task = asyncio.create_task(server.serve())
+    try:
+        await server.wait_ready(timeout_s=5)
+        # Parked on serve_forever — not completed, not errored out.
+        assert task.done() is False
+
+        # While serve() parks, the channel is live for real traffic.
+        resp = await send_command(socket_path, "discover", {"bound": 1})
+        assert resp == {"ok": True, "detail": "discovery processed 1"}
+        assert task.done() is False
+    finally:
+        # close() cancels serve_forever, so the parked serve() task unwinds
+        # (cancelled). Deadlock guard only — not an ordering assertion: the
+        # assertion is the CancelledError below, and the budget only keeps a
+        # regression to a non-parking serve() a fast, named failure instead of
+        # a hang. The shield keeps the guard's own timeout from cancelling the
+        # task under inspection.
+        await server.close()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=DEADLOCK_GUARD_S)
+
+
 async def test_handler_error_becomes_ok_false_and_host_survives(tmp_path) -> None:
     """A failing command returns ok=false without crashing the host."""
     handler, _ = _stub_handler(fail_on="add_path")
@@ -120,10 +145,7 @@ async def test_handler_error_becomes_ok_false_and_host_survives(tmp_path) -> Non
     server = OperatorServer(handler, socket_path=socket_path)
     task = asyncio.create_task(server.serve())
     try:
-        for _ in range(50):
-            if _socket_bound(socket_path):
-                break
-            await asyncio.sleep(0.01)
+        await server.wait_ready()
 
         resp = await send_command(
             socket_path,
@@ -150,10 +172,7 @@ async def test_malformed_request_returns_ok_false(tmp_path) -> None:
     server = OperatorServer(handler, socket_path=socket_path)
     task = asyncio.create_task(server.serve())
     try:
-        for _ in range(50):
-            if _socket_bound(socket_path):
-                break
-            await asyncio.sleep(0.01)
+        await server.wait_ready()
 
         reader, writer = await asyncio.open_unix_connection(socket_path)
         writer.write(b"not-json\n")
@@ -171,11 +190,25 @@ async def test_malformed_request_returns_ok_false(tmp_path) -> None:
         await server.close()
 
 
-def _socket_bound(path: str) -> bool:
-    """Return True once the server has bound its Unix socket file."""
-    from pathlib import Path
+async def test_close_observes_serve_cancellation(tmp_path) -> None:
+    """``close()`` asserts the serve_forever cancellation it requested: a
+    serve future that absorbs the cancel fails loudly instead of being
+    reaped silently by the ``contextlib.suppress`` reap."""
+    handler, _seen = _stub_handler()
+    server = OperatorServer(handler, socket_path=str(tmp_path / "obs.sock"))
 
-    return Path(path).exists()
+    async def absorbing_serve_forever() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return  # the swallow the reap assertion must catch
+
+    server._serving = asyncio.ensure_future(absorbing_serve_forever())
+    server._server = None  # no real socket: close() only reaps the future
+    await asyncio.sleep(0)  # start the body so the cancel lands mid-await
+
+    with pytest.raises(AssertionError, match="cancellation"):
+        await server.close()
 
 
 def test_wrap_handler_normalizes_detail_and_error() -> None:

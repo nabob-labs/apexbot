@@ -1,0 +1,265 @@
+## Architecture
+
+`apexbot` has migrated from a pure-Python library to a Rust core composed of standalone crates. The end state has two equally first-class consumers:
+
+**Rust is the engine; Python is a driver shell, not a co-implementation.**
+
+1. **Pure-Rust MEV bot.** Someone should be able to `cargo add apexbot` (the umbrella crate re-exporting the cores) and build a fully functional MEV bot using Rust components ONLY without involving Python. That core must own **everything** a functional MEV bot needs. The Rust core must be capable of performing every action the bot requires.
+2. **Python-driven MEV bot.** Someone in Python should be able to build a functional MEV bot using the Python interface as a **driver** over the same Rust core, via a thin PyO3 layer that translates Python calls into Rust calls.
+
+## Concurrent Work Coordination
+Check for other agents working concurrently before you begin work and any time you notice any edits, files, or changes in the working tree that are unrelated to your work. Use `/skill:pi-intercom` for both proactive checks and responding to messages.
+
+## Build and test through `just`
+
+Every build and test command goes through the justfile. **Never hand-type `cargo test`, `cargo build`, `maturin develop`, or `uv run pytest`.** The recipes are the only commands that carry the full contract — `--locked`, the Python libdir export for the libpython-linking harnesses, the canonical feature aliases, `RUSTFLAGS`, the nextest profile, the pytest marker filters — and they are what CI and the hooks run. A hand-typed equivalent silently drops part of that contract, so its result does not mean what a green recipe means.
+
+- **Run everything, not a slice.** `just test` is the default gate: the Rust lint check-orchestration leg (`lint-rust-check`) first, so a lint failure fails fast before any suite starts, then the standalone smoke plus the whole cargo workspace suite under nextest plus the full pytest suite, in one command. Run the full suites rather than picking files: they surface cross-module breakage (signature changes rippling into dependent crates, PyO3 seam drift, registry/vendor fallout) immediately. The nextest track is fast (~20s warm wall) and the full pytest suite is fast too, so there is no cost argument for a scoped run before you are done.
+- **Build through the recipes.** `just dev` is the sole editable-extension build path; `just build-rust-extension` builds the release-equivalent extension set. `just test-python` / `just test` build the extension first (incremental `maturin develop`), so a test run never exercises a stale `.so`. A bare `cargo build` or `maturin develop` can still serve the wrong feature set.
+- **Tight red-green loops only.** Inside a tight loop you may narrow with the recipe's argument forwarding — `just test-rust-nextest -p <crate>` or `just test-rust-nextest -E 'test(name)'` — and then re-run `just test` whole before declaring work done. Narrow Rust runs still go through the recipe, not `cargo test`.
+- **Before pushing**, check the gates with `just pre-push`, which delegates to the prek pre-push stage (`prek run --stage pre-push`): prek.toml's `stages = ["pre-push"]` entries are the one push-gate manifest, so the recipe cannot run a shorter list than `git push` does (ADR-074).
+
+## ADRs
+
+New and modified ADRs live in `docs/adr/` and follow `docs/adr/README.md`. Whenever an ADR is created or its status/decision changes, update the decisions table in `docs/adr/README.md` in the same change — the table is the entry point consumers plan against, and a stale row misroutes work (ADR-080 sat implemented while the table's lag made a downstream task block on it). Keep the row's status terse and true to the ADR file's own status line.
+
+## Backwards Compatibility
+Design standalone features without a backwards compatibility layer. Add a feature flag to allow parallel implementations if necessary, followed by a hard cutover and flag removal.
+
+## Planning
+Use `ergo` for all planning. Discover usage with `ergo --help` and `ergo quickstart`. Include detailed implementation and planning notes in the body of each task. The `result` key is only for tasks with a durable document deliverable — most tasks produce code changes, and the merged diff is the deliverable, so close those with `{"state":"done"}` and no `result`.
+
+## Refactoring & Feature Development
+Use red/green test-driven development when refactoring and adding new features. Use `/skill:tdd` for guidelines.
+
+## Complex System State
+Prefer enum-based finite state machines to manage transitions within systems. When you encounter an existing system with ad-hoc rules and detailed comments meant to clarify complex interactions, propose a refactor to encapsulate that logic into a state machine.
+
+## Comment Hygiene
+Comments carry the *why* only if it outlives its lookup: no task/epic IDs (commits carry those), no "RED/merged/post-fix" narration, no refactor provenance. Sequencing rules belong in types, acceptance criteria in named tests, history in ADRs. Full rules and the first-home test: `docs/comments.md`.
+
+## Web
+Use `agent-browser`.
+
+## Dispatched-agent lane rules
+Workers arriving here by dispatch (one-shot agents, actors) follow `/skill:dispatched-agent` before touching anything: never commit or push; run only scoped gates (`just test-rust-nextest -p <crate>`, the pytest files you touched); run commands foreground and mark detached gates PENDING in the sign-off; and leave unfamiliar tree modifications untouched.
+
+## Formatting and commit staging
+
+Run `cargo fmt` only through the justfile recipes (`just fmt-check`) — a bare
+`cargo fmt` on PATH may bind a rustfmt that disagrees with the pinned toolchain, and
+the pre-commit formatter is the authority. Commit with the whole tree staged
+(`git add -A` before `git commit`): partial staging makes the pre-commit stash dance
+conflict with hook-side formatting changes and the commit aborts. The drift-gate and
+negative-probe idioms govern every machine-emitted artifact (see GLOSSARY.md).
+
+## Rust toolchain policy
+
+The repository-root `rust-toolchain.toml` pins local development and release
+builds to Rust 1.98.1 with `clippy` and `rustfmt`. From the repository root,
+run `rustup show active-toolchain` to verify the override or `just toolchain`
+to print the active compiler and Cargo versions. The workspace MSRV remains
+Rust 1.97; the `MSRV (Rust 1.97)` CI job runs
+`cargo +1.97.0 check --manifest-path rust/Cargo.toml --workspace --all-targets --locked`.
+Release workflows use the same 1.98.1 development channel rather than floating
+`stable`. Do not raise the MSRV without an explicit dependency-compatibility
+decision and an update to this policy.
+
+Gates certify tiers, not a toolchain identity (`scripts/toolchain_tier.sh`): any
+toolchain meeting the MSRV certifies the portable contract (build, tests,
+architecture gates, clippy's deny-by-default lints), while the strict layer
+(clippy `--deny warnings`, exact fmt) is the reference channel's verdict and
+runs in CI. A compliant toolchain never fails a gate on lint/format vintage.
+
+## Rust workspace selection
+
+Cargo commands without a package selector use the workspace's two pure-Rust
+entry-point defaults: `apexbot` and `apexbot-cli`. Plain `cargo build` does not
+build the PyO3 `apexbot_rs` extension or non-publishable sample crates. Build
+the extension explicitly with
+`cargo build --locked --manifest-path rust/Cargo.toml -p apexbot_rs --features extension-module`;
+maturin is already pinned to that crate's manifest. Commands intended to cover
+every member must retain an explicit `--workspace` selector.
+
+### One `apexbot` console, two invocation paths
+
+Two executables named `apexbot` exist, and they are one console by construction.
+The native path is `cargo run --locked --manifest-path rust/Cargo.toml -p
+apexbot-cli -- <args>` (or the built `rust/target/debug/apexbot`); the Python
+path is `uv run --no-sync apexbot`, the venv shim from `[project.scripts]`
+(`apexbot = "apexbot._cli:main"`). Both are thin callers of the single
+composition root `apexbot_cli::run_args` over the one clap tree, so identical
+output and exit codes are structural, not a convention held by hand. maturin's
+`manifest-path` points only at the cdylib crate, so the wheel never installs the
+binary — the venv name can only ever be the shim. Pick the native path for a
+fast standalone CLI invocation; pick the shim when the call must start from
+installed Python state, because its module init has already installed the typed
+config and the Rust→Python log forwarder, while the native path installs both
+via `sinks::boot()`. Both are supported; neither is deprecated.
+
+## Rust build profiles
+
+Local development uses the workspace `[profile.dev]` intentionally: `opt-level = 1`,
+no LTO or stripping, and line-tables-only debug information. This favors
+representative optimization over an unoptimized debug build while keeping
+`cargo test`, `just dev`, and editable-install rebuilds substantially cheaper
+than release. The development extension therefore exercises representative
+optimization rather than an unoptimized debug build.
+
+Release builds use the workspace `[profile.release]`: thin LTO, stripping, and
+`codegen-units = 1` for the final extension link. The listed core-library
+package overrides intentionally use `codegen-units = 16` to reduce compile time;
+Cargo has no per-package LTO or strip override, and the final thin-LTO link
+reconverges those units. Do not change these release values or the per-package
+policy without an explicit compatibility and build-time decision.
+
+## Rust feature matrix
+
+Rust validation is split into named lanes rather than one `--all-features` gate:
+
+- `just lint-rust-check` / `just check-rust-default`: workspace Clippy/check
+  with each crate's declared default features and no `--all-features`.
+- `just check-rust-consumer`: the pure-Rust `apexbot` umbrella and its
+  standalone consumer examples, without the PyO3 binding crate.
+- `just check-rust-binding-default`: `apexbot_rs` with its intentionally broad
+  default domain surface, but without `extension-module`.
+- `just check-rust-dev-features`: the binding manifest's canonical
+  `dev-features` alias (extension-module, hotpath, Prometheus hotpath,
+  solver hotpath, allocator control, OTel, and mimalloc). The alias is
+  intentionally outside the package defaults.
+- `just check-rust-extension-release` / `just build-rust-extension`: the
+  release-equivalent extension set, `extension-module` (forwarding to
+  `pyo3/extension-module`) plus binding defaults. Release wheels use
+  `maturin --release --features pyo3/extension-module` and exclude all
+  development-only profiling, telemetry, allocator-control, and mimalloc
+  features.
+- `just check-rust-all-features`: exhaustive workspace compilation as an
+  explicit diagnostic/secondary gate only. It is not the default gate because
+  it enables test-only and mutually exclusive build variants.
+
+CI runs the default, consumer, binding-default, development-only, and release
+feature checks before the all-features diagnostic. The default gate therefore
+remains meaningful even when the diagnostic is enabled.
+
+Hotpath's full Tokio `RuntimeMetrics` getters are behind Tokio's unstable API
+(`cfg(tokio_unstable)`). The cfg is declared once in `.cargo/config.toml`
+(`[target.'cfg(all())'] rustflags`), so every cargo and uv build — including
+uv's PEP 517 project build and the `just check-rust-*` / `just dev` /
+`just test-hotpath` recipes — gets it without an ad-hoc `RUSTFLAGS=`. The
+binding layer's `dev-features` set (which enables `hotpath`) is applied to uv
+project builds via `[tool.uv] config-settings-package` (`maturin.build-args`),
+so a plain `uv sync` builds the same extension `just dev` installs.
+
+## Rust test scope
+
+For whole-workspace runs, use `just test-rust-nextest` — never a hand-typed `cargo test`. It runs the identical workspace artifacts under nextest's process-per-test scheduler (measured ~20s warm wall vs ~90s for `cargo test --workspace`) and records per-test durations as JUnit XML at `rust/target/nextest/ci/nextest-ci.junit.xml`; rank slowest tests with `just test-timing [top]`. The recipe pins `--locked`, exports the Python libdir the libpython-linking harnesses need, and sets `--no-fail-fast` so one failing test never aborts the whole run. `just test-rust` (cargo) remains the canonical gate before declaring work done: nextest skips doc-tests, and CI runs cargo. Per-crate narrowing inside a tight red-green loop goes through the recipe too — `just test-rust-nextest -p <crate>` (or `-E 'test(name)'`) — but re-run the whole workspace suite through the recipe before declaring work done.
+
+Why: resolver v3 unifies features for `--workspace`, so its artifacts are the one warm, canonical set in `rust/target`. A `-p <crate>` selection unifies features differently (core crates lose the `pyo3` feature the binding layer enables; dep features like tokio's shrink), so cargo stores a second rlib set under different metadata hashes — alternating between the two rebuilds shared dependencies on every shared edit (measured: `-p apexbot-simulation` recompiled 6 just-built crates in ~1m; a leaf crate pays nothing). The workspace run also executes every crate's suite, catching cross-crate fallout (signature changes rippling into dependents, e.g. examples/settlement_bot) that a scoped run never sees.
+
+A failure that passes locally and fails in CI gets `just test-rust-ci` first —
+the identical suite under CI's build flags (`CARGO_PROFILE_DEV_DEBUG=0
+`CARGO_INCREMENTAL=0`, which CI sets for cache size). If it reproduces there,
+the bug is real; if it does not, the build config is the story — and the test
+or gate is asserting a layout-level fact it should not (ADR-072).
+
+## Python test scope
+
+The canonical Python gate is `just test-python` (CI and the pre-push hook run it directly) — never a hand-typed `uv run pytest`. Prefer the whole suite over selecting individual test files: the full run is fast and it is the run that surfaces seam and cross-module regressions. The suite carries pytest-timeout so a hung test fails with a timeout report instead of parking its xdist worker (the 300s timeout budget is set in `pyproject.toml`; no per-test or per-suite headroom exists — a timeout failure is the signal to investigate a slow or hung test; marker-filter enforcement lives in `tests/conftest.py`). The ordering-sensitive suites (`tests/arbitrage/test_arbitrage_session.py`, `tests/operator/test_operator_channel.py`) have a repeat-run gate: `just test-flake-probe` runs them three consecutive times with `-p no:cacheprovider` and fails on any failing run.
+
+## Fork/RPC-gated suites (`just test-fork`)
+
+`just test-fork` is the ONE on-demand lane for the legs every offline gate (`test`, pre-push, CI) deliberately deselects: the pytest live-RPC tiers (`-m '(online_rpc or base) and not slow'` — the fork-marked suites under `tests/`, e.g. the `AnvilFork`-driven live legs and `tests/registry/test_deployment_onchain_verification.py`) and the Rust live revm fork-truth legs (the `#[ignore]`d `live_*` tests in `apexbot-simulation`, run with `--run-ignored only` behind `APEXBOT_RPC_HTTP_CHAINID_1`, which the recipe exports from the probe target).
+
+It fails CLOSED when the RPC env is absent OR the endpoint is unreachable (probed with `eth_chainId`, not assumed): `TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI` must be declared (process environment or the gitignored `tests.env`; resolved env → tests.env → conftest table default) and must answer. The devcontainer's reth satisfies both (`containerEnv` sets `http://host.containers.internal:8545/`, WS on `:8546` — see `Node access` above); any reachable Ethereum endpoint works; the pytest harness resolves the same layers through `tests/conftest.py`, so the probe and the legs dial one URI. Never wired into `test` / pre-push / CI: the lane costs minutes of live-RPC work.
+
+## Build-Artifact Housekeeping
+
+`rust/target` holds several independently rebuildable cache families (normal
+Cargo, maturin, coverage, LLVM coverage, Criterion, wheels, rustdoc, and the
+`gen-stubs` introspected build under `stubgen-inspect`). The family policy lives
+in `scripts/gc-target.sh`; `just gc-target` reports and sweeps them per-family.
+Preview before cleanup:
+
+```bash
+DRY_RUN=1 just gc-target        # report candidates; delete nothing
+AGE=7 just gc-target            # destructive seven-day sweep
+```
+
+`AGE=N` uses `find -mtime +N`, so `AGE=0` means older than one day rather than
+literally every file. `target/maturin` is always outside the deletion boundary.
+
+The dev profile already uses `opt-level = 1` + `debug = "line-tables-only"` (the
+minimal-debuginfo setting), so a large `rust/target` is not a debuginfo problem:
+it is feature-variant fan-out — differing feature unification across the
+`--workspace` / `-p` / `--all-features` / `dev-features` lanes gives each crate
+dozens of distinct `.rlib` variants. `just gc-target` reclaims the stale ones by
+age; a fresh sweep after a burst of lane-switching is the normal remedy.
+
+## Building the Rust extension
+
+Maturin and Cargo can serve cached artifacts, so an apparently successful
+rebuild can still ship a **stale `.so`**. This repository does not run a runtime
+build-receipt/staleness gate; the build is instead a mandatory, incremental step
+of the test entrypoints:
+
+- `just dev` is the sole editable-extension build path (incremental
+  `maturin develop`); `just build-rust-extension` builds the release-equivalent
+  feature set.
+- `just test-python` (and therefore `just test`) depends on `just dev`, so the
+  Python suite always rebuilds the extension first and can never test a stale
+  `.so`.
+- After a Rust edit that a running bot must reflect, run `just dev` before it.
+
+The extension is the editable install's artifact: a gitignored
+`src/apexbot/_ffi.abi3.so` written into the source tree, not a cache. It
+self-heals from every entrypoint — `just dev`, `just test-python`, and a plain
+`uv sync` (whose project build selects `dev-features` via `[tool.uv]
+config-settings-package`, so it can no longer clobber the extension with a
+default-features wheel). There is deliberately no pointer/staleness layer: the
+artifact must live in-tree for the editable import to resolve, and rebuilding it
+is the fix.
+
+A bare `cargo build` or `maturin develop` can still serve the wrong feature set;
+prefer the recipes.
+
+## Python Environment
+
+Use `uv`. The `--no-sync` prefix is defined once as the justfile `py_run`
+variable (`uv run --no-sync`), so recipes never hand-write the flag; `just venv`
+prints the active venv path, and `just py <cmd>` runs an ad-hoc command against
+it.
+
+On the host, direnv loads a gitignored `.envrc` that redirects the venv
+(`UV_PROJECT_ENVIRONMENT`), the bytecode cache (`PYTHONPYCACHEPREFIX`), and the
+cargo target dir (`CARGO_TARGET_DIR`) out of the bind-mounted tree; the tracked
+`.envrc.example` is the template. The devcontainer sets the equivalents in
+`containerEnv`.
+
+Python linters run through `uvx` (ephemeral, latest), so their recipes carry no
+`--no-sync`: `just lint-python` / `lint-python-check` use `uvx ruff`, `dead-code`
+uses `uvx vulture`. The exception is `ty`: it resolves third-party imports and
+the `apexbot` stubs from the project environment, so it cannot run under `uvx`
+(that resolves against uvx's ephemeral site-packages and reports spurious
+errors). Its recipe uses the `py_run` prefix with `--with ty` — latest `ty`, run
+under the project venv. `maturin` likewise needs the project venv (`maturin
+develop` installs into the *current* virtualenv), so it stays on the `py_run`
+prefix.
+
+## Node access
+
+An archive-capable Ethereum mainnet node (reth) is ALWAYS available in this
+environment. The URIs come from the devcontainer's `containerEnv`
+(.devcontainer/devcontainer.json), which overrides `tests.env` inside the
+container: `TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI` = `http://host.containers.internal:8545/`
+(WS on `:8546`). The `tests.env` `localhost:8545` form is the same node seen
+from the host. Never conclude "no node access" from tests.env alone, and never
+defer live-node work (golden-capture recording, probes, span reconnaissance)
+on that basis.
+
+## Local node identity
+
+The node this environment points at is **reth**, not anvil. Identify a node by
+asking it, never by which binary is installed: `just node-identity`. A locally
+spawned anvil is a separate node, and anvil fails closed on both `eth_callMany`
+bundle shapes, so nothing would ever be submitted against it. The measured
+shape matrix and sim-gate implications: `/skill:node-identity`.

@@ -13,12 +13,11 @@ from typing import TYPE_CHECKING
 
 from apexbot._ffi import Bot as _Engine
 from apexbot.abi import encode as abi_encode
-from apexbot.config import DatabaseSettings, ApexbotConfig
 from apexbot.constants import ZERO_ADDRESS
 from apexbot.provider import OfflineProvider
 from apexbot.provider.call_helpers import encode_function_calldata
 from apexbot.utils.bytes import to_bytes
-from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.conftest import TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI
 from tests.helpers.erc20_factory import make_erc20
 
 if TYPE_CHECKING:
@@ -51,13 +50,9 @@ V4_TICK_SPACING = 10
 V4_HOOKS = ZERO_ADDRESS
 
 
-def make_test_config(tmp_path: pathlib.Path) -> ApexbotConfig:
-    """A throwaway config bound to ``tmp_path`` and the archive-node RPC URI."""
-    return ApexbotConfig(
-        database=DatabaseSettings(path=tmp_path / "test.db"),
-        rpc={1: ETHEREUM_ARCHIVE_NODE_HTTP_URI},
-        default_chain_id=1,
-    )
+def make_test_database(tmp_path: pathlib.Path) -> str:
+    """A throwaway database path bound to ``tmp_path``."""
+    return str(tmp_path / "test.db")
 
 
 def make_weth(py_bot: _Engine = PY_BOT) -> Erc20Token:

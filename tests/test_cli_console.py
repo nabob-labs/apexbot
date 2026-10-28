@@ -1,5 +1,5 @@
 """Smoke tests for the Rust-owned console reached through the Python seam
-(ADR-051 D3, ergo HHNEL2).
+(ADR-051 D3).
 
 The Python console script (``apexbot``, from ``[project.scripts]``) and
 ``python -m apexbot`` are both five-line passthroughs over

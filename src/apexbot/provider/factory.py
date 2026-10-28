@@ -1,115 +1,165 @@
-"""Provider construction from a :class:`ApexbotConfig` RPC endpoint.
+"""Provider construction over a cascade-resolved endpoint (ADR-062 D8).
 
-The canonical URL→provider factory (ADR-006 D5: one Bot per chain). The
-factory enforces that the RPC it connects to returns the configured
-``chain_id`` — a mismatch raises :class:`ValueError` (fail-fast on a
-misconfigured endpoint, before any pool/token I/O runs).
+The canonical chain-bound URL-to-provider factory. The endpoint and the chain
+both come from the installed typed config, and the chain binding itself is the
+Rust core's: the factory hands the resolved ``chain_id`` to the provider and the
+core reads ``eth_chainId`` once at construction, refusing a misconfigured
+endpoint before any pool/token I/O runs. A Rust consumer that constructs a
+provider directly gets the same refusal (see
+``apexbot_rpc::provider::AlloyProvider::for_chain``). What is left here is
+translating the core's refusal into this package's error hierarchy.
 
-The factory is alloy-only: it builds a Rust-backed
-:class:`~apexbot._ffi.AlloyProvider` (HTTP/WS/IPC, scheme-detected)
-unconditionally and verifies ``eth_chainId`` against ``chain_id``.
-
-Lives in ``apexbot.provider`` (the lib layer) so both ``Bot.__init__`` and
-the CLI can reach it without a lib→cli reverse dependency. ``cli/utils.py``
-re-exports it for backward compatibility.
+Lives in ``apexbot.provider`` (the lib layer) so both ``Bot.__init__`` and the
+CLI can reach it without a lib->cli reverse dependency.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from apexbot.config import ApexbotConfig, _init_config, resolve_http_rpc_uri
+from apexbot.config import resolve_chain_id, resolve_http_rpc_uri
+from apexbot.exceptions.base import ApexbotValueError
+from apexbot.provider import ChainMismatchError
+from apexbot.provider.async_provider import AsyncAlloyProvider
+from apexbot.provider.sync import AlloyProvider
 
 if TYPE_CHECKING:
-    from apexbot.provider import AlloyProvider, AsyncAlloyProvider
+    from collections.abc import Callable
+    from typing import Any
+
+
+class ChainIdentityMismatchError(ApexbotValueError, ValueError):
+    """The core's chain-binding refusal, re-homed into this package's hierarchy.
+
+    The check is the core's invariant; only the error class is re-homed here.
+    It stays a :class:`ValueError` as well as a
+    :class:`~apexbot.exceptions.base.ApexbotValueError`, so a caller that
+    already handled a misconfigured endpoint keeps catching it exactly as it
+    caught the core's own refusal.
+    """
+
+
+def _chain_mismatch_message(exc: ChainMismatchError) -> str:
+    """Render the core's chain-binding refusal as this package's message.
+
+    The check is the core's invariant; the factory only re-homes the refusal so
+    a caller catching ``ApexbotValueError`` keeps catching it. The
+    disagreement is rendered from the typed attributes, not parsed out of the
+    core's message.
+
+    Args:
+        exc: The refusal raised by the core at provider construction.
+
+    Returns:
+        The message naming the endpoint and both chain ids.
+
+    """
+    # The refusal's typed attributes are set by the Rust core and are absent
+    # from the generated stub (the stubtest-allowlist class of generator gaps).
+    return (
+        f"the endpoint {exc.endpoint} serves chain {exc.actual}, but the session "  # ty: ignore[unresolved-attribute]
+        f"targets chain {exc.expected}: refusing to start a provider against the wrong chain"  # ty: ignore[unresolved-attribute]
+    )
 
 
 def get_provider_from_config(
     *,
-    chain_id: int,
-    config: ApexbotConfig | None = None,
+    chain_id: int | str | None = None,
+    node: str | None = None,
+    resolve_uri: Callable[..., str] = resolve_http_rpc_uri,
+    provider_factory: Callable[..., AlloyProvider] | None = None,
+    chain_mismatch_error: type[ChainMismatchError] = ChainMismatchError,
 ) -> AlloyProvider:
-    """Build an :class:`AlloyProvider` for ``chain_id`` from the resolved RPC entry.
+    """Build a chain-bound :class:`AlloyProvider` for the session chain.
 
-    Resolves the HTTP/IPC endpoint through the standard cascade
-    (:func:`apexbot.config.resolve_http_rpc_uri`): CLI arg > OS env
-    ``APEXBOT_RPC_HTTP_CHAINID_{cid}`` > caller fallback > config.toml
-    ``rpc[cid]`` > raise. This is the single resolution path shared by the
-    library, the ``apexbot`` click CLI, and the settlement-arbitrage example (see
-    the rpc-uri-cascade migration guide, removed in the stale-docs cleanup
-    `71ec78b2`), so a plain ``export`` in the
-    devcontainer takes effect here too.
+    The endpoint resolves through the request scope of the four-layer cascade
+    and the chain through the chain-id cascade, both from the installed typed
+    config; ``chain_id``/``node`` are the explicit override layer when given.
 
-    Constructs an :class:`~apexbot._ffi.AlloyProvider` over the
-    resolved endpoint (HTTP/WS/IPC, detected by scheme), then **enforces**
-    the connected RPC's ``eth_chainId`` equals ``chain_id`` — raises
-    :class:`ValueError` on mismatch (fail-fast).
+    The constructed provider is BOUND to that chain: the Rust core verifies the
+    endpoint's ``eth_chainId`` once, and its refusal is translated into a
+    :class:`ApexbotValueError` here.
+
+    ``resolve_uri``/``provider_factory``/``chain_mismatch_error`` are the DI
+    seams (tests inject a recording resolver, a stand-in constructor, and a
+    constructible stand-in for the PyO3 refusal class); omitted kwargs keep
+    the production bindings.
 
     Args:
-        chain_id: The chain ID to get a provider for
-        config: Optional config override; loaded from disk if not provided (also
-            passed to the resolver as the config.toml layer)
+        chain_id: The explicit chain override; resolved from the config layers
+            when absent.
+        node: The explicit endpoint override, classified by its own value.
+        resolve_uri: The endpoint resolver called as
+            ``resolve_uri(session_chain_id, node=node)``.
+        provider_factory: The provider constructor called as
+            ``provider_factory(endpoint, chain_id=session_chain_id)``.
+        chain_mismatch_error: The exception class the core's refusal is
+            caught as before re-homing.
 
     Returns:
-        An AlloyProvider over the resolved RPC endpoint.
+        A chain-bound AlloyProvider over the resolved RPC endpoint.
 
     Raises:
-        ValueError: If no RPC is configured for ``chain_id`` (raised as
-            :class:`RpcNotConfiguredError`, a ``ValueError`` subclass), or the
-            connected RPC's chain ID does not match ``chain_id``.
+        ChainIdentityMismatchError: When the endpoint serves another chain than
+            the session targets. It is both a
+            :class:`~apexbot.exceptions.base.ApexbotValueError` and a
+            :class:`ValueError`.
 
     """
-    if config is None:
-        config = _init_config()
-    from apexbot.provider import AlloyProvider
-
-    endpoint = resolve_http_rpc_uri(chain_id, config=config)
-    alloy = AlloyProvider(endpoint)
-    actual = alloy.get_chain_id()
-    if actual != chain_id:
-        msg = (
-            f"The chain ID ({actual}) at endpoint {endpoint} does not match "
-            f"the chain ID ({chain_id}) defined in the config file."
-        )
-        raise ValueError(msg)
-    return alloy
+    session_chain_id = resolve_chain_id(chain_id)
+    endpoint = resolve_uri(session_chain_id, node=node)
+    if provider_factory is None:
+        provider_factory = AlloyProvider
+    try:
+        return provider_factory(endpoint, chain_id=session_chain_id)
+    except chain_mismatch_error as exc:
+        raise ChainIdentityMismatchError(message=_chain_mismatch_message(exc)) from exc
 
 
 async def get_async_provider_from_config(
     *,
-    chain_id: int,
-    config: ApexbotConfig | None = None,
+    chain_id: int | str | None = None,
+    node: str | None = None,
+    resolve_uri: Callable[..., str] = resolve_http_rpc_uri,
+    provider_factory: Callable[..., Any] | None = None,
+    chain_mismatch_error: type[ChainMismatchError] = ChainMismatchError,
 ) -> AsyncAlloyProvider:
-    """Build an :class:`AsyncAlloyProvider` for ``chain_id`` from the resolved RPC entry.
+    """Build a chain-bound :class:`AsyncAlloyProvider` for the session chain.
 
-    Async counterpart of :func:`get_provider_from_config`. Resolves the
-    HTTP/IPC endpoint through the standard cascade
-    (:func:`apexbot.config.resolve_http_rpc_uri`) — same precedence as the
-    sync factory — constructs an async Alloy provider, then **enforces** the
-    connected RPC's ``eth_chainId`` equals ``chain_id`` via an awaited
-    ``get_chain_id()`` (async providers cannot read it synchronously) —
-    raises :class:`ValueError` on mismatch (fail-fast, ADR-006 D5).
+    Async counterpart of :func:`get_provider_from_config`: the same resolution,
+    the same core check, awaited on the caller's event loop. The DI seams are
+    the sync factory's; an omitted ``provider_factory`` resolves to
+    ``AsyncAlloyProvider.create``.
+
+    Args:
+        chain_id: The explicit chain override; resolved from the config layers
+            when absent.
+        node: The explicit endpoint override, classified by its own value.
+        resolve_uri: The endpoint resolver called as
+            ``resolve_uri(session_chain_id, node=node)``.
+        provider_factory: The awaited provider constructor called as
+            ``provider_factory(endpoint, chain_id=session_chain_id)``.
+        chain_mismatch_error: The exception class the core's refusal is
+            caught as before re-homing.
 
     Returns:
-        An AsyncAlloyProvider over the resolved RPC endpoint.
+        A chain-bound AsyncAlloyProvider over the resolved RPC endpoint.
 
     Raises:
-        ValueError: If no RPC is configured for ``chain_id`` (raised as
-            :class:`RpcNotConfiguredError`, a ``ValueError`` subclass), or the
-            connected RPC's chain ID does not match ``chain_id``.
+        ChainIdentityMismatchError: When the endpoint serves another chain than
+            the session targets. It is both a
+            :class:`~apexbot.exceptions.base.ApexbotValueError` and a
+            :class:`ValueError`.
 
     """
-    if config is None:
-        config = _init_config()
-    from apexbot.provider import AsyncAlloyProvider
-
-    endpoint = resolve_http_rpc_uri(chain_id, config=config)
-    alloy = await AsyncAlloyProvider.create(endpoint)
-    actual = await alloy.get_chain_id()
-    if actual != chain_id:
-        msg = (
-            f"The chain ID ({actual}) at endpoint {endpoint} does not match "
-            f"the configured chain ID ({chain_id})."
+    session_chain_id = resolve_chain_id(chain_id)
+    endpoint = resolve_uri(session_chain_id, node=node)
+    if provider_factory is None:
+        provider_factory = AsyncAlloyProvider.create
+    try:
+        return cast(
+            "AsyncAlloyProvider",
+            await provider_factory(endpoint, chain_id=session_chain_id),
         )
-        raise ValueError(msg)
-    return alloy
+    except chain_mismatch_error as exc:
+        raise ChainIdentityMismatchError(message=_chain_mismatch_message(exc)) from exc

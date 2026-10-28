@@ -9,69 +9,42 @@ results.
 
 The former ``core.py`` (pure math + dataclasses) + ``protocols.py`` (typing
 seams) were retired once the Rust core reached byte-identical parity (verified
-by the §4.2 parity gate before deletion). The ``PositionAnalysisResult``
-bucket-sorter stays here (it's trivial Python, not math).
+by the parity gate (``docs/architecture/parity-gate.md``) before deletion).
+The ``PositionAnalysisResult`` bucket-sorter stays here (it's trivial Python, not math).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy.engine import Engine
-
-from apexbot._ffi.db import DatabasePositionQuery as _EnginePositionQuery
 from apexbot.aave import AavePriceOracle
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.db import UserPositionSummary, analyze_aave_user_position
+from apexbot.db import DatabasePositionQuery as _EnginePositionQuery
+from apexbot.db import (
+    UserPositionSummary,
+    analyze_aave_user_position,
+)
 from apexbot.logging import logger
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import Session
+    import pathlib
 
-    from apexbot._ffi import ChecksummedAddress
     from apexbot.provider import AlloyProvider
+    from apexbot.types.chain import ChecksummedAddress
 
 
 class DatabasePositionQuery:
     """PositionQuery backed by the Rust ``_EnginePositionQuery`` reader.
 
-    Routes every read through the PyO3 seam (ADR-005). The ``session`` is
-    retained for resolving the DB file path + the ``AaveV3Market`` lookup at
-    the CLI boundary; reads no longer use the SQLAlchemy session.
+    Routes every read through the PyO3 seam (ADR-005) over one explicit,
+    file-backed database path.
     """
 
-    def __init__(self, session: Session) -> None:
-        """Initialize the instance.
-
-        Args:
-            session: A SQLAlchemy session (used to resolve the database file
-                path + look up the ``AaveV3Market`` id at the CLI boundary).
-
-        """
-        self._session = session
-        self._rust: _EnginePositionQuery | None = None
-
-    def _db_path(self) -> str:
-        """Resolve the SQLite file path the Rust reader opens.
-
-        Returns:
-            The resolved database file path.
-
-        Raises:
-            ValueError: If no file path can be resolved (e.g. an in-memory engine).
-
-        """
-        engine = self._session.get_bind()
-        if isinstance(engine, Engine):
-            db_path = engine.url.database
-            if db_path and db_path != ":memory:":
-                return db_path
-        msg = "a file-backed database is required for Rust-backed position reads"
-        raise ValueError(msg)
+    def __init__(self, database_path: pathlib.Path) -> None:
+        """Open the Rust read handle over ``database_path``."""
+        self._rust = _EnginePositionQuery(str(database_path))
 
     def _handle(self) -> _EnginePositionQuery:
-        if self._rust is None:
-            self._rust = _EnginePositionQuery(self._db_path())
         return self._rust
 
     def get_users_with_debt(self, market_id: int, limit: int | None = None) -> list[dict[str, Any]]:
@@ -109,7 +82,7 @@ class DatabasePositionQuery:
             The computed value.
 
         """
-        return self._handle().get_collateral_config_map(user_id)
+        return cast("dict[int, bool]", self._handle().get_collateral_config_map(user_id))
 
     def get_oracle_address(self, market_id: int) -> ChecksummedAddress | None:
         """Get the price oracle address for a market.
@@ -221,7 +194,7 @@ class PositionAnalysisResult:
 
 
 def analyze_positions_for_market(
-    session: Session,
+    database_path: pathlib.Path,
     market_id: int,
     health_factor_threshold: float = 1.1,
     limit: int | None = None,
@@ -235,7 +208,7 @@ def analyze_positions_for_market(
     (``apexbot-aave::analysis``).
 
     Args:
-        session: A SQLAlchemy session (for DB path resolution).
+        database_path: File-backed SQLite database opened by the Rust reader.
         market_id: The Aave V3 market id.
         health_factor_threshold: The at-risk threshold (default 1.1).
         limit: Optional cap on the number of users analyzed.
@@ -246,7 +219,7 @@ def analyze_positions_for_market(
         The bucketed analysis result.
 
     """
-    position_query = DatabasePositionQuery(session)
+    position_query = DatabasePositionQuery(database_path)
 
     price_map: dict[ChecksummedAddress, int] = {}
     if provider is not None:

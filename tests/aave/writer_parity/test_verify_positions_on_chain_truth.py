@@ -1,7 +1,7 @@
-"""§4.2 + §4.3 VV5OTV — `verify_touched_positions_on_chain` value-correctness
+"""Parity — `verify_touched_positions_on_chain` value-correctness
 gate.
 
-The per-chunk value-correctness gate (the minimal BE474R slice — port of
+The per-chunk value-correctness gate (the minimal slice — port of
 Python `verification.py::verify_scaled_token_positions`). Mirrors the
 Python's assertion contract: `scaledBalanceOf(user)` +
 `getPreviousIndex(user)` at `block_number` MUST equal the DB position row's
@@ -14,12 +14,12 @@ field, expected, actual) BEFORE the chunk's wrong balance could compile-up
 into a future "balance would go negative" crash somewhere downstream.
 
 The GREEN case proves the gate stays clean when the DB matches on-chain
-truth — so a future regression that re-introduces the NMWPI6/3MF5QM-class
+truth — so a future regression that re-introduces the
 masked bugs (which left balances SILENTLY wrong, never negative) would be
 caught RED by this gate, not just-green.
 
 Login: the fixture is one Supply at `liquidity_index = 2 * _RAY` (so the
-scaled balance != underlying — the NMWPI6-shaped discriminator). The
+scaled balance != underlying — the). The
 MockRpcServer's `eth_call_responses` are keyed by selector — sufficient for
 this one-user fixture: `scaledBalanceOf` + `getPreviousIndex` both serve the
 canonical on-chain truth = the Rust writer's scaled-balance output.
@@ -27,18 +27,20 @@ canonical on-chain truth = the Rust writer's scaled-balance output.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session
 
+from apexbot._ffi import call_on_ambient_runtime
 from apexbot._ffi.aave import (
     run_aave_update,
     verify_touched_positions_on_chain,
 )
-from apexbot._ffi import call_on_ambient_runtime
 from apexbot._ffi.cancel import CancelHandle
 from tests.aave.writer_parity.harness import (
     FIXTURE_BLOCK,
@@ -51,6 +53,7 @@ from tests.aave.writer_parity.harness import (
     mock_rpc_server,
     seeded_db,
 )
+from tests.helpers.database import sqlite_connection
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -188,7 +191,7 @@ def _drive_rust(rust_path: str, rpc_url: str) -> dict[str, object]:
 def _verify_all(database_path: str, rpc_url: str) -> list[dict[str, object]]:
     """Run the standalone verify seam in verify-all mode (`touched_users=None`).
 
-    The seam is an ambient-runtime-only consumer (VJGZJ2: a missing ambient
+    The seam is an ambient-runtime-only consumer (a missing ambient
     tokio runtime is a typed ValueError, never a per-call runtime spawn), so
     the direct call goes through the Rust ambient-runtime driver seam, which
     enters the shared apexbot-core runtime around the callable — the same
@@ -211,40 +214,83 @@ def _corrupt_balance(rust_path: str, user_address: str, new_balance: int) -> Non
     """Mutate the SENDER's collateral position balance to `new_balance` in
     the DB. Used by the RED case to simulate a regression that left the DB
     state silently wrong."""
-    engine = create_engine(f"sqlite:///{rust_path}")
-    with Session(engine) as s:
-        s.execute(
-            text(
-                "UPDATE aave_v3_collateral_positions \
-                 SET balance = :b \
-                 WHERE user_id IN (SELECT id FROM aave_v3_users WHERE LOWER(address) = LOWER(:a))"
-            ),
+    with sqlite_connection(rust_path) as connection:
+        connection.execute(
+            "UPDATE aave_v3_collateral_positions "
+            "SET balance = :b "
+            "WHERE user_id IN (SELECT id FROM aave_v3_users WHERE LOWER(address) = LOWER(:a))",
             {"b": str(new_balance), "a": user_address},
         )
-        s.commit()
-    engine.dispose()
 
 
 def _scaled_balance_of(rust_path: str, user_address: str) -> int:
     """Helper: read the SENDER's collateral position balance from the DB
     (to confirm the writer seeded the expected scaled balance)."""
-    engine = create_engine(f"sqlite:///{rust_path}")
-    with Session(engine) as s:
-        row = s.execute(
-            text(
-                "SELECT cp.balance FROM aave_v3_collateral_positions cp \
-                 JOIN aave_v3_users u ON u.id = cp.user_id WHERE LOWER(u.address) = LOWER(:a)"
-            ),
+    with sqlite_connection(rust_path) as connection:
+        row = connection.execute(
+            "SELECT cp.balance FROM aave_v3_collateral_positions cp "
+            "JOIN aave_v3_users u ON u.id = cp.user_id WHERE LOWER(u.address) = LOWER(:a)",
             {"a": user_address},
-        ).one()
-        result = int(row[0])
-    engine.dispose()
-    return result
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+
+@dataclasses.dataclass(frozen=True)
+class _WrittenChunk:
+    """One Rust-written chunk: the open DB + RPC handles and the post-chunk
+    SENDER balance the gate reads."""
+
+    database_path: str
+    rpc_url: str
+    db_balance: int
+
+
+@pytest.fixture()
+def written_chunk(tmp_path: Path) -> Callable[..., AbstractContextManager[_WrittenChunk]]:
+    """Seed the DB + MockRpcServer, then drive one chunk through the Rust writer.
+
+    The fixture's setup assert rides here: a writer that failed to commit its
+    chunk fails HERE, not as a confusing gate divergence. The RPC server and
+    the seeded DB stay open for the life of the ``with`` — the verify gate
+    calls the MockRpcServer over the same socket.
+
+    Returns:
+        A context manager yielding the :class:`_WrittenChunk` for one
+        (logs, eth_call_responses) fixture body.
+
+    """
+
+    @contextlib.contextmanager
+    def _write(
+        *, logs: list[dict[str, object]], eth_call_responses: dict[str, str]
+    ) -> Iterator[_WrittenChunk]:
+        with (
+            seeded_db(tmp_path, name="rust", with_price_oracle=True) as (rust_path, _rust_session),
+            mock_rpc_server(
+                logs=logs,
+                block_number=FIXTURE_BLOCK,
+                eth_call_responses=eth_call_responses,
+            ) as rpc_url,
+        ):
+            # Drive the chunk through the Rust writer — FIX-in-place (the writer
+            # writes its scaled balance for SENDER).
+            report_dict = _drive_rust(rust_path, rpc_url)
+            assert report_dict["chunks_committed"] == 1, (
+                f"fixture setup failed: rust writer didn't commit its chunk; report={report_dict}"
+            )
+            yield _WrittenChunk(
+                database_path=str(rust_path),
+                rpc_url=rpc_url,
+                db_balance=_scaled_balance_of(str(rust_path), _SENDER),
+            )
+
+    return _write
 
 
 @pytest.mark.parametrize("corrupt_db", [False, True], ids=["green", "red"])
 def test_verify_touched_positions_on_chain_catches_corrupted_balance(
-    tmp_path: Path,
+    written_chunk: Callable[..., AbstractContextManager[_WrittenChunk]],
     *,
     corrupt_db: bool,
 ) -> None:
@@ -252,45 +298,28 @@ def test_verify_touched_positions_on_chain_catches_corrupted_balance(
     RED: corrupt the DB balance + verify surfaces a NAMED divergence
     (proving the gate catches masked wrong-value bugs the crash-gate cannot).
     """
-    logs = _build_chunk_logs()
-    with (
-        seeded_db(tmp_path, name="rust", with_price_oracle=True) as (rust_path, _rust_session),
-        mock_rpc_server(
-            logs=logs,
-            block_number=FIXTURE_BLOCK,
-            eth_call_responses=_eth_call_responses(),
-        ) as rpc_url,
-    ):
-        # Drive the chunk through the Rust writer — FIX-in-place (the writer
-        # writes _AMOUNT as SENDER's scaled balance).
-        report_dict = _drive_rust(rust_path, rpc_url)
-        assert report_dict["chunks_committed"] == 1, (
-            f"fixture setup failed: rust writer didn't commit its chunk; report={report_dict}"
-        )
-
-        # The writer's DB state post-chunk.
-        db_balance = _scaled_balance_of(str(rust_path), _SENDER)
-        # The MockRpcServer's on-chain truth.
-        on_chain = _ON_CHAIN_SCALED_BALANCE
-        assert db_balance == on_chain, (
-            f"fixture setup failed: DB balance {db_balance} != on-chain {on_chain}"
+    with written_chunk(logs=_build_chunk_logs(), eth_call_responses=_eth_call_responses()) as chunk:
+        # The writer's DB state post-chunk vs the MockRpcServer's on-chain truth.
+        assert chunk.db_balance == _ON_CHAIN_SCALED_BALANCE, (
+            f"fixture setup failed: DB balance {chunk.db_balance} != "
+            f"on-chain {_ON_CHAIN_SCALED_BALANCE}"
         )
 
         if corrupt_db:
             # RED arm: corrupt the DB balance to a wrong value (simulating a
-            # masked wrong-value bug — e.g. the pre-NMWPI6 user-as-int U256
+            # masked wrong-value bug — e.g. the earlier user-as-int U256
             # would have left balance = a wildly wrong but always-positive
             # value, structurally invisible to the crash-gate).
-            _corrupt_balance(str(rust_path), _SENDER, db_balance + 1)
+            _corrupt_balance(chunk.database_path, _SENDER, chunk.db_balance + 1)
 
         # The gate fires: verify_touched_positions_on_chain.
         # NOTE: `None` for `touched_users` instructs the verify fn to check
         # ALL nonzero positions (verify-all mode — the orchestrator-required
-        # surface-44JTVN-before-crash path: positions whose divergence was
+        # surface-before-crash path: positions whose divergence was
         # introduced in EARLIER chunks surface before their
         # crash-cycle chunk commits). The touched-filter would miss p534
         # here (it wasn't touched in THIS chunk).
-        divergences = _verify_all(str(rust_path), rpc_url)
+        divergences = _verify_all(chunk.database_path, chunk.rpc_url)
 
         if corrupt_db:
             # RED — the gate surfaces the SENDER's collateral balance
@@ -303,15 +332,15 @@ def test_verify_touched_positions_on_chain_catches_corrupted_balance(
             assert d["user_address"].lower() == _SENDER.lower()
             assert d["token_address"].lower() == _A_WETH.lower()
             assert d["block_number"] == FIXTURE_BLOCK
-            assert int(d["expected"]) == db_balance + 1  # the corrupted value
-            assert int(d["actual"]) == on_chain  # the on-chain truth (_AMOUNT)
+            assert int(d["expected"]) == chunk.db_balance + 1  # the corrupted value
+            assert int(d["actual"]) == _ON_CHAIN_SCALED_BALANCE  # the on-chain truth (_AMOUNT)
         else:
             # GREEN — the on-chain truth matches the DB state.
             assert divergences == [], f"expected no divergences on GREEN arm; got: {divergences}"
 
 
 # ─┐
-# │ EIWEPM — LiquidationCall double-debit (shared writer-spec MATH bug).    │
+# │ LiquidationCall double-debit (shared writer-spec MATH bug).             │
 # │                                                                        │
 # │ Class: inside `collect_collateral_events` (ops_parser.rs:1906-1941),   │
 # │ the LiquidationCall op's `scaled_events` ends up containing BOTH the   │
@@ -496,7 +525,7 @@ def _build_liquidation_burn_side_chunk_logs() -> list[dict[str, object]]:
 
 
 def test_liquidation_burn_side_pair_single_debit(
-    tmp_path: Path,
+    written_chunk: Callable[..., AbstractContextManager[_WrittenChunk]],
 ) -> None:
     """RED pre-fix: `collect_collateral_events` includes the burn-side pair
     ERC20 Transfer-to-0x0 in `op.scaled_events`; `dispatch_liquidation` applies
@@ -506,24 +535,13 @@ def test_liquidation_burn_side_pair_single_debit(
     GREEN post-fix: `collect_collateral_events` calls `is_part_of_burn` to
     filter the paired ERC20 Transfer-to-0x0 out of `collateral_transfers` →
     `dispatch_liquidation` applies only the Burn event → single-debit ==
-    on-chain truth → VV5OTV gate reports no divergence.
+    on-chain truth → the gate reports no divergence.
     """
-    logs = _build_liquidation_burn_side_chunk_logs()
-    with (
-        seeded_db(tmp_path, name="rust", with_price_oracle=True) as (rust_path, _rust_session),
-        mock_rpc_server(
-            logs=logs,
-            block_number=FIXTURE_BLOCK,
-            eth_call_responses=_liq_eth_call_responses(),
-        ) as rpc_url,
-    ):
-        report_dict = _drive_rust(rust_path, rpc_url)
-        assert report_dict["chunks_committed"] == 1, (
-            f"fixture setup failed: rust writer didn't commit its chunk; report={report_dict}"
-        )
-
+    with written_chunk(
+        logs=_build_liquidation_burn_side_chunk_logs(), eth_call_responses=_liq_eth_call_responses()
+    ) as chunk:
         # The verify gate fires for ALL nonzero positions (verify-all mode).
-        divergences = _verify_all(str(rust_path), rpc_url)
+        divergences = _verify_all(chunk.database_path, chunk.rpc_url)
 
         # GREEN: zero divergences (DB balance == on-chain truth).
         bal_divs = [d for d in divergences if d["field"] == "balance"]

@@ -1,4 +1,4 @@
-"""Pipeline-side skip recording for path registration (INN6TK + PRG-2).
+"""Pipeline-side skip recording for path registration.
 
 The reason-tagged skip breakdown ([build_paths] Progress lines) records every
 candidate skip; PRG-2 additionally lands each skip in the Rust
@@ -10,22 +10,20 @@ raced duplicate builds self-heal in the engine single-flight path (PRG-1).
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from apexbot.runner.build_paths import PathRegistrationPipeline
+from tests.fakes.runner_pipelines import FakeFleetHostedBot, FakePipelineContext
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
-def make_pipeline(py_bot: object | None = None) -> PathRegistrationPipeline:
-    ctx = SimpleNamespace(
-        bot=SimpleNamespace(_py_bot=py_bot, registration_fleet_hosted=lambda: True),
-        chain_id=1,
-        db=None,
-        uniswap_v3_tracker=None,
-        sushiswap_v3_tracker=None,
-        pancakeswap_v3_tracker=None,
-        weth=None,
+def make_pipeline(database_path: Path, py_bot: object | None = None) -> PathRegistrationPipeline:
+    ctx = FakePipelineContext(bot=FakeFleetHostedBot(_py_bot=py_bot), database_path=database_path)
+    return PathRegistrationPipeline(
+        context=ctx, engine_registry=None, max_paths=0, discovery_batch_size=1000
     )
-    return PathRegistrationPipeline(context=ctx, engine_registry=None)
 
 
 class _RecordingPyBot:
@@ -36,35 +34,29 @@ class _RecordingPyBot:
         self.reasons.append(reason)
 
 
-def test_record_skip_counts_the_reason() -> None:
-    p = make_pipeline()
-    p._record_skip("build-v3:ConnectionError")
-    p._record_skip("build-v3:ConnectionError")
-    p._record_skip("dup")
+def test_record_skip_counts_the_reason(tmp_path: Path) -> None:
+    p = make_pipeline(tmp_path / "unused.db")
+    p.record_skip("build-v3:ConnectionError")
+    p.record_skip("build-v3:ConnectionError")
+    p.record_skip("dup")
     assert p._skip_reasons["build-v3:ConnectionError"] == 2
     assert p._skip_reasons["dup"] == 1
 
 
-def test_record_skip_forwards_to_the_rust_meter() -> None:
+def test_record_skip_forwards_to_the_rust_meter(tmp_path: Path) -> None:
     meter = _RecordingPyBot()
-    p = make_pipeline(py_bot=meter)
-    p._record_skip("v4-dynamic-fee-rejected")
-    p._record_skip("path-cap")
+    p = make_pipeline(tmp_path / "unused.db", py_bot=meter)
+    p.record_skip("v4-dynamic-fee-rejected")
+    p.record_skip("path-cap")
     assert meter.reasons == ["v4-dynamic-fee-rejected", "path-cap"]
 
 
-def test_record_skip_without_a_bot_only_counts() -> None:
+def test_record_skip_without_a_bot_only_counts(tmp_path: Path) -> None:
     # Construction contexts without a live core (pipeline tests) must not
     # attempt the meter record.
-    ctx = SimpleNamespace(
-        bot=SimpleNamespace(_py_bot=None, registration_fleet_hosted=lambda: True),
-        chain_id=1,
-        db=None,
-        uniswap_v3_tracker=None,
-        sushiswap_v3_tracker=None,
-        pancakeswap_v3_tracker=None,
-        weth=None,
+    ctx = FakePipelineContext(bot=FakeFleetHostedBot(), database_path=tmp_path / "unused.db")
+    p = PathRegistrationPipeline(
+        context=ctx, engine_registry=None, max_paths=0, discovery_batch_size=1000
     )
-    p = PathRegistrationPipeline(context=ctx, engine_registry=None)
-    p._record_skip("v4-no-hash")
+    p.record_skip("v4-no-hash")
     assert p._skip_reasons["v4-no-hash"] == 1

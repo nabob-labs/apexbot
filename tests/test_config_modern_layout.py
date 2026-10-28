@@ -1,178 +1,80 @@
-"""Tests for the 0.6 modern config.toml layout loading in Python (ergo JLFE2F).
+"""The Python driver owns no database bootstrap (ADR-052 / ADR-062).
 
-The shared operator file ~/.config/apexbot/config.toml is now the typed
-Rust BotConfig file layer: its tables are the schema sections (telemetry,
-failure_policy, ...), and the pre-0.6 Python-domain sections ([database],
-[rpc]/[ws], default_chain_id) have LEFT the file (they resolve through the
-env/cascade layers). The Python ApexbotConfig therefore must load a
-modern-layout file that carries NO Python-domain sections at all, defaulting
-database to the standard DB_PATH and leaving rpc/ws empty (the RPC cascade
-then resolves endpoints from env or the caller).
+The operator file's ``database.path`` resolves through the Rust cascade, and
+the Rust core owns creating the database at open. These tests pin the driver's
+side of that boundary: resolving a path writes nothing, the driver exposes no
+creation helper, and the core's ensure-at-open is what materializes the file
+and its Rust schema. They run against pinned tmp paths, so the suite never
+touches an operator's state home.
 """
 
 from __future__ import annotations
 
+import contextlib
+import sqlite3
 from typing import TYPE_CHECKING
 
-import pytest
-
 from apexbot import config as config_module
-from apexbot.config import CONFIG_DIR, _init_config, load_config_from_file
+from apexbot.config import resolve_database_path
+from apexbot.db import db_upgrade_database
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-
-# The envvar name of the Python-cascade chain-id layer (env > retired file key).
-_CHAIN_ID_ENV_VAR = "APEXBOT_DEFAULT_CHAIN_ID"
+RUST_STAMP_TABLE = "_apexbot_db_schema_version"
 
 
-# The modern layout: ONLY typed-Rust schema sections (both are also read by
-# the live Python readers — failure_policy by the Rust log layer, telemetry
-# by nothing on the Python side — plus it exercises the default extra-key
-# posture for every other schema section).
-MODERN_LAYOUT = """\
-[telemetry]
-otel = true
-jaeger_endpoint = "http://localhost:4318"
-metrics_addr = "0.0.0.0:9464"
-
-[failure_policy]
-"""
+def test_the_python_config_surface_exposes_no_database_bootstrap() -> None:
+    """Database creation moved to the core; the driver imports no starter."""
+    assert not hasattr(config_module, "db_create_new_database")
 
 
-def test_modern_layout_file_loads_in_python(tmp_path: Path) -> None:
-    """A modern-layout file with no Python-domain sections loads with defaults."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text(MODERN_LAYOUT, encoding="utf-8")
+def test_resolving_a_database_path_writes_nothing(tmp_path: Path) -> None:
+    """Resolution is a pure verdict: no parent directory, no file."""
+    target = tmp_path / "state" / "apexbot" / "db" / "apexbot.db"
 
-    config = load_config_from_file(cfg)
+    resolved = resolve_database_path(str(target))
 
-    from apexbot.config import DB_PATH
-
-    assert config.database.path == DB_PATH, "database defaults to the standard path"
-    assert config.rpc == {}, "rpc is empty (env/cascade layer owns endpoints)"
-    assert config.ws == {}, "ws is empty (env/cascade layer owns endpoints)"
-    assert config.default_chain_id is None
-    assert config.failure_policy == {}
+    assert resolved == str(target)
+    assert not target.exists()
+    assert not target.parent.exists()
 
 
-def test_modern_layout_sections_are_ignored_not_errors(tmp_path: Path) -> None:
-    """Unknown-to-Python schema sections (telemetry ...) load without error."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text(MODERN_LAYOUT + "\n[runtime]\nio_workers = 4\n", encoding="utf-8")
-
-    config = load_config_from_file(cfg)
-    assert config.rpc == {}
-    assert CONFIG_DIR.name == "apexbot", "sanity: standard config dir"
+def test_resolving_an_in_memory_database_creates_nothing(tmp_path: Path) -> None:
+    """``:memory:`` has no parent and no file; resolution leaves it alone."""
+    assert resolve_database_path(":memory:") == ":memory:"
+    assert list(tmp_path.iterdir()) == []
 
 
-# ──────────────────────────────────────────────────────────────────────
-# The Python-cascade default_chain_id env layer (JLFE2F follow-up)
-#
-# The 0.6 cutover retired top-level `default_chain_id` from the operator
-# file (the typed Rust loader refuses it at boot — apexbot-python/src/
-# lib.rs exits 2), but the Python CLI boot (`_init_config()`) could only
-# obtain the chain id from that same file, so every `Bot.from_config_file()`
-# subcommand was unresolvable. The cascade gains the env layer the migration
-# doc promised: env `APEXBOT_DEFAULT_CHAIN_ID` > (retired) file key.
-# ──────────────────────────────────────────────────────────────────────
+def test_the_core_creates_the_database_with_its_schema(tmp_path: Path) -> None:
+    """The core's ensure-at-open materializes the file and the Rust schema."""
+    db_path = tmp_path / "apexbot.db"
+
+    db_upgrade_database(str(db_path))
+
+    assert db_path.is_file()
+    with contextlib.closing(sqlite3.connect(db_path)) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert {"erc20_tokens", "exchanges", "pools"} <= tables
+    assert RUST_STAMP_TABLE in tables
+    assert "alembic_version" not in tables
 
 
-@pytest.fixture
-def isolated_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point ``CONFIG_FILE`` at a modern-layout file in a tmp path."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text(MODERN_LAYOUT, encoding="utf-8")
-    monkeypatch.setattr(config_module, "CONFIG_FILE", cfg)
-    return cfg
-
-
-def test_env_supplies_default_chain_id_when_file_has_none(
-    isolated_config_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A modern-layout file (no Python-domain keys) plus env gives a chain id.
-
-    This is the devcontainer/default-operator setup: config.toml carries only
-    typed-Rust sections, and the chain id comes from the environment.
-    """
-    monkeypatch.setenv(_CHAIN_ID_ENV_VAR, "8453")
-
-    config = _init_config()
-
-    assert config.default_chain_id == 8453
-
-
-def test_env_overrides_a_retired_file_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The env layer outranks the retired file key (mirrors the Rust cascade)."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text(
-        "default_chain_id = 137\n\n" + MODERN_LAYOUT, encoding="utf-8"
-    )
-    monkeypatch.setattr(config_module, "CONFIG_FILE", cfg)
-    monkeypatch.setenv(_CHAIN_ID_ENV_VAR, "1")
-
-    config = _init_config()
-
-    assert config.default_chain_id == 1
-
-
-def test_malformed_env_value_raises_pointed_error(
-    isolated_config_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-integer chain id fails with a message naming the envvar."""
-    monkeypatch.setenv(_CHAIN_ID_ENV_VAR, "mainnet")
-
-    with pytest.raises(ValueError, match=_CHAIN_ID_ENV_VAR):
-        _init_config()
-
-
-def test_unset_env_leaves_default_chain_id_none(
-    isolated_config_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Without the env layer the modern-layout file yields no chain id.
-
-    ``Bot`` then refuses to construct with its own pointed error — this test
-    pins the resolver contract, not the Bot refusal (tested by the Bot).
-    """
-    monkeypatch.delenv(_CHAIN_ID_ENV_VAR, raising=False)
-
-    config = _init_config()
-
-    assert config.default_chain_id is None
-
-
-def test_fresh_init_creates_no_config_file(
+def test_neither_resolution_nor_the_core_writes_an_operator_file(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fresh bootstrap writes NO operator file (the typed Rust layer owns it).
+    """The operator file belongs to the typed Rust loader, never to a boot.
 
-    The pre-0.6 bootstrap saved the full ``ApexbotConfig`` dump — including
-    the retired ``default_chain_id`` key the typed loader refuses, and which
-    TOML cannot even represent when unset (tomlkit raises on ``None``). The
-    modern bootstrap creates the directory + database only; an absent user
-    file is contractually schema defaults. The env chain id still applies in
-    memory (not persisted to the shared file).
+    The pre-0.6 bootstrap saved a config dump here, which wrote the retired
+    ``default_chain_id`` key the typed loader refuses at boot.
     """
-    config_dir = tmp_path / "cfgdir"
-    config_file = config_dir / "config.toml"
-    monkeypatch.setattr(config_module, "CONFIG_DIR", config_dir)
-    monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
-    monkeypatch.setattr(
-        config_module,
-        "create_new_sqlite_database",
-        lambda **_kwargs: None,
-    )
-    monkeypatch.setenv(_CHAIN_ID_ENV_VAR, "1")
+    db_path = tmp_path / "apexbot.db"
+    config_module.resolve_database_path(str(db_path))
+    db_upgrade_database(str(db_path))
 
-    config = _init_config()
-
-    assert config_dir.is_dir(), "the configuration directory is still created"
-    assert not config_file.exists(), "no operator file is written by the bootstrap"
-    assert config.default_chain_id == 1, "the env chain id applies in memory"
-    # Whatever lands in the file tree must stay loadable by the typed loader's
-    # TOML subset — sanity via a round-trip (nothing was written).
-    assert not any(config_dir.glob("*.toml")), "no TOML artifacts at all"
+    assert list(tmp_path.glob("**/*.toml")) == []

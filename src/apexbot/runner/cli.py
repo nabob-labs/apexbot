@@ -1,9 +1,9 @@
 """Settlement-arbitrage bot CLI (argparse) building — stable package home.
 
-The ``argv -> BotRunner`` entrypoint's argument parser (epic 5TSYKN). The
+The ``argv -> BotRunner`` entrypoint's argument parser. The
 example ``examples/eth_settlement_arbitrage_v2_v3_v4_rust.py`` is a thin wrapper that calls
 :func:`build_arbitrage_arg_parser`; keeping the parser in the package makes the
-CLI surface (notably the ``--node-http`` / ``--node-ws`` cascade overrides)
+CLI surface (notably the ``--node`` cascade override)
 directly testable without importing from ``examples/``.
 """
 
@@ -15,11 +15,12 @@ import argparse
 def build_arbitrage_arg_parser() -> argparse.ArgumentParser:
     """Build the settlement-arbitrage example's argument parser.
 
-    Extracted so the CLI surface (especially the ``--node-http`` / ``--node-ws``
+    Extracted so the CLI surface (especially the ``--node``
     cascade overrides) is testable without running the full async session.
 
     Returns:
         The configured ``ArgumentParser`` (caller invokes ``parse_args``).
+
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -38,23 +39,15 @@ def build_arbitrage_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--node-http",
+        "--node",
         type=str,
         default=None,
         help=(
-            "HTTP RPC endpoint for the arbitrage chain (Ethereum mainnet). "
-            "Highest-priority source in the RPC URI cascade: "
-            "--node-http > APEXBOT_RPC_HTTP_CHAINID_1 > config.toml rpc[1] > error."
-        ),
-    )
-    parser.add_argument(
-        "--node-ws",
-        type=str,
-        default=None,
-        help=(
-            "WebSocket RPC endpoint for the arbitrage chain (Ethereum mainnet). "
-            "Highest-priority source in the RPC URI cascade: "
-            "--node-ws > APEXBOT_RPC_WS_CHAINID_1 > config.toml ws[1] > error."
+            "RPC endpoint override for the arbitrage chain (Ethereum mainnet). "
+            "One flag, self-classifying: ws:// fills the ws key, http:// the http "
+            "key, ipc:// or a path the ipc key. Highest-priority layer of the "
+            "cascade: --node > APEXBOT_RPC_{IPC,WS,HTTP}_CHAINID_1 > the "
+            "operator file's [nodes.*] tables > error."
         ),
     )
     parser.add_argument(
@@ -62,8 +55,8 @@ def build_arbitrage_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Optional Unix domain socket path for the operator command channel "
-            "(NWTUM3). When set, the bot hosts an OperatorServer here so the "
+            "Optional Unix domain socket path for the operator command channel. "
+            "When set, the bot hosts an OperatorServer here so the "
             "`apexbot path add` / `apexbot path discover` CLI can add a path "
             "or trigger bounded on-demand discovery on the LIVE pump without "
             "restarting it."

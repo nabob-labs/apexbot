@@ -12,8 +12,10 @@ accepts both ``.functions.foo(a, b)`` and ``.functions.foo(arg1=a, arg2=b)``).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from apexbot.abi import canonical_type
 from apexbot.abi import decode as abi_decode
 from apexbot.abi import encode as abi_encode
 from apexbot.crypto import function_selector
@@ -43,10 +45,9 @@ class _FunctionsResult:
 
     def call(self, block_identifier: int | None = None) -> Any:
         func_entry = _find_abi_entry(self._abi, self._method_name)
-        input_types = [i["type"] for i in func_entry["inputs"]]
-        output_types = [o["type"] for o in func_entry.get("outputs", [])]
+        input_types = [canonical_type(i) for i in func_entry["inputs"]]
+        output_types = [canonical_type(o) for o in func_entry.get("outputs", [])]
 
-        # Build the function selector
         sig = f"{self._method_name}({','.join(input_types)})"
         selector = function_selector(sig)
 
@@ -104,10 +105,17 @@ class _FunctionsAccessor:
 class ContractCompat:
     """eth.contract-style function-call surface backed by AlloyProvider + apexbot.abi."""
 
-    def __init__(self, address: str, abi: list[dict[str, Any]], provider: AlloyProvider) -> None:
+    def __init__(
+        self,
+        address: str,
+        abi: list[dict[str, Any]] | str,
+        provider: AlloyProvider,
+    ) -> None:
         self._provider = provider
         self._address = address
-        self._abi = abi
+        # A JSON document string is accepted alongside the parsed form, as the
+        # web3 contract factory this wraps did.
+        self._abi: list[dict[str, Any]] = json.loads(abi) if isinstance(abi, str) else abi
 
     @property
     def address(self) -> str:
@@ -131,7 +139,7 @@ def _find_abi_entry(abi: list[dict[str, Any]], method_name: str) -> dict[str, An
 def make_contract(
     provider_url: str,
     address: str,
-    abi: list[dict[str, Any]],
+    abi: list[dict[str, Any]] | str,
 ) -> ContractCompat:
     """Create a web3-compatible contract wrapper.
 

@@ -12,7 +12,7 @@ The pure-Rust settlement bot (`rust/examples/settlement_bot`) is the parity twin
 
 Two recorded doctrines meet head-on:
 
-- **CONTEXT.md / ADR-049** record the `pub(crate)` choice as deliberate (epic `5TBT7L` Q2b): the engine's interface is **one stage seam**, `EngineStages`; the engine recedes to composition machinery behind it, and the one-impl-block census gate (`just check-engine-impl-blocks`) keeps a second door from re-opening. CONTEXT.md's glossary even says _avoid_ the phrase "engine facade" — "a facade fronts ANOTHER still-pub surface; the whole point is there is no second door."
+- **GLOSSARY.md / ADR-049** record the `pub(crate)` choice as deliberate (epic `5TBT7L` Q2b): the engine's interface is **one stage seam**, `EngineStages`; the engine recedes to composition machinery behind it, and the one-impl-block census gate (`just check-engine-impl-blocks`) keeps a second door from re-opening. GLOSSARY.md's glossary even says _avoid_ the phrase "engine facade" — "a facade fronts ANOTHER still-pub surface; the whole point is there is no second door."
 - **AGENTS.md** says a pure-Rust MEV bot must be buildable from `cargo add apexbot` — "Rust is the engine; Python is a driver shell, not a co-implementation."
 
 Meanwhile the startup ritual and phase machine live **twice** in shape if not yet in code: `EngineRegistry.start()` (`src/apexbot/arbitrage/engine_registry.py`) owns S-read → subscribe → verify-config and deliberately stops before `resume()`; `BotRunner` (`src/apexbot/runner/bot_runner.py`) owns the `_Phase` FSM (`New → Started → Running → Closed`), the "attach consumer before resume" ordering, and the "stop the pump first, then cancel the consumer" teardown. A Rust driver that reimplemented this would be a **twin implementation of one concept** — exactly the ADR-046 failure mode (`on_pump_ended` had an inherent twin that silently skipped a required log; two implementations, only one correct). Task `IUGFLH` (RSP-9) already frames this as a **LIFT candidate**: the sequencing is correct for every driver, so the core should own it once.
@@ -23,7 +23,7 @@ Meanwhile the startup ritual and phase machine live **twice** in shape if not ye
 
 `EngineDriver` composes the already-public `Arc<EngineStages>` (the engine's one seam) with the pump session state that currently lives in the PyO3 `PumpState`: the shared `Arc<Bot>`, the `ReorgCoordinator`, the shutdown flag, the subscribe state, the pump `JoinHandle`, the verify provider, and the result/block channel ends.
 
-This is **not** the "engine facade" CONTEXT.md forbids. That note rejects a facade that fronts a _still-pub_ engine — a cosmetic wrapper over a second door. `EngineDriver` fronts nothing that is publicly reachable by another path: the engine type remains `pub(crate)`, and every `EngineDriver` member that touches engine state crosses `EngineStages`. The crate keeps **one door to the engine** (`EngineStages`) and gains **one driver seam above it** (`EngineDriver`), which is a layer, not a second door. The type is named a *driver*, matching the ledger's G1 wording and the driver/engine vocabulary (`docs/architecture/rust-owned-bot.md`).
+This is **not** the "engine facade" GLOSSARY.md forbids. That note rejects a facade that fronts a _still-pub_ engine — a cosmetic wrapper over a second door. `EngineDriver` fronts nothing that is publicly reachable by another path: the engine type remains `pub(crate)`, and every `EngineDriver` member that touches engine state crosses `EngineStages`. The crate keeps **one door to the engine** (`EngineStages`) and gains **one driver seam above it** (`EngineDriver`), which is a layer, not a second door. The type is named a *driver*, matching the ledger's G1 wording and the driver/engine vocabulary (`docs/architecture/rust-owned-bot.md`).
 
 The Python `PyArbEngine` becomes a **second adapter** onto the same `EngineDriver` (D7) — so both the pure-Rust consumer and the FFI consumer share exactly one implementation of the ritual.
 
@@ -111,9 +111,11 @@ pub fn run_v4_registration_lifecycle_sync(&self, pool_manager: &str, pool_id_hex
 - **Lifecycles.** The `run_v3/v4_registration_lifecycle` + `_sync` bodies move **down** from `PumpState` (D7). The core owns the quarantine → seed-verify → drain+pin → post-drain-verify → `set_live` choreography (ADR-022 D1); the async/blocking twin is the async form + a runtime `block_on`, replacing the PyO3 `future_into_py` shape. `VerifyError` (mismatch = fatal; RPC = retryable) is the typed Rust error. The **retry policy is not lifted** here: the values and the retry-with-backoff loop stay consumer-side (RSP-9 `IUGFLH` row).
 - **inline sim.** The core member is `set_inline_simulator(Arc<dyn InlineSimulator>)` (already on `EngineStages`). The Python `install_inline_simulator` stays in `apexbot-python`: it builds the `InlineSimHook` from the session's `PySimulateContext` and registers the escalation port, then calls the core member. A pure-Rust consumer builds its own `InlineSimulator` and calls it directly.
 
-### D5 — `EnginePhase` is reused; `Stopped` is a driver terminal latch; phase violations are typed
+### D5 — `PumpPhase` (formerly `EnginePhase`) is the pump-protocol phase; `Stopped` is a driver terminal latch; phase violations are typed
 
-The engine-lifecycle truth stays the existing `EnginePhase` FSM (`Created → Subscribed → SnapshotLoaded → Backfilled → Resumed`); the driver reproduces today's transitions exactly (`after_subscribe` landing at `SnapshotLoaded`; `resume` landing at `Resumed`). No new discriminant is added to `EnginePhase`.
+The engine-session protocol truth stays the existing FSM (`Created → Subscribed → SnapshotLoaded → Backfilled → Resumed`); the driver reproduces today's transitions exactly (`after_subscribe` landing at `SnapshotLoaded`; `resume` landing at `Resumed`). No new discriminant is added to it.
+
+**Pump-protocol naming.** The enum is now `PumpPhase`: it is a protocol-phase machine for `subscribe`/`load_snapshot`/`backfill`/`resume` ordering, NOT the operator-facing lifecycle. The one operator lifecycle (`Registered → Enabled → Running → Stopped | Halted | Disabled`) is owned by `strategy_host::StrategyHost`; a consumer reads the pump machinery through `EngineDriver::current_phase()` and its sibling accessors and never derives operator legality from it.
 
 The driver adds a **terminal stopped latch** (`stopped: AtomicBool`), because the engine enum cannot express teardown. Every driver member except `stop()` rejects once stopped. `stop()` is deliberately any-phase and idempotent — the `BotRunner.shutdown` contract (the SIGINT/partial-startup teardown depends on it).
 
@@ -121,7 +123,9 @@ The driver adds a **terminal stopped latch** (`stopped: AtomicBool`), because th
 
 ### D6 — `stop()` mirrors `BotRunner.shutdown`/`__aexit__` ordering
 
-`stop()` sets the shutdown `AtomicBool`, takes and `abort()`s the pump handle, `block_on`s the join so the WS subscription futures (and the `Arc<dyn StageHandlers>` clones) drop before return, clears the subscribe state (re-allowing a later `subscribe`), and sets the stopped latch. Idempotent — a second call is a no-op.
+`stop()` sets the shutdown `AtomicBool`, takes the pump handle, waits up to `PUMP_STOP_GRACE` for the pump task to exit **cooperatively**, `block_on`s the join so the WS subscription futures (and the `Arc<dyn StageHandlers>` clones) drop before return, clears the subscribe state (re-allowing a later `subscribe`), and sets the stopped latch. Idempotent — a second call is a no-op.
+
+**Termination is cooperative, not aborted.** The pump arms a 500 ms `timed_exit_tick` whose select arm polls the shutdown flag precisely so the loop can unwind through its own span guards and return normally; cancelling the task at an arbitrary await point bypasses that machinery. So `stop()` gives the pump a grace window (four ticks with margin) to observe the flag and return, and only escalates to `abort()` + join when the grace expires — a pump parked somewhere the tick cannot reach (a GIL re-entry park through `PySubscriberAdapter`, or engine-lock contention inside `on_drain`/`apply_buffer_v3`; the `run_loop.rs` limitation note names both). Each path is logged, so an escalation is visible rather than silent. The grace tightens only the pump-termination mechanism: the ordering contract below is unchanged.
 
 The **ordering contract** is stated once here and consumed by every driver: **stop the pump first** → the delivery lifecycle closes the result/block channels → a pending consumer `recv().await` sees the natural end → the consumer ends cleanly → *then* the consumer task is cancelled/joined. Cancelling the consumer first leaves the pump holding the WS task on the shared runtime, blocking process exit up to `BACKFILL_TIMEOUT_SECS` (60s) — the exact bug `BotRunner.__aexit__` documents. The driver owns the stop; the consumer owns its own task cancellation.
 
@@ -146,9 +150,11 @@ The PyO3 wrapper holds `Arc<EngineDriver>` and delegates `start`/`subscribe`/`re
 
 The once-per-pool key maps and the `VerifyClaims` TOCTOU dance remain `XFEJUG`'s to lift or keep per the sweep; this ADR only fixes the **driver seam** they attach to.
 
-### D10 — 0.7 kill list untouched
+### D10 — Historical snapshot: the 0.7 kill list was untouched by this decision
 
-This decision changes only `apexbot-bot` and `apexbot-python`. It deletes nothing on the AGENTS.md 0.7 kill list: `src/apexbot/migrations/`, the `alembic`/`sqlalchemy` dependencies, `DatabaseSessionManager`, the SQLAlchemy models package, `ALEMBIC_HEAD`, the `ensure_schema` Alembic branch, and the `query_only` pragma all remain exactly as they are.
+At the time of this decision, the change was limited to `apexbot-bot` and `apexbot-python`. It deleted nothing on the AGENTS.md 0.7 kill list: `src/apexbot/migrations/`, the `alembic`/`sqlalchemy` dependencies, `DatabaseSessionManager`, the SQLAlchemy models package, `ALEMBIC_HEAD`, the `ensure_schema` Alembic branch, and the `query_only` pragma all remained exactly as they were.
+
+**Current status:** this D10 snapshot is historical. CPBCNS subsequently completed the SQLAlchemy retirement recorded in ADR-052 D7; the ORM dependency, `DatabaseSessionManager`, and models package are no longer part of the Python database surface.
 
 ## Retired shape
 
@@ -169,7 +175,7 @@ The **Python-only pump ritual** is retired: `PumpState`'s `subscribe`/`resume`/`
 - The Python-visible API is byte-identical: same class name, same method signatures; only the Rust ownership behind `PyArbEngine` changes.
 - The apexbot umbrella re-exports `EngineDriver` (via `apexbot_bot::arb_engine` / `apexbot::bot`), so `cargo add apexbot` reaches it without naming a sub-crate.
 - Risks to manage in implementation: the `PumpState`→core move is a behavioral cutover over the verify machinery (the async/blocking twin, the provider ownership, the GIL-detach shape); `apexbot-bot`'s test suite and the pyo3 parity tests are the characterization net; telemetry labels (ADR-043) must stay byte-identical.
-- `IUGFLH` records the supersedure pointer for the previously "stays-python" sequencing doctrine so CONTEXT.md can be updated by the implementing task.
+- `IUGFLH` records the supersedure pointer for the previously "stays-python" sequencing doctrine so GLOSSARY.md can be updated by the implementing task.
 
 ## Open questions deferred to implementation
 
@@ -188,6 +194,10 @@ The **Python-only pump ritual** is retired: `PumpState`'s `subscribe`/`resume`/`
 - **ADR-006** (Bot as the per-chain orchestrator) — the pump/engine ownership the session state composes.
 - **ADR-041** (block-epoch pipeline) — the stage machine whose driver surface this completes.
 - **ADR-043** (observability standard) — the telemetry labels the move must preserve.
+- **ADR-055** (pending-transaction strategy seams) — Phase C records the ADR-018
+  engine-family trigger as *pulled by decision* with the dynamic strategy host
+  (parameterized stage payloads, `EngineDriver<S>` over a second settled-block
+  strategy). Scheduled; do not expand the driver shape for a hypothetical strategy.
 - Epic `RGZG4S` (Rust settlement-bot parity), task `OJI4FH` (this ADR), `5XOGRK` (Gap G1), `XFEJUG`, `L4E7RI`, `IUGFLH` (RSP-9), `23DLCY` (the running parity gate), `YFIOSF` (Gap G2), `KPLWUM` (Gap G5).
 - The task chain behind the preserved invariant: epic `5TBT7L`, tasks `2NLZE3` / `3WI4EO` / `RS64JJ` / `5AFSXM` / `RPEBMX` / `MHLURV` / `XURYVA`.
-- `docs/architecture/rust-settlement-bot-parity.md` (the G1 ledger rows), `docs/architecture/rust-owned-bot.md` (the Rust-owned design), `CONTEXT.md` ("Engine seam deepening", "Engine retune", "Driver seam").
+- `docs/architecture/rust-settlement-bot-parity.md` (the G1 ledger rows), `docs/architecture/rust-owned-bot.md` (the Rust-owned design), `GLOSSARY.md` ("Engine seam deepening", "Engine retune", "Driver seam").

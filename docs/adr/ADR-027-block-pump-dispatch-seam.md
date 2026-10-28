@@ -1,6 +1,7 @@
 # ADR-027: The block-pump dispatch seam — one owner, three application-specific pipes
 
-**Status: accepted.** Codifies the block pump's delivery architecture (ergo epic `5CGU4V`,
+**Status: historical — superseded by [ADR-041](ADR-041-block-epoch-pipeline.md); provenance only.**
+(Original status: accepted.) Codifies the block pump's delivery architecture (ergo epic `5CGU4V`,
 tasks B1–B4): the pump's hand-offs to the sink, the solver-state verifier, and Python's
 block clock are owned by a single **dispatch owner** but delivered over **three
 application-specific pipes**, each with the delivery semantics its task needs. A future
@@ -14,7 +15,7 @@ architecture review must not re-suggest a third bespoke channel or a single-bus 
 
 ## Context
 
-`BlockPump::run_with_stream` (rust/crates/apexbot-bot/src/bot_core/block_pump.rs) drives the
+`BlockPump::run_with_stream` (rust/crates/engine/apexbot-bot/src/bot_core/block_pump.rs) drives the
 block pump's drain loop. Its hand-offs were ad-hoc and coupled:
 
 - The **drain pipe** sent `Drain`/`Finalize`/`Publish`/`Notify` through one `mpsc` to a
@@ -33,7 +34,7 @@ correct twice.
 
 ## Decision
 
-One **dispatch owner** module (`rust/crates/apexbot-bot/src/bot_core/event_dispatch.rs`,
+One **dispatch owner** module (`rust/crates/engine/apexbot-bot/src/bot_core/event_dispatch.rs`,
 `DispatchOwner`) owns all three pipes and coordinates ordering/liveness in one place. It is
 a coordinated home — **NOT a single bus**; each pipe keeps the delivery semantics its task
 needs ("one owner, multiple application-specific pipes").

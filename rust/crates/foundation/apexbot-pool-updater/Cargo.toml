@@ -1,0 +1,48 @@
+[package]
+name = "apexbot-pool-updater"
+description = "Pure-Rust pool-updater chunk-loop core: typed RPC event fetching + decode-to-row-input mapping."
+keywords = ["mev", "pools", "events", "evm"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5" }
+# ADR-070: updater shell — owns DB writes; enables the writer substrate.
+apexbot-db = { workspace = true, features = ["writer"] }
+# Tick-map types from apexbot-db are hashbrown maps.
+hashbrown.workspace = true
+apexbot-decoders.workspace = true
+# Taxonomy projection (ADR-059 D1): `PoolFamily::from_identity` projects the
+# pool family kernel's `Identity` onto the decode family. Pyo3-free core.
+apexbot-pools.workspace = true
+apexbot-core.workspace = true
+apexbot-rpc.workspace = true
+tokio = { version = "^1.54", features = ["rt-multi-thread", "macros", "sync"] }
+thiserror = { version = "^2.0" }
+tracing = { version = "^0.1" }
+# Plain rusqlite (no `bundled`) — the bundled libsqlite3-sys link is owned
+# solely by apexbot-db; here we only need the Connection/Transaction types.
+rusqlite = { version = "^0.40" }
+
+[features]
+default = []
+
+[dev-dependencies]
+alloy = { version = "^2.5" }
+# The statement-ledger golden tests capture the chunk apply's SQL through the
+# test-only `LedgerDb` wrapper (ADR-068 D3). Dev-only: the feature (and with it
+# the trace hooks) never reaches production builds of this crate.
+apexbot-db = { workspace = true, features = ["sql-ledger"] }
+apexbot-rpc.workspace = true
+# The lifecycle contract test parses the JSON-RPC requests its local stub
+# node receives (method/route matching only — the crate proper never
+# serializes JSON-RPC itself).
+serde_json = { version = "^1" }
+tempfile = { version = "^3.27" }

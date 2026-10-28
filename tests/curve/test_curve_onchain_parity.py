@@ -29,7 +29,7 @@ per pool + 18/18 ``calc_withdraw_one_coin``/``calc_token_amount`` matches for
 
 Pinned to Ethereum mainnet block 24,407,242 (tip minus ~1M), served by a
 local archive node (URI configurable via ``tests.env``; see
-``ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
+``TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
 """
 
 from __future__ import annotations
@@ -46,23 +46,29 @@ from apexbot._ffi import Bot
 from apexbot.abi import decode as abi_decode
 from apexbot.abi import encode as abi_encode
 from apexbot.crypto import function_selector, keccak256
-from apexbot.curve.strategies import (
+from apexbot.curve.stableswap_pool_state import PoolStrategies
+from apexbot.curve.types import (
     DVariant,
     LendingRateStyle,
     MetapoolRateStyle,
     MetapoolUnderlyingStyle,
-    PoolStrategies,
     SwapStyle,
     YDVariant,
     YVariant,
 )
-from apexbot.fork import AnvilFork
-from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from apexbot.fork import AnvilFork, ForkLaunchConfig
+from tests.conftest import TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI
 from tests.fakes.curve_data_provider import FakeCurveDataProvider
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.curve_pool_factory import make_curve_pool
 from tests.helpers.erc20_factory import make_erc20
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from apexbot.curve.curve_stableswap_liquidity_pool import CurveStableswapPool
 
 CURVE_PARITY_BLOCK = 24_407_242  # tip minus ~1M
@@ -235,10 +241,12 @@ class _RecordFork(AbstractContextManager):
     def __enter__(self) -> Self:
         if self._recording:
             self.fork = AnvilFork(
-                fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+                fork_url=TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI,
                 fork_block=self._block,
-                storage_caching=True,
-                anvil_opts=["--accounts=0"],
+                launch=ForkLaunchConfig(
+                    storage_caching=True,
+                    anvil_opts=["--accounts=0"],
+                ),
             )
         return self
 
@@ -374,7 +382,7 @@ def _build_metapool_io_free(
 
     The base pool + metapool share a single local ``Bot`` so the metapool
     handle's go-between (``curve_base_pool()``) resolves the base pool within
-    the same ``BotState`` (ADR-005 BQM2OA). A fresh bot per call keeps each
+    the same ``BotState``. A fresh bot per call keeps each
     build isolated (the multiblock parity test rebuilds per block).
     """
     bot = Bot()
@@ -735,12 +743,11 @@ def _run_metapool_parity(
 def test_curve_metapool_get_dy(golden_factory) -> None:
     """Curve RAI/3Crv metapool: get_dy + get_dy_underlying == golden.
 
-    Covers ``test_metapool_with_valid_base_cache`` parity at the pinned block
-    (25,144,000) where the base cache has not expired — so virtual_price
-    resolution exercises the cached path. The cache-expiry regression
-    assertions live in the original live test; this golden test covers the
-    ``get_dy``/``get_dy_underlying`` parity across the full permutation x
-    multiplier loop (24 keys).
+    Pinned at block 25,144,000, where the metapool's base cache has not
+    expired, so the swap prices off the cached base virtual price. The 600 s
+    freshness rule lives only in the Rust core
+    (``curve_dy_io::resolve_metapool_base_rate``); exact parity across the full
+    permutation x multiplier loop (24 keys) pins it on real state.
     """
     _run_metapool_parity(
         golden_factory,
@@ -773,3 +780,121 @@ def test_curve_metapool_multiblock_get_dy(golden_factory) -> None:
         block=METAPOOL_MULTIBLOCK_START,
         blocks=blocks,
     )
+
+
+def _get_dy_golden_keys(cassette: dict[str, Any]) -> set[str]:
+    """The oracle keys one ``get_dy`` parity run drives: all token directions
+    over the multiplier grid, amounts scaled from the cassette balances."""
+    address = cassette["address"]
+    symbols = [token["symbol"] for token in cassette["tokens"]]
+    keys: set[str] = set()
+    for i, j in itertools.permutations(range(len(symbols)), 2):
+        for mult in _AMOUNT_MULTIPLIERS:
+            amount = int(mult * cassette["balances"][i])
+            keys.add(f"{address}|get_dy|{symbols[i]}->{symbols[j]}|{amount}")
+    return keys
+
+
+def _calc_golden_keys(cassette: dict[str, Any]) -> set[str]:
+    """The oracle keys the LP-math parity run drives: withdraw-one-coin and
+    single-slot deposit amounts over the base-pool multiplier grid."""
+    address = cassette["address"]
+    balances = cassette["balances"]
+    keys: set[str] = set()
+    for i in range(len(balances)):
+        for mult in _BASE_POOL_AMOUNT_MULTIPLIERS:
+            amount = int(mult * balances[i])
+            keys.add(f"{address}|calc_withdraw_one_coin|i={i}|{amount}")
+            keys.add(f"{address}|calc_token_amount|deposit|i={i}|{amount}")
+    return keys
+
+
+def _metapool_golden_keys(cassette: dict[str, Any], blocks: list[int]) -> set[str]:
+    """The oracle keys the metapool parity loops drive: get_dy over the pool
+    tokens plus get_dy_underlying over the underlying tokens (amounts scale
+    from the pool's balance for in-pool tokens, the base pool's otherwise),
+    tagged per block for the multiblock golden."""
+    if "immutable" in cassette:
+        immutable, states = cassette["immutable"], cassette["states"]
+        balances = {int(block): states[str(block)]["balances"] for block in blocks}
+        base_balances = {int(block): states[str(block)]["base_balances"] for block in blocks}
+    else:
+        immutable = cassette
+        balances = {METAPOOL_PARITY_BLOCK: cassette["balances"]}
+        base_balances = {METAPOOL_PARITY_BLOCK: cassette["base_pool"]["balances"]}
+    address = immutable["address"]
+    pool_symbols = [token["symbol"] for token in immutable["tokens"]]
+    underlying_symbols = [token["symbol"] for token in immutable["tokens_underlying"]]
+    base_symbols = [token["symbol"] for token in immutable["base_pool"]["tokens"]]
+    keys: set[str] = set()
+    for block, pool_balances in balances.items():
+        tag = f"blk{block}|" if blocks != [METAPOOL_PARITY_BLOCK] else ""
+        for i, j in itertools.permutations(range(len(pool_symbols)), 2):
+            for mult in _METAPOOL_INPOOL_MULTIPLIERS:
+                amount = int(mult * pool_balances[i])
+                keys.add(f"{address}|get_dy|{pool_symbols[i]}->{pool_symbols[j]}|{tag}{amount}")
+        for i, j in itertools.permutations(range(len(underlying_symbols)), 2):
+            for mult in _METAPOOL_UNDERLYING_MULTIPLIERS:
+                symbol = underlying_symbols[i]
+                if symbol in pool_symbols:
+                    amount = int(mult * pool_balances[pool_symbols.index(symbol)])
+                else:
+                    amount = int(mult * base_balances[block][base_symbols.index(symbol)])
+                keys.add(
+                    f"{address}|get_dy_underlying|"
+                    f"{underlying_symbols[i]}->{underlying_symbols[j]}|{tag}{amount}"
+                )
+    return keys
+
+
+_MULTIBLOCK_BLOCKS = list(
+    range(
+        METAPOOL_MULTIBLOCK_START + METAPOOL_MULTIBLOCK_SPAN,
+        METAPOOL_MULTIBLOCK_END,
+        METAPOOL_MULTIBLOCK_SPAN,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("test_name", "expected_keys"),
+    [
+        (
+            "test_curve_tripool_get_dy",
+            lambda: _get_dy_golden_keys(_load_cassette(_TRIPOOL_CASSETTE)),
+        ),
+        (
+            "test_curve_tricrypto_get_dy",
+            lambda: _get_dy_golden_keys(_load_cassette(_TRICRYPTO_CASSETTE)),
+        ),
+        (
+            "test_curve_tripool_calc_withdraw_and_token_amount",
+            lambda: _calc_golden_keys(_load_cassette(_TRIPOOL_CASSETTE)),
+        ),
+        (
+            "test_curve_metapool_get_dy",
+            lambda: _metapool_golden_keys(
+                _load_cassette(_METAPOOL_CASSETTE), [METAPOOL_PARITY_BLOCK]
+            ),
+        ),
+        (
+            "test_curve_metapool_multiblock_get_dy",
+            lambda: _metapool_golden_keys(
+                _load_cassette(_METAPOOL_MULTIBLOCK_CASSETTE), _MULTIBLOCK_BLOCKS
+            ),
+        ),
+    ],
+    ids=lambda name: name,
+)
+def test_golden_keys_exactly_match_the_oracle_surface(
+    request: pytest.FixtureRequest,
+    test_name: str,
+    expected_keys: Callable[[], set[str]],
+) -> None:
+    """The golden file holds exactly the keys this module's replay drives.
+
+    Replay fails loud on a missing key but stays silent on a stale extra one —
+    nothing looks it up. Set-equality against the recorded file closes that
+    drift: a shrunken case list cannot leave orphaned oracle entries behind."""
+    expected = expected_keys()
+    assert_golden_keys_exact(request, test_name, expected)

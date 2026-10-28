@@ -1,11 +1,10 @@
-"""IKGQ6F / ADR-022: registry delegation + D1 core-owned verify-lifecycle.
+"""ADR-022: registry delegation + D1 core-owned verify-lifecycle.
 
 `engine_registry.register_v3_pool` / `register_v4_pool` are now THIN
-delegating shells: each makes ONE call to the core-owned
-`run_v3_registration_lifecycle(pool_addr, snapshot_block)` /
-`run_v4_registration_lifecycle(pm, pool_id, snapshot_block)`, which sequences
-the D4 lifecycle in Rust — quarantine (6N7XVR) → seed-verify @ snapshot block
-(CBCH6H) → drain+pin (single core.write() hold) → post-drain-verify @ the
+delegating shells: each states ONE `RegistrationLifecycle` value
+(`family` + target + `mode="async"` + snapshot block) and the core sequences
+the D4 lifecycle in Rust — quarantine → seed-verify @ snapshot block
+→ drain+pin (single core.write() hold) → post-drain-verify @ the
 pin's own block → set_live, with the mismatch tripwire as the final gate.
 
 The step ordering / quarantine-before-verify / live-after-drain semantics are
@@ -24,94 +23,9 @@ import pytest
 import apexbot.arbitrage.engine_registry as runner
 from apexbot.exceptions import VerificationMismatchError
 from apexbot.utils.bytes import to_0x_hex
+from tests.fakes.engine import FakeEngine as _RecordingVerifyEngine
 
 _V4_POOL_ID_HEX = to_0x_hex(b"V4POOLID")
-
-
-class _RecordingVerifyEngine:
-    """Fake engine that records the core-owned lifecycle delegation call.
-
-    Mirrors the `PyArbitrageEngine.run_v3/v4_registration_lifecycle` pyo3
-    seam (async, via future_into_py — the registry `await`s it standing in for
-    a coroutine). The step ordering inside the core lifecycle is NOT observable
-    here; those invariants are asserted by the Rust `registration_lifecycle`
-    unit tests.
-    """
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-        self.run_calls: list[dict] = []
-        self.fail_next: str | None = None
-        self._last_processed_block: int | None = 18_000_042
-        # JUCFCB: the DB path reads `snapshot_seed_block` from the engine.
-        self._snapshot_seed_block: int | None = None
-
-    @property
-    def snapshot_seed_block(self) -> int | None:
-        return self._snapshot_seed_block
-
-    @snapshot_seed_block.setter
-    def snapshot_seed_block(self, value: int | None) -> None:
-        self.calls.append("set_snapshot_seed_block")
-        self._snapshot_seed_block = value
-
-    # lifecycle (subscribe/backfill) — minimal, record-only
-    def subscribe(self, ws: str) -> int:
-        self.calls.append("subscribe")
-        return 18_000_000
-
-    def backfill_from_snapshot(self, rpc: str, snapshot_block: int) -> int:
-        self.calls.append("backfill")
-        return 0
-
-    def load_v3_snapshot_from_py(self, py_data: object) -> None:
-        self.calls.append("load_v3_snapshot_from_py")
-
-    def load_v4_snapshot_from_py(self, py_data: object) -> None:
-        self.calls.append("load_v4_snapshot_from_py")
-
-    def set_verify_rpc_url(self, rpc: str) -> None:
-        self.calls.append("set_verify_rpc_url")
-
-    def set_verify_state_view(self, addr: str) -> None:
-        self.calls.append("set_verify_state_view")
-
-    def last_processed_block(self) -> int | None:
-        return self._last_processed_block
-
-    # IKGQ6F / ADR-022 D1: the single core-owned lifecycle entry point. A
-    # mismatch (fail_next set) surfaces as VerificationMismatchError — the
-    # tripwire propagates from build_paths without auto-repair.
-    async def run_v3_registration_lifecycle(self, address: str, snapshot_block: int | None) -> None:
-        self.run_calls.append({
-            "family": "v3",
-            "address": address,
-            "snapshot_block": snapshot_block,
-        })
-        if self.fail_next == "v3":
-            msg = "synthetic V3 seed tick mismatch"
-            raise VerificationMismatchError(msg)
-
-    async def run_v4_registration_lifecycle(
-        self,
-        pool_manager_address: str,
-        pool_id_hex: str,
-        snapshot_block: int | None,
-    ) -> None:
-        self.run_calls.append({
-            "family": "v4",
-            "address": pool_manager_address,
-            "pool_id": pool_id_hex,
-            "snapshot_block": snapshot_block,
-        })
-        if self.fail_next == "v4":
-            msg = "synthetic V4 seed tick mismatch"
-            raise VerificationMismatchError(msg)
-
-
-class _FakeSnapshot:
-    def __init__(self, newest_block: int) -> None:
-        self.newest_block = newest_block
 
 
 class _FakeV3Pool:
@@ -137,31 +51,27 @@ class _FakeV4Pool:
     _py_pool = _PyPool()
 
 
-def _registry_started_with_snapshots(
-    monkeypatch,
-) -> tuple[runner.EngineRegistry, _RecordingVerifyEngine]:
-    fake = _RecordingVerifyEngine()
+def _registry_started_with_seed() -> tuple[runner.EngineRegistry, _RecordingVerifyEngine]:
+    fake = _RecordingVerifyEngine(snapshot_seed_block=18_000_050)
     registry = runner.EngineRegistry(bot=None, engine=fake)
-    # XEANMB: `load_*_from_py` is retired; `start()` sets `snapshot_seed_block`
-    # from `min(newest_block)` directly. `S = min(newest_block)` across the
-    # supplied snapshots is stashed as `_verify_snapshot_block` and passed to
-    # the core lifecycle (step-1 seed verify @ snapshot block).
+    # `load_*_from_py` is retired; the seed `S` is recorded on the shared
+    # `BotState` by the DB load at construction and `start()` reads it back.
+    # It is stashed as `_verify_snapshot_block` and passed to the core
+    # lifecycle (step-1 seed verify @ snapshot block).
     registry.start(
         "http://localhost:8545",
         "ws://localhost:8546",
-        v3_snapshot=_FakeSnapshot(18_000_100),
-        v4_snapshot=_FakeSnapshot(18_000_050),
         verify_state_view="0x0000000000000000000000000000000000000abc",
     )
     assert registry._verify_snapshot_block == 18_000_050
     return registry, fake
 
 
-def test_register_v3_pool_delegates_to_core_lifecycle(monkeypatch) -> None:
+def test_register_v3_pool_delegates_to_core_lifecycle() -> None:
     """D1: register_v3_pool makes ONE core-owned call, passing the stashed
     snapshot block (step-1 seed-verify target). The drain/pin/step-2/live
     ordering is owned inside the core lifecycle (Rust-tested)."""
-    registry, fake = _registry_started_with_snapshots(monkeypatch)
+    registry, fake = _registry_started_with_seed()
     assert inspect.iscoroutinefunction(registry.register_v3_pool)
 
     async def _go() -> int:
@@ -173,14 +83,17 @@ def test_register_v3_pool_delegates_to_core_lifecycle(monkeypatch) -> None:
     assert len(fake.run_calls) == 1, "exactly one core lifecycle call per register"
     assert fake.run_calls[0] == {
         "family": "v3",
+        "mode": "async",
         "address": "0xV3POOL",
+        "pool_id": None,
         "snapshot_block": 18_000_050,
+        "policy": None,
     }
 
 
-def test_register_v4_pool_delegates_to_core_lifecycle(monkeypatch) -> None:
+def test_register_v4_pool_delegates_to_core_lifecycle() -> None:
     """D1: register_v4_pool makes ONE core-owned call (pm + pool_id + block)."""
-    registry, fake = _registry_started_with_snapshots(monkeypatch)
+    registry, fake = _registry_started_with_seed()
     assert inspect.iscoroutinefunction(registry.register_v4_pool)
 
     async def _go() -> int:
@@ -192,49 +105,47 @@ def test_register_v4_pool_delegates_to_core_lifecycle(monkeypatch) -> None:
     assert len(fake.run_calls) == 1
     assert fake.run_calls[0] == {
         "family": "v4",
+        "mode": "async",
         "address": "0xV4PM",
         "pool_id": _V4_POOL_ID_HEX,
         "snapshot_block": 18_000_050,
+        "policy": None,
     }
 
 
 @pytest.mark.parametrize("family", ["v3", "v4"])
 def test_register_fail_fast_surfaces_error_to_racing_sibling(
-    monkeypatch,
     family: str,
 ) -> None:
-    """A sibling that claims the DMZ3DD inflight entry while a tripwired
-    lifecycle is in flight must receive the VerificationMismatchError DIRECTLY
-    from the shared claim (not a hang, cancel, or dropped future)."""
-    registry, fake = _registry_started_with_snapshots(monkeypatch)
-    inflight = (
-        (registry._v3_inflight, "0xV3POOL")
-        if family == "v3"
-        else (
-            registry._v4_inflight,
-            _V4_POOL_ID_HEX,
-        )
-    )
-    inflight, key = inflight
+    """A sibling registering the same pool while a tripwired lifecycle is in
+    flight receives the VerificationMismatchError, not a hang or a silent skip.
+
+    The claim table is the CORE's now (ADR-022 D1 + the driver's session
+    `VerifyClaims`), so the sibling is a second caller of the same core-owned
+    entry: it receives the leader's settled outcome. The Python side keeps no
+    claim state to inspect, so this pins the observable contract — both callers
+    fail loudly with the same typed error — rather than a table's internals.
+    """
+    registry, fake = _registry_started_with_seed()
     register = getattr(registry, f"register_{family}_pool")
     pool = _FakeV3Pool() if family == "v3" else _FakeV4Pool()
     seen: dict[str, object] = {}
 
-    async def _sibling() -> None:
-        try:
-            await inflight[key]
-        except BaseException as exc:  # ruff: ignore[blind-except] - record whatever surfaces
-            seen["exc"] = exc
-
     async def _failing_lifecycle(*_args, **_kwargs):
-        # Start the sibling, then yield once so it grabs the live claim BEFORE
-        # the mismatch trips (ready-queue FIFO makes this deterministic).
+        # Start the sibling, then yield once so it reaches the claim BEFORE the
+        # mismatch trips (ready-queue FIFO makes this deterministic).
         seen["sibling"] = asyncio.get_running_loop().create_task(_sibling())
         await asyncio.sleep(0)
         msg = f"synthetic {family} seed tick mismatch"
         raise VerificationMismatchError(msg)
 
-    setattr(fake, f"run_{family}_registration_lifecycle", _failing_lifecycle)
+    async def _sibling() -> None:
+        try:
+            await register(pool)
+        except BaseException as exc:  # ruff: ignore[blind-except] - record whatever surfaces
+            seen["exc"] = exc
+
+    fake.run_registration_lifecycle = _failing_lifecycle  # type: ignore[method-assign]
 
     async def _go() -> None:
         with pytest.raises(
@@ -250,11 +161,11 @@ def test_register_fail_fast_surfaces_error_to_racing_sibling(
     asyncio.run(_go())
 
 
-def test_register_v3_pool_fail_fast_surfaces_mismatch(monkeypatch) -> None:
+def test_register_v3_pool_fail_fast_surfaces_mismatch() -> None:
     """The verification tripwire (D-A) propagates as VerificationMismatchError
     from the core lifecycle, surfacing from build_paths — not 18k pools later.
     No auto-repair: the exception is not caught by the registry."""
-    registry, fake = _registry_started_with_snapshots(monkeypatch)
+    registry, fake = _registry_started_with_seed()
     fake.fail_next = "v3"
 
     async def _go() -> int:
@@ -287,20 +198,29 @@ def test_register_always_delegates_even_without_verify_config() -> None:
         "register must always delegate to the core lifecycle — a Python-side "
         "skip would reintroduce a verify-disabled path for tracked pools"
     )
-    # no snapshots supplied → snapshot_block is None (step-1 no-op; step-2 +
+    # no DB seed → snapshot_block is None (step-1 no-op; step-2 +
     # tripwire still run core-side).
     assert fake.run_calls[0]["snapshot_block"] is None
 
 
-def test_register_v3_pool_idempotent_skips_lifecycle(monkeypatch) -> None:
-    """A pool already in the cache short-circuits before the core lifecycle —
-    no second run on the next path that touches the same pool."""
-    registry, fake = _registry_started_with_snapshots(monkeypatch)
+def test_repeat_registration_delegates_and_reads_the_same_core_id() -> None:
+    """A second path touching the same pool still delegates, and still answers
+    the same id.
+
+    The retired Python key cache short-circuited the second call. Nothing does
+    that now: the cross-window dedup belongs to the core, which makes a repeat
+    verify of an already-live pool a no-op (ADR-022 D1) rather than a Python
+    guess about what the core would have done.
+    """
+    registry, fake = _registry_started_with_seed()
 
     async def _go() -> int:
         return await registry.register_v3_pool(_FakeV3Pool())
 
     k1 = asyncio.run(_go())
     k2 = asyncio.run(_go())
-    assert k1 == k2 == 7
-    assert len(fake.run_calls) == 1, "second register must short-circuit the lifecycle"
+    assert k1 == k2 == 7, "the id is the core's, and it is stable"
+    assert len(fake.run_calls) == 2, (
+        "each registration enters the core-owned lifecycle; the core decides "
+        "whether a repeat run is a no-op"
+    )

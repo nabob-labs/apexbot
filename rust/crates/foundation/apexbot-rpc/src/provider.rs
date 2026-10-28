@@ -1,0 +1,3875 @@
+//! Ethereum RPC provider implementation using Alloy.
+//!
+//! Provides high-performance HTTP/HTTPS/WS connections with connection pooling,
+//! retry logic, response caching, optional transport-level rate limiting, and
+//! chunked log fetching. Also supports IPC endpoints for local node connections.
+
+use alloy::consensus::{Header as ConsensusHeader, TxEnvelope};
+use alloy::eips::{BlockId, BlockNumberOrTag};
+use alloy::network::Ethereum;
+use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::client::ClientBuilder;
+use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
+use alloy::rpc::types::eth::{
+    simulate::{SimulatePayload, SimulatedBlock},
+    FeeHistory,
+};
+use alloy::rpc::types::eth::{
+    AccessListResult, Block, Header as RpcHeader, Transaction, TransactionReceipt,
+};
+use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{Filter, Log};
+use alloy::transports::http::reqwest::Url;
+use alloy::transports::ipc::IpcConnect;
+use alloy::transports::layers::ThrottleLayer;
+use alloy::transports::ws::{WebSocketConfig, WsConnect};
+use alloy::transports::{RpcError, TransportErrorKind, TransportFut};
+use apexbot_core::diag;
+use apexbot_core::errors::{ProviderError, ProviderResult};
+use apexbot_core::retry::RetryPolicy;
+use apexbot_core::{op_error, op_warn};
+use rand::RngExt;
+use std::num::NonZeroU32;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+/// The hostnames that make an endpoint LOCAL — the exemption list
+/// `nodes.rate_limit_rps` documents. A local node has no per-IP upstream
+/// budget to protect.
+const LOCAL_RPC_HOSTS: [&str; 5] = [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "host.containers.internal",
+    "host.docker.internal",
+];
+
+/// A local endpoint has no per-IP budget to protect, and throttling it
+/// would only slow the local lanes — the configured throttle skips it.
+///
+/// The classification compares the URL's parsed host against
+/// [`LOCAL_RPC_HOSTS`], so a remote endpoint that merely *contains* a local
+/// marker (`http://localhost.example.com`, a `127.0.0.1` in the path or query)
+/// is throttled like the remote endpoint it is, while a local one is recognized
+/// whatever its userinfo or hostname case. A URL that does not parse is not
+/// local: no transport is ever built from one, so no throttle could apply to
+/// it.
+///
+/// This is the predicate's ONE home. The Python shell reaches the same function
+/// through `apexbot._ffi.provider.is_local_rpc_url` when it derives a fork
+/// target's default upstream cap, so the throttle lane and the fork lane cannot
+/// disagree about which hostnames a local node owns.
+#[must_use]
+pub fn is_local_rpc_url(rpc_url: &str) -> bool {
+    let Ok(url) = Url::parse(rpc_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    // `host_str` renders an IPv6 literal between brackets (`[::1]`).
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    LOCAL_RPC_HOSTS
+        .iter()
+        .any(|local| host.eq_ignore_ascii_case(local))
+}
+
+/// Resolve the config-declared throttle (`nodes.rate_limit_rps` /
+/// `nodes.rate_limit_burst`) for `rpc_url`, if any.
+fn configured_rate_limit(rpc_url: &str) -> Option<(u32, NonZeroU32)> {
+    if is_local_rpc_url(rpc_url) {
+        return None;
+    }
+    let nodes = &::apexbot_config::holder::config().nodes;
+    let rps = NonZeroU32::new(u32::try_from(nodes.rate_limit_rps?).ok()?)?;
+    let burst = nodes
+        .rate_limit_burst
+        .and_then(|v| u32::try_from(v).ok())
+        .and_then(NonZeroU32::new)
+        .unwrap_or(rps);
+    Some((rps.get(), burst))
+}
+
+/// Resolve the config-declared cumulative retry budget
+/// (`nodes.retry_budget_ms`): the wall-clock ONE call may spend retrying.
+///
+/// `None` (unset) is the production default and means no cumulative cap — the
+/// schedule's own arithmetic bounds the wait, which for the default ceiling is
+/// 81.1s of backoff per call. Constructors snapshot this value, so a provider
+/// keeps the posture it was built with rather than reading live config on the
+/// hot retry path.
+fn configured_retry_budget() -> Option<Duration> {
+    ::apexbot_config::holder::config()
+        .nodes
+        .retry_budget_ms
+        .map(Duration::from_millis)
+}
+
+/// Constants for retry logic. `pub(crate)` so the subscription watchdog
+/// ([`crate::subscription::pump_blocks`]) reuses the same backoff curve for
+/// its reconnect retries — one retry vocabulary across the crate, not a
+/// duplicate per-module tuning.
+pub(crate) const INITIAL_RETRY_DELAY_MS: u64 = 100;
+pub(crate) const MAX_RETRY_DELAY_MS: u64 = 30_000; // 30 seconds
+const MAX_JITTER_MS: u64 = 100; // Add up to 100ms of jitter
+
+/// The provider's retry policy for `max_attempts` total attempts, built on
+/// the workspace-canonical [`RetryPolicy`] . The exponential
+/// growth (x2, saturating at the cap) lives in the shared type — not a
+/// hand-rolled multiplier at each loop.
+///
+/// The curve's arithmetic is the reason callers get a budget knob rather than
+/// only an attempt count: from 100ms doubling to a 30s cap, the driver's
+/// 11-attempt ceiling sleeps 81.1s in backoff alone
+/// ([`RetryPolicy::cumulative_backoff`]) before a single call fails. An attempt
+/// count therefore does not bound wall clock, and
+/// [`configured_retry_budget`] is what a caller with its own deadline sets.
+#[must_use]
+pub(crate) fn rpc_retry_policy(max_attempts: u32) -> RetryPolicy {
+    RetryPolicy::from_millis(
+        max_attempts,
+        INITIAL_RETRY_DELAY_MS,
+        MAX_RETRY_DELAY_MS,
+        MAX_JITTER_MS,
+    )
+}
+
+/// The backoff for one retry: the capped exponential curve owned by the shared
+/// policy plus this site's uniform jitter draw (uses `random_range`, avoiding
+/// modulo bias).
+fn jittered_backoff(policy: &RetryPolicy, retry: u32) -> Duration {
+    policy.capped_backoff(retry) + Duration::from_millis(rand::rng().random_range(0..MAX_JITTER_MS))
+}
+
+/// The distinguishable terminal error for a retry chain that ran out of
+/// budget rather than attempts.
+///
+/// `None` means the chain may keep retrying: no budget is configured (the
+/// default, where the schedule's own arithmetic is the only bound) or the next
+/// backoff still lands inside it. `Some` carries the error the caller
+/// surfaces — never the bare transport failure it replaces, so a budget
+/// refusal can never be read as "the endpoint returned 429 once".
+///
+/// The decision includes the backoff about to be slept, so the loop never
+/// schedules a sleep that would land past the budget: the wait is bounded by
+/// the budget itself, not by the budget plus one attempt's duration.
+fn retry_budget_exhausted(
+    retry_budget: Option<Duration>,
+    started: std::time::Instant,
+    attempt: u32,
+    next_backoff: Duration,
+    last_error: &ProviderError,
+) -> Option<ProviderError> {
+    let budget = retry_budget?;
+    let elapsed = started.elapsed();
+    if elapsed + next_backoff < budget {
+        return None;
+    }
+    Some(ProviderError::RetryBudgetExhausted {
+        attempt,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        last_error: last_error.to_string(),
+    })
+}
+
+/// Advance a broadcast retry chain by one retry: consume an attempt, then wait
+/// the jittered backoff that attempt earned — unless the chain is out of
+/// attempts or the backoff would land past the retry budget, in which case the
+/// terminal error comes back for the caller to surface.
+///
+/// One home for the broadcast loop's three backoff sites: the attempt ceiling
+/// and the budget are two different stops, and both must be logged and
+/// surfaced the same way wherever the chain reached them.
+async fn broadcast_retry_step(
+    policy: &RetryPolicy,
+    retry_budget: Option<Duration>,
+    started: std::time::Instant,
+    attempt: &mut u32,
+    max_attempts: u32,
+    last_error: &ProviderError,
+) -> Option<ProviderError> {
+    *attempt += 1;
+    if *attempt >= max_attempts {
+        op_error!(domain = rpc, attempt = *attempt,
+            max_attempts,
+            %last_error,
+            "eth_sendRawTransaction: retries exhausted"
+        );
+        return Some(last_error.clone());
+    }
+    let next_backoff = jittered_backoff(policy, *attempt);
+    if let Some(exhausted) =
+        retry_budget_exhausted(retry_budget, started, *attempt, next_backoff, last_error)
+    {
+        op_error!(domain = rpc, attempt = *attempt,
+            max_attempts,
+            %exhausted,
+            "eth_sendRawTransaction: retry budget exhausted"
+        );
+        return Some(exhausted);
+    }
+    tokio::time::sleep(next_backoff).await;
+    None
+}
+
+/// Retry an async operation with exponential backoff, emitting `log` records on
+/// every retry attempt so operators can see backoff in logs.
+///
+/// The codebase's logging vocabulary is `log` (used across every Rust core
+/// crate); `log` is already a dependency of `apexbot-rpc`, so no new dep is
+/// introduced. The per-call context label is embedded in the `ProviderError`
+/// `Display` (baked in via `into_provider_error("<context>")` at the call site,
+/// which formats `{context}: {self}`), so the emitted `{error}` carries the
+/// context verbatim.
+///
+/// Adoption verdict (spike, 2026-09,): alloy 2.4.2's
+/// `transports::layers::RetryBackoffLayer` was evaluated as the
+/// transport-idiomatic replacement for this loop and rejected: it only
+/// `trace!`s retries (no leveled records, no provider `{context}`
+/// labels), has no per-attempt deadline knob, its
+/// `initial_backoff` is a fixed base that is explicitly "not an exponential
+/// base", and exhaustion collapses typed errors into a `custom_str`. It is
+/// also replay-unsafe for the non-idempotent `eth_sendRawTransaction` path
+/// (see the broadcast comment further down). Do not re-litigate without
+/// alloy API changes (per-attempt observer hooks, policy flexibility,
+/// error-preserving exhaustion).
+///
+/// Adoption verdict (`backoff` crate,): NOT adopted. It is not a
+/// workspace dependency today, its error wrapper would collapse typed
+/// `ProviderError`s, its jitter is a multiplicative `randomization_factor`
+/// rather than the additive tenacity-style jitter the verification policy
+/// uses (adopting it would CHANGE the curves), and it cannot wrap the
+/// per-call `tokio::time::timeout`. The loop stays centralized here
+/// and consumes the shared [`RetryPolicy`] curve.
+///
+/// Emission policy:
+/// - First retry (attempt 1): `log::debug!` — transient, often benign.
+/// - Subsequent retries (attempt >= 2): `log::warn!` — sustained backoff.
+/// - Exhausted all attempts: `log::error!` — terminal failure.
+///
+/// `retry_budget` bounds the chain's wall clock (see
+/// [`retry_budget_exhausted`]); `None` keeps the attempt count as the only
+/// bound.
+///
+/// Extracted from `AlloyProvider::retry_with_backoff` (which delegates, passing
+/// `self.max_attempts` + `self.call_timeout` + `self.retry_budget`) so the loop
+/// is unit-testable without constructing a live provider, and so a test can
+/// drive `max_attempts = 2` for a fast, deterministic assertion that the
+/// expected structured fields are emitted.
+pub(crate) async fn retry_with_backoff_loop<F, Fut, T>(
+    max_attempts: u32,
+    call_timeout: Duration,
+    retry_budget: Option<Duration>,
+    operation: F,
+) -> ProviderResult<T>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = ProviderResult<T>> + Send,
+    T: Send,
+{
+    let policy = rpc_retry_policy(max_attempts);
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+
+    loop {
+        // bound every attempt so a stuck transport (especially
+        // WS/IPC mid-read) cannot hang the loop indefinitely. HTTP has alloy's
+        // read timeout, but WS/IPC have no default — a half-open socket hangs
+        // forever without this wrapper. On elapsed, classify as
+        // `ProviderError::Timeout` so the existing `is_retryable()` picks it up.
+        let outcome = match tokio::time::timeout(call_timeout, operation()).await {
+            Ok(Ok(result)) => return Ok(result),
+            Ok(Err(e)) if !e.is_retryable() => return Err(e),
+            // Retryable failure OR per-call timeout → fall through to backoff.
+            Ok(Err(e)) => e,
+            Err(_elapsed) => ProviderError::Timeout {
+                message: format!(
+                    "RPC call timed out after {}ms (attempt {}/{max_attempts})",
+                    call_timeout.as_millis(),
+                    attempt + 1
+                ),
+            },
+        };
+
+        attempt += 1;
+        if attempt >= max_attempts {
+            op_error!(domain = rpc, attempt,
+                max_attempts,
+                %outcome,
+                "RPC retries exhausted"
+            );
+            return Err(outcome);
+        }
+
+        // Capped exponential backoff + site-owned uniform jitter.
+        let sleep = jittered_backoff(&policy, attempt);
+        let sleep_ms = sleep.as_millis();
+
+        // Budget check BEFORE the retry log line: a refused sleep must not be
+        // announced as a retry that then never happens.
+        if let Some(exhausted) =
+            retry_budget_exhausted(retry_budget, started, attempt, sleep, &outcome)
+        {
+            op_error!(domain = rpc, attempt,
+                max_attempts,
+                %exhausted,
+                "RPC retry budget exhausted"
+            );
+            return Err(exhausted);
+        }
+
+        if attempt <= 1 {
+            diag!(domain = rpc, attempt,
+                max_attempts,
+                sleep_ms,
+                %outcome,
+                "RPC retry"
+            );
+        } else {
+            op_warn!(domain = rpc, attempt,
+                max_attempts,
+                sleep_ms,
+                %outcome,
+                "RPC retry"
+            );
+        }
+
+        tokio::time::sleep(sleep).await;
+    }
+}
+
+/// Compute the transaction hash locally from a raw signed (RLP-encoded)
+/// transaction payload. Broadcasting via `eth_sendRawTransaction`
+/// can lose the response to a timeout / connection drop AFTER the body
+/// reached the node — so reconciliation via `get_transaction_receipt` needs
+/// the hash, and it must be computable without the broadcast response.
+///
+/// Returns the keccak256 of the RLP-encoded envelope (the on-chain tx hash).
+///
+/// # Errors
+///
+/// Returns `ProviderError::DecodingError` if `encoded_tx` is not a valid
+/// RLP-encoded signed transaction envelope.
+pub(crate) fn compute_tx_hash_from_signed_payload(encoded_tx: &[u8]) -> ProviderResult<B256> {
+    use alloy::rlp::Decodable as _;
+    let envelope =
+        TxEnvelope::decode(&mut &encoded_tx[..]).map_err(|e| ProviderError::DecodingError {
+            message: format!(
+                "Failed to decode signed transaction envelope for tx-hash computation: {e}"
+            ),
+        })?;
+    Ok(*envelope.hash())
+}
+
+/// Broadcast-aware reconciliation loop for `eth_sendRawTransaction`.
+///
+/// Broadcast is NOT idempotent: a `Timeout` / `ConnectionFailed` after the
+/// body was sent may have delivered the tx to the mempool, so blindly
+/// re-sending the identical signed payload (the previous behavior — routing
+/// through `retry_with_backoff`) risks double-inclusion on rebroadcast. This
+/// loop reconciles the outcome before rebroadcasting.
+///
+/// Outcome branches:
+/// - `Ok(hash)` → return the hash (success).
+/// - `RateLimited` → back off and rebroadcast (the request never reached the
+///   node; the mempool never saw it, so rebroadcast is safe).
+/// - `Timeout` / `ConnectionFailed` (ambiguous: body may have reached the
+///   node) → reconcile via `reconcile_receipt()`: if the receipt is present,
+///   return `tx_hash` (already broadcast + mined); if absent, back off and
+///   rebroadcast.
+/// - `RpcError` / any other non-retryable error → surface immediately. The
+///   tx was seen and rejected by the node's validation ("already known",
+///   "nonce too low", "replacement underpriced"); retrying the identical
+///   payload won't change the outcome.
+///
+/// Extracted from `AlloyProvider::eth_send_raw_transaction` (delegating
+/// `self.call_timeout`, `self.max_attempts`, `tx_hash`, the broadcast op, and
+/// the receipt-reconcile op) so the decision logic is unit-testable without
+/// a live provider — the tests inject closures simulating each branch.
+pub(crate) async fn send_raw_transaction_with_reconciliation<F, Fut, G, FutR>(
+    tx_hash: B256,
+    broadcast: F,
+    reconcile_receipt: G,
+    max_attempts: u32,
+    retry_budget: Option<Duration>,
+) -> ProviderResult<B256>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = ProviderResult<B256>> + Send,
+    G: Fn() -> FutR + Send + Sync,
+    FutR: std::future::Future<Output = ProviderResult<bool>> + Send,
+{
+    let policy = rpc_retry_policy(max_attempts);
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+
+    loop {
+        match broadcast().await {
+            Ok(returned_hash) => return Ok(returned_hash),
+            Err(e) => match &e {
+                // Ambiguous: the body may have reached the node's mempool.
+                // Reconcile via the receipt before deciding to rebroadcast.
+                ProviderError::Timeout { .. } | ProviderError::ConnectionFailed { .. } => {
+                    match reconcile_receipt().await {
+                        Ok(true) => {
+                            // Receipt present → the tx was already broadcast
+                            // (and mined). Return the locally-computed hash;
+                            // do NOT rebroadcast.
+                            diag!(domain = rpc, %e,
+                                %tx_hash,
+                                "eth_sendRawTransaction: ambiguous outcome reconciled — receipt present"
+                            );
+                            return Ok(tx_hash);
+                        }
+                        Ok(false) => {
+                            // Receipt absent → the body did NOT reach the node
+                            // (or hasn't been mined). Rebroadcast after backoff.
+                            op_warn!(domain = rpc, %e,
+                                "eth_sendRawTransaction: ambiguous outcome — receipt absent, rebroadcasting"
+                            );
+                            // fall through to the shared backoff/retry block below
+                            if let Some(terminal) = broadcast_retry_step(
+                                &policy,
+                                retry_budget,
+                                started,
+                                &mut attempt,
+                                max_attempts,
+                                &e,
+                            )
+                            .await
+                            {
+                                return Err(terminal);
+                            }
+                        }
+                        Err(reconcile_err) => {
+                            // Reconciliation itself failed (e.g. a transient
+                            // RPC error on get_transaction_receipt). Treat as
+                            // "absent / unknown" and rebroadcast — a missed
+                            // receipt-probe must not strand the broadcast.
+                            op_warn!(domain = rpc, %e,
+                                %reconcile_err,
+                                "eth_sendRawTransaction: ambiguous outcome; reconcile probe failed — rebroadcasting"
+                            );
+                            if let Some(terminal) = broadcast_retry_step(
+                                &policy,
+                                retry_budget,
+                                started,
+                                &mut attempt,
+                                max_attempts,
+                                &e,
+                            )
+                            .await
+                            {
+                                return Err(terminal);
+                            }
+                        }
+                    }
+                }
+                // Rate-limited: the request never reached the node. The
+                // mempool never saw it, so rebroadcast is safe + necessary.
+                ProviderError::RateLimited { .. } => {
+                    op_warn!(
+                        domain = rpc,
+                        attempt,
+                        max_attempts,
+                        "eth_sendRawTransaction: rate-limited — rebroadcasting"
+                    );
+                    if let Some(terminal) = broadcast_retry_step(
+                        &policy,
+                        retry_budget,
+                        started,
+                        &mut attempt,
+                        max_attempts,
+                        &e,
+                    )
+                    .await
+                    {
+                        return Err(terminal);
+                    }
+                }
+                // RpcError / ExecutionReverted / InvalidParams / etc.: the tx
+                // was seen and rejected by the node's validation. Retrying the
+                // identical payload won't change the outcome — surface immediately.
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
+/// Maximum allowed concurrent requests in `LogFetcher`.
+///
+/// Prevents file-descriptor exhaustion and RPC rate-limit bans from
+/// spawning thousands of simultaneous connections.
+const MAX_CONCURRENT_REQUESTS_CAP: usize = 32;
+
+/// Default per-call timeout for `AlloyProvider`. HTTP uses alloy's
+/// read timeout, but WS/IPC have no default — a half-open socket hangs the
+/// retry loop indefinitely. This bounds every attempt so a stuck transport
+/// retries (or fails) within a known wall-clock. 30s is generous for any
+/// single RPC call; `eth_simulate_v1` / very large `eth_getLogs` ranges may
+/// need a longer value via the builder/constructor arg.
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-subscription WS channel size (alloy `PubSubFrontend::set_channel_size`).
+/// Alloy's default is 16, and `tokio::sync::broadcast` DROPS the OLDEST
+/// messages for a lagging receiver — so a 16-slot buffer overflows during the
+/// blocking snapshot→WS backfill (which does not drain the live stream) and
+/// silently loses the freshly-mined live logs. This value effectively
+/// unbounds the receiver: it far exceeds any realistic backlog accumulated
+/// while the pump is not draining the stream, so a slow consumer can never lag
+/// the node's log stream out of existence.
+pub const SUBSCRIPTION_CHANNEL_SIZE: usize = 1_000_000;
+
+/// Default maximum total attempts for provider operations (1 initial + 2
+/// retries). This is the actual production default the bot hotpath
+/// (`apexbot-bot` pump) uses — previously `10` but every `new()` call site
+/// passed `3`, making the constant misleading. Now the constant matches the
+/// hotpath default; non-hotpath updaters (Aave/pool-updater) pass their own
+/// `RPC_MAX_RETRIES` constant as an intentional override.
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Detect an IPC path explicitly. A string is an IPC path if it
+/// starts with `ipc://`, is an absolute Unix path (starts with `/`), or is a
+/// Windows named pipe (starts with `\\`). A bare `host:port` (a typo missing
+/// the `http://` scheme) is NOT an IPC path — it falls through to the
+/// unsupported-scheme error so the typo surfaces immediately instead of
+/// silently routing to a nonexistent IPC file.
+#[must_use]
+pub fn is_ipc_path(rpc_url: &str) -> bool {
+    rpc_url.starts_with("ipc://") || rpc_url.starts_with('/') || rpc_url.starts_with("\\\\")
+}
+
+/// Retry a WS connect at construction with the existing backoff.
+/// Previously `connect_ws(ws_connect).await?` was eagerly fatal — a transient
+/// outage at build time failed the provider permanently while HTTP was lazy.
+/// Now construction retries the connect a bounded number of times, matching
+/// HTTP's lazy-retry behavior at the transport-establishment boundary.
+async fn connect_ws_with_retries(
+    ws_connect: WsConnect,
+    max_retries: u32,
+) -> ProviderResult<Arc<dyn Provider<Ethereum>>> {
+    let policy = rpc_retry_policy(max_retries);
+    let mut attempt = 0;
+    loop {
+        match ProviderBuilder::default()
+            .with_default_caching()
+            .connect_ws(ws_connect.clone())
+            .await
+        {
+            Ok(provider) => return Ok(Arc::new(provider.erased())),
+            Err(e) => {
+                if is_unresolvable_host(&e) {
+                    return Err(ProviderError::ConnectionFailed {
+                        message: format!(
+                            "WebSocket endpoint host does not resolve (name resolution is deterministic; no retries spent): {e}"
+                        ),
+                    });
+                }
+                attempt += 1;
+                if attempt >= max_retries {
+                    return Err(ProviderError::ConnectionFailed {
+                        message: format!(
+                            "Failed to connect to WebSocket endpoint after {attempt} attempts: {e}"
+                        ),
+                    });
+                }
+                let delay = policy.capped_backoff(attempt);
+                let delay_ms = delay.as_millis();
+                op_warn!(domain = rpc, attempt,
+                    max_retries,
+                    delay_ms,
+                    %e,
+                    "WS connect retry"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// The resolver's verdict at boot is final: a lookup failure will not heal
+/// after backoff, so the retry budget must not be spent on it — fail fast and
+/// name the endpoint instead.
+fn is_unresolvable_host<E: std::fmt::Display>(error: &E) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("failed to lookup address information")
+        || text.contains("name or service not known")
+        || text.contains("no such host")
+        || text.contains("nodename nor servname")
+}
+
+/// Retry an IPC connect at construction with the existing backoff.
+/// Same rationale as `connect_ws_with_retries` — IPC connect was eagerly
+/// fatal; now it retries a bounded number of times.
+async fn connect_ipc_with_retries(
+    ipc_connect: IpcConnect<String>,
+    max_retries: u32,
+) -> ProviderResult<Arc<dyn Provider<Ethereum>>> {
+    let policy = rpc_retry_policy(max_retries);
+    let mut attempt = 0;
+    loop {
+        match ProviderBuilder::default()
+            .with_default_caching()
+            .connect_ipc(ipc_connect.clone())
+            .await
+        {
+            Ok(provider) => return Ok(Arc::new(provider.erased())),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_retries {
+                    return Err(ProviderError::ConnectionFailed {
+                        message: format!(
+                            "Failed to connect to IPC endpoint after {attempt} attempts: {e}"
+                        ),
+                    });
+                }
+                let delay = policy.capped_backoff(attempt);
+                let delay_ms = delay.as_millis();
+                op_warn!(domain = rpc, attempt,
+                    max_retries,
+                    delay_ms,
+                    %e,
+                    "IPC connect retry"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// The idempotent-RPC-method allowlist. `make_request` is a raw
+/// escape hatch that can issue ANY method — including non-idempotent
+/// `debug_*` / `trace_*` / state-mutating methods. Retrying those blindly (the
+/// previous behavior) is unsafe: a partial timeout on a mutating call re-sends
+/// the payload. `make_request` retries ONLY methods in this allowlist (read-only
+/// eth_* calls that are safe to repeat); all other methods get a single
+/// attempt. Callers who know their custom method is idempotent should route
+/// through the typed methods (`get_block`, `eth_call`, etc.) instead.
+#[must_use]
+fn is_idempotent_rpc_method(method: &str) -> bool {
+    // Read-only eth_* methods safe to retry. Mutating methods (eth_sendRawTransaction,
+    // eth_sendTransaction) and stateful trace/debug methods are excluded.
+    matches!(
+        method,
+        "eth_call"
+            | "eth_chainId"
+            | "eth_estimateGas"
+            | "eth_blockNumber"
+            | "eth_getBalance"
+            | "eth_getCode"
+            | "eth_getStorageAt"
+            | "eth_getTransactionByHash"
+            | "eth_getTransactionReceipt"
+            | "eth_getTransactionCount"
+            | "eth_getBlockByNumber"
+            | "eth_getBlockByHash"
+            | "eth_getLogs"
+            | "eth_getBlockTransactionCountByNumber"
+            | "eth_getBlockTransactionCountByHash"
+            | "eth_getTransactionByBlockHashAndIndex"
+            | "eth_getTransactionByBlockNumberAndIndex"
+            | "eth_getUncleByBlockHashAndIndex"
+            | "eth_getUncleByBlockNumberAndIndex"
+            | "eth_getUncleCountByBlockHash"
+            | "eth_getUncleCountByBlockNumber"
+            | "eth_feeHistory"
+            | "eth_gasPrice"
+            | "eth_maxPriorityFeePerGas"
+            | "eth_getProof"
+    )
+}
+
+/// Type alias for the full Ethereum block type returned by `get_block`.
+///
+/// Centralises the generic parameters so callers don't repeat
+/// `Block<Transaction<TxEnvelope>, RpcHeader<ConsensusHeader>>`.
+pub type EthBlock = Block<Transaction<TxEnvelope>, RpcHeader<ConsensusHeader>>;
+
+/// Helper macro that wraps a simple Alloy RPC call with retry logic and
+/// error classification. Reduces per-method boilerplate from 9 lines to 1.
+///
+/// For methods that need request construction (e.g. `eth_call`, `estimate_gas`)
+/// or conditional block-id handling, write the `retry_with_backoff` call manually.
+macro_rules! rpc_call {
+    ($self:expr, $context:literal, $expr:expr) => {
+        $self
+            .retry_with_backoff(|| async {
+                $expr.await.map_err(|e| e.into_provider_error($context))
+            })
+            .await
+    };
+}
+
+/// JSON-RPC error codes that providers use to signal request-rate / quota
+/// exhaustion over HTTP 200 (the transport did NOT fail at the HTTP layer,
+/// so the 429-based classification in [`IntoProviderError`] does not fire).
+///
+/// Conservative set:
+/// - `-32005` — `Alchemy` "your app has exceeded its compute unit capacity".
+/// - `-32004` — `QuickNode` "rate limit exceeded".
+///
+/// Infura reuses the generic `-32001` code for quota errors but disambiguates
+/// via the *message*; that case is caught by [`JSON_RPC_RATE_LIMIT_MESSAGE_MARKERS`],
+/// not by this code table, so a `-32001` without a rate-limit message stays
+/// `RpcError` (pinned by `non_revert_error_stays_rpc_error`).
+///
+/// Adding a provider code is one line here — not a match-arm edit.
+const JSON_RPC_RATE_LIMIT_CODES: &[i64] = &[-32_005, -32_004];
+
+/// Case-insensitive message substrings that mark a JSON-RPC error response as
+/// a rate-limit / quota error regardless of code. Catches providers that reuse
+/// a generic code (e.g. Infura's `-32001`) for quota exhaustion. The check is
+/// exact substring match on the lowercased message, so a non-rate-limit
+/// `-32001` (e.g. "requested block not available") stays `RpcError`.
+///
+/// Adding a provider's marker phrasing is one line here — not a match-arm edit.
+const JSON_RPC_RATE_LIMIT_MESSAGE_MARKERS: &[&str] = &[
+    "rate limit",
+    "too many requests",
+    "compute units exceeded",
+    "exceeded its rate",
+];
+
+/// Whether a JSON-RPC `ErrorResp` (code, message) represents a provider
+/// rate-limit / quota response. Data-driven via
+/// [`JSON_RPC_RATE_LIMIT_CODES`] (code match) and
+/// [`JSON_RPC_RATE_LIMIT_MESSAGE_MARKERS`] (case-insensitive message
+/// substring). Used by [`IntoProviderError::into_provider_error`] so such
+/// responses map to [`ProviderError::RateLimited`] and feed the retry loop.
+///
+/// (`is_retryable()` already returns true for `RateLimited`, so no
+/// predicate change is needed.)
+fn is_json_rpc_rate_limit_response(code: i64, message: &str) -> bool {
+    if JSON_RPC_RATE_LIMIT_CODES.contains(&code) {
+        return true;
+    }
+    let lower = message.to_lowercase();
+    JSON_RPC_RATE_LIMIT_MESSAGE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Extension trait that converts an Alloy `RpcError` into a `ProviderError`.
+///
+/// Consumes the error (no double-borrow) and classifies it by Alloy's
+/// type-based error variants instead of string scraping:
+/// - `RpcError::Transport(TransportErrorKind::HttpError)` with 429 → `RateLimited`
+/// - `RpcError::Transport(TransportErrorKind::HttpError)` with 5xx → `ConnectionFailed`
+/// - `RpcError::Transport` with retryable transport errors → `Timeout`
+/// - `RpcError::ErrorResp` → `RpcError` with the JSON-RPC error code
+/// - `RpcError::LocalUsageError` → `Other`
+/// - Other → `RpcError` with code -1
+trait IntoProviderError {
+    fn into_provider_error(self, context: &str) -> ProviderError;
+}
+
+impl IntoProviderError for RpcError<TransportErrorKind> {
+    fn into_provider_error(self, context: &str) -> ProviderError {
+        let message = format!("{context}: {self}");
+
+        // Check for transport-level errors
+        if let Some(transport_err) = self.as_transport_err() {
+            // HTTP 429 = rate limited
+            if let Some(http_err) = transport_err.as_http_error() {
+                let status = http_err.status;
+                if status == 429 {
+                    return ProviderError::RateLimited { message };
+                }
+                // 5xx server errors are retryable as connection failures
+                if (500..600).contains(&status) {
+                    return ProviderError::ConnectionFailed { message };
+                }
+            }
+
+            // Backend gone or pubsub unavailable = connection failed
+            if transport_err.is_backend_gone() || transport_err.is_pubsub_unavailable() {
+                return ProviderError::ConnectionFailed { message };
+            }
+
+            // Use Alloy's built-in retry heuristic for other transport errors
+            if transport_err.is_retry_err() {
+                return ProviderError::Timeout { message };
+            }
+
+            // Other transport errors → RPC error
+            return ProviderError::RpcError { code: -1, message };
+        }
+
+        // Server returned an error response (JSON-RPC error)
+        if let Some(error_resp) = self.as_error_resp() {
+            // JSON-RPC-level rate-limit responses. Providers signal
+            // quota exhaustion over HTTP 200 (the transport did NOT fail at
+            // the HTTP layer, so the 429 transport branch above does not fire).
+            // Detect by (a) a known provider quota code, or (b) a rate-limit
+            // message marker on any code (Infura reuses -32001 for quota
+            // errors). Map to `RateLimited` so the retry loop's
+            // `is_retryable()` picks them up. Both tables are data-driven so
+            // adding a provider code/marker later is one line, not a match-arm
+            // edit.
+            if is_json_rpc_rate_limit_response(error_resp.code, &error_resp.message) {
+                return ProviderError::RateLimited { message };
+            }
+
+            // Detect EVM execution reverts structurally (alloy's
+            // `as_revert_data()` checks `message.contains("revert")` + spelunks
+            // `data` for the 0x08c379a0/0x4e487b71 selector). The classification
+            // here is by message content (case-insensitive marker substring),
+            // mirroring the Python `alloy_errors.is_alloy_revert` markers; the
+            // FFI layer (apexbot-python) raises the apexbot-owned
+            // `ContractLogicError` from this variant.
+            let is_revert = error_resp.message.to_lowercase().contains("revert")
+                || error_resp.as_revert_data().is_some();
+            if is_revert {
+                return ProviderError::ExecutionReverted {
+                    code: error_resp.code,
+                    message,
+                };
+            }
+            return ProviderError::RpcError {
+                code: error_resp.code,
+                message,
+            };
+        }
+
+        // Local usage errors (signer errors, pre-processing failures)
+        if self.is_local_usage_error() {
+            return ProviderError::Other { message };
+        }
+
+        // Serialization/deserialization errors
+        if self.is_ser_error() || self.is_deser_error() {
+            return ProviderError::SerializationError { message };
+        }
+
+        // Fallback
+        ProviderError::RpcError { code: -1, message }
+    }
+}
+
+/// Filter criteria for log fetching with pre-resolved typed values.
+///
+/// All address and topic strings are validated and parsed at construction
+/// time so that `to_alloy_filter()` is infallible and cheap — no redundant
+/// parsing on every retry or across concurrent chunk tasks.
+#[derive(Debug, Clone)]
+pub struct LogFilter {
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    addresses: Arc<[Address]>,
+    topics: Arc<[Vec<B256>]>,
+}
+
+impl LogFilter {
+    /// Create a new `LogFilter`, validating and parsing all inputs eagerly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::InvalidBlockRange` if `from_block > to_block`,
+    /// `ProviderError::InvalidAddress` if any address string is malformed, or
+    /// `ProviderError::InvalidTopic` if any topic string is malformed or out of
+    /// range.
+    pub fn new(
+        from_block: u64,
+        to_block: u64,
+        addresses: Option<Vec<String>>,
+        topics: Option<Vec<Vec<String>>>,
+    ) -> ProviderResult<Self> {
+        if from_block > to_block {
+            return Err(ProviderError::InvalidBlockRange {
+                from: from_block,
+                to: to_block,
+            });
+        }
+
+        // Parse addresses eagerly — fail fast on bad input
+        let parsed_addresses: Vec<Address> = addresses
+            .unwrap_or_default()
+            .into_iter()
+            .map(|addr| {
+                apexbot_core::address_utils::parse_address(&addr).map_err(|e| {
+                    ProviderError::InvalidAddress {
+                        address: addr,
+                        reason: format!("{e}"),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Parse topics eagerly — each element maps to a topic position (0-3)
+        let parsed_topics: Vec<Vec<B256>> = topics
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, topic_list)| {
+                if topic_list.is_empty() {
+                    return Ok(vec![]);
+                }
+                if i > 3 {
+                    return Err(ProviderError::InvalidTopic {
+                        topic: String::new(),
+                        reason: format!("topic position {i} is out of range (max 3)"),
+                    });
+                }
+                topic_list
+                    .into_iter()
+                    .map(|t| {
+                        B256::from_str(&t).map_err(|e| ProviderError::InvalidTopic {
+                            topic: t,
+                            reason: format!("{e}"),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            from_block: Some(from_block),
+            to_block: Some(to_block),
+            addresses: parsed_addresses.into(),
+            topics: parsed_topics.into(),
+        })
+    }
+
+    /// Returns the `from_block` value.
+    #[must_use]
+    pub const fn from_block(&self) -> Option<u64> {
+        self.from_block
+    }
+
+    /// Returns the `to_block` value.
+    #[must_use]
+    pub const fn to_block(&self) -> Option<u64> {
+        self.to_block
+    }
+
+    /// Convert to Alloy `Filter` (infallible — all parsing done at construction).
+    #[must_use]
+    pub fn to_alloy_filter(&self) -> Filter {
+        let mut filter = Filter::new();
+
+        if let Some(from) = self.from_block {
+            filter = filter.from_block(from);
+        }
+
+        if let Some(to) = self.to_block {
+            filter = filter.to_block(to);
+        }
+
+        if !self.addresses.is_empty() {
+            filter = filter.address(self.addresses.to_vec());
+        }
+
+        for (i, topic_list) in self.topics.iter().enumerate() {
+            if topic_list.is_empty() {
+                continue;
+            }
+            filter = match i {
+                0 => filter.event_signature(topic_list.clone()),
+                1 => filter.topic1(topic_list.clone()),
+                2 => filter.topic2(topic_list.clone()),
+                3 => filter.topic3(topic_list.clone()),
+                _ => break, // validated at construction; unreachable
+            };
+        }
+
+        filter
+    }
+
+    /// Returns the addresses as EIP-55 checksummed strings.
+    ///
+    /// Re-serialises the pre-parsed `Address` values back to checksummed
+    /// strings. Used by the `PyO3` `__repr__` and property getters.
+    #[must_use]
+    pub fn address_strings(&self) -> Vec<String> {
+        self.addresses
+            .iter()
+            .map(apexbot_core::address_utils::address_to_checksum_string)
+            .collect()
+    }
+
+    /// Returns the topics as hex strings.
+    ///
+    /// Re-serialises the pre-parsed `B256` values back to hex strings.
+    /// Used by the `PyO3` property getters.
+    #[must_use]
+    pub fn topic_strings(&self) -> Vec<Vec<String>> {
+        self.topics
+            .iter()
+            .map(|list| list.iter().map(|t| format!("{t}")).collect())
+            .collect()
+    }
+}
+
+/// The process-wide HTTP JSON-RPC round-trip counter — the production twin of
+/// the cassette gates' round-trip counters (ADR-068 D6): every request packet
+/// the standard-constructor HTTP transport dispatches counts once (a batch
+/// packet is ONE wire round trip; a transport-level retry re-enters `call`,
+/// so each attempt counts, exactly as a replay-served request would).
+///
+/// PASSIVE: one `Relaxed` `fetch_add` per dispatch — the request stream, its
+/// order, and its bytes are untouched, so the golden RPC gates cannot move.
+///
+/// SCOPE, stated rather than papered over: HTTP only. The WS/IPC
+/// constructors (the bot's subscription surfaces) are not layered, and
+/// cassette/offline providers never reach [`AlloyProvider::build_provider`].
+/// Under the single-writer one-shot updater processes this telemetry targets
+/// (the CLI / fleet updater runs), the counted transport IS the updater
+/// run's; a mixed-traffic process attributes concurrent HTTP traffic to
+/// whichever updater chunk boundary brackets it. Delta two reads around a
+/// phase to scope it — the same protocol the replay transport's
+/// `served_snapshot` prescribes.
+static HTTP_RPC_ROUND_TRIPS: AtomicU64 = AtomicU64::new(0);
+
+/// The process-wide HTTP JSON-RPC round-trip count so far.
+#[must_use]
+pub fn rpc_round_trips() -> u64 {
+    HTTP_RPC_ROUND_TRIPS.load(Ordering::Relaxed)
+}
+
+/// The counting tower layer: one increment per dispatched request packet.
+/// Attached in [`AlloyProvider::build_provider`] next to the `ThrottleLayer`
+/// arm (tower-shaped exactly like it — a `Layer` over the transport service).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RoundTripCountLayer;
+
+impl<S> tower::Layer<S> for RoundTripCountLayer {
+    type Service = RoundTripCountService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RoundTripCountService { inner }
+    }
+}
+
+/// The counting service — counts, then delegates; the delegate future is
+/// boxed straight through (no clone, no `poll_ready` dance beyond the inner's).
+#[derive(Debug, Clone)]
+pub(crate) struct RoundTripCountService<S> {
+    inner: S,
+}
+
+impl<S> tower::Service<RequestPacket> for RoundTripCountService<S>
+where
+    S: tower::Service<
+            RequestPacket,
+            Response = ResponsePacket,
+            Error = alloy::transports::TransportError,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: RequestPacket) -> Self::Future {
+        HTTP_RPC_ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(self.inner.call(req))
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test fixture serialization fails loudly"
+)]
+mod round_trip_layer_tests {
+    use super::*;
+    use tower::Layer as _;
+    use tower::Service as _;
+
+    /// A pending-forever inner: the test only asserts the COUNT, never a
+    /// response — the layer's contract is count-then-delegate.
+    struct PendingInner;
+
+    impl tower::Service<RequestPacket> for PendingInner {
+        type Response = ResponsePacket;
+        type Error = alloy::transports::TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: RequestPacket) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// One dispatched packet = exactly one counted round trip.
+    #[test]
+    fn counting_layer_counts_then_delegates() {
+        let request = alloy::rpc::json_rpc::Request::<()>::new(
+            "eth_blockNumber",
+            alloy::rpc::json_rpc::Id::Number(1),
+            (),
+        )
+        .serialize()
+        .expect("request serializes");
+        let mut service = RoundTripCountLayer.layer(PendingInner);
+        let before = rpc_round_trips();
+        let _future = service.call(RequestPacket::from(request));
+        assert_eq!(
+            rpc_round_trips(),
+            before + 1,
+            "one dispatched packet = one counted round trip"
+        );
+    }
+}
+
+/// High-performance Ethereum RPC provider.
+pub struct AlloyProvider {
+    inner: Arc<dyn Provider<Ethereum>>,
+    rpc_url: String,
+    max_attempts: u32,
+    /// Per-call timeout. Each `operation()` in `retry_with_backoff`
+    /// is wrapped in `tokio::time::timeout(call_timeout, ...)`; a stuck
+    /// transport (especially WS/IPC mid-read) classifies as
+    /// `ProviderError::Timeout` and feeds the existing `is_retryable()`.
+    /// Default `DEFAULT_CALL_TIMEOUT` (30s); raise via the constructor for
+    /// `eth_simulate_v1` / large `eth_getLogs` ranges.
+    call_timeout: Duration,
+    /// Cumulative wall-clock budget ONE call may spend retrying, snapshotted
+    /// from `nodes.retry_budget_ms` at construction
+    /// ([`configured_retry_budget`]).
+    ///
+    /// `None` — the declared default, and therefore production's posture — is
+    /// no cumulative cap: the backoff schedule alone bounds the wait, which for
+    /// an 11-attempt call is 81.1s. A caller with a shorter deadline (a test
+    /// lane whose budget is a pytest timeout) pins one here and the chain
+    /// stops at it with [`ProviderError::RetryBudgetExhausted`] instead of
+    /// running the schedule out.
+    retry_budget: Option<Duration>,
+    /// The chain this endpoint was BOUND to, verified once at bind time.
+    /// A `OnceLock` because the verification is a fact about the endpoint, not
+    /// about the handle: every clone reads the one verified value, and no
+    /// hot-path call re-reads `eth_chainId`.
+    verified_chain_id: Arc<OnceLock<u64>>,
+}
+
+// Manual Clone impl makes Arc::clone sharing semantics explicit
+// (vs deriving Clone, which would produce the same code).
+impl Clone for AlloyProvider {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            rpc_url: self.rpc_url.clone(),
+            max_attempts: self.max_attempts,
+            call_timeout: self.call_timeout,
+            retry_budget: self.retry_budget,
+            verified_chain_id: Arc::clone(&self.verified_chain_id),
+        }
+    }
+}
+
+/// Per-call timeout for the in-process SIMULATION path (incident 2026-08-20):
+/// the dispatch fan-out holds a `BotState` READ guard across `BlockSimHandle`
+/// build + sim-loop fetches on the fan-out worker; GIL-held FFI writers park
+/// behind that reader and keep the GIL while parked. With the default 30s
+/// call timeout x 3-5 attempts + backoff, one stalled RPC stalled the guard
+/// (and therefore the GIL) for MINUTES - the observed 'GIL deadlock'. The sim
+/// path uses a fail-fast budget instead: a slow cold miss tallies
+/// `rpc-failed` quickly rather than stalling graph state for the retry
+/// budget's duration.
+pub const SIM_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+pub const SIM_MAX_ATTEMPTS: u32 = 2;
+
+impl AlloyProvider {
+    /// A clone of this provider bounded for the in-process simulation path
+    /// ([`SIM_CALL_TIMEOUT`] / [`SIM_MAX_ATTEMPTS`]). Shares the same
+    /// transport (the `inner` `Arc` is cloned) - only the retry policy
+    /// changes, so there is no connection-pool cost.
+    #[must_use]
+    pub fn sim_bounded(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            rpc_url: self.rpc_url.clone(),
+            max_attempts: SIM_MAX_ATTEMPTS,
+            call_timeout: SIM_CALL_TIMEOUT,
+            retry_budget: self.retry_budget,
+            verified_chain_id: Arc::clone(&self.verified_chain_id),
+        }
+    }
+}
+
+impl AlloyProvider {
+    /// Bound this provider's retry wall clock explicitly, overriding the
+    /// `nodes.retry_budget_ms` value its constructor snapshotted.
+    ///
+    /// The handle a caller with its OWN deadline uses — a test lane whose
+    /// budget is a pytest timeout, a one-shot script that would rather fail
+    /// fast than recover slowly — without touching process config.
+    #[must_use]
+    pub const fn with_retry_budget(mut self, retry_budget: Option<Duration>) -> Self {
+        self.retry_budget = retry_budget;
+        self
+    }
+
+    /// Create a new provider with the given RPC URL.
+    ///
+    /// Automatically detects the connection type based on the URL:
+    /// - HTTP/HTTPS URLs use HTTP transport with connection pooling
+    /// - WS/WSS URLs use WebSocket transport
+    /// - File paths (starting with / or \\) use IPC transport
+    ///
+    /// All connections use `ProviderBuilder::default()` (no fillers) with response
+    /// caching enabled (100 entries). No transport-level rate limiting is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::ConnectionFailed` if the HTTP client cannot be created
+    /// or IPC/WS connection fails.
+    pub async fn new(rpc_url: &str, max_retries: u32) -> ProviderResult<Self> {
+        Self::build_provider(rpc_url, max_retries, None).await
+    }
+
+    /// Create a new provider with transport-level rate limiting.
+    ///
+    /// # Arguments
+    ///
+    /// * `rpc_url` - The RPC endpoint URL
+    /// * `max_retries` - Maximum retry attempts
+    /// * `requests_per_second` - Rate limit for HTTP connections (ignored for WS/IPC)
+    /// * `burst` - Burst size for rate limiting
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::ConnectionFailed` if the connection cannot be established.
+    pub async fn with_rate_limit(
+        rpc_url: &str,
+        max_retries: u32,
+        requests_per_second: u32,
+        burst: NonZeroU32,
+    ) -> ProviderResult<Self> {
+        Self::build_provider(rpc_url, max_retries, Some((requests_per_second, burst))).await
+    }
+
+    /// Create a provider over an endpoint BOUND to `chain_id`.
+    ///
+    /// The transport is constructed exactly as [`Self::new`] constructs it
+    /// (HTTP/WS/IPC by scheme), then the binding is verified: one
+    /// `eth_chainId` round-trip, refused with
+    /// [`ProviderError::ChainMismatch`] when the endpoint serves another
+    /// chain, before any pool or token I/O runs. The verified id is cached on
+    /// the provider, so [`Self::get_chain_id`] and every later consumer read
+    /// it without another round-trip.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::ConnectionFailed`] when the endpoint cannot be
+    /// reached, or [`ProviderError::ChainMismatch`] when it answers with a
+    /// different chain.
+    pub async fn for_chain(rpc_url: &str, chain_id: u64, max_retries: u32) -> ProviderResult<Self> {
+        let provider = Self::new(rpc_url, max_retries).await?;
+        provider.bind_to_chain(chain_id).await?;
+        Ok(provider)
+    }
+
+    /// [`Self::for_chain`] over a rate-limited HTTP transport.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::ConnectionFailed`] when the endpoint cannot be
+    /// reached, or [`ProviderError::ChainMismatch`] when it answers with a
+    /// different chain.
+    pub async fn for_chain_with_rate_limit(
+        rpc_url: &str,
+        chain_id: u64,
+        max_retries: u32,
+        requests_per_second: u32,
+        burst: NonZeroU32,
+    ) -> ProviderResult<Self> {
+        let provider =
+            Self::with_rate_limit(rpc_url, max_retries, requests_per_second, burst).await?;
+        provider.bind_to_chain(chain_id).await?;
+        Ok(provider)
+    }
+
+    /// Verify this provider's endpoint against the chain its consumer resolved.
+    ///
+    /// Idempotent: an already-verified provider is not re-verified, so binding
+    /// it a second time costs no round-trip. A refusal caches nothing, so a
+    /// later bind re-reads the endpoint rather than trusting a failed check.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError::ChainMismatch`] when the endpoint's `eth_chainId` is
+    /// not `chain_id`, or the read's own error when the endpoint cannot be
+    /// reached.
+    pub async fn bind_to_chain(&self, chain_id: u64) -> ProviderResult<()> {
+        if self.verified_chain_id().is_some() {
+            return Ok(());
+        }
+        let actual = self.get_chain_id().await?;
+        if actual != chain_id {
+            return Err(ProviderError::ChainMismatch {
+                expected: chain_id,
+                actual,
+                endpoint: self.rpc_url.clone(),
+            });
+        }
+        let _ = self.verified_chain_id.set(actual);
+        Ok(())
+    }
+
+    /// The chain this endpoint was verified to serve, or `None` when no
+    /// binding has verified it (an unbound provider, an offline recording).
+    #[must_use]
+    pub fn verified_chain_id(&self) -> Option<u64> {
+        self.verified_chain_id.get().copied()
+    }
+
+    /// Internal constructor shared by `new` and `with_rate_limit`.
+    ///
+    /// If `rate_limit` is `Some((rps, burst))`, the HTTP transport gets a
+    /// `ThrottleLayer`. Otherwise the client is built without throttling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::ConnectionFailed`] if the RPC URL is invalid or the
+    /// transport cannot be constructed.
+    pub async fn build_provider(
+        rpc_url: &str,
+        max_retries: u32,
+        rate_limit: Option<(u32, NonZeroU32)>,
+    ) -> ProviderResult<Self> {
+        // A caller-declared limit wins; otherwise the typed config's
+        // `nodes.rate_limit_*` applies.
+        let rate_limit = rate_limit.or_else(|| configured_rate_limit(rpc_url));
+        let provider: Arc<dyn Provider<Ethereum>> =
+            if rpc_url.starts_with("http://") || rpc_url.starts_with("https://") {
+                let url = rpc_url
+                    .parse()
+                    .map_err(|e| ProviderError::ConnectionFailed {
+                        message: format!("Invalid RPC URL: {e}"),
+                    })?;
+
+                // The round-trip counter rides OUTERMOST (layers added first
+                // are called with the request first), so every dispatched
+                // packet counts exactly once regardless of the throttle arm.
+                let client = if let Some((rps, burst)) = rate_limit {
+                    let throttle = ThrottleLayer::new_with_burst(rps, burst);
+                    ClientBuilder::default()
+                        .layer(RoundTripCountLayer)
+                        .layer(throttle)
+                        .http(url)
+                } else {
+                    ClientBuilder::default()
+                        .layer(RoundTripCountLayer)
+                        .http(url)
+                };
+
+                let provider = ProviderBuilder::default()
+                    .with_default_caching()
+                    .connect_client(client)
+                    .erased();
+                Arc::new(provider)
+            } else if rpc_url.starts_with("ws://") || rpc_url.starts_with("wss://") {
+                // Raise tungstenite's default message/frame size caps (`64 MiB`
+                // / `16 MiB`) to `None` (unlimited). A single WS connection is
+                // used for BOTH subscriptions (`newHeads`/logs — tiny messages)
+                // AND batch `eth_getLogs` (the snapshot→WS backfill issues a
+                // 6-topic OR filter over up to 2000 blocks → ~100k logs, ~90 MB
+                // well over both default caps).
+                //
+                // Failure mode WITHOUT the raise (confirmed via
+                // `ws_getlogs_large_filter_diagnostic` + tracing, 2026-07-12):
+                // tungstenite correctly returns `Error::Capacity(MessageTooLong)`
+                // when the oversized response arrives, but `alloy-pubsub`'s
+                // `WsBackend` converts that to `TransportErrorKind::backend_gone()`
+                // (a *retryable* error) at the backend→service boundary — losing
+                // the Capacity specificity. The pubsub service then enters an
+                // INFINITE reconnect→redispatch loop: `reconnect()` succeeds on
+                // the first attempt (the WS handshake is fine; only the response
+                // is too big), `max_retries` is never consumed, and the pending
+                // in-flight `eth_getLogs` is re-dispatched each cycle
+                // (`service.rs: Reissuing pending requests count=1`). The
+                // caller's `get_logs` future never resolves — small concurrent
+                // calls (`get_block_number`) keep succeeding on the same
+                // provider, so the transport isn't stalled, just the one
+                // oversized request. This is the "overly-broad catch": the
+                // `is_non_retryable()` gate treats every backend death as
+                // retryable, so a structurally-oversized request hangs forever.
+                //
+                // Raising the caps removes the trigger entirely; this matches
+                // HTTP transport behaviour (no body cap) and the apexbot
+                // threat model (the RPC endpoint is the user's own node, not
+                // an untrusted server that would DoS via oversized messages).
+                let ws_connect = WsConnect::new(rpc_url.to_string()).with_config(
+                    WebSocketConfig::default()
+                        .max_message_size(None)
+                        .max_frame_size(None),
+                );
+                let provider = connect_ws_with_retries(ws_connect, max_retries).await?;
+                provider
+            } else if is_ipc_path(rpc_url) {
+                // Explicit IPC path detection — require `ipc://`, an
+                // absolute Unix path (`/`), or a Windows named pipe (`\\`). A
+                // bare `localhost:8545` (a typo missing `http://`) is NO longer
+                // silently routed to IPC; it falls through to the
+                // unsupported-scheme error below with a clear message.
+                let ipc_path = rpc_url.strip_prefix("ipc://").unwrap_or(rpc_url);
+                let ipc_connect: IpcConnect<String> = IpcConnect::new(ipc_path.to_string());
+                // WS/IPC connect is no longer eagerly fatal. HTTP
+                // is lazy (connects on first call, retried via
+                // retry_with_backoff); WS/IPC `.await?`'d at construction, so a
+                // transient outage at build time failed the provider
+                // permanently. Now construction retries the connect a bounded
+                // number of times (max_retries) with the existing backoff.
+                let provider = connect_ipc_with_retries(ipc_connect, max_retries).await?;
+                provider
+            } else {
+                // `rpc_url` contains an unrecognised scheme.
+                // Extract the scheme portion for the error message.
+                let scheme = rpc_url.split("://").next().unwrap_or(rpc_url);
+                return Err(ProviderError::ConnectionFailed {
+                    message: format!("Unsupported transport scheme: {scheme}"),
+                });
+            };
+
+        // Effectively unbounded the pubsub receiver: see
+        // `SUBSCRIPTION_CHANNEL_SIZE`. Must be set BEFORE any subscription is
+        // created (the channel size is read at subscription dispatch time);
+        // `new` runs before the pump's `subscribe_blocks`/`subscribe_logs`.
+        if let Some(frontend) = provider.client().pubsub_frontend() {
+            frontend.set_channel_size(SUBSCRIPTION_CHANNEL_SIZE);
+        }
+
+        Ok(Self {
+            inner: provider,
+            rpc_url: rpc_url.to_string(),
+            max_attempts: max_retries.saturating_add(1),
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            retry_budget: configured_retry_budget(),
+            verified_chain_id: Arc::new(OnceLock::new()),
+        })
+    }
+
+    /// Get current block number.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_block_number(&self) -> ProviderResult<u64> {
+        rpc_call!(
+            self,
+            "Failed to get block number",
+            self.inner.get_block_number()
+        )
+    }
+
+    /// Get chain ID.
+    ///
+    /// An endpoint bound to a chain answers from the value its binding
+    /// verified, so a hot-path read costs no round-trip; an unbound provider
+    /// reads `eth_chainId` as usual.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_chain_id(&self) -> ProviderResult<u64> {
+        if let Some(verified) = self.verified_chain_id() {
+            return Ok(verified);
+        }
+        rpc_call!(self, "Failed to get chain ID", self.inner.get_chain_id())
+    }
+
+    /// Fetch logs with retry logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError` if the RPC call fails or filter is invalid.
+    pub async fn get_logs(&self, filter: &LogFilter) -> ProviderResult<Vec<Log>> {
+        let alloy_filter = filter.to_alloy_filter();
+
+        self.retry_with_backoff(|| async {
+            let result: Vec<Log> = self
+                .inner
+                .get_logs(&alloy_filter)
+                .await
+                .map_err(|e| e.into_provider_error("Failed to get logs"))?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Get contract code at an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_code(
+        &self,
+        address: &Address,
+        block_number: Option<u64>,
+    ) -> ProviderResult<Bytes> {
+        self.retry_with_backoff(|| async {
+            let result = if let Some(block) = block_number {
+                self.inner
+                    .get_code_at(*address)
+                    .block_id(block.into())
+                    .await
+            } else {
+                self.inner.get_code_at(*address).await
+            }
+            .map_err(|e| e.into_provider_error("Failed to get code"))?;
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Get a block by number.
+    ///
+    /// Returns the full block data including header and transactions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_block(&self, block_number: u64) -> ProviderResult<Option<EthBlock>> {
+        self.retry_with_backoff(|| async {
+            let block_num_tag = BlockNumberOrTag::Number(block_number);
+            let result = self
+                .inner
+                .get_block_by_number(block_num_tag)
+                .await
+                .map_err(|e| e.into_provider_error("Failed to get block"))?;
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Retry an async operation with exponential backoff.
+    ///
+    /// Uses exponential backoff with jitter to avoid thundering herd problems.
+    /// All retryable errors (rate limit, timeout, connection failures) receive
+    /// the same backoff treatment.
+    async fn retry_with_backoff<F, Fut, T>(&self, operation: F) -> ProviderResult<T>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ProviderResult<T>> + Send,
+        T: Send,
+    {
+        retry_with_backoff_loop(
+            self.max_attempts,
+            self.call_timeout,
+            self.retry_budget,
+            operation,
+        )
+        .await
+    }
+
+    /// Get the RPC URL.
+    #[must_use]
+    pub fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+
+    /// Get a reference-counted clone of the inner Alloy provider.
+    ///
+    /// Used by the subscription module to spawn pump tasks that
+    /// need access to the provider for subscription calls.
+    #[must_use]
+    pub fn provider_arc(&self) -> Arc<dyn Provider<Ethereum>> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Execute an `eth_call`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn eth_call(
+        &self,
+        to: &Address,
+        data: Bytes,
+        block_number: Option<u64>,
+    ) -> ProviderResult<Bytes> {
+        self.retry_with_backoff(|| async {
+            let tx = TransactionRequest::default()
+                .to(*to)
+                .input(data.clone().into());
+
+            // Call at specific block if provided, otherwise use latest
+            let result = if let Some(block) = block_number {
+                self.inner.call(tx).block(block.into()).await
+            } else {
+                self.inner.call(tx).await
+            }
+            .map_err(|e| e.into_provider_error("eth_call failed"))?;
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Get the current gas price.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_gas_price(&self) -> ProviderResult<u128> {
+        rpc_call!(self, "Failed to get gas price", self.inner.get_gas_price())
+    }
+
+    /// Estimate gas for a transaction.
+    ///
+    /// # Arguments
+    /// * `to` - Target address
+    /// * `data` - Transaction data
+    /// * `from` - Optional sender address
+    /// * `value` - Optional value in wei
+    /// * `block_number` - Optional block number to estimate at
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn estimate_gas(
+        &self,
+        to: &Address,
+        data: Bytes,
+        from: Option<&Address>,
+        value: Option<u128>,
+        block_number: Option<u64>,
+    ) -> ProviderResult<u64> {
+        self.retry_with_backoff(|| async {
+            let mut tx = TransactionRequest::default()
+                .to(*to)
+                .input(data.clone().into());
+
+            if let Some(addr) = from {
+                tx = tx.from(*addr);
+            }
+
+            if let Some(val) = value {
+                tx = tx.value(alloy::primitives::U256::from(val));
+            }
+
+            // Estimate at specific block if provided, otherwise use pending
+            let result = if let Some(block) = block_number {
+                self.inner.estimate_gas(tx).block(block.into()).await
+            } else {
+                self.inner.estimate_gas(tx).await
+            }
+            .map_err(|e| e.into_provider_error("Failed to estimate gas"))?;
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Get a transaction by hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_transaction(&self, tx_hash: &str) -> ProviderResult<Option<Transaction>> {
+        let hash = B256::from_str(tx_hash).map_err(|e| ProviderError::InvalidParams {
+            message: format!("Invalid transaction hash: {e}"),
+        })?;
+
+        // Return alloy's typed `Transaction` (consistent with
+        // `EthBlock`'s `Transaction<TxEnvelope>`), not a serialize-then-reparse
+        // `serde_json::Value` round-trip. The PyO3 wrapper serializes to JSON
+        // at the FFI boundary when a Python caller needs it.
+        self.retry_with_backoff(|| async {
+            self.inner
+                .get_transaction_by_hash(hash)
+                .await
+                .map_err(|e| e.into_provider_error("Failed to get transaction"))
+        })
+        .await
+    }
+
+    /// Get a transaction receipt by hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_transaction_receipt(
+        &self,
+        tx_hash: &str,
+    ) -> ProviderResult<Option<TransactionReceipt>> {
+        let hash = B256::from_str(tx_hash).map_err(|e| ProviderError::InvalidParams {
+            message: format!("Invalid transaction hash: {e}"),
+        })?;
+
+        // Return alloy's typed `TransactionReceipt`, not a
+        // serialize-then-reparse `serde_json::Value` round-trip.
+        self.retry_with_backoff(|| async {
+            self.inner
+                .get_transaction_receipt(hash)
+                .await
+                .map_err(|e| e.into_provider_error("Failed to get transaction receipt"))
+        })
+        .await
+    }
+
+    /// Get storage at a given address and position.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_storage_at(
+        &self,
+        address: &Address,
+        position: U256,
+        block_number: Option<u64>,
+    ) -> ProviderResult<B256> {
+        // The `to_be_bytes::<32>()` byte-array detour is NOT
+        // pointless — alloy's `get_storage_at` returns a `U256`
+        // (`StorageValue = U256`), and there is no direct `From<U256> for
+        // B256`. The 32-byte big-endian form of a `U256` IS the `B256` layout,
+        // so `to_be_bytes::<32>()` → `B256::from([u8; 32])` is the canonical
+        // (and zero-cost) conversion. If alloy ever returns `B256` directly,
+        // return it as-is here.
+        self.retry_with_backoff(|| async {
+            let result = if let Some(block) = block_number {
+                self.inner
+                    .get_storage_at(*address, position)
+                    .block_id(block.into())
+                    .await
+            } else {
+                self.inner.get_storage_at(*address, position).await
+            }
+            .map_err(|e| e.into_provider_error("Failed to get storage"))?;
+
+            // Direct conversion: U256's 32-byte big-endian form is a B256.
+            Ok(B256::from(result.to_be_bytes::<32>()))
+        })
+        .await
+    }
+
+    /// Get the balance of an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_balance(
+        &self,
+        address: &Address,
+        block_number: Option<u64>,
+    ) -> ProviderResult<U256> {
+        self.retry_with_backoff(|| async {
+            let result = if let Some(block) = block_number {
+                self.inner
+                    .get_balance(*address)
+                    .block_id(block.into())
+                    .await
+            } else {
+                self.inner.get_balance(*address).await
+            }
+            .map_err(|e| e.into_provider_error("Failed to get balance"))?;
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Get the transaction count (nonce) for an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn get_transaction_count(
+        &self,
+        address: &Address,
+        block_number: Option<u64>,
+    ) -> ProviderResult<u64> {
+        self.retry_with_backoff(|| async {
+            let result = if let Some(block) = block_number {
+                self.inner
+                    .get_transaction_count(*address)
+                    .block_id(block.into())
+                    .await
+            } else {
+                self.inner.get_transaction_count(*address).await
+            }
+            .map_err(|e| e.into_provider_error("Failed to get transaction count"))?;
+
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Execute `eth_simulateV1` — simulate a batch of calls on top of the
+    /// requested state (Alloy spec: `SimulatePayload` / `BlockStateCallV1` /
+    /// `StateOverride` / `AccountOverride`).
+    ///
+    /// This is the transport primitive; the simulate orchestration (7-call
+    /// profit pattern, state override construction, revert decoding) is the
+    /// Simulation epic — this fn only performs the typed RPC round-trip.
+    ///
+    /// `block_id` selects the base state (`BlockId::Number(Tag::Pending)` for
+    /// the simulate-v1 `block_identifier="pending"` parity, `BlockId::Number(Tag::Latest)`
+    /// to default to the head block, or `BlockId::Hash(..)` for a specific hash).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn eth_simulate_v1(
+        &self,
+        payload: &SimulatePayload,
+        block_id: BlockId,
+    ) -> ProviderResult<Vec<SimulatedBlock<EthBlock>>> {
+        self.retry_with_backoff(|| async {
+            let result = self
+                .inner
+                .simulate(payload)
+                .block_id(block_id)
+                .await
+                .map_err(|e| e.into_provider_error("eth_simulateV1 failed"))?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Execute `eth_feeHistory` — historical gas info for EIP-1559 fee
+    /// estimation.
+    ///
+    /// Returns `baseFeePerGas`, `gasUsedRatio`, `reward` (per-percentile
+    /// priority-fee samples), `oldestBlock`, and EIP-4844 blob fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn eth_fee_history(
+        &self,
+        block_count: u64,
+        last_block: BlockNumberOrTag,
+        reward_percentiles: &[f64],
+    ) -> ProviderResult<FeeHistory> {
+        rpc_call!(
+            self,
+            "eth_feeHistory failed",
+            self.inner
+                .get_fee_history(block_count, last_block, reward_percentiles)
+        )
+    }
+
+    /// Execute `eth_createAccessList` — compute the EIP-2930 access list for a
+    /// transaction.
+    ///
+    /// Returns `{accessList, gasUsed}` (plus an optional `error` field if the
+    /// transaction would revert).
+    ///
+    /// `block_id` selects the base state; `BlockId::Number(Tag::Latest)` is the
+    /// default-of-defaults (the previous `None` semantics).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn eth_create_access_list(
+        &self,
+        request: &TransactionRequest,
+        block_id: BlockId,
+    ) -> ProviderResult<AccessListResult> {
+        self.retry_with_backoff(|| async {
+            let result = self
+                .inner
+                .create_access_list(request)
+                .block_id(block_id)
+                .await
+                .map_err(|e| e.into_provider_error("eth_createAccessList failed"))?;
+            Ok(result)
+        })
+        .await
+    }
+
+    /// Execute `eth_sendRawTransaction` — broadcast a raw signed transaction.
+    ///
+    /// This is the broadcast that `apexbot-submission`'s `TxSigner` produces
+    /// the bytes for; this fn returns the resulting `TxHash` (the transport
+    /// primitive — receipt monitoring is owned upstream).
+    ///
+    /// # Broadcast-aware reconciliation
+    ///
+    /// Broadcast is NOT idempotent: a timeout / connection drop after the body
+    /// was sent may have delivered the tx to the mempool, so blindly retrying
+    /// via `retry_with_backoff` risks double-inclusion on rebroadcast. This fn
+    /// uses [`send_raw_transaction_with_reconciliation`] instead: on ambiguous
+    /// outcomes (`Timeout` / `ConnectionFailed`) it reconciles via
+    /// [`get_transaction_receipt`](Self::get_transaction_receipt) before
+    /// rebroadcasting; on `RateLimited` it rebroadcasts (the request never
+    /// reached the node); on `RpcError` ("already known" / "nonce too low" /
+    /// "replacement underpriced") it surfaces immediately — the tx was seen and
+    /// rejected, retrying won't help. The tx hash is computed locally from the
+    /// signed payload so reconciliation works even when the broadcast response
+    /// was lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails or the tx is
+    /// rejected.
+    pub async fn eth_send_raw_transaction(&self, encoded_tx: &[u8]) -> ProviderResult<B256> {
+        // Compute the hash locally so reconciliation can proceed even when the
+        // broadcast response was lost to a timeout / connection drop.
+        let tx_hash = compute_tx_hash_from_signed_payload(encoded_tx)?;
+        let max_attempts = self.max_attempts;
+        let inner = Arc::clone(&self.inner);
+        let inner_for_reconcile = Arc::clone(&self.inner);
+
+        send_raw_transaction_with_reconciliation(
+            tx_hash,
+            move || {
+                let inner = Arc::clone(&inner);
+                async move {
+                    let pending = inner
+                        .send_raw_transaction(encoded_tx)
+                        .await
+                        .map_err(|e| e.into_provider_error("eth_sendRawTransaction failed"))?;
+                    Ok(*pending.tx_hash())
+                }
+            },
+            move || {
+                let inner = Arc::clone(&inner_for_reconcile);
+                async move {
+                    let receipt = inner.get_transaction_receipt(tx_hash).await.map_err(|e| {
+                        e.into_provider_error("reconcile get_transaction_receipt failed")
+                    })?;
+                    Ok(receipt.is_some())
+                }
+            },
+            max_attempts,
+            self.retry_budget,
+        )
+        .await
+    }
+
+    /// Make a raw JSON-RPC request.
+    ///
+    /// This method allows calling arbitrary RPC methods that don't have
+    /// typed wrappers, such as debug methods, trace methods, or node-specific APIs.
+    ///
+    /// # Arguments
+    /// * `method` - The RPC method name
+    /// * `params` - The parameters as a JSON value (typically an array)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::RpcError` if the RPC call fails.
+    pub async fn make_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> ProviderResult<serde_json::Value> {
+        let method = method.to_string();
+        let params = Arc::new(params);
+
+        // `make_request` is a raw escape hatch that can issue ANY
+        // method. Retrying non-idempotent methods (debug_*, trace_*, state-
+        // mutating) is unsafe — a partial timeout re-sends the payload. Retry
+        // ONLY the idempotent allowlist (`is_idempotent_rpc_method`); all other
+        // methods get a single attempt. Callers who need retry for a custom
+        // idempotent method should route through the typed methods instead.
+        if is_idempotent_rpc_method(&method) {
+            self.retry_with_backoff(|| {
+                let client = self.inner.client();
+                let method = method.clone();
+                let params = Arc::clone(&params);
+                async move {
+                    let result: serde_json::Value = client
+                        .request(method, (*params).clone())
+                        .await
+                        .map_err(|e| e.into_provider_error("RPC request failed"))?;
+                    Ok(result)
+                }
+            })
+            .await
+        } else {
+            // Non-idempotent method: single attempt, no retry.
+            let client = self.inner.client();
+            let result: serde_json::Value = client
+                .request(method, (*params).clone())
+                .await
+                .map_err(|e| e.into_provider_error("RPC request failed"))?;
+            Ok(result)
+        }
+    }
+}
+
+impl AlloyProvider {
+    /// Wraps a pre-built provider (e.g. a custom transport such as the
+    /// `OfflineProvider`, or a mock transport). Used both at runtime (the
+    /// offline provider wraps an in-memory transport via this constructor) and
+    /// by tests that drive `run_with_stream` from a deterministic synthetic
+    /// `WsEvent` stream without a live RPC.
+    #[must_use]
+    pub fn from_provider(inner: Arc<dyn Provider<Ethereum>>) -> Self {
+        Self {
+            inner,
+            rpc_url: String::from("test"),
+            max_attempts: DEFAULT_MAX_RETRIES,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+            retry_budget: configured_retry_budget(),
+            verified_chain_id: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
+/// Log fetcher with fixed chunk sizing.
+pub struct LogFetcher {
+    provider: Arc<AlloyProvider>,
+    max_blocks_per_request: u64,
+    max_concurrent_requests: usize,
+}
+
+impl LogFetcher {
+    /// Create a new log fetcher.
+    #[must_use]
+    pub const fn new(provider: Arc<AlloyProvider>, max_blocks_per_request: u64) -> Self {
+        Self {
+            provider,
+            max_blocks_per_request,
+            max_concurrent_requests: 4, // Default concurrency limit
+        }
+    }
+
+    /// Set the maximum number of concurrent requests.
+    ///
+    /// The value is capped at [`MAX_CONCURRENT_REQUESTS_CAP`] (32) to prevent
+    /// file-descriptor exhaustion and RPC rate-limit bans.
+    #[must_use]
+    pub fn with_concurrency(mut self, max_concurrent: usize) -> Self {
+        self.max_concurrent_requests = max_concurrent.min(MAX_CONCURRENT_REQUESTS_CAP);
+        self
+    }
+
+    /// Fetch logs across a block range with chunking.
+    ///
+    /// Uses concurrent requests to fetch multiple chunks in parallel,
+    /// improving performance for large block ranges. Logs are sorted
+    /// by `(block_number, log_index)` for deterministic ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ProviderError::InvalidBlockRange` if `from_block > to_block`.
+    pub async fn fetch_logs_chunked(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        addresses: Option<Vec<String>>,
+        topics: Option<Vec<Vec<String>>>,
+    ) -> ProviderResult<Vec<Log>> {
+        if from_block > to_block {
+            return Err(ProviderError::InvalidBlockRange {
+                from: from_block,
+                to: to_block,
+            });
+        }
+
+        if self.max_blocks_per_request == 0 {
+            return Err(ProviderError::InvalidParams {
+                message: "max_blocks_per_request must be greater than 0".to_string(),
+            });
+        }
+
+        // Resolve the filter once and share it across chunk tasks via Arc.
+        // All string→typed parsing happens here, not per-chunk.
+        let base_filter = Arc::new(LogFilter::new(from_block, to_block, addresses, topics)?);
+
+        // Build list of chunk ranges
+        let mut chunks = Vec::new();
+        let mut current_block = from_block;
+
+        while current_block <= to_block {
+            let chunk_end =
+                std::cmp::min(current_block + self.max_blocks_per_request - 1, to_block);
+            chunks.push((current_block, chunk_end));
+            current_block = chunk_end + 1;
+        }
+
+        // Spawn all tasks immediately; the semaphore gates execution inside each task
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_requests));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for (chunk_start, chunk_end) in chunks {
+            let sem = Arc::clone(&sem);
+            let provider = Arc::clone(&self.provider);
+            let base_filter = Arc::clone(&base_filter);
+
+            join_set.spawn(async move {
+                // Acquire permit inside the task so all tasks can be spawned first
+                let _permit = sem.acquire().await.map_err(|_| ProviderError::Other {
+                    message: "Semaphore acquisition failed".to_string(),
+                })?;
+
+                // Build chunk-specific filter from the pre-resolved base
+                let chunk_filter = LogFilter {
+                    from_block: Some(chunk_start),
+                    to_block: Some(chunk_end),
+                    addresses: Arc::clone(&base_filter.addresses),
+                    topics: Arc::clone(&base_filter.topics),
+                };
+                provider.get_logs(&chunk_filter).await
+            });
+        }
+
+        // Collect results as tasks complete; JoinSet yields in completion order
+        let mut all_logs = Vec::new();
+        while let Some(join_result) = join_set.join_next().await {
+            let logs = join_result.map_err(|e| ProviderError::Other {
+                message: format!("Task join error: {e}"),
+            })??;
+            all_logs.extend(logs);
+        }
+
+        // Sort by (block_number, log_index) for deterministic ordering
+        all_logs.sort_by(|a, b| {
+            let a_block = a.block_number.unwrap_or(0);
+            let b_block = b.block_number.unwrap_or(0);
+            a_block
+                .cmp(&b_block)
+                .then_with(|| a.log_index.unwrap_or(0).cmp(&b.log_index.unwrap_or(0)))
+        });
+
+        Ok(all_logs)
+    }
+}
+
+#[expect(clippy::panic)]
+#[cfg(test)]
+#[expect(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Holder-reinstalling tests serialize on one lock: the holder is
+    // process-global, and cargo runs this binary's tests on shared threads.
+    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn govern_nodes(rate_limit_rps: Option<usize>, rate_limit_burst: Option<usize>) {
+        let mut cfg = ::apexbot_config::BotConfig::default();
+        cfg.nodes.rate_limit_rps = rate_limit_rps;
+        cfg.nodes.rate_limit_burst = rate_limit_burst;
+        let _ = ::apexbot_config::holder::reinstall_for_tests(std::sync::Arc::new(cfg));
+    }
+
+    #[test]
+    fn configured_rate_limit_off_when_unset() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        govern_nodes(None, None);
+        assert_eq!(configured_rate_limit("https://rpc.example.com"), None);
+    }
+
+    #[test]
+    fn configured_rate_limit_applies_with_burst_defaulting_to_rps() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        govern_nodes(Some(25), None);
+        let (rps, burst) = configured_rate_limit("https://rpc.example.com").unwrap();
+        assert_eq!(rps, 25);
+        assert_eq!(burst.get(), 25);
+        govern_nodes(Some(25), Some(5));
+        let (_, burst) = configured_rate_limit("https://rpc.example.com").unwrap();
+        assert_eq!(burst.get(), 5);
+        govern_nodes(None, None);
+    }
+
+    #[test]
+    fn configured_rate_limit_skips_local_endpoints() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        govern_nodes(Some(25), None);
+        for url in [
+            "http://localhost:8545/",
+            "http://127.0.0.1:8545/",
+            "http://[::1]:8545/",
+            "http://host.containers.internal:8545/",
+            "http://host.docker.internal:8545/",
+        ] {
+            assert_eq!(
+                configured_rate_limit(url),
+                None,
+                "local url throttled: {url}"
+            );
+        }
+        govern_nodes(None, None);
+    }
+
+    /// The exemption compares the URL's parsed host, so every input a substring
+    /// scan (`"://localhost"` anywhere in the string) would classify differently
+    /// resolves on the host:
+    ///
+    /// - `http://localhost.example.com:8545` / `http://127.0.0.1.nip.io:8545` —
+    ///   a substring scan calls these local; here they are remote, because a
+    ///   remote name that merely starts with (or nests) a local one still has an
+    ///   upstream per-IP budget to protect.
+    /// - `https://user:pw@localhost:8545` / `http://LOCALHOST:8545` — a substring
+    ///   scan calls these remote (userinfo sits between the scheme and the host,
+    ///   and the scan was case-sensitive); here they are local, because the HOST
+    ///   is local whatever the userinfo or the hostname's case.
+    /// - `http://localhost:not-a-port` — a substring scan calls it local; here it
+    ///   is remote, since a URL the parser rejects never reaches a transport
+    ///   whose throttle could matter.
+    #[test]
+    fn local_endpoint_classification_is_by_parsed_host() {
+        for url in [
+            "http://localhost:8545",
+            "http://localhost:8545/",
+            "ws://localhost:8546",
+            "http://127.0.0.1:8545/eth-mainnet",
+            "http://[::1]:8545",
+            "http://host.containers.internal:8545/",
+            "http://host.docker.internal:8545/",
+            "https://user:pw@localhost:8545",
+            "http://LOCALHOST:8545",
+            "HTTP://LocalHost:8545/",
+        ] {
+            assert!(is_local_rpc_url(url), "expected local: {url}");
+        }
+        for url in [
+            "https://rpc.example.com",
+            "http://localhost.example.com:8545",
+            "http://127.0.0.1.nip.io:8545",
+            "http://host.containers.internal.example.com:8545",
+            "https://evil.example/?next=http://localhost:8545",
+            "http://localhost:not-a-port",
+            "",
+        ] {
+            assert!(!is_local_rpc_url(url), "expected remote: {url}");
+        }
+    }
+
+    // ── Unresolvable-host classification (WS connect fail-fast) ────────
+
+    /// Every name-lookup failure text is terminal for the WS connect loop:
+    /// the resolver's verdict is final, so no retry budget may be spent on
+    /// it. Covers glibc's spellings (`EAI_NONAME` and `EAI_AGAIN` both arrive
+    /// prefixed "failed to lookup address information") and the
+    /// macOS/Windows wordings.
+    #[test]
+    fn lookup_failure_texts_classify_as_unresolvable_hosts() {
+        for text in [
+            "failed to lookup address information: Name or service not known",
+            "failed to lookup address information: Temporary failure in name resolution",
+            "Name or service not known",
+            "no such host is known",
+            "nodename nor servname provided, or not known",
+        ] {
+            assert!(is_unresolvable_host(&text), "expected terminal: {text}");
+        }
+    }
+
+    /// A name that RESOLVED but refused or hung is a connection failure —
+    /// retryable by design — so it must not classify as unresolvable.
+    #[test]
+    fn connection_failure_texts_stay_retryable() {
+        for text in [
+            "IO error: Connection refused (os error 111)",
+            "connection timed out",
+            "tcp connect error: Network is unreachable (os error 101)",
+        ] {
+            assert!(!is_unresolvable_host(&text), "expected retryable: {text}");
+        }
+    }
+
+    // ── Revert classification ───────────────────────────────────────────
+
+    /// An EVM execution revert ("execution reverted" message, code -32000)
+    /// classifies as `ProviderError::ExecutionReverted`, not `RpcError`.
+    #[test]
+    fn execution_revert_classified_as_execution_reverted() {
+        let json = r#"{"code":-32000,"message":"execution reverted"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_call failed");
+        assert!(
+            matches!(
+                provider_err,
+                ProviderError::ExecutionReverted { code: -32000, .. }
+            ),
+            "expected ExecutionReverted, got {provider_err:?}"
+        );
+        assert!(!provider_err.is_retryable());
+    }
+
+    /// An Anvil-style revert ("error code 3: execution reverted") also
+    /// classifies as `ExecutionReverted` (case-insensitive marker match).
+    #[test]
+    fn anvil_revert_classified_as_execution_reverted() {
+        let json = r#"{"code":3,"message":"error code 3: execution reverted"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_call failed");
+        assert!(
+            matches!(
+                provider_err,
+                ProviderError::ExecutionReverted { code: 3, .. }
+            ),
+            "expected ExecutionReverted, got {provider_err:?}"
+        );
+    }
+
+    /// A non-revert JSON-RPC error stays `RpcError`.
+    #[test]
+    fn non_revert_error_stays_rpc_error() {
+        let json = r#"{"code":-32001,"message":"requested block not available"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_call failed");
+        assert!(
+            matches!(provider_err, ProviderError::RpcError { code: -32001, .. }),
+            "expected RpcError, got {provider_err:?}"
+        );
+    }
+
+    // ── JSON-RPC-level rate-limit error responses ───────────────
+    //
+    // HTTP 200 + a JSON-RPC error body is how providers (Alchemy, QuickNode,
+    // Infura) signal quota exhaustion over a transport that did NOT fail at
+    // the HTTP layer. `into_provider_error` must recognise these and map them
+    // to `ProviderError::RateLimited` so the retry loop's `is_retryable()`
+    // picks them up (instead of failing fast as `RpcError { code }`).
+
+    /// Alchemy/QuickNode `-32005` (request rate exceeded) maps to
+    /// `RateLimited` (retryable), not `RpcError`.
+    #[test]
+    fn json_rpc_rate_limit_code_32005_classified_as_rate_limited() {
+        let json = r#"{"code":-32005,"message":"your app has exceeded its compute unit capacity"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_getLogs failed");
+        assert!(
+            matches!(provider_err, ProviderError::RateLimited { .. }),
+            "-32005 should map to RateLimited, got {provider_err:?}"
+        );
+        assert!(
+            provider_err.is_retryable(),
+            "RateLimited must be retryable, got {provider_err:?}"
+        );
+        // The per-call context label is preserved in the message.
+        let ProviderError::RateLimited { message } = &provider_err else {
+            unreachable!()
+        };
+        assert!(
+            message.contains("eth_getLogs failed"),
+            "context label lost: {message}"
+        );
+    }
+
+    /// `QuickNode` `-32004` (rate limit) also maps to `RateLimited`.
+    #[test]
+    fn json_rpc_rate_limit_code_32004_classified_as_rate_limited() {
+        let json = r#"{"code":-32004,"message":"rate limit exceeded"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_call failed");
+        assert!(
+            matches!(provider_err, ProviderError::RateLimited { .. }),
+            "-32004 should map to RateLimited, got {provider_err:?}"
+        );
+        assert!(provider_err.is_retryable());
+    }
+
+    /// `Infura`-style `-32001` carrying a rate-limit *message* maps to
+    /// `RateLimited` (the message-marker fallback catches providers that reuse
+    /// a generic code for quota errors). The companion test
+    /// `non_revert_error_stays_rpc_error` pins that `-32001` WITHOUT a
+    /// rate-limit message stays `RpcError` — so the message-marker check is
+    /// exact, not a blanket code match.
+    #[test]
+    fn json_rpc_rate_limit_message_classified_as_rate_limited() {
+        let json = r#"{"code":-32001,"message":"rate limit exceeded, try again later"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_call failed");
+        assert!(
+            matches!(provider_err, ProviderError::RateLimited { .. }),
+            "-32001 with a rate-limit message should map to RateLimited, got {provider_err:?}"
+        );
+        assert!(provider_err.is_retryable());
+    }
+
+    /// `-32601` (method not found) is NOT a rate-limit code and must
+    /// stay `RpcError` (not retried). Guards against an over-broad code set.
+    #[test]
+    fn json_rpc_method_not_found_stays_rpc_error() {
+        let json = r#"{"code":-32601,"message":"the method eth_getLogs does not exist"}"#;
+        let payload: alloy::rpc::json_rpc::ErrorPayload = serde_json::from_str(json).unwrap();
+        let rpc_err: RpcError<TransportErrorKind> = RpcError::ErrorResp(payload);
+        let provider_err = rpc_err.into_provider_error("eth_getLogs failed");
+        assert!(
+            matches!(provider_err, ProviderError::RpcError { code: -32601, .. }),
+            "-32601 should stay RpcError, got {provider_err:?}"
+        );
+        assert!(!provider_err.is_retryable());
+    }
+
+    // ── LogFilter construction ──────────────────────────────────────────
+
+    #[test]
+    fn test_log_filter_creation() {
+        let filter = LogFilter::new(
+            100,
+            200,
+            Some(vec![
+                "0x1234567890abcdef1234567890abcdef12345678".to_string()
+            ]),
+            Some(vec![vec![
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ]]),
+        )
+        .expect("valid log filter should be created");
+
+        assert_eq!(filter.from_block(), Some(100));
+        assert_eq!(filter.to_block(), Some(200));
+        assert_eq!(filter.addresses.len(), 1);
+    }
+
+    #[test]
+    fn test_log_filter_invalid_range() {
+        let result = LogFilter::new(200, 100, None, None);
+
+        assert!(result.is_err());
+        match result {
+            Err(ProviderError::InvalidBlockRange { from, to }) => {
+                assert_eq!(from, 200);
+                assert_eq!(to, 100);
+            }
+            _ => panic!("Expected InvalidBlockRange error"),
+        }
+    }
+
+    #[test]
+    fn test_log_filter_equal_range() {
+        // from_block == to_block is valid (single-block query)
+        let filter = LogFilter::new(42, 42, None, None).expect("equal range should be valid");
+        assert_eq!(filter.from_block(), Some(42));
+        assert_eq!(filter.to_block(), Some(42));
+    }
+
+    #[test]
+    fn test_log_filter_defaults() {
+        let filter = LogFilter::new(0, 100, None, None).expect("valid");
+        assert!(filter.addresses.is_empty());
+        assert!(filter.topics.is_empty());
+    }
+
+    #[test]
+    fn test_log_filter_invalid_address_eager() {
+        // Invalid addresses are now caught at construction time
+        let result = LogFilter::new(100, 200, Some(vec!["not_an_address".to_string()]), None);
+        assert!(result.is_err());
+        match result {
+            Err(ProviderError::InvalidAddress { address, .. }) => {
+                assert_eq!(address, "not_an_address");
+            }
+            other => panic!("Expected InvalidAddress error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_log_filter_invalid_topic_eager() {
+        // Invalid topics are now caught at construction time
+        let result = LogFilter::new(100, 200, None, Some(vec![vec!["not_a_topic".to_string()]]));
+        assert!(result.is_err());
+        match result {
+            Err(ProviderError::InvalidTopic { topic, .. }) => {
+                assert_eq!(topic, "not_a_topic");
+            }
+            other => panic!("Expected InvalidTopic error, got {other:?}"),
+        }
+    }
+
+    // ── LogFilter → Alloy Filter conversion ─────────────────────────────
+
+    #[test]
+    fn test_to_alloy_filter_maps_topic_positions() {
+        let topic0_val = "0x0000000000000000000000000000000000000000000000000000000000000001";
+        let topic1_val = "0x0000000000000000000000000000000000000000000000000000000000000002";
+        let topic2_val = "0x0000000000000000000000000000000000000000000000000000000000000003";
+
+        let filter = LogFilter::new(
+            100,
+            200,
+            None,
+            Some(vec![
+                vec![topic0_val.to_string()],
+                vec![topic1_val.to_string()],
+                vec![topic2_val.to_string()],
+            ]),
+        )
+        .expect("valid filter");
+
+        let alloy_filter = filter.to_alloy_filter();
+        let topics = &alloy_filter.topics;
+
+        assert_eq!(
+            topics[0].clone().into_iter().collect::<Vec<_>>(),
+            vec![B256::from_str(topic0_val).unwrap()]
+        );
+        assert_eq!(
+            topics[1].clone().into_iter().collect::<Vec<_>>(),
+            vec![B256::from_str(topic1_val).unwrap()]
+        );
+        assert_eq!(
+            topics[2].clone().into_iter().collect::<Vec<_>>(),
+            vec![B256::from_str(topic2_val).unwrap()]
+        );
+    }
+
+    #[test]
+    fn test_to_alloy_filter_rejects_topic_position_out_of_range() {
+        let result = LogFilter::new(
+            100,
+            200,
+            None,
+            Some(vec![
+                vec![
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                        .to_string(),
+                ],
+                vec![],
+                vec![],
+                vec![],
+                vec![
+                    "0x0000000000000000000000000000000000000000000000000000000000000002"
+                        .to_string(),
+                ],
+            ]),
+        );
+
+        assert!(result.is_err());
+        match result {
+            Err(ProviderError::InvalidTopic { reason, .. }) => {
+                assert!(reason.contains("out of range"));
+            }
+            _ => panic!("Expected InvalidTopic error"),
+        }
+    }
+
+    #[test]
+    fn test_to_alloy_filter_skips_empty_topic_slots() {
+        // Verify that empty inner vecs are skipped without error
+        let filter = LogFilter::new(
+            100,
+            200,
+            None,
+            Some(vec![
+                vec![
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                        .to_string(),
+                ],
+                vec![], // should be skipped
+                vec![
+                    "0x0000000000000000000000000000000000000000000000000000000000000003"
+                        .to_string(),
+                ],
+            ]),
+        )
+        .expect("valid filter");
+
+        let _ = filter.to_alloy_filter(); // infallible, just verifying no panic
+    }
+
+    // ── Retry backoff logic ─────────────────────────────────────────────
+
+    #[test]
+    fn test_backoff_is_capped() {
+        // The shared policy caps at MAX_RETRY_DELAY_MS without overflow even
+        // at a saturating attempt ordinal.
+        let policy = rpc_retry_policy(100);
+        assert_eq!(
+            policy.capped_backoff(u32::MAX),
+            Duration::from_millis(MAX_RETRY_DELAY_MS)
+        );
+        assert_eq!(
+            policy.capped_backoff(100),
+            Duration::from_millis(MAX_RETRY_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn test_backoff_progression() {
+        // Verify the exponential backoff sequence up to the cap via the shared
+        // RetryPolicy curve.
+        let policy = rpc_retry_policy(20);
+        let delays: Vec<u128> = (1..=11)
+            .map(|attempt| policy.capped_backoff(attempt).as_millis())
+            .collect();
+
+        // Should double each step until hitting the 30s cap
+        assert_eq!(
+            delays,
+            vec![100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 30000, 30000,]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_returns_ok_immediately() {
+        // Successful operations should return on the first attempt
+
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count_clone = Arc::clone(&call_count);
+
+        // Simulate retry_with_backoff logic inline
+        let max_attempts: u32 = 10;
+        let mut attempt = 0;
+
+        let result: ProviderResult<u64> = loop {
+            let count = count_clone.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                break Ok(42);
+            }
+            attempt += 1;
+            if attempt >= max_attempts {
+                break Err(ProviderError::Other {
+                    message: "too many attempts".to_string(),
+                });
+            }
+        };
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_retryable_error_classification() {
+        // Retryable errors
+        assert!(ProviderError::RateLimited {
+            message: "test".to_string()
+        }
+        .is_retryable());
+        assert!(ProviderError::Timeout {
+            message: "test".to_string()
+        }
+        .is_retryable());
+        assert!(ProviderError::ConnectionFailed {
+            message: "test".to_string()
+        }
+        .is_retryable());
+
+        // Non-retryable errors
+        let non_retryable = [
+            ProviderError::RpcError {
+                code: -32000,
+                message: "revert".to_string(),
+            },
+            ProviderError::ExecutionReverted {
+                code: -32000,
+                message: "execution reverted".to_string(),
+            },
+            ProviderError::InvalidBlockRange { from: 1, to: 0 },
+            ProviderError::InvalidParams {
+                message: "bad".to_string(),
+            },
+            ProviderError::SerializationError {
+                message: "bad".to_string(),
+            },
+            ProviderError::Other {
+                message: "bad".to_string(),
+            },
+        ];
+
+        for err in non_retryable {
+            assert!(!err.is_retryable(), "{err:?} should not be retryable");
+        }
+    }
+
+    // ── retry-loop emits tracing records on every attempt ───────
+    //
+    // `tracing::subscriber::set_global_default` is once-per-process, so a
+    // `Once` guard installs a subscriber that forwards events to a
+    // thread-local `Sender`. Each test registers its own capture sink.
+    use std::cell::RefCell;
+    use std::sync::Once;
+    use tracing_subscriber::layer::{Context, Layer};
+    use tracing_subscriber::registry::LookupSpan;
+    thread_local! {
+        static RETRY_CAPTURE: RefCell<Option<std::sync::mpsc::Sender<String>>> =
+            const { RefCell::new(None) };
+    }
+    struct CapturingLayer;
+    impl<S> Layer<S> for CapturingLayer
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &tracing::Event, _ctx: Context<'_, S>) {
+            let meta = event.metadata();
+            // ADR-043: retry events moved to the closed `apexbot::rpc` target;
+            // the loop's own attempt-0 debug still uses the module target.
+            if !meta.target().starts_with("apexbot_rpc::provider")
+                && meta.target() != "apexbot::rpc"
+            {
+                return;
+            }
+            // Format the event message by visiting fields.
+            let mut collector = apexbot_core::log_capture::MessageVisitor::default();
+            event.record(&mut collector);
+            let message = collector.into_unquoted().unwrap_or_default();
+            RETRY_CAPTURE.with(|c| {
+                if let Some(tx) = &*c.borrow() {
+                    let _ = tx.send(format!("{}|{}|{}", meta.level(), meta.target(), message));
+                }
+            });
+        }
+    }
+
+    static INSTALL_CAPTURE_SUBSCRIBER: Once = Once::new();
+    fn install_capturing_subscriber() {
+        INSTALL_CAPTURE_SUBSCRIBER.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let subscriber = tracing_subscriber::registry().with(CapturingLayer);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+    fn capture_retry_logs() -> std::sync::mpsc::Receiver<String> {
+        install_capturing_subscriber();
+        let (tx, rx) = std::sync::mpsc::channel();
+        RETRY_CAPTURE.with(|c| *c.borrow_mut() = Some(tx));
+        rx
+    }
+    fn stop_capturing_retry_logs() {
+        RETRY_CAPTURE.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// a retryable error that exhausts all attempts emits one `error!`
+    /// record (the terminal failure) plus a `debug!`/`warn!` per preceding retry,
+    /// each carrying `attempt`, `max_attempts`, the delay, and the `ProviderError`
+    /// display (which embeds the per-call context label).
+    #[tokio::test]
+    async fn retry_with_backoff_loop_emits_log_on_each_retry_and_terminal_failure() {
+        let rx = capture_retry_logs();
+
+        let attempt = 0;
+        let max_attempts: u32 = 3;
+        // Each invocation fails with a retryable rate-limit error; the context
+        // label "eth_call failed" is baked into the message via Display.
+        let result: ProviderResult<u64> = retry_with_backoff_loop(
+            max_attempts,
+            Duration::from_secs(30),
+            None,
+            move || async move {
+                diag!(domain = rpc, attempt, "invocation attempt");
+                Err(ProviderError::RateLimited {
+                    message: "eth_call failed: rate limited".to_string(),
+                })
+            },
+        )
+        .await;
+
+        stop_capturing_retry_logs();
+
+        assert!(result.is_err(), "should exhaust retries");
+        let logs: Vec<String> = rx.iter().collect();
+        // attempt 1 (debug), attempt 2 (warn), then the terminal error (attempt 3).
+        let retry_lines: Vec<&String> = logs
+            .iter()
+            .filter(|l| l.contains("DEBUG|") || l.contains("WARN|"))
+            .filter(|l| l.contains("RPC retry"))
+            .collect();
+        let terminal_lines: Vec<&String> = logs
+            .iter()
+            .filter(|l| l.contains("ERROR|"))
+            .filter(|l| l.contains("RPC retries exhausted"))
+            .collect();
+        assert_eq!(
+            retry_lines.len(),
+            2,
+            "expected exactly two retry records (attempts 1 and 2), got {retry_lines:?}"
+        );
+        assert_eq!(
+            terminal_lines.len(),
+            1,
+            "expected exactly one terminal-failure record, got {terminal_lines:?}"
+        );
+
+        // Assert levels: first attempt is DEBUG, second is WARN.
+        let first = &retry_lines[0];
+        assert!(
+            first.starts_with("DEBUG|"),
+            "attempt 1 should be debug!: {first}"
+        );
+        assert!(
+            first.contains("RPC retry"),
+            "first retry missing message: {first}"
+        );
+        let second = &retry_lines[1];
+        assert!(
+            second.starts_with("WARN|"),
+            "attempt 2 should be warn!: {second}"
+        );
+        assert!(
+            second.contains("RPC retry"),
+            "second retry missing message: {second}"
+        );
+        let terminal = &terminal_lines[0];
+        assert!(
+            terminal.starts_with("ERROR|"),
+            "terminal failure should be error!: {terminal}"
+        );
+        assert!(
+            terminal.contains("RPC retries exhausted"),
+            "terminal record missing message: {terminal}"
+        );
+    }
+
+    /// a non-retryable error is surfaced immediately with NO retry log
+    /// emission (the loop returns before the logging branch).
+    #[tokio::test]
+    async fn retry_with_backoff_loop_emits_no_log_for_non_retryable_error() {
+        let rx = capture_retry_logs();
+
+        let max_attempts: u32 = 5;
+        let result: ProviderResult<u64> =
+            retry_with_backoff_loop(max_attempts, Duration::from_secs(30), None, || async {
+                Err(ProviderError::InvalidBlockRange { from: 2, to: 1 })
+            })
+            .await;
+
+        stop_capturing_retry_logs();
+
+        assert!(result.is_err(), "non-retryable should surface immediately");
+        let logs: Vec<String> = rx.iter().collect();
+        assert!(
+            logs.iter()
+                .all(|l| !l.contains("RPC retry") && !l.contains("RPC retries exhausted")),
+            "non-retryable error must not emit retry/exhausted logs, got {logs:?}"
+        );
+    }
+
+    /// a successful first attempt emits NO retry log (the happy path).
+    #[tokio::test]
+    async fn retry_with_backoff_loop_emits_no_log_on_first_success() {
+        let rx = capture_retry_logs();
+
+        let max_attempts: u32 = 3;
+        let result: ProviderResult<u64> =
+            retry_with_backoff_loop(max_attempts, Duration::from_secs(30), None, || async {
+                Ok(7_u64)
+            })
+            .await;
+
+        stop_capturing_retry_logs();
+
+        assert_eq!(result.unwrap(), 7);
+        let logs: Vec<String> = rx.iter().collect();
+        assert!(
+            logs.is_empty(),
+            "successful first attempt must emit no provider logs, got {logs:?}"
+        );
+    }
+
+    /// a stuck call (operation sleeps longer than the per-call
+    /// timeout) is bounded — the loop does NOT hang forever, it classifies
+    /// the elapsed attempt as `ProviderError::Timeout`, retries, and after
+    /// exhausting attempts returns `Timeout`. Wall-clock is bounded by
+    /// `(attempts × call_timeout) + backoff`, not by the hung transport.
+    #[tokio::test]
+    async fn retry_with_backoff_loop_times_out_hung_call_within_bounded_wall_clock() {
+        // A timeout so short a real network call could never complete, but long
+        // enough to be measurable. The operation sleeps far longer than the
+        // timeout, so it can never win the race — simulating a stuck WS/IPC read.
+        let call_timeout = Duration::from_millis(20);
+        let hung_sleep = Duration::from_millis(500);
+        // max_attempts = 2 so we get exactly: 1st attempt times out → backoff
+        // (INITIAL_RETRY_DELAY_MS=100ms + 0..MAX_JITTER_MS) → 2nd attempt times
+        // out → exhausted → return `Timeout`.
+        let max_attempts: u32 = 2;
+
+        let started = std::time::Instant::now();
+        let result: ProviderResult<u64> =
+            retry_with_backoff_loop(max_attempts, call_timeout, None, || async {
+                tokio::time::sleep(hung_sleep).await;
+                Ok(7_u64)
+            })
+            .await;
+        let elapsed = started.elapsed();
+
+        // Does not hang forever: elapsed is dominated by the backoff
+        // (INITIAL_RETRY_DELAY_MS=100ms + jitter up to MAX_JITTER_MS=100ms)
+        // plus the two cut-off attempts (2 × 20ms), NOT by the hung
+        // transport's 500ms sleep. Worst case ≈ 20 + 200 + 20 = 240ms; the
+        // key property is that we never waited for even ONE full hung sleep.
+        assert!(
+            elapsed < hung_sleep,
+            "hung call should have been cut off by the per-call timeout, not blocked on tokio::sleep for {hung_sleep:?}; elapsed {elapsed:?}"
+        );
+        assert!(
+            matches!(result, Err(ProviderError::Timeout { .. })),
+            "exhausted retries on a hung call should surface Timeout, got {result:?}"
+        );
+    }
+
+    /// after a per-call timeout, the loop retries and can succeed on
+    /// a later attempt — the timeout is classified as retryable (feeds
+    /// `is_retryable()`), the backoff applies, and a fast retry wins.
+    #[tokio::test]
+    async fn retry_with_backoff_loop_recovers_after_timeout_then_success() {
+        // Short timeout so the first (hung) attempt is cut off quickly.
+        let call_timeout = Duration::from_millis(20);
+        let max_attempts: u32 = 3;
+        let attempt_counter = Arc::new(AtomicU32::new(0));
+        let counter = attempt_counter.clone();
+
+        let result: ProviderResult<u64> =
+            retry_with_backoff_loop(max_attempts, call_timeout, None, move || {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First attempt: hang (simulates a stuck WS/IPC read).
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Ok(42_u64)
+                }
+            })
+            .await;
+
+        assert_eq!(
+            result.unwrap(),
+            42,
+            "should recover after the hung first attempt"
+        );
+        assert_eq!(
+            attempt_counter.load(Ordering::SeqCst),
+            2,
+            "exactly two attempts: the first timed out, the second succeeded"
+        );
+    }
+
+    /// The declared key is what a provider constructor snapshots.
+    #[test]
+    fn configured_retry_budget_reads_the_declared_key() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        govern_nodes(None, None);
+        assert_eq!(
+            configured_retry_budget(),
+            None,
+            "unset is production's unbounded schedule"
+        );
+
+        let mut cfg = ::apexbot_config::BotConfig::default();
+        cfg.nodes.retry_budget_ms = Some(2_500);
+        let _ = ::apexbot_config::holder::reinstall_for_tests(std::sync::Arc::new(cfg));
+        assert_eq!(
+            configured_retry_budget(),
+            Some(Duration::from_millis(2_500))
+        );
+
+        govern_nodes(None, None);
+    }
+
+    /// A constructed provider carries the declared budget, so the key reaches
+    /// the retry loop through the provider rather than a live config read.
+    #[test]
+    fn a_constructed_provider_snapshots_the_declared_retry_budget() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        let mut cfg = ::apexbot_config::BotConfig::default();
+        cfg.nodes.retry_budget_ms = Some(1_234);
+        let _ = ::apexbot_config::holder::reinstall_for_tests(std::sync::Arc::new(cfg));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a current-thread runtime for one construction");
+        // HTTP connects lazily, so an unused address still builds a provider.
+        let provider = runtime
+            .block_on(AlloyProvider::new("http://127.0.0.1:1", 1))
+            .expect("an HTTP endpoint builds without connecting");
+        assert_eq!(provider.retry_budget, Some(Duration::from_millis(1_234)));
+
+        govern_nodes(None, None);
+    }
+
+    /// A budget the next backoff would overrun stops the chain with the
+    /// distinguishable error, and the refused backoff is never slept.
+    #[tokio::test]
+    async fn retry_with_backoff_loop_stops_at_the_retry_budget_with_a_distinguishable_error() {
+        let max_attempts: u32 = 11;
+        let budget = Duration::from_millis(250);
+        let started = std::time::Instant::now();
+        let result: ProviderResult<u64> = retry_with_backoff_loop(
+            max_attempts,
+            Duration::from_secs(30),
+            Some(budget),
+            || async {
+                Err(ProviderError::RateLimited {
+                    message: "429 from the fake node".to_string(),
+                })
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        // The second backoff (200-300ms after jitter) cannot fit in what is
+        // left of 250ms, so it is refused rather than slept: the wall clock
+        // stays inside the budget plus scheduling slack.
+        assert!(
+            elapsed < budget + Duration::from_millis(100),
+            "the refused backoff was never slept, elapsed {elapsed:?} against budget {budget:?}"
+        );
+        match result {
+            Err(ProviderError::RetryBudgetExhausted {
+                attempt,
+                budget_ms,
+                last_error,
+                ..
+            }) => {
+                assert_eq!(
+                    attempt, 2,
+                    "the 100ms retry fits the budget, the following 200ms does not"
+                );
+                assert_eq!(budget_ms, 250);
+                assert!(
+                    last_error.contains("429 from the fake node"),
+                    "the last transport failure travels with the refusal: {last_error}"
+                );
+            }
+            other => panic!("expected a retry-budget exhaustion, got {other:?}"),
+        }
+    }
+
+    /// `None` is production's posture: the attempt count alone bounds the chain
+    /// and the underlying transport error surfaces verbatim. Pinned so a budget
+    /// can never quietly shorten the default schedule.
+    #[tokio::test]
+    async fn retry_with_backoff_loop_without_a_budget_keeps_the_full_attempt_chain() {
+        let max_attempts: u32 = 3;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let counter = attempts.clone();
+        let result: ProviderResult<u64> =
+            retry_with_backoff_loop(max_attempts, Duration::from_secs(30), None, move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(ProviderError::RateLimited {
+                        message: "429 that never stops".to_string(),
+                    })
+                }
+            })
+            .await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            max_attempts,
+            "an unbudgeted chain spends every attempt it was given"
+        );
+        assert!(
+            matches!(result, Err(ProviderError::RateLimited { .. })),
+            "no budget means no substitution: the transport error surfaces as-is, got {result:?}"
+        );
+    }
+
+    /// A fault-injected node: every HTTP request answers `429 Too Many
+    /// Requests`.
+    ///
+    /// A std listener on a detached thread, so the probe needs neither tokio's
+    /// `net` feature nor a test-only transport fake: the real transport
+    /// classification, the real retry loop, and the real budget all run.
+    fn spawn_429_node() -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("listener address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // The request body is irrelevant; the status line IS the fault.
+                let mut buf = [0_u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The lane's failure shape, end to end: a node answering 429 to every
+    /// request drives a real provider through its retry chain, and the budget
+    /// ends that chain with a DISTINGUISHABLE error instead of letting it run
+    /// the schedule out (11 attempts, sleeps to 12.8s, 81.1s of backoff) into
+    /// whatever timeout the caller happens to have.
+    #[tokio::test]
+    async fn forced_429_node_fails_with_the_retry_budget_error() {
+        let url = spawn_429_node();
+        let budget = Duration::from_millis(300);
+        let provider = AlloyProvider::new(&url, 10)
+            .await
+            .expect("a provider builds against a listening endpoint")
+            .with_retry_budget(Some(budget));
+        let rx = capture_retry_logs();
+
+        let started = std::time::Instant::now();
+        let result = provider.get_block_number().await;
+        let elapsed = started.elapsed();
+
+        stop_capturing_retry_logs();
+        let logs: Vec<String> = rx.iter().collect();
+
+        // The retry lines fired before the terminal one: this is a chain that
+        // was stopped, not a first-attempt failure.
+        assert!(
+            logs.iter().any(|line| line.contains("RPC retry")),
+            "the stopped chain had already retried, logs: {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("RPC retry budget exhausted")),
+            "the terminal record names the budget as the cause, logs: {logs:?}"
+        );
+        assert!(
+            elapsed < budget + Duration::from_millis(500),
+            "the budget bounds the wait (the unbudgeted schedule would sleep 81.1s), \
+             elapsed {elapsed:?} against budget {budget:?}"
+        );
+        match result {
+            Err(ProviderError::RetryBudgetExhausted {
+                attempt,
+                elapsed_ms,
+                budget_ms,
+                last_error,
+            }) => {
+                assert!(attempt >= 2, "at least one retry happened, got {attempt}");
+                assert!(
+                    attempt < 11,
+                    "the budget, not the attempt count, ended the chain: {attempt}"
+                );
+                assert_eq!(budget_ms, 300);
+                assert!(
+                    elapsed_ms <= 400,
+                    "elapsed_ms tracks the measured wait, got {elapsed_ms}"
+                );
+                assert!(
+                    last_error.contains("Rate limited"),
+                    "the 429 classification travels with the refusal: {last_error}"
+                );
+            }
+            other => panic!("expected a retry-budget exhaustion, got {other:?}"),
+        }
+    }
+
+    // ── Chunk calculation ───────────────────────────────────────────────
+
+    #[test]
+    fn test_chunk_ranges_exact_division() {
+        // 100 blocks, 100 per chunk → 1 chunk
+        let from = 0u64;
+        let to = 99u64;
+        let chunk_size = 100u64;
+
+        let mut chunks = Vec::new();
+        let mut current = from;
+        while current <= to {
+            let end = std::cmp::min(current + chunk_size - 1, to);
+            chunks.push((current, end));
+            current = end + 1;
+        }
+
+        assert_eq!(chunks, vec![(0, 99)]);
+    }
+
+    #[test]
+    fn test_chunk_ranges_partial() {
+        // 250 blocks, 100 per chunk → 3 chunks
+        let from = 0u64;
+        let to = 249u64;
+        let chunk_size = 100u64;
+
+        let mut chunks = Vec::new();
+        let mut current = from;
+        while current <= to {
+            let end = std::cmp::min(current + chunk_size - 1, to);
+            chunks.push((current, end));
+            current = end + 1;
+        }
+
+        assert_eq!(chunks, vec![(0, 99), (100, 199), (200, 249)]);
+    }
+
+    #[test]
+    fn test_chunk_ranges_single_block() {
+        // 1 block → 1 chunk of size 1
+        let from = 42u64;
+        let to = 42u64;
+        let chunk_size = 100u64;
+
+        let mut chunks = Vec::new();
+        let mut current = from;
+        while current <= to {
+            let end = std::cmp::min(current + chunk_size - 1, to);
+            chunks.push((current, end));
+            current = end + 1;
+        }
+
+        assert_eq!(chunks, vec![(42, 42)]);
+    }
+
+    #[test]
+    fn test_chunk_ranges_non_zero_start() {
+        // Starting from block 500
+        let from = 500u64;
+        let to = 799u64;
+        let chunk_size = 100u64;
+
+        let mut chunks = Vec::new();
+        let mut current = from;
+        while current <= to {
+            let end = std::cmp::min(current + chunk_size - 1, to);
+            chunks.push((current, end));
+            current = end + 1;
+        }
+
+        assert_eq!(chunks, vec![(500, 599), (600, 699), (700, 799)]);
+    }
+
+    // ── URL scheme detection ────────────────────────────────────────────
+
+    #[test]
+    fn test_url_scheme_detection() {
+        // HTTP variants
+        assert!("http://localhost:8545".starts_with("http://"));
+        assert!("https://mainnet.infura.io".starts_with("https://"));
+
+        // WebSocket variants
+        assert!("ws://localhost:8546".starts_with("ws://"));
+        assert!("wss://mainnet.infura.io/ws".starts_with("wss://"));
+
+        // IPC paths (no ://)
+        assert!(!"/tmp/anvil.ipc".contains("://"));
+        assert!(!"\\\\.\\pipe\\anvil".contains("://"));
+
+        // Unsupported schemes
+        assert!("ftp://example.com".starts_with("ftp://"));
+    }
+
+    #[test]
+    fn test_unsupported_scheme_extraction() {
+        let url = "ftp://example.com";
+        let scheme = url.split("://").next().unwrap_or(url);
+        assert_eq!(scheme, "ftp");
+    }
+
+    // ── LogFetcher validation ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fetch_logs_chunked_zero_chunk_size_rejected() {
+        let max_blocks_per_request = 0u64;
+
+        // This is the check from fetch_logs_chunked:
+        let result = if max_blocks_per_request == 0 {
+            Err(ProviderError::InvalidParams {
+                message: "max_blocks_per_request must be greater than 0".to_string(),
+            })
+        } else {
+            Ok(())
+        };
+
+        assert!(result.is_err());
+        match result {
+            Err(ProviderError::InvalidParams { message }) => {
+                assert!(message.contains("greater than 0"));
+            }
+            other => panic!("Expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_logs_chunked_invalid_range_rejected() {
+        let from_block = 200u64;
+        let to_block = 100u64;
+
+        // This is the check from fetch_logs_chunked:
+        let result = if from_block > to_block {
+            Err(ProviderError::InvalidBlockRange {
+                from: from_block,
+                to: to_block,
+            })
+        } else {
+            Ok(())
+        };
+
+        assert!(result.is_err());
+        match result {
+            Err(ProviderError::InvalidBlockRange { from, to }) => {
+                assert_eq!(from, 200);
+                assert_eq!(to, 100);
+            }
+            other => panic!("Expected InvalidBlockRange, got {other:?}"),
+        }
+    }
+
+    // ── LogFetcher concurrency cap ─────────────────────────────────────
+
+    #[test]
+    fn test_concurrency_cap() {
+        // Values above the cap should be clamped
+        let requested = 1000usize;
+        let clamped = requested.min(MAX_CONCURRENT_REQUESTS_CAP);
+        assert_eq!(clamped, MAX_CONCURRENT_REQUESTS_CAP);
+    }
+
+    #[test]
+    fn test_concurrency_within_cap() {
+        // Values within the cap should pass through
+        let requested = 8usize;
+        let clamped = requested.min(MAX_CONCURRENT_REQUESTS_CAP);
+        assert_eq!(clamped, 8);
+    }
+
+    // ── Log sorting ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_log_sort_order() {
+        // Verify logs sort by (block_number, log_index) even when provided out of order.
+        let logs: Vec<Log> = vec![
+            Log {
+                block_number: Some(100),
+                log_index: Some(2),
+                ..Default::default()
+            },
+            Log {
+                block_number: Some(99),
+                log_index: Some(0),
+                ..Default::default()
+            },
+            Log {
+                block_number: Some(100),
+                log_index: Some(0),
+                ..Default::default()
+            },
+            Log {
+                block_number: None,
+                log_index: None,
+                ..Default::default()
+            },
+        ];
+
+        let mut sorted = logs;
+        sorted.sort_by(|a, b| {
+            let a_block = a.block_number.unwrap_or(0);
+            let b_block = b.block_number.unwrap_or(0);
+            a_block
+                .cmp(&b_block)
+                .then_with(|| a.log_index.unwrap_or(0).cmp(&b.log_index.unwrap_or(0)))
+        });
+
+        // Expected order: block_number=None(0,0), 99(99,0), 100(100,0), 100(100,2)
+        assert_eq!(sorted[0].log_index, None); // pending log comes first (0,0)
+        assert_eq!(sorted[1].block_number, Some(99));
+        assert_eq!(sorted[2].block_number, Some(100));
+        assert_eq!(sorted[2].log_index, Some(0));
+        assert_eq!(sorted[3].block_number, Some(100));
+        assert_eq!(sorted[3].log_index, Some(2));
+    }
+
+    // ── EthBlock type alias ────────────────────────────────────────────
+
+    #[test]
+    fn test_eth_block_type_alias_compiles() {
+        // Verify the type alias is usable (compile-time check)
+        fn assert_block_type(_: Option<EthBlock>) {}
+        assert_block_type(None);
+    }
+
+    // ── IPC path detection + idempotent retry allowlist ─────────
+
+    #[test]
+    fn test_is_ipc_path_detects_unix_and_windows_and_scheme() {
+        // Unix absolute path
+        assert!(is_ipc_path("/tmp/anvil.ipc"));
+        assert!(is_ipc_path("/var/run/geth.ipc"));
+        // Windows named pipe (backslash-backslash)
+        assert!(is_ipc_path("\\\\.\\pipe\\geth.ipc"));
+        // Explicit ipc:// scheme
+        assert!(is_ipc_path("ipc:///tmp/anvil.ipc"));
+    }
+
+    #[test]
+    fn test_is_ipc_path_rejects_bare_hostport_typo() {
+        // A bare `localhost:8545` (missing the http:// scheme) is
+        // NO longer silently routed to IPC. It must be rejected so the typo
+        // surfaces in the unsupported-scheme error.
+        assert!(!is_ipc_path("localhost:8545"));
+        assert!(!is_ipc_path("127.0.0.1:8545"));
+        assert!(!is_ipc_path("example.com:8545"));
+        // Unrecognized schemes are not IPC paths either.
+        assert!(!is_ipc_path("ftp://something"));
+        assert!(!is_ipc_path("ldap://something"));
+    }
+
+    #[test]
+    fn test_is_idempotent_rpc_method_allowlist() {
+        // Read-only eth_* methods are retry-safe.
+        assert!(is_idempotent_rpc_method("eth_call"));
+        assert!(is_idempotent_rpc_method("eth_getLogs"));
+        assert!(is_idempotent_rpc_method("eth_getBlockByNumber"));
+        assert!(is_idempotent_rpc_method("eth_getTransactionReceipt"));
+        assert!(is_idempotent_rpc_method("eth_chainId"));
+        assert!(is_idempotent_rpc_method("eth_feeHistory"));
+    }
+
+    #[test]
+    fn test_is_idempotent_rpc_method_rejects_non_idempotent() {
+        // Mutating + stateful methods must NOT be retried blindly.
+        assert!(!is_idempotent_rpc_method("eth_sendRawTransaction"));
+        assert!(!is_idempotent_rpc_method("eth_sendTransaction"));
+        assert!(!is_idempotent_rpc_method("debug_traceCallByBlockhash"));
+        assert!(!is_idempotent_rpc_method("trace_call"));
+        assert!(!is_idempotent_rpc_method("trace_block"));
+        assert!(!is_idempotent_rpc_method("custom_method"));
+    }
+
+    // ── parity gate (`docs/architecture/parity-gate.md`): typed RPC struct JSON round-trips match web3.py ───
+    //
+    // The parity oracle is the web3.py JSON shape (the execution-apis spec).
+    // These tests assert that the typed Rust request/response structs
+    // deserialize + re-serialize to byte-identical JSON, proving the typed
+    // fns' JSON↔struct transforms match web3.py exactly (no field renaming,
+    // no quantity-encoding drift). Canonical fixtures from the execution-apis
+    // spec + alloy's own conformance tests.
+
+    #[test]
+    fn fee_history_response_round_trips_byte_identical_to_web3() {
+        // Canonical eth_feeHistory response. web3.py decodes this into its
+        // FeeHistory dict; the Rust struct must re-serialize byte-identically.
+        let sample = r#"{"baseFeePerGas":["0x342770c0","0x2da282a8"],"gasUsedRatio":[0.0],"baseFeePerBlobGas":["0x0","0x0"],"blobGasUsedRatio":[0.0],"oldestBlock":"0x1"}"#;
+        let fh: FeeHistory = serde_json::from_str(sample).expect("decode web3 feeHistory");
+        // Field-level parity (the values web3.py would surface)
+        assert_eq!(fh.oldest_block, 1);
+        assert_eq!(fh.base_fee_per_gas, vec![875_000_000, 765_625_000]);
+        assert_eq!(fh.gas_used_ratio, vec![0.0]);
+        assert_eq!(fh.reward, None);
+        // Byte-identical re-serialization
+        assert_eq!(serde_json::to_string(&fh).unwrap(), sample);
+    }
+
+    #[test]
+    fn fee_history_with_reward_percentiles_decodes() {
+        // Response including the `reward` field (priority-fee samples per
+        // percentile) — the shape the bot's _compute_priority_fee consumes.
+        let json = r#"{"baseFeePerBlobGas":["0xc0","0xb2"],"baseFeePerGas":["0x4cb8cf181","0x53075988e"],"blobGasUsedRatio":[0.16666666666666666,0.3333333333333333],"gasUsedRatio":[0.8288135,0.3407616666666667],"oldestBlock":"0x59f94f","reward":[["0x59682f00"],["0x59682f00"]]}"#;
+        let fh: FeeHistory = serde_json::from_str(json).expect("decode feeHistory w/ reward");
+        assert_eq!(fh.oldest_block, 0x59_f94f);
+        assert_eq!(fh.base_fee_per_gas.len(), 2);
+        let reward = fh.reward.expect("reward field present");
+        assert_eq!(reward.len(), 2);
+        assert_eq!(reward[0], vec![0x5968_2f00_u128]);
+    }
+
+    #[test]
+    fn create_access_list_response_decodes_to_web3_shape() {
+        // Canonical eth_createAccessList response: {accessList, gasUsed}.
+        let json = r#"{"accessList":[{"address":"0x0000000000000000000000000000000000000101","storageKeys":["0x0000000000000000000000000000000000000000000000000000000000000000"]}],"gasUsed":"0x5208"}"#;
+        let result: AccessListResult = serde_json::from_str(json).expect("decode access list");
+        assert!(result.error.is_none());
+        assert_eq!(result.gas_used, alloy::primitives::U256::from(0x5208));
+        assert_eq!(result.access_list.0.len(), 1);
+        let item = &result.access_list.0[0];
+        assert_eq!(
+            format!("{:?}", item.address),
+            "0x0000000000000000000000000000000000000101"
+        );
+        assert_eq!(item.storage_keys.len(), 1);
+        assert_eq!(item.storage_keys[0], alloy::primitives::B256::ZERO);
+        // Re-serialize → camelCase shape matches web3.py
+        let reser = serde_json::to_string(&result).unwrap();
+        assert!(reser.contains("\"accessList\""));
+        assert!(reser.contains("\"gasUsed\""));
+    }
+
+    #[test]
+    fn create_access_list_error_response_decodes() {
+        // web3.py surfaces the `error` field when the tx would revert.
+        let json = r#"{"accessList":[],"gasUsed":"0x0","error":"transaction execution failed"}"#;
+        let result: AccessListResult =
+            serde_json::from_str(json).expect("decode errored access list");
+        assert_eq!(
+            result.error.as_deref(),
+            Some("transaction execution failed")
+        );
+        assert_eq!(result.gas_used, alloy::primitives::U256::ZERO);
+    }
+
+    #[test]
+    fn simulate_v1_request_round_trips_byte_identical_to_web3() {
+        // Canonical eth_simulateV1 request payload (execution-apis spec):
+        // blockStateCalls with state overrides + calls. web3.py builds this
+        // dict; the Rust SimulatePayload must re-serialize byte-identically.
+        let request_json = serde_json::json!({
+            "blockStateCalls": [
+                {
+                    "blockOverrides": {},
+                    "stateOverrides": {
+                        "0xc000000000000000000000000000000000000000": {
+                            "nonce": "0x5"
+                        }
+                    },
+                    "calls": []
+                },
+                {
+                    "blockOverrides": {},
+                    "stateOverrides": {
+                        "0xc000000000000000000000000000000000000000": {
+                            "code": "0x600035600055"
+                        }
+                    },
+                    "calls": [
+                        {
+                            "from": "0xc000000000000000000000000000000000000000",
+                            "to": "0xc000000000000000000000000000000000000000",
+                            "nonce": "0x0"
+                        }
+                    ]
+                }
+            ],
+            "traceTransfers": false,
+            "validation": true,
+            "returnFullTransactions": false
+        });
+        let payload: SimulatePayload =
+            serde_json::from_value(request_json.clone()).expect("decode simulate payload");
+        assert!(payload.validation);
+        assert_eq!(payload.block_state_calls.len(), 2);
+        let reser = serde_json::to_value(&payload).unwrap();
+        // Byte-identical round-trip (camelCase, quantity hex preserved)
+        assert_eq!(reser, request_json);
+    }
+
+    #[test]
+    fn simulate_v1_call_result_decodes_gas_used_return_data() {
+        // The per-call result shape: {returnData, logs, gasUsed, status}.
+        // This is what the simulate orchestration reads to decode swap results.
+        let json = r#"{"returnData":"0x12345678","logs":[],"gasUsed":"0x5208","status":"0x1"}"#;
+        let result: alloy::rpc::types::eth::simulate::SimCallResult =
+            serde_json::from_str(json).expect("decode sim call result");
+        assert_eq!(
+            result.return_data,
+            alloy::primitives::Bytes::from_static(&[0x12, 0x34, 0x56, 0x78])
+        );
+        assert_eq!(result.gas_used, 0x5208);
+        assert!(result.status);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn simulate_v1_revert_error_decodes_with_data() {
+        // web3.py / execution-apis revert shape: error.code + message + data.
+        let error_json = serde_json::json!({
+            "code": -32000,
+            "message": "Execution reverted",
+            "data": "0xcabedea8"
+        });
+        let err: alloy::rpc::types::eth::simulate::SimulateError =
+            serde_json::from_value(error_json).expect("decode simulate error");
+        assert_eq!(err.message, "Execution reverted");
+        assert_eq!(
+            err.data,
+            Some(alloy::primitives::Bytes::from_static(&[
+                0xca, 0xbe, 0xde, 0xa8
+            ]))
+        );
+    }
+
+    #[test]
+    fn send_raw_transaction_request_hex_encoding_matches_web3() {
+        // eth_sendRawTransaction sends ("0x"+hexlify(bytes),). web3.py uses
+        // `/`-prefixed hex; alloy uses `hex::encode_prefixed`. Assert they
+        // match for a fixture payload (the parity-gate signed-bytes fixture — an
+        // anvil-key-0 type-2 envelope prefix).
+        let signed_bytes: &[u8] = &[0x02, 0xf8, 0x70, 0x01, 0x07];
+        let hex = alloy::hex::encode_prefixed(signed_bytes);
+        // web3.py `web3.Web3.to_hex(bytes)` produces the same 0x-prefixed hex
+        assert_eq!(hex, "0x02f8700107");
+        // The param tuple shape: [hex] — matches `eth_sendRawTransaction`.
+        let params = serde_json::json!([hex]);
+        assert_eq!(params, serde_json::json!(["0x02f8700107"]));
+    }
+
+    // ── local tx-hash computation + broadcast-aware reconciliation ─
+
+    /// A real signed type-2 transaction broadcast by anvil key 0 (cast send
+    /// of 1 wei to the zero address), and its on-chain hash as returned by the
+    /// node. Used to prove `compute_tx_hash_from_signed_payload` derives the
+    /// SAME hash the node assigned — the foundation of broadcast
+    /// reconciliation (if the locally-computed hash didn't match the node's,
+    /// receipt reconciliation would look up the wrong hash).
+    ///
+    /// Captured via `anvil` + `cast rpc debug_getRawTransaction` (chainId 31337).
+    const J3RIFU_SIGNED_TX_HEX: &str =
+        "0x02f868827a698001843b9aca008252089400000000000000000000000000000000000000000180c080a06dabac39e44552d8164c7e95c996ea7d8dee13ecdf3c34bf74a32a70616f8bc2a07d2cacb344c39f8a9b5f1739803f6373ccf0aa25808998032e735351c6200b28";
+    const J3RIFU_EXPECTED_TX_HASH: &str =
+        "0xdf7c749bc5e7a46561d43676ba826807352aa32ee7573f815337970e97c3ffc5";
+
+    #[test]
+    fn compute_tx_hash_from_signed_payload_matches_node_assigned_hash() {
+        let signed_bytes = alloy::hex::decode(J3RIFU_SIGNED_TX_HEX).unwrap();
+        let computed = compute_tx_hash_from_signed_payload(&signed_bytes).unwrap();
+        let expected = B256::from_str(J3RIFU_EXPECTED_TX_HASH).unwrap();
+        assert_eq!(
+            computed, expected,
+            "locally-computed tx hash must match the node-assigned hash so receipt reconciliation looks up the right tx"
+        );
+    }
+
+    #[test]
+    fn compute_tx_hash_from_signed_payload_rejects_invalid_rlp() {
+        // Not a valid RLP-encoded envelope → DecodingError, not a panic.
+        let garbage: &[u8] = &[0x00, 0xff, 0x42];
+        let result = compute_tx_hash_from_signed_payload(garbage);
+        assert!(
+            matches!(result, Err(ProviderError::DecodingError { .. })),
+            "invalid envelope must surface DecodingError, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_reconciliation_success_on_first_try_no_rebroadcast() {
+        // Broadcast succeeds on the first attempt → returns the hash, no
+        // reconcile probe, no rebroadcast.
+        let tx_hash = B256::from_str(J3RIFU_EXPECTED_TX_HASH).unwrap();
+        let broadcast_count = Arc::new(AtomicU32::new(0));
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+        let bc = broadcast_count.clone();
+        let rc = reconcile_count.clone();
+
+        let result = send_raw_transaction_with_reconciliation(
+            tx_hash,
+            move || {
+                let bc = bc.clone();
+                async move {
+                    bc.fetch_add(1, Ordering::SeqCst);
+                    Ok(tx_hash)
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.fetch_add(1, Ordering::SeqCst);
+                    // Should NOT be called on success.
+                    Ok(false)
+                }
+            },
+            5,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), tx_hash);
+        assert_eq!(
+            broadcast_count.load(Ordering::SeqCst),
+            1,
+            "success on first try must broadcast exactly once"
+        );
+        assert_eq!(
+            reconcile_count.load(Ordering::SeqCst),
+            0,
+            "reconcile must NOT be called on a successful broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_reconciliation_rate_limited_retries_then_succeeds() {
+        // RateLimited on attempt 1 → rebroadcast (the request never reached
+        // the node) → success on attempt 2.
+        let tx_hash = B256::from_str(J3RIFU_EXPECTED_TX_HASH).unwrap();
+        let broadcast_count = Arc::new(AtomicU32::new(0));
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+        let bc = broadcast_count.clone();
+        let rc = reconcile_count.clone();
+
+        let result = send_raw_transaction_with_reconciliation(
+            tx_hash,
+            move || {
+                let bc = bc.clone();
+                async move {
+                    let n = bc.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(ProviderError::RateLimited {
+                            message: "rate limited".to_string(),
+                        })
+                    } else {
+                        Ok(tx_hash)
+                    }
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.fetch_add(1, Ordering::SeqCst);
+                    Ok(false)
+                }
+            },
+            5,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), tx_hash);
+        assert_eq!(
+            broadcast_count.load(Ordering::SeqCst),
+            2,
+            "rate-limited then success = exactly 2 broadcasts"
+        );
+        assert_eq!(
+            reconcile_count.load(Ordering::SeqCst),
+            0,
+            "reconcile must NOT be called for RateLimited (request never reached the node)"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_reconciliation_timeout_receipt_present_returns_without_rebroadcast(
+    ) {
+        // Timeout on the broadcast (ambiguous: body may have reached the node)
+        // → reconcile; receipt present → return tx_hash WITHOUT rebroadcast.
+        let tx_hash = B256::from_str(J3RIFU_EXPECTED_TX_HASH).unwrap();
+        let broadcast_count = Arc::new(AtomicU32::new(0));
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+        let bc = broadcast_count.clone();
+        let rc = reconcile_count.clone();
+
+        let result = send_raw_transaction_with_reconciliation(
+            tx_hash,
+            move || {
+                let bc = bc.clone();
+                async move {
+                    bc.fetch_add(1, Ordering::SeqCst);
+                    Err(ProviderError::Timeout {
+                        message: "broadcast timed out".to_string(),
+                    })
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.fetch_add(1, Ordering::SeqCst);
+                    // Receipt IS present → the tx was already broadcast.
+                    Ok(true)
+                }
+            },
+            5,
+            None,
+        )
+        .await;
+
+        // Returns the locally-computed hash (NOT a rebroadcast).
+        assert_eq!(result.unwrap(), tx_hash);
+        assert_eq!(
+            broadcast_count.load(Ordering::SeqCst),
+            1,
+            "must NOT rebroadcast when the receipt is present"
+        );
+        assert_eq!(
+            reconcile_count.load(Ordering::SeqCst),
+            1,
+            "reconcile must be called exactly once on a Timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_reconciliation_timeout_receipt_absent_rebroadcasts() {
+        // Timeout → reconcile; receipt absent → rebroadcast → success.
+        let tx_hash = B256::from_str(J3RIFU_EXPECTED_TX_HASH).unwrap();
+        let broadcast_count = Arc::new(AtomicU32::new(0));
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+        let bc = broadcast_count.clone();
+        let rc = reconcile_count.clone();
+
+        let result = send_raw_transaction_with_reconciliation(
+            tx_hash,
+            move || {
+                let bc = bc.clone();
+                async move {
+                    let n = bc.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Err(ProviderError::Timeout {
+                            message: "broadcast timed out".to_string(),
+                        })
+                    } else {
+                        Ok(tx_hash)
+                    }
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.fetch_add(1, Ordering::SeqCst);
+                    Ok(false)
+                }
+            },
+            5,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), tx_hash);
+        assert_eq!(
+            broadcast_count.load(Ordering::SeqCst),
+            2,
+            "timeout then receipt-absent then success = exactly 2 broadcasts"
+        );
+        assert_eq!(
+            reconcile_count.load(Ordering::SeqCst),
+            1,
+            "reconcile called once after the first timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_reconciliation_rpc_error_surfaces_immediately_no_retry() {
+        // RpcError "already known" (-32000) → the tx was seen and rejected;
+        // surfacing immediately, no retry, no reconcile.
+        let tx_hash = B256::from_str(J3RIFU_EXPECTED_TX_HASH).unwrap();
+        let broadcast_count = Arc::new(AtomicU32::new(0));
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+        let bc = broadcast_count.clone();
+        let rc = reconcile_count.clone();
+
+        let result = send_raw_transaction_with_reconciliation(
+            tx_hash,
+            move || {
+                let bc = bc.clone();
+                async move {
+                    bc.fetch_add(1, Ordering::SeqCst);
+                    Err(ProviderError::RpcError {
+                        code: -32000,
+                        message: "already known".to_string(),
+                    })
+                }
+            },
+            move || {
+                let rc = rc.clone();
+                async move {
+                    rc.fetch_add(1, Ordering::SeqCst);
+                    Ok(false)
+                }
+            },
+            5,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ProviderError::RpcError { code: -32000, .. })),
+            "RpcError \"already known\" must surface immediately, got {result:?}"
+        );
+        assert_eq!(
+            broadcast_count.load(Ordering::SeqCst),
+            1,
+            "RpcError must NOT retry the identical payload"
+        );
+        assert_eq!(
+            reconcile_count.load(Ordering::SeqCst),
+            0,
+            "reconcile must NOT be called for a definitive RpcError rejection"
+        );
+    }
+}

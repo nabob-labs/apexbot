@@ -11,9 +11,10 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import pathlib
+
     from apexbot._ffi import Bot
     from apexbot.builders.erc20_builder import Erc20Builder
-    from apexbot.database.session_manager import DatabaseSessionManager
     from apexbot.registry import PoolRegistry, TokenRegistry
     from apexbot.types.aliases import ChainId
 
@@ -27,7 +28,7 @@ class BuilderContext:
     dependency — it is constructed before the context and passed in.
     """
 
-    db: DatabaseSessionManager
+    database_path: pathlib.Path
     pools: PoolRegistry
     tokens: TokenRegistry
     erc20_builder: Erc20Builder

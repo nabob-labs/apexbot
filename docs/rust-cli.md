@@ -6,10 +6,10 @@ tags:
   - rust-owned
   - database
 related_files:
-  - ../rust/crates/apexbot-cli/src/argv.rs
-  - ../rust/crates/apexbot-cli-core/src/command.rs
-  - ../rust/crates/apexbot-cli-core/src/error.rs
-  - ../rust/crates/apexbot-config/src/resolvers.rs
+  - ../rust/crates/shells/apexbot-cli/src/argv.rs
+  - ../rust/crates/shells/apexbot-cli-core/src/command.rs
+  - ../rust/crates/shells/apexbot-cli-core/src/error.rs
+  - ../rust/crates/foundation/apexbot-config/src/resolvers.rs
 complexity: standard
 ---
 
@@ -17,12 +17,19 @@ complexity: standard
 
 The `apexbot` console is a **Rust binary** (ADR-051). One argv declaration
 exists — the clap v4 tree in `apexbot-cli`
-(`rust/crates/apexbot-cli/src/argv.rs`) over the clap-free command model in
-`apexbot-cli-core` (`rust/crates/apexbot-cli-core/src/command.rs`). The
+(`rust/crates/shells/apexbot-cli/src/argv.rs`) over the clap-free command model in
+`apexbot-cli-core` (`rust/crates/shells/apexbot-cli-core/src/command.rs`). The
 Python console script is a five-line passthrough to the same binary
 (`apexbot._ffi.cli_main`), so Python and Rust operators run the same program
-with the same vocabulary. Rendering, prompting, progress, and SIGINT are the
-façade's job; execution returns typed reports and one `CliError → ExitCode`
+with the same vocabulary. Invoke it as `uv run apexbot <command>` (the
+console script) or `uv run python -m apexbot <command>` — both route through
+the same `cli_main`; `uv run apexbot` is the primary entry point.
+
+After a Rust change, rebuild the extension before driving the console (`just
+dev`); at startup the console warns on stderr when the loaded extension
+predates the source tree.
+
+Rendering, prompting, progress, and SIGINT are the façade's job; execution returns typed reports and one `CliError → ExitCode`
 mapping (ADR-051 D1/D2/Q1).
 
 This page is the authoritative command/flag/exit-code reference. Per-domain
@@ -35,18 +42,19 @@ Accepted before **or** after the subcommand (clap `global = true`).
 
 | Option | Resolved value / cascade |
 |---|---|
-| `--database <PATH>` | SQLite database path: `--database` > `APEXBOT_DB_PATH` > `~/.config/apexbot/apexbot.db` |
+| `--database <PATH>` | SQLite database path: `--database` > `APEXBOT_DB_PATH` > `~/.local/state/apexbot/db/apexbot.db` (XDG state home) |
 | `--chain-id <CHAIN_ID>` | Session chain id: `--chain-id` > `APEXBOT_DEFAULT_CHAIN_ID` |
-| `--node-http <URI>` | HTTP RPC endpoint: `--node-http` > `APEXBOT_RPC_HTTP_CHAINID_<id>` |
-| `--node-ws <URI>` | WebSocket RPC endpoint: `--node-ws` > `APEXBOT_RPC_WS_CHAINID_<id>` |
+| `--node <URI>` (repeatable) | Node RPC endpoint. The value classifies its own transport: `ws://`/`wss://` → `nodes.ws`, `http://`/`https://` → `nodes.http`, `ipc://` or a socket path → `nodes.ipc`. A value no transport can serve (e.g. `ftp://host`) is a usage error, exit 2. The explicit layer outranks the per-chain `APEXBOT_RPC_*_CHAINID_<id>` env families and the `nodes.*` file tables. |
 | `-h, --help` | Print help and exit 0. |
-| `-V, --version` | Print the workspace version plus the shared build receipt and exit 0. |
+| `-V, --version` | Print the workspace version and exit 0. |
 
-The four value options are the **driver-domain resolvers** (ADR-051 D8), owned
-by `apexbot-config` (`rust/crates/apexbot-config/src/resolvers.rs`): each is a
-CLI-over-env cascade with a provenance tag, and the retired
-`[rpc]`/`[ws]`/`[database]`/`default_chain_id` file keys are deliberately
-**not** consulted (see [config-migration](config-migration.md)).
+These value options are the **driver-domain resolvers** (ADR-051 D8), owned
+by `apexbot-config` (`rust/crates/foundation/apexbot-config/src/resolvers.rs`): each is a
+cascade over an explicit argument, the environment, and the `database.path` /
+`session.chain_id` / `nodes.*` file tables, with the winning layer reported as
+provenance, with the file the BASE layer. The pre-0.6 `[rpc]`/`[ws]`/
+`[database] filepath`/`default_chain_id` spellings stay refused (see
+[config-migration](config-migration.md)).
 
 ## Commands
 
@@ -78,7 +86,7 @@ one data-driven pair.
 
 | Command | Flags | Behaviour |
 |---|---|---|
-| `pool update` | `--chunk <BLOCKS>` (default `10000`), `--to-block <BLOCK>` (default `latest:-64`), `--verify-chunk` / `--no-verify-chunk` (default: on), `--verify-all` / `--no-verify-all` (default: off), `--verify-all-interval <BLOCKS>` (default `1000000`) | Advance liquidity-pool state for every activated exchange, committing per chunk. |
+| `pool update` | `--chunk <BLOCKS>` (default `10000`), `--max-block-range <BLOCKS>` (default `10000`), `--to-block <BLOCK>` (default `latest:-64`), `--verify-chunk` / `--no-verify-chunk` (default: on), `--verify-all` / `--no-verify-all` (default: off), `--verify-all-interval <BLOCKS>` (default `1000000`) | Advance liquidity-pool state for every activated exchange, committing per chunk. |
 | `pool verify` | `--rpc-url <URL>`, `--chain <CHAIN_ID>`, `--block <BLOCK>`, `--pool <POOL>`, `--family <v3\|v4>` (all required), `--pool-manager <ADDRESS>` (V4 only) | Compare a pool's committed liquidity map against on-chain truth at `--block`; prints GREEN/RED with named divergences. |
 
 `BLOCK` is a block tag (`earliest`, `finalized`, `safe`, `latest`, `pending`,
@@ -90,7 +98,8 @@ one data-driven pair.
 |---|---|---|
 | `aave activate` | — | Activate the Aave V3 market for the session chain (Ethereum default 1 when no chain layer supplied a value). |
 | `aave deactivate` | `--name <MARKET>` (default `Aave Ethereum Market`) | Deactivate a market. |
-| `aave update` | `--chunk`, `--to-block`, the verify group, `--verify-all-interval`, `--one-chunk`, `--dry-run`, `--backup` / `--no-backup` | Advance Aave V3 position state for active markets. |
+| `aave reset` | `--name <MARKET>` (default `Aave Ethereum Market`), `--dry-run` | Purge one market's populated state, then re-run the cold-boot update a fresh empty database takes for it. |
+| `aave update` | `--chunk`, `--max-block-range`, `--to-block`, the verify group, `--verify-all-interval`, `--one-chunk`, `--dry-run`, `--backup` / `--no-backup` | Advance Aave V3 position state for active markets. |
 | `aave position show` | `<ADDRESS>` (positional), `--market <MARKET>` (default `Aave Ethereum Market`) | Print a user's collateral and debt positions. |
 
 ### `apexbot fleet` / `apexbot path` (live operator channel)
@@ -106,10 +115,42 @@ bot's `OperatorServer` is the authority. `--socket` resolves through
 | `path add` | `--hop <FAMILY:ADDRESS[:HASH]>` (repeatable, required), `--direction <zfo\|ozf>`, `--socket <PATH>` | Add one specific path to the live bot mid-run. |
 | `path discover` | `--bound <COUNT>`, `--socket <PATH>` | Trigger a bounded on-demand discovery sweep. |
 
+### `apexbot config`
+
+The read and write surface over the operator file (ADR-062 D6/D12). The
+mutating arms confirm unless `--force`; every rendered value is redacted.
+
+| Command | Flags | Behaviour |
+|---|---|---|
+| `config show` | — | The driver-domain values the operator FILE declares: `database.path`, `session.chain_id`, and the `[nodes.*]` endpoint tables, one line per value and no layer column. |
+| `config show --resolved` | `--resolved` | The same keys as the process resolves them, each annotated with its winning layer: `cli` > `env` > `file` > `default`. A key no layer supplied renders `(unresolved)` rather than disappearing. A per-chain entry renders as `nodes.ws[8453] = …`; an explicit `--node` fills the transport's slot and renders unindexed as `nodes.ws = … (cli)`. |
+| `config get <key>` | — | Resolve one key (`session.chain_id`, `database.path`, `nodes.http.1`) with its winning layer. |
+| `config set <key> <value>` | `--force` | Write one declared key or `str_map` entry through the validate-before-write writer; reports `Shadowed { env: APEXBOT_RPC_HTTP_CHAINID_<id> }` when the environment will win for that chain. |
+| `config unset <key>` | `--force` | Remove one key's or entry's override so the declared default (or a shadowing env var) applies again. |
+| `config path` | — | Print the config file the mutating arms read and write: `--config` > `APEXBOT_CONFIG` > the XDG config home. |
+
+Credentials never appear in a rendered line: userinfo (`user:secret@`) and the
+credential-bearing query parameters (`api_key`, `apikey`, `key`, `token`,
+`secret`, `password`, `access_token`) are redacted in `config show`, `config
+get`, write reports, and config error text. The file on disk keeps what the
+operator wrote, so an operator who writes
+`config set nodes.http.1 'https://user:secret@host/x?api_key=abc'` sees
+`nodes.http[1] = https://host/x?api_key=REDACTED (file)` on the next read.
+
+```console
+$ apexbot --config ./config.toml config show --resolved
+config = ./config.toml
+database.path = /home/you/.local/state/apexbot/db/apexbot.db (default)
+session.chain_id = 8453 (file)
+nodes.http[1] = http://127.0.0.1:8545 (file)
+nodes.ws[1] = ws://127.0.0.1:8546 (env)
+nodes.ipc = (unresolved)
+```
+
 ## Exit codes
 
 Execution returns typed results and cli-core declares the one
-`CliError → ExitCode` site (`rust/crates/apexbot-cli-core/src/error.rs`); the
+`CliError → ExitCode` site (`rust/crates/shells/apexbot-cli-core/src/error.rs`); the
 façade returns the code (`exit = "deny"` — a library never aborts the host).
 
 | Code | Meaning |

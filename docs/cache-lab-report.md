@@ -1,19 +1,19 @@
-# CL cache-lab sweep & rebuild matrix (S0-S7)
+# Concentrated-liquidity cache-lab sweep & rebuild matrix (S0-S7)
 
-Task: Z5NOPD (epic KIMRKS) — 369-line corpus sweep of the instrumented CL-table
+Task: Z5NOPD (epic KIMRKS) — 369-line corpus sweep of the instrumented concentrated-liquidity-table
 cache strategies, every solve byte-compared against the full-rebuild reference.
 
 ## How the cache layer works (high level)
 
 Reference for reading the matrix. The cache-less reference solve
-(`int_solve_cl_path`) rebuilds two derived tables per hop on every solve:
+(`int_solve_concentrated_liquidity_path`) rebuilds two derived tables per hop on every solve:
 
 1. **Crossing table** — one entry per range; each entry carries the
    accumulated integer `(gross_input, output)` crossing amounts as the walk
    moves through successive ranges. The active-set Möbius walk consumes it to
    jump across already-crossed ranges. The entries are cumulative, so they can
    be stored as per-range *segments* (diffs) and re-summed cheaply.
-2. **Word profiles** (`ClProfileTable`) — one optional profile per range,
+2. **Word profiles** (`ConcentratedLiquidityProfileTable`) — one optional profile per range,
    built only for "dense" ranges spanning ≥ `WORD_PROFILE_THRESHOLD`
    256-tick word boundaries. It is a piecewise bucket curve that lets the
    solver and profit envelope skip straight to the next meaningful boundary.
@@ -25,7 +25,7 @@ The seam: every call passes the hop sequences plus a
 `CacheEvent` (`Fresh` | `PriceMove` | `Liquidity` | `TickCross` |
 `Restore`) to `strategy.refill(seqs, event)`, which returns one
 prepared `(crossing, profile)` pair per hop, consumed by
-`int_solve_cl_path_cached`. Each strategy answers one question per hop:
+`solve_concentrated_liquidity_piecewise`. Each strategy answers one question per hop:
 *can I serve the solver a correct table cheaper than rebuilding?* Correctness
 is exact — every epoch's solution must be byte-identical to the S0
 full-rebuild reference; any divergence is a failure, not a tolerance band.
@@ -58,11 +58,11 @@ or clean full rebuild, no partial-state corruption risk.
 
 ## Method
 
-- Harness: `rust/crates/apexbot-solvers/examples/cl_cache_lab.rs`, replaying
-  `rust/crates/apexbot-solvers/tests/fixtures/heavy_cl_solve_captures.jsonl`
+- Harness: `rust/crates/engine/apexbot-solvers/examples/concentrated_liquidity_cache_lab.rs`, replaying
+  `rust/crates/engine/apexbot-solvers/tests/fixtures/heavy_concentrated_liquidity_solve_captures.jsonl`
   (420 corpus lines) as deterministic pool-state transition commands.
 - Strategies refill crossing tables + word profiles through the same production
-  builders and solve through the production `int_solve_cl_path_cached` entry;
+  builders and solve through the production `solve_concentrated_liquidity_piecewise` entry;
   no parallel implementation (measurement is of the real code path).
 - Each path's transition stream is seeded from `(path_id, line_index)`; event
   classes are sampled price-only 2/5, liquidity 1/5, tick-cross 1/5,
@@ -75,6 +75,12 @@ or clean full rebuild, no partial-state corruption risk.
   total-divergences line only at normal completion and exits 1 on any
   divergence; all runs below completed with 0 divergences and no DIVERGENCE
   lines, so every run exited 0.
+- Timing readouts — the `anchor split`, the `walk-sim`/`anchors`/`predictions`/
+  `solve` totals, and the per-section `edge`/`redge`/`dir`/`refine` nanoseconds —
+  are drained from the engine-owned `WalkTelemetry` collector via `drain_ns()`
+  (one lock per readout), not the retired process-global timing statics. See
+  `docs/architecture/walk-telemetry-collector-sizing.md`; the channel follows
+  ADR-043 (`docs/adr/ADR-043-observability-standard.md`).
 
 ## 1. 369-line corpus sweep (the deliverable run)
 
@@ -86,7 +92,7 @@ including process start). A second capture of the same run is byte-identical
 Validation-gate invocation:
 
 ```
-DRCLAB_MAX_PATHS=369 DRCLAB_TRANS=2 cargo run -q -p apexbot-solvers   --manifest-path rust/Cargo.toml --example cl_cache_lab --   rust/crates/apexbot-solvers/tests/fixtures/heavy_cl_solve_captures.jsonl
+DRCLAB_MAX_PATHS=369 DRCLAB_TRANS=2 cargo run -q -p apexbot-solvers   --manifest-path rust/Cargo.toml --example concentrated_liquidity_cache_lab --   rust/crates/engine/apexbot-solvers/tests/fixtures/heavy_concentrated_liquidity_solve_captures.jsonl
 ```
 
 ### Table A — class rebuild deltas, 369x2 sweep (crossing tables built)

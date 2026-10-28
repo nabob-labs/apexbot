@@ -3,11 +3,13 @@
 Thin delegation shim over the Rust ``apexbot-core`` core, exposed via the
 ``apexbot._ffi.solady`` extension module (Rust cdylib crate
 ``apexbot_rs``). The pure-Python implementation has been retired
-(per ADR-005 sub-step C, the §3.3 transition rubric in the
-three-layer-transition guide, removed in the stale-docs cleanup `71ec78b2`);
-the Rust core (``rust/crates/apexbot-core/src/libzip.rs``) is the single
+(per ADR-005 sub-step C: route the companion through the Rust seam and
+delete the Python port);
+the Rust core (``rust/crates/foundation/apexbot-core/src/libzip.rs``) is the single
 implementation, ``#[cfg(test)]`` corpus the regression set.
 """
+
+from typing import cast
 
 from apexbot._ffi.solady import flz_compress as _flz_compress_rust
 from apexbot._ffi.solady import flz_decompress as _flz_decompress_rust
@@ -27,7 +29,7 @@ def flz_compress(uncompressed_data: str | bytes) -> bytes:
         The compressed data.
 
     """
-    return _flz_compress_rust(uncompressed_data)
+    return cast("bytes", _flz_compress_rust(uncompressed_data))
 
 
 def flz_decompress(compressed_data: bytes | bytearray | HexStr) -> bytes:
@@ -42,4 +44,4 @@ def flz_decompress(compressed_data: bytes | bytearray | HexStr) -> bytes:
         The decompressed data.
 
     """
-    return _flz_decompress_rust(compressed_data)
+    return cast("bytes", _flz_decompress_rust(compressed_data))

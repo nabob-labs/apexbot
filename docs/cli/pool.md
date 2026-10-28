@@ -13,8 +13,8 @@ tags:
   - liquidity
 related_files:
   - ../rust-cli.md
-  - ../../src/apexbot/database/models/pools.py
-  - ../../src/apexbot/database/models/base.py
+  - ../../src/apexbot/db/__init__.py
+  - ../../rust/crates/foundation/apexbot-db/src/schema.rs
   - ../../src/apexbot/uniswap/v3_liquidity_pool.py
   - ../../src/apexbot/uniswap/v4_liquidity_pool.py
 complexity: complex
@@ -53,14 +53,14 @@ V4 uses separate `ManagedPool` database tables with PoolManager contract referen
 
 ## Commands
 
-The command vocabulary is **Rust-owned**: [`apexbot-cli`](../../rust/crates/apexbot-cli/src/argv.rs) declares it over `apexbot-cli-core`'s [pool](../../rust/crates/apexbot-cli-core/src/pool.rs) and [exchange](../../rust/crates/apexbot-cli-core/src/exchange.rs) arms. The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the domain behaviour below is unchanged.
+The command vocabulary is **Rust-owned**: [`apexbot-cli`](../../rust/crates/shells/apexbot-cli/src/argv.rs) declares it over `apexbot-cli-core`'s [pool](../../rust/crates/shells/apexbot-cli-core/src/pool.rs) and [exchange](../../rust/crates/shells/apexbot-cli-core/src/exchange.rs) arms. The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the domain behaviour below is unchanged.
 
 ### `apexbot pool update`
 
 Update pool metadata and liquidity positions for all activated exchanges.
 
 ```bash
-apexbot pool update [--chunk SIZE] [--to-block BLOCK] [--verify-chunk|--no-verify-chunk] [--verify-all|--no-verify-all] [--verify-all-interval BLOCKS]
+apexbot pool update [--chunk SIZE] [--max-block-range BLOCKS] [--to-block BLOCK] [--verify-chunk|--no-verify-chunk] [--verify-all|--no-verify-all] [--verify-all-interval BLOCKS]
 ```
 
 #### Parameters
@@ -68,6 +68,7 @@ apexbot pool update [--chunk SIZE] [--to-block BLOCK] [--verify-chunk|--no-verif
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--chunk` | 10,000 | Maximum number of blocks to process per database commit |
+| `--max-block-range` | 10,000 | Maximum block range a single `eth_getLogs` request may span, independent of `--chunk`. Lower it for RPC providers that cap the `eth_getLogs` block range |
 | `--to-block` | `latest:-64` | Last block in update range. Format: `TAG[:OFFSET]` |
 
 #### Block Identifiers
@@ -93,7 +94,25 @@ Examples:
 ```bash
 apexbot pool update --to-block "latest:-128"
 apexbot pool update --chunk 5000
+
+# Cap the per-request block range for an RPC whose eth_getLogs
+# range limit is tighter than the commit chunk (e.g. dRPC free)
+apexbot pool update --max-block-range 100
 ```
+
+#### Failure output
+
+A failed run names the endpoint, the chain, and the requested block range.
+When the failure is the RPC-connection class (a dropped or unreachable
+transport — the `backend connection task has stopped` family), the report says
+so directly, states that chunks already committed are kept, points at
+rerunning from the recorded per-exchange cursors, and then lists the
+per-exchange resume state (current at the requested target / behind with the
+last committed block / never updated) read from `exchanges.last_update_block`
+in the operator database. The updater commits per chunk, so this is the
+authoritative outstanding-work record; there is no automatic transport retry
+(retrying a dropped transport has partial-chunk correctness implications and
+needs its own decision).
 
 ### `apexbot exchange activate`
 
@@ -107,7 +126,7 @@ apexbot exchange activate --chain <CHAIN> --name <NAME>
 `CHAIN` is a chain slug (`base`, `ethereum`) or a numeric chain id; `NAME` is the
 DEX slug (`aerodrome_v2`, `uniswap_v3`, `uniswap_v4`, …). ADR-051 D5 collapses
 the retired per-`(chain, DEX)` click verbs onto this one data-driven pair.
-V4 exchanges additionally create a `PoolManagerTable` entry.
+V4 exchanges additionally create a `pool_managers` row.
 
 ### `apexbot exchange deactivate`
 
@@ -203,19 +222,20 @@ Mock pool classes (`MockV3LiquidityPool`, `MockV4LiquidityPool`) are lightweight
 
 ## Data Model Updates
 
-All database models are defined in [`src/apexbot/database/models/pools.py`](../../src/apexbot/database/models/pools.py) and [`src/apexbot/database/models/base.py`](../../src/apexbot/database/models/base.py):
+The Rust `apexbot-db` schema owns the tables below. Python callers receive typed
+row mirrors from `apexbot.db`; the updater writes through Rust-owned seams:
 
 | Table | Fields Updated | Notes |
 |-------|----------------|-------|
-| `ExchangeTable` | `last_update_block` | After each chunk completes |
-| `Erc20TokenTable` | New rows created | For token0/token1/currency0/currency1 |
-| `LiquidityPoolTable` | New rows created | V2/V3 pool metadata from factory events |
-| `UniswapV4PoolTable` | New rows created | V4 pool metadata from manager events |
-| `PoolManagerTable` | New rows created | V4 manager metadata (on activate) |
-| `LiquidityPositionTable` | `liquidity_net`, `liquidity_gross` | Upsert from V3 liquidity events |
-| `InitializationMapTable` | `bitmap` | Upsert from V3 tick bitmap updates |
-| `ManagedPoolLiquidityPositionTable` | `liquidity_net`, `liquidity_gross` | Upsert from V4 liquidity events |
-| `ManagedPoolInitializationMapTable` | `bitmap` | Upsert from V4 tick bitmap updates |
+| `exchanges` | `last_update_block` | After each chunk completes |
+| `erc20_tokens` | New rows created | For token0/token1/currency0/currency1 |
+| `pools` | New rows created | V2/V3 pool metadata from factory events |
+| `uniswap_v4_pools` | New rows created | V4 pool metadata from manager events |
+| `pool_managers` | New rows created | V4 manager metadata (on activate) |
+| `liquidity_positions` | `liquidity_net`, `liquidity_gross` | Upsert from V3 liquidity events |
+| `initialization_maps` | `bitmap` | Upsert from V3 tick bitmap updates |
+| `managed_pool_liquidity_positions` | `liquidity_net`, `liquidity_gross` | Upsert from V4 liquidity events |
+| `managed_pool_initialization_maps` | `bitmap` | Upsert from V4 tick bitmap updates |
 
 ## Algorithm Details
 
@@ -269,6 +289,6 @@ The command uses Web3 connections from apexbot config file. Each active chain mu
 
 ## Dependencies
 
-- **Database**: SQLAlchemy ORM (nominal models; the updater's writes are Rust-owned)
+- **Database**: Rust `apexbot-db` owner, consumed through the stable `apexbot.db` Python mirror
 - **Blockchain**: Rust `apexbot-rpc` / `apexbot-pool-updater` for RPC calls
 - **Math**: Rust `apexbot-math` + `apexbot-pools` (tick bitmap, tick math, liquidity math)

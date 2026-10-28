@@ -1,15 +1,15 @@
-"""ADR-005 slice 9 — V4 calc delegation to ``LiquidityPool``.
+"""V4 calc delegation to ``Pool``.
 
 The V4 swap-calc path (``UniswapV4PoolCalc`` mixin is pricing-only by design;
 swap math lives on ``UniswapV4Pool``) routes both
 ``calculate_tokens_out_from_tokens_in`` and
 ``calculate_tokens_in_from_tokens_out`` through the Rust
-``LiquidityPool.simulate_swap_with_fetch`` /
+``Pool.simulate_swap_with_fetch`` /
 ``simulate_exact_output_swap_with_fetch`` seams.
 
 This is the **delegation-detection** counterpart to the parity tests in
 ``tests/test_v4_rust_swap_parity.py`` (which pin the *numbers*). Per the
-three-layer rubric §4.5, a routing cutover where the math already has a parity
+parity program's delegation rule: a routing cutover where the math already has a parity
 test should add a spy that proves the seam was hit with the right args — not
 just "the result matches". Mirrors
 ``tests/pool_companion/test_io_free_behavior.py::TestV2CalcDelegation``.
@@ -75,32 +75,22 @@ def _make_tokens(py_bot: Bot, tag: str):
 
 
 class _DelegateSpy:
-    """Wraps a ``LiquidityPool`` to record V4 swap-seam calls.
+    """Wraps a ``Pool`` to record the V4 swap-simulation seam calls.
 
     Pass-through for all other handle methods via ``__getattr__``. Records
-    ``simulate_swap_with_fetch`` (exact-input) and
-    ``simulate_exact_output_swap_with_fetch`` (exact-output) invocations.
+    ``simulate`` invocations as ``(zero_for_one, amount_specified)``.
     """
 
     def __init__(self, real_pool):
         self._real = real_pool
-        self.swap_with_fetch_calls: list[tuple[bool, int]] = []
-        self.exact_output_with_fetch_calls: list[tuple[bool, int]] = []
+        self.simulate_calls: list[tuple[bool, int]] = []
 
-    def simulate_swap_with_fetch(self, *, zero_for_one, amount_in, **_):
-        self.swap_with_fetch_calls.append((bool(zero_for_one), int(amount_in)))
-        return self._real.simulate_swap_with_fetch(
+    def simulate(self, *, zero_for_one, amount_specified, **kwargs):
+        self.simulate_calls.append((bool(zero_for_one), int(amount_specified)))
+        return self._real.simulate(
             zero_for_one=zero_for_one,
-            amount_in=amount_in,
-            **_,
-        )
-
-    def simulate_exact_output_swap_with_fetch(self, *, zero_for_one, amount_out, **_):
-        self.exact_output_with_fetch_calls.append((bool(zero_for_one), int(amount_out)))
-        return self._real.simulate_exact_output_swap_with_fetch(
-            zero_for_one=zero_for_one,
-            amount_out=amount_out,
-            **_,
+            amount_specified=amount_specified,
+            **kwargs,
         )
 
     def __getattr__(self, name):
@@ -152,7 +142,7 @@ class TestV4CalcDelegation:
 
     def test_calculate_tokens_out_delegates_to_rust_no_override(self) -> None:
         """No override_state: ``calculate_tokens_out_from_tokens_in`` routes
-        to ``LiquidityPool.simulate_swap_with_fetch`` (token0 in → zfo=True)."""
+        to ``Pool.simulate_swap_with_fetch`` (token0 in → zfo=True)."""
         py_bot = Bot()
         pool = _make_dense_v4_pool(py_bot)
         spy = _DelegateSpy(pool._py_pool)
@@ -163,8 +153,7 @@ class TestV4CalcDelegation:
             token_in_quantity=1_000,
         )
 
-        assert spy.swap_with_fetch_calls == [(True, 1_000)]
-        assert spy.exact_output_with_fetch_calls == []
+        assert spy.simulate_calls == [(True, -1_000)]
         assert result > 0
 
     def test_calculate_tokens_out_reverse_delegates_to_rust(self) -> None:
@@ -179,12 +168,12 @@ class TestV4CalcDelegation:
             token_in_quantity=1_000,
         )
 
-        assert spy.swap_with_fetch_calls == [(False, 1_000)]
+        assert spy.simulate_calls == [(False, -1_000)]
         assert result > 0
 
     def test_calculate_tokens_in_delegates_to_rust_no_override(self) -> None:
         """No override_state: ``calculate_tokens_in_from_tokens_out`` routes
-        to ``LiquidityPool.simulate_exact_output_swap_with_fetch``
+        to ``Pool.simulate_exact_output_swap_with_fetch``
         (token1 out → zfo=True)."""
         py_bot = Bot()
         pool = _make_dense_v4_pool(py_bot)
@@ -196,8 +185,7 @@ class TestV4CalcDelegation:
             token_out_quantity=1_000,
         )
 
-        assert spy.exact_output_with_fetch_calls == [(True, 1_000)]
-        assert spy.swap_with_fetch_calls == []
+        assert spy.simulate_calls == [(True, 1_000)]
         assert result > 0
 
     def test_calculate_tokens_in_reverse_delegates_to_rust(self) -> None:
@@ -212,5 +200,5 @@ class TestV4CalcDelegation:
             token_out_quantity=1_000,
         )
 
-        assert spy.exact_output_with_fetch_calls == [(False, 1_000)]
+        assert spy.simulate_calls == [(False, 1_000)]
         assert result > 0

@@ -17,12 +17,41 @@ Curve StableSwap state is significantly different from V2/V3/V4:
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
+from apexbot.curve.types import (
+    DVariant,
+    LendingRateStyle,
+    MetapoolRateStyle,
+    MetapoolUnderlyingStyle,
+    SwapStyle,
+    YDVariant,
+    YVariant,
+)
+
 if TYPE_CHECKING:
-    from apexbot.curve.curve_stableswap_liquidity_pool import CurveStableswapPool
-    from apexbot.curve.strategies import PoolStrategies
+    from apexbot.curve.types import BasePoolPort
     from apexbot.erc20 import Erc20Token
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class PoolStrategies:
+    """Resolved calculation strategies for a Curve pool instance.
+
+    Set at construction time by the builder from the pool address. The pool
+    class is address-agnostic — it only reads these strategy values and passes
+    them to the Rust core. The Rust core derives its math axes from the same
+    enum discriminants, so no Python calculator is auto-constructed here.
+    """
+
+    d_variant: DVariant = DVariant.STANDARD
+    y_variant: YVariant = YVariant.STANDARD
+    yd_variant: YDVariant = YDVariant.STANDARD
+    swap_style: SwapStyle = SwapStyle.STANDARD
+    metapool_rate_style: MetapoolRateStyle = MetapoolRateStyle.STANDARD
+    metapool_underlying_style: MetapoolUnderlyingStyle = MetapoolUnderlyingStyle.STANDARD
+    lending_rate_style: LendingRateStyle = LendingRateStyle.NONE
 
 
 class StableswapPoolState:
@@ -45,7 +74,7 @@ class StableswapPoolState:
     _admin_fee: int
     _rate_multipliers: tuple[int, ...]
     _precision_multipliers: tuple[int, ...]
-    _base_pool: CurveStableswapPool | None
+    _base_pool: BasePoolPort | None
     _tokens_underlying: tuple[Erc20Token, ...] | None
     _lp_token: Erc20Token
     _use_lending: tuple[bool, ...]
@@ -96,7 +125,7 @@ class StableswapPoolState:
         return self._precision_multipliers
 
     @property
-    def base_pool(self) -> CurveStableswapPool | None:
+    def base_pool(self) -> BasePoolPort | None:
         """Base pool."""
         return self._base_pool
 
@@ -169,5 +198,5 @@ class StableswapPoolState:
 
     # Note: base_cache_updated and base_virtual_price are set on the pool
     # class __init__ (they interact with caches/locks). The mutable slot
-    # ``_state`` / ``balances`` is Rust-owned now (ADR-005 slice 11b); the
+    # ``_state`` / ``balances`` is Rust-owned; the
     # properties below provide read access through the mixin for locality.

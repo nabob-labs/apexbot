@@ -1,14 +1,14 @@
-"""One session watch behind the cockpit's end-state (ergo MJJUXL).
+"""One session watch behind the cockpit's end-state.
 
-The cockpit's single owner of a pump session's end-state (the CONTEXT.md
+The cockpit's single owner of a pump session's end-state (the GLOSSARY.md
 *session watch* term): the watch-set assembly ({consumer} + optional
 {registration, watchdog} — exactly the task sets the former twin await loops
 ``_await_main_loop_with_registration_fail_fast`` /
 ``_await_main_loop_with_pump_watchdog`` watched), the
 :class:`SessionEndVerdict` ranking (fail-fast registration outranks a
-watchdog trip in the same wait batch — written ONCE here, where it used to
-live in the first twin only), and the cancel/teardown duties the ``run()``
-finally / ``__aexit__`` / twin-loop sites hand-rolled.
+watchdog trip in the same wait batch — a property of the typed
+:class:`_WatchSet`, not of the await loop), and the cancel/teardown duties the
+``run()`` finally / ``__aexit__`` / twin-loop sites hand-rolled.
 
 The watch coordinates plain ``asyncio.Task`` objects handed to it by
 :class:`~apexbot.runner.BotRunner` and touches no engine surface of its own
@@ -19,9 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from apexbot.utils.tasks import cancel_and_reap
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
 
 
 class SessionEndVerdict(Enum):
@@ -44,6 +49,73 @@ class SessionEndVerdict(Enum):
     PumpEnded = auto()
     RegistrationFailed = auto()
     WatchdogTripped = auto()
+
+
+class _WatchKind(Enum):
+    """The typed per-batch decision of the session watch's task set."""
+
+    CONTINUE = auto()
+    REGISTRATION_FAILED = auto()
+    WATCHDOG_TRIPPED = auto()
+
+
+@dataclass(frozen=True)
+class _WatchSet:
+    """The session watch's typed task set: consumer + watchdog + optional registration.
+
+    :meth:`on_task_done` owns the batched legality decision — a fatal
+    registration error outranks a watchdog trip in the same wait batch — so the
+    await loop only applies the transition it returns. A clean registration
+    completion drops that member and keeps watching ``{consumer, watchdog}``.
+    """
+
+    consumer: asyncio.Task[Any]
+    watchdog: asyncio.Task[None]
+    registration: asyncio.Task[Any] | None = None
+
+    def members(self) -> set[asyncio.Task[Any]]:
+        """Collect the tasks to wait on this batch.
+
+        Returns:
+            The still-watchable member tasks (registration drops out once
+            it finishes).
+
+        """
+        members: set[asyncio.Task[Any]] = {self.consumer, self.watchdog}
+        if self.registration is not None:
+            members.add(self.registration)
+        return members
+
+    def on_task_done(self, done: set[asyncio.Task[Any]]) -> _WatchTransition:
+        """Decide the session's next move from one completed wait batch.
+
+        Returns:
+            The watch transition (next watch-set + verdict kind).
+
+        """
+        registration = self.registration
+        if registration is not None and registration in done:
+            exc = registration.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                return _WatchTransition(_WatchKind.REGISTRATION_FAILED, self, error=exc)
+            # Registration finished cleanly; stop watching it, keep
+            # blocking on {consumer, watchdog}.
+            return _WatchTransition(
+                _WatchKind.CONTINUE,
+                _WatchSet(self.consumer, self.watchdog, None),
+            )
+        if self.watchdog in done:
+            return _WatchTransition(_WatchKind.WATCHDOG_TRIPPED, self)
+        return _WatchTransition(_WatchKind.CONTINUE, self)
+
+
+@dataclass(frozen=True)
+class _WatchTransition:
+    """One :meth:`_WatchSet.on_task_done` decision: its kind, watch-set, and error."""
+
+    kind: _WatchKind
+    watch: _WatchSet
+    error: BaseException | None = None
 
 
 class SessionWatch:
@@ -72,8 +144,9 @@ class SessionWatch:
         consumer_task: asyncio.Task[Any],
         watchdog_factory: Callable[[], Coroutine[Any, Any, None]],
     ) -> None:
-        """Attach the always-on watch members: the consumer task and the
-        pump-finished watchdog factory.
+        """Attach the always-on watch members.
+
+        The members are the consumer task and the pump-finished watchdog factory.
 
         Called the moment the consumer task exists, so a teardown after any
         later ``run()`` failure (e.g. an inline ``build_paths`` raise) still
@@ -83,90 +156,91 @@ class SessionWatch:
         self._watchdog_factory = watchdog_factory
 
     def attach_registration(self, registration_task: asyncio.Task[Any]) -> None:
-        """Attach the optional registration member (the Sub-B background
-        task). Inline/injected sessions never call this — the watch-set is
-        then exactly {consumer, watchdog}."""
+        """Attach the optional registration member (the Sub-B background task).
+
+        Inline/injected sessions never call this — the watch-set is
+        then exactly {consumer, watchdog}.
+        """
         self._registration_task = registration_task
 
     @property
     def registration_error(self) -> BaseException | None:
-        """The fatal registration error behind the ``RegistrationFailed``
-        verdict (``None`` until then)."""
+        """The fatal registration error behind the ``RegistrationFailed`` verdict.
+
+        ``None`` until then.
+        """
         return self._registration_error
 
     # ── The wait ──────────────────────────────────────────────────────
     async def wait(self) -> SessionEndVerdict:
         """Watch the session's task set until the session ends; return the verdict.
 
-        The same-batch ranking is written ONCE here: a fail-fast registration
-        verdict outranks a watchdog verdict in the same wait batch. On the
-        fail-fast path the consumer is cancelled + drained and the error
-        stored; the caller re-raises it.
+        The batched legality decision lives on the typed :class:`_WatchSet`
+        (:meth:`_WatchSet.on_task_done`), not in this loop: a fail-fast
+        registration verdict outranks a watchdog verdict in the same wait
+        batch. On the fail-fast path the consumer is cancelled + drained and
+        the error stored; the caller re-raises it.
 
         Returns:
             The end-state verdict — ``RegistrationFailed`` (caller must
-            re-raise :attr:`registration_error`), ``WatchdogTripped`` (graceful
-            teardown), or ``PumpEnded`` (the session ran to its own end).
+            re-raise :attr:`registration_error`), ``WatchdogTripped``
+            (graceful teardown; a raising watchdog future surfaces here via
+            ``result()``), or ``PumpEnded`` (the session ran to its own end).
 
-        Raises:
-            BaseException: the consumer task's own exception when the session
-                ends through the consumer (the ``PumpEnded`` path).
         """
         consumer_task = self._consumer_task
         assert consumer_task is not None
-        registration_task = self._registration_task
         watchdog_factory = self._watchdog_factory
         assert watchdog_factory is not None
         watchdog_task = asyncio.create_task(watchdog_factory(), name="pump-finished-watchdog")
         self._watchdog_task = watchdog_task
+        watch = _WatchSet(consumer_task, watchdog_task, self._registration_task)
         pump_ended = False
         try:
             # The watchdog stays in the watch-set for the WHOLE loop — including
             # after registration completes (only the main loop remains then, but
             # a timed-exit pump can still finish, and must not be missed).
             while not consumer_task.done():
-                watch = {consumer_task, watchdog_task}
-                if registration_task is not None:
-                    watch.add(registration_task)
                 done, _pending = await asyncio.wait(
-                    watch,
+                    watch.members(),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                # Fail-fast outranks everything: a fatal registration error must
-                # be surfaced even when the watchdog fired in the same wait
-                # batch. Written ONCE here (MJJUXL) — the ranking used to live
-                # in the registration twin only.
-                if registration_task is not None and registration_task in done:
-                    exc = registration_task.exception()
-                    if exc is not None and not isinstance(exc, asyncio.CancelledError):
-                        # Fatal registration error → fail loudly: stop the hot loop.
-                        consumer_task.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await consumer_task
-                        self._registration_error = exc
-                        return SessionEndVerdict.RegistrationFailed
-                    # Registration finished cleanly; stop watching, keep
-                    # blocking on {consumer, watchdog}.
-                    registration_task = None
-                if watchdog_task in done:
+                step = watch.on_task_done(done)
+                watch = step.watch
+                if step.kind is _WatchKind.REGISTRATION_FAILED:
+                    # Fatal registration error → fail loudly: stop the hot
+                    # loop; the reap asserts the cancellation was observed.
+                    await cancel_and_reap(consumer_task)
+                    self._registration_error = step.error
+                    return SessionEndVerdict.RegistrationFailed
+                if step.kind is _WatchKind.WATCHDOG_TRIPPED:
                     # The completion future resolves ONLY when the pump really
                     # stopped, so its completion IS a pump end; surface a
                     # watchdog fault (a raising future) rather than swallowing it.
                     watchdog_task.result()
+                    registration = watch.registration
+                    if registration is not None and not registration.done():
+                        registration.cancel()
                     pump_ended = True
-                    if registration_task is not None and not registration_task.done():
-                        registration_task.cancel()
                     break
             if pump_ended:
+                # No local cancel: the watchdog (or the pump's own stop)
+                # already ended the consumer, so its unwind here is the
+                # graceful end — an externally requested cancellation is
+                # teardown noise, not a lost failure.
                 with contextlib.suppress(asyncio.CancelledError):
                     await consumer_task
                 return SessionEndVerdict.WatchdogTripped
             await consumer_task
             return SessionEndVerdict.PumpEnded
         finally:
-            watchdog_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog_task
+            if not watchdog_task.done():
+                # A watchdog still pending at exit is cancelled + reaped;
+                # the reap asserts its cancellation was observed. A done
+                # watchdog was already consumed in the loop (its fault
+                # surfaced via result()) — reaping it here would re-raise
+                # or mask the in-flight exception.
+                await cancel_and_reap(watchdog_task)
 
     # ── Teardown ──────────────────────────────────────────────────────
     async def teardown_registration(self) -> None:
@@ -182,12 +256,10 @@ class SessionWatch:
             and not registration_task.done()
             and not registration_task.cancelled()
         ):
-            registration_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await registration_task
+            await cancel_and_reap(registration_task)
 
     async def teardown(self) -> None:
-        """The idempotent end-of-session teardown (MJJUXL).
+        """Tear down the session idempotently at end-of-session.
 
         Folds the cancel/teardown duties the ``run()`` finally and
         ``__aexit__`` hand-rolled: the registration drain (a no-op once
@@ -201,11 +273,13 @@ class SessionWatch:
         await self.teardown_registration()
         watchdog_task = self._watchdog_task
         if watchdog_task is not None and not watchdog_task.done():
-            watchdog_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog_task
+            await cancel_and_reap(watchdog_task)
         consumer_task = self._consumer_task
         if consumer_task is not None and not consumer_task.done():
+            # Best-effort, deliberately without the cancelled() assertion:
+            # the consumer may unwind with a real error after the pump
+            # stop, and teardown must never mask the original in-flight
+            # exception (the __aexit__ contract).
             consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await consumer_task

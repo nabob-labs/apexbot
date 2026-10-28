@@ -1,4 +1,9 @@
-"""Test helpers for apexbot."""
+"""Test helpers for apexbot.
+
+A fresh interpreter is for claims that only exist at process level: import
+cost, exit codes, argv, transport. Resolution claims go through
+``resolve_hypothetical``; installed-verdict claims through ``resolved_config``.
+"""
 
 from pathlib import Path
 

@@ -1,5 +1,5 @@
 //! Discovery graph construction + batched path finding — parity-ledger
-//! row 12 (ergo `XFEJUG`).
+//! row 12 .
 //!
 //! Mirrors the graph half of `src/apexbot/pathfinding/_pathfinding.py`
 //! (`_prepare_graph` / `build_path_graph`: candidate-token degree filter,
@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use apexbot::core::address_utils::address_to_checksum_string;
 use apexbot::db::discovery_read::DiscoveryPoolRow;
-use apexbot::pathfinding::{OwnedPathFinder, PathGraph, PoolKind};
+use apexbot::pathfinding::{OwnedPathFinder, PathGraph, PoolKind, SearchSpec};
 
 /// V4 graph-id namespace offset (mirrors
 /// `apexbot_db::pathfinding::V4_POOL_ID_OFFSET`).
@@ -334,12 +334,14 @@ impl BatchedPathFinder {
                 .map(|(start, end, reverse)| {
                     OwnedPathFinder::new(
                         graph.clone(),
-                        start,
-                        end,
-                        min_depth,
-                        params.max_depth,
-                        reverse,
-                        params.pool_type_per_depth.clone(),
+                        SearchSpec::new(
+                            start,
+                            end,
+                            min_depth,
+                            params.max_depth,
+                            reverse,
+                            params.pool_type_per_depth.clone(),
+                        ),
                     )
                 })
                 .collect();

@@ -1,0 +1,136 @@
+[package]
+name = "apexbot-pools"
+description = "Value-only pool identity/state structs, stateless swap simulation, and the multi-hop solve tree for the apexbot pool families."
+keywords = ["mev", "pools", "uniswap", "swap"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5" }
+thiserror = { version = "^2.0" }
+parking_lot = { version = "^0.13" }
+# Hot map type for tick liquidity (foldhash; see workspace.dependencies note).
+hashbrown.workspace = true
+apexbot-decoders.workspace = true
+apexbot-uniswap.workspace = true
+apexbot-math.workspace = true
+apexbot-core.workspace = true
+# --- solver-kernel tree (ADR-073 endgame re-home; src/solve/) ---
+tracing = { version = "^0.1" }
+serde_json = { version = "^1.0" }
+# Exact rational integer arithmetic for the Möbius shifted-piece kernel.
+num-bigint = { version = "^0.5" }
+num-integer = { version = "^0.1" }
+# Capture-fixture transparent decompress (src/solve/capture_fixture.rs); large
+# fixtures ship as .jsonl.zst, readers decode in memory. Optional behind
+# `capture-fixtures` (ADR-084 D3): the C-build dependency is fixture machinery,
+# not part of the value/solve charter, so `cargo add apexbot-pools` (and every
+# downstream tree) compiles no zstd by default. `serde_json` stays mandatory:
+# `DegeneratePathEvent::to_jsonl_row` is production capture API (bot's
+# solver_capture sink), not fixture machinery.
+zstd = { workspace = true, optional = true }
+# hotpath: solver-phase profiling (ADR-005 core, pyo3-free). Non-optional,
+# default-features = false -> no-op stubs in default builds; the
+# `hotpath` feature enables real instrumentation. Version matched to apexbot-bot.
+hotpath = { version = "^0.29.0", default-features = false }
+
+[features]
+hotpath = ["hotpath/hotpath", "hotpath/threads"]
+# Fixture capture/replay I/O (src/solve/capture_fixture.rs, the profit-envelope
+# capture writer, and the fixture-reading test modules). Test lanes enable it
+# explicitly so the golden corpora stay executed, not silently skipped.
+capture-fixtures = ["dep:zstd"]
+# Ambient walk telemetry: the per-thread walk-combinator counters, event
+# census, and process-wide timing statics. Off by default so a release build
+# that never reads the counters pays nothing for them; enabling it turns
+# the writers on. See src/solve/concentrated_liquidity/telemetry.rs for the gate.
+telemetry = []
+
+[dev-dependencies]
+proptest = "^1.12"
+rayon = { version = "^1.12" }
+criterion = { version = "^0.8", default-features = false, features = ["cargo_bench_support"] }
+tempfile = { version = "^3.27" }
+# No `apexbot-rpc` here: the RPC-backed CL harnesses (the network-gated V3
+# mainnet-fixture reproduction and the capture generator) live in
+# `apexbot-rpc`. `apexbot-rpc` depends on this crate, so a dev-dependency
+# from here would close a publish cycle (pools -> rpc -> pools) that no
+# crates.io version can satisfy.
+tokio = { version = "^1.54", features = ["rt-multi-thread", "macros"] }
+serde_json = "^1.0"
+hex = "^0.4"
+# revm drives the Tier-3b end-to-end `Pool.swap` oracle: it deploys real
+# v3-core/v4-core bytecode into an offline CacheDB and calls swap, so the Rust
+# `v3_simulate_swap` / `v4_simulate_swap` are compared against the canonical
+# on-chain swap logic byte-for-byte. A
+# dev-dep only — does NOT pull revm into the core lib build (cargo tree on
+# default features excludes dev-deps), so the no-pyo3-in-cores invariant is
+# unaffected.
+revm = { version = "^43.0", default-features = true }
+
+# Fixture-reading integration tests: required-features keeps the default
+# `-p apexbot-pools` build compiling while the lanes that own the corpora
+# enable `capture-fixtures` explicitly.
+[[test]]
+name = "offline_heavy_replay"
+required-features = ["capture-fixtures"]
+
+[[test]]
+name = "profit_envelope_tests"
+required-features = ["capture-fixtures"]
+
+[[test]]
+name = "concentrated_liquidity_cache_lab_goldens"
+required-features = ["capture-fixtures"]
+
+# Fixture-reading examples ([[example]] sections exist only to carry
+# required-features; unlisted examples auto-discover and compile everywhere).
+# The pre-push/CI lanes that run them enable the feature explicitly.
+
+[[example]]
+name = "concentrated_liquidity_cache_lab"
+required-features = ["capture-fixtures"]
+
+[[example]]
+name = "concentrated_liquidity_solve_replay"
+required-features = ["capture-fixtures"]
+
+[[example]]
+name = "entry_ab_readout"
+required-features = ["capture-fixtures"]
+
+[[example]]
+name = "mixed_solve_replay"
+required-features = ["capture-fixtures"]
+
+[[example]]
+name = "rayon_scale_probe"
+required-features = ["capture-fixtures"]
+
+[[example]]
+name = "v2_concentrated_liquidity_parity_probe"
+required-features = ["capture-fixtures"]
+
+[[example]]
+name = "walkmemo_readout"
+required-features = ["capture-fixtures"]
+
+[[bench]]
+name = "digest"
+harness = false
+
+[[bench]]
+name = "walkmemo_contention"
+harness = false
+
+[[bench]]
+name = "stable_arms"
+harness = false
+

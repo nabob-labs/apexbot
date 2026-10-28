@@ -1,99 +1,51 @@
-"""Tests for the pure functions extracted from type_resolution.py.
+"""Tests for the pure probing descriptor logic extracted from type_resolution.py."""
 
-Plan 066, Slice 1: _build_descriptor_from_db_result and
-_descriptor_from_probing_result are the first pure-logic extractions.
-These tests verify behavior through the public interface of each function.
-"""
+import pytest
 
-from unittest.mock import MagicMock
-
-from apexbot.builders.type_resolution import (
-    _build_descriptor_from_db_result,
-    _descriptor_from_probing_result,
-)
-from apexbot.types.pool_type import PoolFamily
+from apexbot.builders.type_resolution import _descriptor_from_probing_result
+from apexbot.exceptions.base import ApexbotValueError
+from apexbot.types.pool_type import PoolFamily, PoolProbe
 
 CHAIN_ID = 1
 UNKNOWN_FACTORY = "0x0000000000000000000000000000000000000001"
 
 
-class TestBuildDescriptorFromDbResult:
-    """_build_descriptor_from_db_result maps a DB row to a PoolTypeDescriptor."""
-
-    def test_known_kind_returns_descriptor(self) -> None:
-        """A registered kind maps to a PoolTypeDescriptor with the right family."""
-        mock_row = MagicMock()
-        mock_row.kind = "uniswap_v2"
-        mock_row.exchange.factory = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
-        result = _build_descriptor_from_db_result(mock_row)
-        assert result is not None
-        assert result.family == PoolFamily.CONSTANT_PRODUCT
-        assert result.kind == "uniswap_v2"
-
-    def test_unknown_kind_returns_none(self) -> None:
-        """An unregistered kind returns None — caller must continue resolution."""
-        mock_row = MagicMock()
-        mock_row.kind = "nonexistent_kind"
-        mock_row.exchange.factory = "0xABCD"
-        result = _build_descriptor_from_db_result(mock_row)
-        assert result is None
-
-    def test_returns_factory_from_exchange(self) -> None:
-        """The descriptor carries the factory from the DB exchange row."""
-        factory = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
-        mock_row = MagicMock()
-        mock_row.kind = "uniswap_v2"
-        mock_row.exchange.factory = factory
-        result = _build_descriptor_from_db_result(mock_row)
-        assert result is not None
-        assert result.factory == factory
-
-    def test_concentrated_liquidity_kind(self) -> None:
-        """A V3 kind maps to CONCENTRATED_LIQUIDITY."""
-        mock_row = MagicMock()
-        mock_row.kind = "uniswap_v3"
-        mock_row.exchange.factory = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
-        result = _build_descriptor_from_db_result(mock_row)
-        assert result is not None
-        assert result.family == PoolFamily.CONCENTRATED_LIQUIDITY
-
-
 class TestDescriptorFromProbingResult:
-    """_descriptor_from_probing_result maps 'which method succeeded' to a descriptor."""
+    """_descriptor_from_probing_result maps 'which probe succeeded' to a descriptor."""
 
-    def test_slot0_succeeds_yields_concentrated_liquidity(self) -> None:
-        """slot0() call succeeding → CONCENTRATED_LIQUIDITY."""
+    def test_v3_succeeds_yields_concentrated_liquidity(self) -> None:
+        """slot0() call succeeding → V3 probe → CONCENTRATED_LIQUIDITY."""
         result = _descriptor_from_probing_result(
-            succeeded_method="slot0",
+            succeeded=PoolProbe.V3,
             chain_id=CHAIN_ID,
             factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
         )
         assert result.family == PoolFamily.CONCENTRATED_LIQUIDITY
 
-    def test_getreserves_succeeds_yields_constant_product(self) -> None:
-        """getReserves() call succeeding → CONSTANT_PRODUCT."""
+    def test_v2_succeeds_yields_constant_product(self) -> None:
+        """getReserves() call succeeding → V2 probe → CONSTANT_PRODUCT."""
         result = _descriptor_from_probing_result(
-            succeeded_method="getReserves",
+            succeeded=PoolProbe.V2,
             chain_id=CHAIN_ID,
             factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
         )
         assert result.family == PoolFamily.CONSTANT_PRODUCT
 
-    def test_no_method_succeeds_yields_stableswap(self) -> None:
-        """All probing methods fail → STABLESWAP fallback."""
-        result = _descriptor_from_probing_result(
-            succeeded_method=None,
-            chain_id=CHAIN_ID,
-            factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
-        )
-        assert result.family == PoolFamily.STABLESWAP
+    def test_no_probe_succeeds_raises(self) -> None:
+        """No probe answered → unverified, not STABLESWAP: raise."""
+        with pytest.raises(ApexbotValueError, match="No pool probe succeeded"):
+            _descriptor_from_probing_result(
+                succeeded=None,
+                chain_id=CHAIN_ID,
+                factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
+            )
 
     def test_registered_factory_prefers_registry_descriptor(self) -> None:
         """When the factory is registered, registry descriptor takes precedence."""
         # Uniswap V2 factory on chain 1 is registered at import time
         factory = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
         result = _descriptor_from_probing_result(
-            succeeded_method="slot0",  # would default to CONCENTRATED_LIQUIDITY
+            succeeded=PoolProbe.V3,  # would default to CONCENTRATED_LIQUIDITY
             chain_id=CHAIN_ID,
             factory=factory,  # type: ignore[arg-type]
         )
@@ -105,18 +57,17 @@ class TestDescriptorFromProbingResult:
     def test_descriptor_carries_factory(self) -> None:
         """The descriptor always carries the factory address."""
         result = _descriptor_from_probing_result(
-            succeeded_method="getReserves",
+            succeeded=PoolProbe.V2,
             chain_id=CHAIN_ID,
             factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
         )
         assert result.factory == UNKNOWN_FACTORY
 
-    def test_stableswap_fallback_carries_factory(self) -> None:
-        """The STABLESWAP fallback descriptor also carries the factory."""
-        result = _descriptor_from_probing_result(
-            succeeded_method=None,
-            chain_id=CHAIN_ID,
-            factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
-        )
-        assert result.factory == UNKNOWN_FACTORY
-        assert result.family == PoolFamily.STABLESWAP
+    def test_none_probe_carries_no_descriptor(self) -> None:
+        """``None`` is an unverified identity: it must never produce a descriptor."""
+        with pytest.raises(ApexbotValueError, match="No pool probe succeeded"):
+            _descriptor_from_probing_result(
+                succeeded=None,
+                chain_id=CHAIN_ID,
+                factory=UNKNOWN_FACTORY,  # type: ignore[arg-type]
+            )

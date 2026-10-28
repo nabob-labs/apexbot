@@ -1,0 +1,46 @@
+[package]
+name = "apexbot-core"
+description = "Foundational utilities (errors, hex, addresses, runtime) for the apexbot Rust crates."
+keywords = ["mev", "evm", "primitives", "utilities"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5" }
+apexbot-config.workspace = true
+tracing = { version = "^0.1" }
+thiserror = { version = "^2.0" }
+tokio = { version = "^1.54", features = ["rt-multi-thread", "time", "sync"] }
+parking_lot = { version = "^0.13" }
+
+# Optional: enables `From<*> for PyErr` conversions in `errors`.
+# Gated (not default) so pure-Rust consumers build without pulling pyo3.
+# The orphan rule forbids placing these impls in a downstream crate where both
+# `PyErr` and the error types are foreign, so they live here with the types.
+pyo3 = { version = "^0.30", features = ["abi3-py312", "serde"], optional = true }
+
+[features]
+default = []
+# Enables `impl From<apexbot_core::errors::*> for pyo3::PyErr`.
+pyo3 = ["dep:pyo3"]
+# ADR-043 §3: turns the engine-span guard from an always-on one-shot WARN into
+# a `debug_assert` (dev builds) as well. Off by default so a diagnostic
+# regression cannot abort a live worker; the Phase-5 observability enforcement
+# test opts in with `--features apexbot-core/strict-engine-spans`.
+strict-engine-spans = []
+
+[dev-dependencies]
+proptest = "^1.12"
+# Test-only: the `#[tokio::test]` macro for the pubsub-runtime teardown pins.
+tokio = { version = "^1.54", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "^0.3"
+# Test-only: a minimal recording Subscriber for the [cpu-budget] boot-log
+# probe (tracing's trait methods take tracing-core types by name).
+tracing-core = "^0.1"

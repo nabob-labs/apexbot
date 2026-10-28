@@ -1,4 +1,4 @@
-"""§4.2 YUPSIB: standalone aToken Transfer-credit stolen by the deficit_coverage
+"""Parity: standalone aToken Transfer-credit stolen by the deficit_coverage
 scavenger → the recipient's Withdraw crashes "balance would go negative".
 
 Aave V3 moves collateral between users via aToken `Transfer` (+ the
@@ -20,7 +20,7 @@ case) is marked assigned WITHOUT creating a DeficitCoverage op. Then
 BalanceTransfer op → the recipient's credit isn't applied → balance stays 0 →
 the recipient's Withdraw's `CollateralBurn` goes negative → crash.
 
-Surfaced by the W2S3WH re-drive `--to 16596000`: block 16496928 (chunk 21),
+Surfaced by the re-drive `--to 16596000`: block 16496928 (chunk 21),
 user `0x872f…30995` received aWETH via a standalone Transfer (from
 `0xe4217…`) then withdrew — the credit wasn't applied → "balance would go
 negative (current=0, delta=-1000000000000000)".
@@ -33,14 +33,12 @@ probes (the (ii) gate): the user's aWETH balanceOf was 0 at block 16496927,
 + the Withdraw tx 0x4a88 contains the incoming Transfer (li=104/107)
 crediting the user before the Burn (li=111).
 
-Per §4.3, TEMPORARY — retired with the Python oracle in CZM7TI.
+TEMPORARY — retired with the Python oracle.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-
-from sqlalchemy import text
 
 from apexbot._ffi.aave import run_aave_update
 from apexbot._ffi.cancel import CancelHandle
@@ -67,6 +65,14 @@ if TYPE_CHECKING:
 
 _RAY = 10**27  # 1e27 — the liquidity index (steady-state).
 _AMOUNT = 10**15  # 0.001 WETH (on-chain-truth value from block 16496928).
+
+# USER withdraws only half its credited balance: the end-of-chunk zero-balance
+# sweep (cleanup_zero_balance_positions, c4085eaa6) deletes positions the chunk
+# zeroed, so a full withdraw would leave NO row to assert against. With a
+# partial withdraw USER's row survives at balance _AMOUNT - _WITHDRAW — keeping
+# the credited-then-burned arithmetic (and its a_token + value gates) observable
+# in the committed table.
+_WITHDRAW = _AMOUNT // 2
 
 # The new reserve (WETH) + its aToken/vToken — created by ReserveInitialized.
 _WETH = "0x" + "c0" * 20
@@ -178,8 +184,8 @@ def _build_chunk_logs() -> list[dict[str, object]]:
     )
     li += 1
 
-    # tx 3 (continued): USER withdraws — Pool Withdraw + aWETH Burn
-    # (CollateralBurn, debits USER) + the outgoing Transfer-to-zero companion.
+    # tx 3 (continued): USER withdraws _WITHDRAW — Pool Withdraw + aWETH Burn
+    # (CollateralBurn, debits USER) + the outgoing Transfer companion.
     # Pre-fix: USER's balance=0 (the Transfer credit stolen) → the Burn →
     # negative → crash.
     logs.append(
@@ -187,7 +193,7 @@ def _build_chunk_logs() -> list[dict[str, object]]:
             reserve=_WETH,
             user=USER_ADDRESS,
             to=USER_ADDRESS,
-            amount=_AMOUNT,
+            amount=_WITHDRAW,
             log_index=li,
             block=FIXTURE_BLOCK,
             tx_hash=_TX_XFER,
@@ -199,7 +205,7 @@ def _build_chunk_logs() -> list[dict[str, object]]:
             token_address=_A_WETH,
             from_address=USER_ADDRESS,
             target=USER_ADDRESS,
-            value=_AMOUNT,
+            value=_WITHDRAW,
             balance_increase=0,
             index=_RAY,
             log_index=li,
@@ -208,12 +214,12 @@ def _build_chunk_logs() -> list[dict[str, object]]:
         )
     )
     li += 1
-    logs.append(  # outgoing Transfer-to-zero companion
+    logs.append(  # outgoing Transfer companion for the burn
         make_erc20_transfer_log(
             token_address=_A_WETH,
             from_address=USER_ADDRESS,
             to_address="0x" + "00" * 20,
-            value=_AMOUNT,
+            value=_WITHDRAW,
             log_index=li,
             block=FIXTURE_BLOCK,
             tx_hash=_TX_XFER,
@@ -227,7 +233,7 @@ def test_standalone_transfer_credit_then_withdraw(tmp_path: Path) -> None:
     standalone aToken Transfer's credit was stolen by the deficit_coverage
     scavenger (marked assigned without creating an op).
 
-    GREEN (post-fix YUPSIB): the standalone Transfer op is created → USER is
+    GREEN: the standalone Transfer op is created → USER is
     credited → the Withdraw debits → non-negative → no crash + the positions
     land (SENDER + USER both settle to balance 0; the a_token == aWETH).
     """
@@ -250,35 +256,35 @@ def test_standalone_transfer_credit_then_withdraw(tmp_path: Path) -> None:
             cancel_handle=CancelHandle(),
         )
         positions = dump_collateral_position_rows(rust_session)
-        a_token_addr = rust_session.execute(
-            text(
-                "SELECT et.address FROM aave_v3_collateral_positions p "
-                "JOIN aave_v3_assets a ON a.id = p.asset_id "
-                "JOIN erc20_tokens et ON et.id = a.a_token_id "
-                "WHERE p.id = (SELECT MIN(id) FROM aave_v3_collateral_positions)"
-            )
-        ).scalar()
+        row = rust_session.execute(
+            "SELECT et.address FROM aave_v3_collateral_positions p "
+            "JOIN aave_v3_assets a ON a.id = p.asset_id "
+            "JOIN erc20_tokens et ON et.id = a.a_token_id "
+            "WHERE p.id = (SELECT MIN(id) FROM aave_v3_collateral_positions)"
+        ).fetchone()
+        assert row is not None
+        a_token_addr = row[0]
 
     # GREEN: no crash (the standalone Transfer credited USER before the
     # Withdraw debited — the deficit_coverage scavenger no longer steals the
-    # unpaired transfer). Two collateral positions land: SENDER (supplied +
-    # transferred out → settles to 0) + USER (received + withdrew → 0). The
-    # a_token == aWETH (the (b) re-fetch + the standalone Transfer op both
-    # target the right token). Loads-bearing: the absence of the
-    # `balance would go negative` crash is the YUPSIB regression guard.
-    assert len(positions) == 2, f"expected 2 positions (SENDER+USER); got {len(positions)}"
+    # unpaired transfer; a stolen credit makes the Burn go negative and
+    # aborts `run_aave_update` before this assertion).
+    #
+    # End-of-chunk contract (cleanup_zero_balance_positions, restored by
+    # c4085eaa6): rows the chunk zeroed are swept, so SENDER (supplied then
+    # standalone-transferred out) leaves NO row. USER received _AMOUNT and
+    # withdrew _WITHDRAW, so exactly one collateral position survives with
+    # balance _AMOUNT - _WITHDRAW — the credited-then-burned arithmetic, plus
+    # a_token == aWETH (the (b) re-fetch + the standalone Transfer op target
+    # the right token). A bare positional existence check once masked a
+    # ~10^69 oddity here (a user's address read as a U256), so the VALUE
+    # assertion below is the load-bearing gate.
+    assert len(positions) == 1, f"expected 1 surviving position (USER); got {positions!r}"
+    assert int(positions[0]["balance"]) == _AMOUNT - _WITHDRAW, (
+        f"expected USER balance {_AMOUNT - _WITHDRAW!r} "
+        f"(credit {_AMOUNT!r} - burn {_WITHDRAW!r}); got {positions[0]!r}"
+    )
     assert a_token_addr is not None, "no a_token resolved for the collateral position"
     assert a_token_addr.lower() == _A_WETH.lower(), (
         f"a_token {a_token_addr!r} ≠ {_A_WETH!r} (the WETH aToken)"
     )
-    # GREEN (NMWPI6): both end-state balances are 0 (SENDER supplied
-    # _AMOUNT then standalone-transferred it out; USER received then
-    # withdrew). Pre-NMWPI6 the SENDER balance was the user's address
-    # interpreted as a U256 (~1.3e57); the value assertion here locks the
-    # correct scaled balance down (the existence-only gap that previously
-    # masked the ~10^69 oddity).
-    for pos in positions:
-        assert int(pos["balance"]) == 0, (
-            f"expected end-state balance 0 (supply+transfer-out for SENDER; "
-            f"receive+withdraw for USER); got {pos!r}"
-        )

@@ -22,12 +22,15 @@ from functools import cache
 from typing import TYPE_CHECKING
 
 from apexbot.checksum_cache import get_checksum_address
+from apexbot.registry.deployment_records import (
+    DeploymentRecord,
+    load_deployments,
+)
 from apexbot.types.abstract import AbstractExchangeDeployment
 from apexbot.types.chain import ChainId
 
 if TYPE_CHECKING:
-    from apexbot._ffi import ChecksummedAddress
-    from apexbot.registry.deployment_loader import DeploymentRecord
+    from apexbot.types.chain import ChecksummedAddress
 
     # Declare the types of the lazy constants so static checkers know their
     # concrete types (not the union that __getattr__ returns at runtime).
@@ -107,17 +110,15 @@ _DeploymentConstant = (
 )
 
 # (chain_id, lowercase-factory) → DeploymentRecord — the JSON source of truth,
-# indexed lazily on first access. ``chain_id`` from the JSON is an ``int``;
+# cached on first access. ``chain_id`` from the JSON is an ``int``;
 # ``ChainId`` is an ``IntEnum`` so it hashes equal for the lookup.
-# Lazy: breaks a circular import (deployment_loader → aerodrome.pools →
-# uniswap.__init__ → uniswap.deployments). The Rust resolve_* fns above are
+# The records load from the leaf ``deployment_records`` module (no pool-class
+# coupling), so this import is top-level. The Rust resolve_* fns above are
 # available immediately; the JSON records load on first _record() call.
 
 
 @cache
 def _records() -> dict[tuple[int, str], DeploymentRecord]:
-    from apexbot.registry.deployment_loader import load_deployments
-
     return {(r.chain_id, r.factory.lower()): r for r in load_deployments()}
 
 
@@ -198,11 +199,10 @@ def _v3(name: str, chain_id: int, factory: str) -> UniswapV3ExchangeDeployment:
     )
 
 
-# Typed per-DEX deployment constants are built lazily via __getattr__ to
-# avoid a circular import: the constants call _record() → load_deployments()
-# → deployment_loader → pool classes → uniswap.__init__ → trackers → this
-# module. The Rust resolver fns (resolve_deployer etc.) are available
-# immediately; the typed constants build on first access.
+# Typed per-DEX deployment constants are built lazily via __getattr__:
+# the constants call _record(), which reads the JSON on first access. The
+# Rust resolver fns (resolve_deployer etc.) are available immediately;
+# the typed constants build on first access.
 
 
 @cache
@@ -369,7 +369,7 @@ def __getattr__(name: str) -> _DeploymentConstant:
 
     This breaks a circular import: the constants call ``_record()`` →
     ``load_deployments()`` → ``deployment_loader`` → pool classes →
-    ``uniswap.__init__`` → ``trackers`` → this module. The Rust resolver
+    ``uniswap.__init__`` → this module. The Rust resolver
     fns (``resolve_deployer``, ``resolve_v2_init_hash``, ``resolve_v3_init_hash``)
     are available immediately as module-level imports; only the typed
     constants need the heavy chain, so they build on first access.

@@ -1,37 +1,38 @@
-"""UniswapV4Pool: concentrated liquidity AMM companion over a LiquidityPool handle.
+"""UniswapV4Pool: concentrated liquidity AMM companion over a Pool handle.
 
-ADR-005 slice 9b — the V4 companion rewritten over the same `LiquidityPool`
-handle topology as the V3 companion. Rust `BotState` is the single source of
+The V4 companion sits on the same `Pool` handle topology as the V3
+companion. Rust `BotState` is the single source of
 truth for V4 mutable state (scalars, tick data, reorg journal); this companion
 reads it through `self._py_pool` (atomic `snapshot_v3()` for scalars — already
-V3/V4-generic via `get_v3_or_v4_pool` — + `tick_data_snapshot()`/
-`tick_bitmap_snapshot()` for the tick maps) and delegates
-`external_update` (Swap) / `update_liquidity_map` (ModifyLiquidity) /
-`update_tick_data` (sparse-map backfill) / discard / restore to the handle.
+V3/V4-generic via `get_v3_or_v4_pool` — + `tick_data()`/`tick_bitmap` for the
+ tick maps). The companion is a READ surface: state moves on the pump's own
+door (`Bot.dispatch_log` → `LogDispatcher` decode → apply), never through a
+companion write method.
 
-`_state_mgr` / `_state_cache` / `state_cache_depth` are dropped — the
-`StateCache` temporal-navigation layer lives in Rust now (journal +
-discard/restore). V3 already has none; V4 follows.
+There is no `_state_mgr` / `_state_cache` / `state_cache_depth`: the
+`StateCache` temporal-navigation layer lives in Rust (journal +
+discard/restore).
 
-V4-specific identity (pool_id, pool_manager_address, pool_key, hook_address,
-protocol_fee, lp_fee, state_view_address) stays Python-side — matches V3
-keeping tokens/factory/fee Python-side. The hook admission floor (reject
+V4-specific identity (pool_id, pool_manager_address, pool_key, hook_address)
+stays Python-side — matches V3 keeping tokens/factory/fee Python-side; the
+fee/state-view values read off the handle (self-describing, ADR-085 D4). The
+hook admission floor (reject
 amount-modifying hooks + dynamic fees) lives in Rust
-(`BotState::register_v4_pool`), surfaced at `Bot.register_v4_pool` (ADR-005
-slice 9a) so the companion never holds a hooked pool.
+(`BotState::register_v4_pool`), surfaced at `Bot.register_v4_pool`, so the
+companion never holds a hooked pool.
 
 Checked words (a tick-data fetcher probed `tickBitmap(word)` and the on-chain
 bitmap was zero) are tracked in Rust `known_bitmap_words` (Sparse only — see
-the V3 companion's sparse-map note); `tick_bitmap_snapshot()` surfaces a
-checked-but-empty word as `(0, block)` so the fetch loop breaks with no
-client-side bitmap shadow.
+the V3 companion's sparse-map note); `tick_bitmap` surfaces the known word
+positions as a `set[int]` so the fetch loop breaks with no client-side bitmap
+shadow.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from apexbot.abi import encode
 from apexbot.checksum_cache import get_checksum_address
@@ -44,19 +45,37 @@ from apexbot.exceptions.pool import (
     IncompleteSwap,
     LiquidityPoolError,
 )
-from apexbot.uniswap.cl_companion import ConcentratedLiquidityCompanion
+from apexbot.uniswap import SwapRefusalKind, SwapRefused, swap_refusal_to_error
+from apexbot.uniswap.concentrated_liquidity_base import ConcentratedLiquidityBase
 from apexbot.uniswap.v4_pool_calc import UniswapV4PoolCalc
 from apexbot.uniswap.v4_pool_state import V4PoolState
 from apexbot.uniswap.v4_types import (
-    Pip,
     UniswapV4PoolKey,
     UniswapV4PoolState,
 )
 from apexbot.utils.bytes import to_0x_hex
 
 if TYPE_CHECKING:
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.chain import ChecksummedAddress
+    from apexbot.uniswap import SwapRead
+
+
+def _signed_amounts(read: SwapRead, *, zero_for_one: bool) -> tuple[int, int]:
+    """Split a computed swap read's signed deltas into (amount_in, amount_out).
+
+    The Rust seam returns the deposited-`+`/sent-`-` per-token deltas; the
+    input side reads positive and the output side negative.
+
+    Returns:
+        The ``(amount_in, amount_out)`` unsigned magnitudes.
+
+    """
+    amount0_delta = int(read.amount0_delta)
+    amount1_delta = int(read.amount1_delta)
+    if zero_for_one:
+        return amount0_delta, -amount1_delta
+    return amount1_delta, -amount0_delta
 
 
 @dataclasses.dataclass(slots=True)
@@ -104,7 +123,6 @@ class Slot0:
     lp_fee: int
 
 
-PIPS_DENOMINATOR = 1_000_000
 NATIVE_CURRENCY_ADDRESS = ZERO_ADDRESS
 
 
@@ -131,18 +149,16 @@ class Hooks(Enum):
 class UniswapV4Pool(
     V4PoolState,
     UniswapV4PoolCalc,
-    ConcentratedLiquidityCompanion,
+    ConcentratedLiquidityBase,
 ):
-    """A Uniswap V4 concentrated-liquidity pool companion over a ``LiquidityPool`` handle.
+    """A Uniswap V4 concentrated-liquidity pool companion over a ``Pool`` handle.
 
     Rust owns the mutable state (scalars + tick data + reorg journal) as
     ``V4PoolState``; this companion reads it through ``self._py_pool`` (one
     atomic ``snapshot_v3()`` for scalars — already V3/V4-generic via
     ``get_v3_or_v4_pool`` — + ``tick_data_snapshot()`` /
-    ``tick_bitmap_snapshot()`` for the tick maps) and delegates
-    ``external_update`` (Swap) / ``update_liquidity_map`` (ModifyLiquidity) /
-    ``update_tick_data`` (sparse-map backfill) / discard / restore to the
-    handle. V4-specific identity (pool_id, pool_manager, pool_key, hooks,
+    ``tick_data()``/``tick_bitmap`` for the tick maps). V4-specific identity
+    (pool_id, pool_manager, pool_key, hooks,
     protocol_fee, lp_fee, state_view_address) stays Python-side — matches V3.
 
     Construct via the V4 builder (which registers in Rust and hands the handle
@@ -156,8 +172,8 @@ class UniswapV4Pool(
 
     type PoolState = UniswapV4PoolState
 
-    # Instance attributes set in `_from_py_pool` (the only construction seam).
-    _py_pool: LiquidityPool
+    # Instance attributes set in `from_handle` (the only construction seam).
+    _py_pool: Pool
     _pool_id: bytes
     _pool_manager_address: ChecksummedAddress
     hook_address: ChecksummedAddress
@@ -175,15 +191,15 @@ class UniswapV4Pool(
         """Direct construction is forbidden.
 
         ``UniswapV4Pool`` is a Python companion over a Rust-owned
-        ``LiquidityPool`` handle. The handle can only be produced by
+        ``Pool`` handle. The handle can only be produced by
         registering a pool in a ``Bot`` — there is no way for a caller to
         hand-build one. Use the registered entry points instead:
 
         - Production: ``Bot.build_pool(address)``
         - Tests: ``make_v4_pool(...)``
 
-        Both register the pool in Rust, obtain the ``LiquidityPool``
-        handle, and wrap it via :meth:`_from_py_pool` (mirroring Polars'
+        Both register the pool in Rust, obtain the ``Pool``
+        handle, and wrap it via :meth:`from_handle` (mirroring Polars'
         ``_from_pydf`` seam).
 
         Raises:
@@ -194,13 +210,13 @@ class UniswapV4Pool(
             f"{type(self).__name__} cannot be constructed directly. "
             "Use Bot.build_pool(address) (production) or make_v4_pool(...) "
             "(tests) to register the pool in Rust and obtain the "
-            "LiquidityPool handle to wrap."
+            "Pool handle to wrap."
         )
         raise TypeError(msg)
 
     @classmethod
-    def _from_py_pool(cls, py_pool: LiquidityPool) -> Self:
-        """Wrap a Rust-owned ``LiquidityPool`` handle as a Python companion.
+    def from_handle(cls, py_pool: Pool) -> Self:
+        """Wrap a Rust-owned ``Pool`` handle as a Python companion.
 
         Internal seam (ADR-005, Polars-style ``_from_pydf`` pattern). The
         handle is self-describing: every identity field (pool_manager,
@@ -210,9 +226,9 @@ class UniswapV4Pool(
         immutable registration metadata as ``V4PoolIdentity``; this companion
         reads both through ``self._py_pool``.
 
-        Protocol fee / LP fee / state_view_address are builder-supplied
-        values the seam defaults; the builder overrides them after
-        ``_from_py_pool`` (matches V3's deployer/init_hash override).
+        Protocol fee / LP fee / state_view_address are read off the handle
+        like every identity field (the handle is self-describing, ADR-085
+        D4) — no builder-supplied override threads them.
 
         Returns:
             A ``cls`` instance wrapping ``py_pool``.
@@ -227,9 +243,9 @@ class UniswapV4Pool(
         # Variant-family guard.
         if py_pool.pool_family != "v4":
             msg = (
-                "LiquidityPool handle is not a V4-family pool "
+                "Pool handle is not a V4-family pool "
                 f"(got pool_family {py_pool.pool_family!r}); "
-                "UniswapV4Pool._from_py_pool requires a handle "
+                "UniswapV4Pool.from_handle requires a handle "
                 "registered via register_v4_pool"
             )
             raise ApexbotValueError(message=msg)
@@ -252,14 +268,15 @@ class UniswapV4Pool(
                 "(ADR-006): get_token0/get_token1 returned None"
             )
             raise ApexbotValueError(message=msg)
-        self._token0 = Erc20Token._from_py_token(py_token0)  # ruff:ignore[private-member-access]
-        self._token1 = Erc20Token._from_py_token(py_token1)  # ruff:ignore[private-member-access]
+        self._token0 = Erc20Token.from_handle(py_token0)
+        self._token1 = Erc20Token.from_handle(py_token1)
 
+        view = py_pool.concentrated_liquidity()
         self._pool_key = UniswapV4PoolKey(
             currency0=self._token0.address,
             currency1=self._token1.address,
-            fee=py_pool.fee,
-            tick_spacing=py_pool.tick_spacing,
+            fee=view.fee,
+            tick_spacing=view.tick_spacing,
             hooks=self.hook_address,
         )
 
@@ -283,11 +300,20 @@ class UniswapV4Pool(
 
         self.name = f"{self._token0}-{self._token1} ({self.__class__.__name__}, id={to_0x_hex(self.pool_id)})"  # ruff:ignore[line-too-long]
 
-        # Protocol fee / LP fee / initial state block — builder-supplied values
-        # the seam defaults; the builder overrides after _from_py_pool.
-        self.protocol_fee = ProtocolFee(zero_for_one=0, one_for_zero=0)
-        self.lp_fee = self.pool_key.fee
-        self._initial_state_block = self._py_pool.update_block
+        # Protocol fee / LP fee / state view — read off the SAME handle as
+        # every identity field (the handle is self-describing: the core's
+        # state machine owns the packed slot0.protocolFee, the pool key owns
+        # the static LP fee, and the manager's state-view registration owns
+        # the StateView address).
+        packed_protocol_fee = py_pool.protocol_fee
+        self.protocol_fee = ProtocolFee(
+            zero_for_one=packed_protocol_fee & 0xFFF,
+            one_for_zero=packed_protocol_fee >> 12,
+        )
+        self.lp_fee = py_pool.lp_fee
+        state_view = py_pool.state_view_address
+        self._state_view_address = get_checksum_address(state_view) if state_view else ZERO_ADDRESS
+        self._initial_state_block = self._py_pool.concentrated_liquidity().update_block
 
         return self
 
@@ -329,22 +355,6 @@ class UniswapV4Pool(
         """
         return self.name
 
-    @staticmethod
-    def _calculate_swap_fee(
-        protocol_fee: int,
-        lp_fee: int,
-    ) -> Pip:
-        """Calculate combined swap fee from protocol + LP fee.
-
-        Returns:
-            The combined fee in pips.
-
-        """
-        protocol_fee &= 0xFFF
-        lp_fee &= 0xFFFFFF
-        numerator = protocol_fee * lp_fee
-        return (protocol_fee + lp_fee) - (numerator // PIPS_DENOMINATOR)
-
     def calculate_tokens_in_from_tokens_out(
         self,
         token_out: Erc20Token,
@@ -360,101 +370,55 @@ class UniswapV4Pool(
             ApexbotValueError: If token_out is not held by this pool.
             HookedPoolResult: If the pool has active hooks that affect the swap.
             IncompleteSwap: If the swap cannot fulfill the full output amount.
-            LiquidityPoolError: If the simulated execution reverts.
+            LiquidityPoolError: If the simulated execution cannot compute.
+            swap_refusal_to_error: Renders a refusal that is not a
+                swap-geometry verdict — the walk entered an unfetched word
+                and the on-demand fetch failed (MissingLiquidityData).
 
         """
         if token_out not in self.tokens:  # pragma: no cover
             raise ApexbotValueError(message="token_out not found!")
-
         zero_for_one = token_out == self._token1
-
-        # ADR-005 slice 4: mainline exact-output swap (no override) delegates to
-        # the Rust exact-output fetch+retry seam. The V4 exact-output sign
-        # convention (amountSpecified > 0) is handled in the Rust core; a custom
-        # limit threads through (the seam honours it). The override path routes
-        # to the Rust exact-output override seam
-        # (``simulate_exact_output_swap_with_override`` — see below).
-        if override_state is None:
-            outcome = self._py_pool.simulate_exact_output_swap_with_fetch(
+        # The typed read (ADR-037/t2): a refusal is the not-computable
+        # verdict (the real pool's revert-analog).
+        try:
+            read = self._py_pool.simulate(
                 zero_for_one=zero_for_one,
-                amount_out=token_out_quantity,
+                amount_specified=token_out_quantity,
                 block=self.update_block,
+                override_state=override_state,
             )
-            if outcome is None:
-                raise LiquidityPoolError(
-                    message=(
-                        f"Simulated execution could not compute. "
-                        f"pool={self.address} zfo={zero_for_one} "
-                        f"amount_out={token_out_quantity}"
-                    ),
-                )
-            rust_amount0, rust_amount1 = int(outcome[0]), int(outcome[1])
-            # The output side is the requested token_out; the input side is the
-            # required token_in (opposing amount). zfo: token1 out / token0 in;
-            # ofz: token0 out / token1 in.
-            rust_amount_out = rust_amount1 if zero_for_one else rust_amount0
-            if rust_amount_out < token_out_quantity:
-                rust_amount_in = rust_amount0 if zero_for_one else rust_amount1
-                raise IncompleteSwap(
-                    amount_in=rust_amount_in,
-                    amount_out=rust_amount_out,
-                )
-            return rust_amount0 if zero_for_one else rust_amount1
-
-        # ADR-005 slice 4: exact-output swap over an override (arbitrage
-        # hypothetical) delegates to the Rust fetch-enhanced exact-output
-        # override seam. HookedPoolResult / IncompleteSwap stay in Python.
-        outcome = self._py_pool.simulate_exact_output_swap_with_override(
-            zero_for_one=zero_for_one,
-            amount_out=token_out_quantity,
-            block=self.update_block,
-            override_sqrt_price_x96=override_state.sqrt_price_x96,
-            override_liquidity=override_state.liquidity,
-            override_tick=override_state.tick,
-            override_tick_data={
-                tick: (la.liquidity_gross, la.liquidity_net, la.block)
-                for tick, la in override_state.tick_data.items()
-            },
-            sqrt_price_limit_x96=None,
-        )
-        if outcome is None:
+        except SwapRefused as exc:
+            if exc.args[0] is not SwapRefusalKind.NotComputable:
+                # An infrastructure failure (an unfetchable word), not a
+                # swap-geometry verdict — render it honestly.
+                raise swap_refusal_to_error(exc) from exc
             raise LiquidityPoolError(
                 message=(
                     f"Simulated execution could not compute. "
                     f"pool={self.address} zfo={zero_for_one} "
-                    f"amount_out={token_out_quantity} override"
+                    f"amount_out={token_out_quantity}"
                 ),
-            )
-        rust_amount0, rust_amount1 = int(outcome[0]), int(outcome[1])
-        # Exact-output: output side is the requested token_out; input side is
-        # the required token_in. ofz (zfo=False): token0 out / token1 in.
-        # zfo: token1 out / token0 in.
-        amount_out = rust_amount1 if zero_for_one else rust_amount0
-        amount_in = rust_amount0 if zero_for_one else rust_amount1
-
-        assert amount_out <= token_out_quantity
-
-        if conflicting_hooks := (
-            {
+            ) from exc
+        amount_in, amount_out = _signed_amounts(read, zero_for_one=zero_for_one)
+        if override_state is not None:
+            conflicting_hooks = {
                 Hooks.AFTER_SWAP,
                 Hooks.AFTER_SWAP_RETURNS_DELTA,
                 Hooks.BEFORE_SWAP,
                 Hooks.BEFORE_SWAP_RETURNS_DELTA,
-            }
-            & self.active_hooks
-        ):
-            raise HookedPoolResult(
-                amount_in=amount_in,
-                amount_out=amount_out,
-                hooks=conflicting_hooks,
-            )
-
+            } & self.active_hooks
+            if conflicting_hooks:
+                raise HookedPoolResult(
+                    amount_in=amount_in,
+                    amount_out=amount_out,
+                    hooks=conflicting_hooks,
+                )
         if amount_out < token_out_quantity:
             raise IncompleteSwap(
                 amount_in=amount_in,
                 amount_out=amount_out,
             )
-
         return amount_in
 
     def calculate_tokens_out_from_tokens_in(
@@ -472,90 +436,55 @@ class UniswapV4Pool(
             ApexbotValueError: If token_in is not held by this pool.
             HookedPoolResult: If the pool has active hooks that affect the swap.
             IncompleteSwap: If the swap cannot fulfill the full input amount.
-            LiquidityPoolError: If the simulated execution reverts.
+            LiquidityPoolError: If the simulated execution cannot compute.
+            swap_refusal_to_error: Renders a refusal that is not a
+                swap-geometry verdict — the walk entered an unfetched word
+                and the on-demand fetch failed (MissingLiquidityData).
 
         """
         if token_in not in self.tokens:  # pragma: no cover
             raise ApexbotValueError(message="token_in not found!")
-
         zero_for_one = token_in == self._token0
-
-        # ADR-005 slice 3b: mainline exact-input swap (no override, no custom
-        # price limit) delegates to the Rust fetch+retry seam. The sparse-path
-        # crossing-swap divergence (ELSE-branch miss check in `v4_simulate_swap`)
-        # is fixed — `test_cached_calculations` was RED on seed 2, now GREEN
-        # across seeds. The override path routes to the Rust override seam
-        # (``simulate_swap_with_override`` — see below); a custom limit threads
-        # through both paths (the seam honours it).
-        if override_state is None:
-            outcome = self._py_pool.simulate_swap_with_fetch(
+        # The typed read (ADR-037/t2): a refusal is the not-computable
+        # verdict (the real pool's revert-analog).
+        try:
+            read = self._py_pool.simulate(
                 zero_for_one=zero_for_one,
-                amount_in=token_in_quantity,
+                amount_specified=-token_in_quantity,
                 block=self.update_block,
+                override_state=override_state,
             )
-            if outcome is None:
-                raise LiquidityPoolError(
-                    message=(
-                        f"Simulated execution could not compute. "
-                        f"pool={self.address} zfo={zero_for_one} "
-                        f"amount_in={token_in_quantity}"
-                    ),
-                )
-            rust_amount0, rust_amount1 = int(outcome[0]), int(outcome[1])
-            return rust_amount1 if zero_for_one else rust_amount0
-
-        # ADR-005 slice 4: exact-input swap over an override (arbitrage
-        # hypothetical) delegates to the Rust fetch-enhanced override seam.
-        # HookedPoolResult / IncompleteSwap stay in Python.
-        outcome = self._py_pool.simulate_swap_with_override(
-            zero_for_one=zero_for_one,
-            amount_in=token_in_quantity,
-            block=self.update_block,
-            override_sqrt_price_x96=override_state.sqrt_price_x96,
-            override_liquidity=override_state.liquidity,
-            override_tick=override_state.tick,
-            override_tick_data={
-                tick: (la.liquidity_gross, la.liquidity_net, la.block)
-                for tick, la in override_state.tick_data.items()
-            },
-            sqrt_price_limit_x96=None,
-        )
-        if outcome is None:
+        except SwapRefused as exc:
+            if exc.args[0] is not SwapRefusalKind.NotComputable:
+                # An infrastructure failure (an unfetchable word), not a
+                # swap-geometry verdict — render it honestly.
+                raise swap_refusal_to_error(exc) from exc
             raise LiquidityPoolError(
                 message=(
                     f"Simulated execution could not compute. "
                     f"pool={self.address} zfo={zero_for_one} "
-                    f"amount_in={token_in_quantity} override"
+                    f"amount_in={token_in_quantity}"
                 ),
-            )
-        rust_amount0, rust_amount1 = int(outcome[0]), int(outcome[1])
-        # ofz (zfo=False): token1 in / token0 out. zfo: token0 in / token1 out.
-        amount_in = rust_amount0 if zero_for_one else rust_amount1
-        amount_out = rust_amount1 if zero_for_one else rust_amount0
-
-        assert amount_in <= token_in_quantity
-
-        if conflicting_hooks := (
-            {
+            ) from exc
+        amount_in, amount_out = _signed_amounts(read, zero_for_one=zero_for_one)
+        if override_state is not None:
+            conflicting_hooks = {
                 Hooks.AFTER_SWAP,
                 Hooks.AFTER_SWAP_RETURNS_DELTA,
                 Hooks.BEFORE_SWAP,
                 Hooks.BEFORE_SWAP_RETURNS_DELTA,
-            }
-            & self.active_hooks
-        ):
-            raise HookedPoolResult(
-                amount_in=amount_in,
-                amount_out=amount_out,
-                hooks=conflicting_hooks,
-            )
-
-        if amount_in < token_in_quantity:
-            raise IncompleteSwap(
-                amount_in=amount_in,
-                amount_out=amount_out,
-            )
-
+            } & self.active_hooks
+            if conflicting_hooks:
+                raise HookedPoolResult(
+                    amount_in=amount_in,
+                    amount_out=amount_out,
+                    hooks=conflicting_hooks,
+                )
+            if amount_in < token_in_quantity:
+                raise IncompleteSwap(
+                    amount_in=amount_in,
+                    amount_out=amount_out,
+                )
         return amount_out
 
     @property
@@ -596,7 +525,7 @@ class UniswapV4Pool(
             The current sqrt price as a Q64.96 value (from Rust).
 
         """
-        return self._py_pool.sqrt_price_x96
+        return cast("int", self._py_pool.concentrated_liquidity().sqrt_price_x96)
 
     @property
     def state(self) -> UniswapV4PoolState:
@@ -611,20 +540,23 @@ class UniswapV4Pool(
             ApexbotValueError: If the pool is not registered in Rust.
 
         """
-        snap = self._py_pool.snapshot_v3()
-        if snap is None:
+        try:
+            view = self._py_pool.concentrated_liquidity()
+        except ValueError as exc:
             msg = "No V4 pool state available (pool not registered in Rust)"
-            raise ApexbotValueError(message=msg)
-        sqrt_price_x96, liquidity, tick, block = snap
-        return self.PoolState.__value__(
-            id=self.pool_id,
-            address=self._pool_manager_address,
-            liquidity=liquidity,
-            sqrt_price_x96=sqrt_price_x96,
-            tick=tick,
-            tick_bitmap=self.tick_bitmap,
-            tick_data=self.tick_data,
-            block=block,
+            raise ApexbotValueError(message=msg) from exc
+        return cast(
+            "UniswapV4PoolState",
+            self.PoolState.__value__(
+                id=self.pool_id,
+                address=self._pool_manager_address,
+                liquidity=view.liquidity,
+                sqrt_price_x96=view.sqrt_price_x96,
+                tick=view.tick,
+                tick_bitmap=self.tick_bitmap,
+                tick_data=self.tick_data,
+                block=view.update_block,
+            ),
         )
 
     @property

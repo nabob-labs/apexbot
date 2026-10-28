@@ -1,11 +1,11 @@
-"""ADR-005 sparse-map feature parity — slice 3a PyO3 fetch-callback seam.
+"""Sparse-map feature parity — the PyO3 fetch-callback seam.
 
 End-to-end gate for the Rust→PyO3→Python fetcher bridge:
 
 * registering a V3 pool via ``Bot`` always creates a *sparse* pool (empty
   ``tick_data`` → no tick-bitmap words known), so the very first
   ``calculate_tokens_out`` must miss on the starting word and return ``0``;
-* ``LiquidityPool.calculate_tokens_out_with_fetch`` drives the Rust
+* ``Pool.calculate_tokens_out_with_fetch`` drives the Rust
   fetch+retry loop: on the miss it calls the injected Python fetcher
   ``fetcher(word, block) -> dict | None`` for the missing word, merges the
   returned tick data into ``BotState``, and retries;
@@ -16,9 +16,8 @@ End-to-end gate for the Rust→PyO3→Python fetcher bridge:
   give up with ``0`` rather than panic or spin.
 
 This proves the FFI seam works (GIL + Python dict → ``FetchedTickWord`` → Rust
-loop). Slice 3b routes the V3/V4 companions' non-override calc through this seam;
-slice 4 retires the Python simulators' swap-loop behind a dense-map parity
-corpus.
+loop). The V3/V4 companions' non-override calc routes through this seam; the
+Python simulators' swap-loop is retired behind a dense-map parity corpus.
 """
 
 from __future__ import annotations

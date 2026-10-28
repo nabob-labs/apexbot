@@ -7,7 +7,7 @@ The Rust core is the engine; Python is a driver shell. Pool/token state, swap ma
 - **Pure-Rust MEV bot** — `cargo add apexbot` and build a fully functional bot in Rust only. API: [docs.rs/apexbot](https://docs.rs/apexbot)
 - **Python-driven MEV bot** — drive the same core through a thin PyO3 layer, `pip install apexbot`. API & docs: this site
 
-Start with {doc}`getting-started` — or open {doc}`adr/index` if you want the design rationale first.
+Start with {doc}`getting-started` — or open {doc}`adr/README` if you want the design rationale first.
 
 ## Where everything lives
 
@@ -20,13 +20,13 @@ Start with {doc}`getting-started` — or open {doc}`adr/index` if you want the d
 - {doc}`architecture/executor-command-grammar` — the execution layer's command language
 - {doc}`architecture/rust-owned-bot` — what moved into the Rust core and why
 
-…plus 14 more in the sidebar: executor grammar usage, CL tickmaps, Curve stableswap, revm diagnostics, storage layouts.
+…plus 14 more in the sidebar: executor grammar usage, concentrated-liquidity tickmaps, Curve stableswap, revm diagnostics, storage layouts.
 
-**{doc}`adr/index`** — 40 settled design decisions, indexed by title and status; the "why" behind the code.
+**{doc}`adr/README`** — the settled design decisions, grouped by whether they still bind; the "why" behind the code.
 
 **Command line** — the `apexbot` CLI: {doc}`cli/pool` (pool inspection & management), {doc}`cli/database` (schema, migrations, cutover), {doc}`cli/aave` (Aave V3 tooling).
 
-**Operations** — {doc}`logging` (log registry, Python-logging forwarding), {doc}`failure-policy` (reaction taxonomy for runtime failures), {doc}`execution-strategy` (strategy configuration), {doc}`telemetry-latency-playbook` (pump/solve latency from Jaeger & Prometheus).
+**Operations** — {doc}`logging` (log registry, Python-logging forwarding), {doc}`failure-policy` (reaction taxonomy for runtime failures), {doc}`execution-strategy` (strategy configuration), {doc}`telemetry-latency-playbook` (pump/solve latency from Jaeger & Prometheus), {doc}`releases/runbook` (cutting, resuming, and verifying a release).
 
 **Aave V3 integration** — {doc}`aave/README` is the overview; {doc}`aave/flows/position_manager` and {doc}`aave/transformations/index` are good first entries into the per-flow behavior notes.
 
@@ -53,7 +53,7 @@ architecture/*
 :caption: ADRs
 :hidden:
 
-adr/index
+adr/README
 ```
 
 ```{toctree}
@@ -86,6 +86,9 @@ aave/transformations/*
 
 cache-lab-report
 hotpath-crossing-cache-verification
+testing/parity-suite-retirement-census
+cow-protocol-survey
+updater-rpc-sql-survey
 rayon-parallelism-lab
 mimalloc-purge-delay-decision
 ratr5a-cxrhw3-closure-census

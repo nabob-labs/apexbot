@@ -1,6 +1,6 @@
 """Shared types: AddressComparable, state caches, pool enums, and aliases."""
 
-from apexbot._ffi import LiquidityPool
+from apexbot._ffi import Pool
 from apexbot._ffi.dex_identity import DexIdentity, dex_identity
 
 from .address_comparable import AddressComparable
@@ -17,8 +17,8 @@ __all__ = (
     "BoundedCache",
     "DexIdentity",
     "KeyedDefaultDict",
-    "LiquidityPool",
     "MultiTokenSwapCalculation",
+    "Pool",
     "PoolSimulation",
     "StateManageablePool",
     "TwoTokenSwapCalculation",

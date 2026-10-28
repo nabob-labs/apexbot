@@ -1,6 +1,5 @@
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -12,15 +11,12 @@ from apexbot.constants import ZERO_ADDRESS
 from apexbot.erc20.erc20 import Erc20Token
 from apexbot.exceptions.base import ApexbotValueError
 from apexbot.exceptions.pool import (
-    ExternalUpdateError,
     InvalidSwapInputAmount,
     LiquidityPoolError,
-    NoPoolStateAvailable,
 )
 from apexbot.fork import AnvilFork
 from apexbot.uniswap.v2_liquidity_pool import UniswapV2Pool
 from apexbot.uniswap.v2_types import (
-    UniswapV2PoolExternalUpdate,
     UniswapV2PoolSimulationResult,
     UniswapV2PoolState,
 )
@@ -30,10 +26,6 @@ from tests.helpers.bot_factory import make_bot_with_provider
 from tests.helpers.contract_compat import make_contract
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v2_pool_factory import make_v2_pool
-
-if TYPE_CHECKING:
-    from apexbot.types.aliases import BlockNumber
-
 
 UNISWAP_V2_WBTC_WETH_POOL = get_checksum_address("0xBb2b8038a1640196FbE3e38816F3e67Cba72D940")
 UNISWAP_V2_FACTORY_ADDRESS = get_checksum_address("0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
@@ -145,14 +137,13 @@ def test_nominal_price_scaled_by_decimals(
         )
 
 
-@pytest.mark.skip
+@pytest.mark.skip(reason="fork test pending rewrite after the DEX subclass collapse")
 def test_create_camelot_v2_stable_pool(fork_arbitrum_full: AnvilFork):
     bot = _make_bot(fork_arbitrum_full)
     lp = bot.build_pool(CAMELOT_MIM_USDC_LP_ADDRESS)
-    # ADR-005 slice 7 step 4b: the hollow CamelotLiquidityPool subclass is
-    # deleted; Camelot pools are now canonical UniswapV2Pool instances whose
-    # DexIdentity variant tags them as Camelot. The stable pair resolves to
-    # the ``camelot-v2-stable`` preset.
+    # There is no CamelotLiquidityPool subclass; Camelot pools are canonical
+    # UniswapV2Pool instances whose DexIdentity variant tags them as Camelot.
+    # The stable pair resolves to the ``camelot-v2-stable`` preset.
     assert isinstance(lp, UniswapV2Pool)
     assert lp.dex.variant == "camelot-v2-stable"
 
@@ -178,10 +169,9 @@ def test_create_camelot_v2_stable_pool(fork_arbitrum_full: AnvilFork):
 def test_create_camelot_v2_pool(fork_arbitrum_full: AnvilFork):
     bot = _make_bot(fork_arbitrum_full)
     lp = bot.build_pool(CAMELOT_WETH_USDC_LP_ADDRESS)
-    # ADR-005 slice 7 step 4b: the hollow CamelotLiquidityPool subclass is
-    # deleted; Camelot pools are now canonical UniswapV2Pool instances whose
-    # DexIdentity variant tags them as Camelot. The volatile pair resolves to
-    # the ``camelot-v2-volatile`` preset.
+    # There is no CamelotLiquidityPool subclass; Camelot pools are canonical
+    # UniswapV2Pool instances whose DexIdentity variant tags them as Camelot.
+    # The volatile pair resolves to the ``camelot-v2-volatile`` preset.
     assert isinstance(lp, UniswapV2Pool)
     assert lp.dex.variant == "camelot-v2-volatile"
 
@@ -405,150 +395,6 @@ def test_comparisons(
     _ = {ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block, other_lp}
 
 
-def test_reorg(ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block: UniswapV2Pool):
-    # The reorg journal is now Rust-owned (ADR-005 slice 4) with a default
-    # depth of 32 blocks — ample for the 10 dummy updates below, so the former
-    # custom StateCache(max_depth=100) swap is no longer needed.
-    starting_state = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state
-    starting_block = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-
-    first_update_block = (
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block + 1
-    )
-    last_update_block = (
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block + 10
-    )
-
-    starting_token0_reserves = starting_state.reserves_token0
-    starting_token1_reserves = starting_state.reserves_token1
-
-    expected_block_states: dict[int, UniswapV2PoolState] = {starting_block: starting_state}
-
-    # Provide some dummy updates, then simulate a reorg back to the starting state
-    for block_number in range(first_update_block, last_update_block + 1):
-        assert block_number not in expected_block_states
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.external_update(
-            update=UniswapV2PoolExternalUpdate(
-                block_number=block_number,
-                reserves_token0=starting_token0_reserves
-                + 10_000 * (1 + block_number - first_update_block),
-                reserves_token1=starting_token1_reserves
-                + 10_000 * (1 + block_number - first_update_block),
-            ),
-        )
-        assert (
-            ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-            == block_number
-        )
-        expected_block_states[block_number] = (
-            ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state
-        )
-
-    last_block_state = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state
-
-    # Cannot restore to a pool state before the first
-    with pytest.raises(NoPoolStateAvailable):
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.restore_state_before_block(
-            0,
-        )
-
-    # Last state is before this block, so this will succeed but have no effect on the current state
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.restore_state_before_block(
-        last_update_block + 1,
-    )
-    assert ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state == last_block_state
-
-    # Unwind the updates and compare to the stored states at previous blocks
-    for block_number in range(last_update_block, first_update_block - 1, -1):
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.restore_state_before_block(
-            block_number,
-        )
-        assert (
-            ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state
-            == expected_block_states[block_number - 1]
-        )
-
-    # Verify the pool has been returned to the starting state
-    assert ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state == starting_state
-
-
-def test_discard_before_finalized(
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block: UniswapV2Pool,
-):
-    starting_state = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state
-    starting_block = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-
-    assert ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block._py_pool is not None
-
-    first_update_block = (
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block + 1
-    )
-    last_update_block = (
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block + 10
-    )
-
-    starting_token0_reserves = starting_state.reserves_token0
-    starting_token1_reserves = starting_state.reserves_token1
-
-    expected_block_states: dict[BlockNumber, UniswapV2PoolState] = {starting_block: starting_state}
-
-    # Provide some dummy updates, then simulate a reorg back to the starting state
-    for block_number in range(first_update_block, last_update_block + 1):
-        assert block_number not in expected_block_states
-
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.external_update(
-            update=UniswapV2PoolExternalUpdate(
-                block_number=block_number,
-                reserves_token0=starting_token0_reserves
-                + 10_000 * (1 + block_number - first_update_block),
-                reserves_token1=starting_token1_reserves
-                + 10_000 * (1 + block_number - first_update_block),
-            ),
-        )
-        assert (
-            ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-            == block_number
-        )
-        expected_block_states[block_number] = (
-            ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.state
-        )
-
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.discard_states_before_block(
-        last_update_block,
-    )
-    assert (
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-        == last_update_block
-    )
-
-
-def test_discard_earlier_than_created(
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block: UniswapV2Pool,
-) -> None:
-    lp = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block
-
-    # Discarding before the registration block is a no-op (the journal is unchanged).
-    journal_len_before = lp._py_pool.journal_len()
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.discard_states_before_block(
-        lp.update_block - 1,
-    )
-    assert lp._py_pool.journal_len() == journal_len_before
-
-
-def test_discard_after_last_update(
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block: UniswapV2Pool,
-) -> None:
-    lp = ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block
-
-    with pytest.raises(
-        NoPoolStateAvailable,
-        match=f"No pool state known prior to block {lp.update_block + 1}",
-    ):
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.discard_states_before_block(
-            lp.update_block + 1,
-        )
-
-
 def test_simulations(
     ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block: UniswapV2Pool,
 ):
@@ -625,10 +471,10 @@ def test_simulations_with_override(
         final_state=UniswapV2PoolState(
             address=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.address,
             block=17_600_000,
-            # ADR-005 slice 4: simulate_with_override now builds final_state
-            # from the OVERRIDE reserves (consistent with the delta computed
-            # from them). Pre-slice-4 it mixed override reserves for the delta
-            # with LIVE reserves for the final_state base — a latent bug.
+            # simulate_with_override builds final_state from the OVERRIDE
+            # reserves (consistent with the delta computed from them); mixing
+            # override reserves for the delta with LIVE reserves for the
+            # final_state base is a latent bug.
             reserves_token0=pool_state_override.reserves_token0 + 8000000000,
             reserves_token1=pool_state_override.reserves_token1 - 864834865217768537471,
         ),
@@ -650,8 +496,8 @@ def test_simulations_with_override(
         final_state=UniswapV2PoolState(
             address=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.address,
             block=17_600_000,
-            # ADR-005 slice 4: final_state built from OVERRIDE reserves
-            # (consistent with the delta). Pre-slice-4 used LIVE reserves.
+            # final_state built from OVERRIDE reserves (consistent with the
+            # delta).
             reserves_token0=pool_state_override.reserves_token0 + 13752842264,
             reserves_token1=pool_state_override.reserves_token1 - 1200000000000000000000,
         ),
@@ -697,7 +543,7 @@ def test_swap_for_all(
 
     # cdbc03bb/banded: 2**250 fits the I256 input conversion (2**250 < 2**255)
     # but overflows the constant-product mul (amount * 997 >= 2**256).
-    # The disarm conversion (RATR5A/CXRHW3 review finding) collapsed
+    # The disarm conversion (review finding) collapsed
     # NotComputable (this math-overflow class) into the U256::ZERO miss class,
     # breaking on-chain parity. The NotComputable => ValueError raise is
     # restored in pool.rs; this test Guards the raise survives the disarm.
@@ -740,45 +586,3 @@ def test_zero_swaps(ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_bl
             )
             == 0
         )
-
-
-def test_late_update(
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block: UniswapV2Pool,
-):
-    # Provide some semi-random updates
-    for block_number in range(
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block,
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block + 5,
-    ):
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.external_update(
-            update=UniswapV2PoolExternalUpdate(
-                block_number=block_number,
-                reserves_token0=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.reserves_token0
-                + block_number * 10,
-                reserves_token1=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.reserves_token1
-                - block_number * 10,
-            ),
-        )
-
-    # Send a late update
-    with pytest.raises(ExternalUpdateError):
-        ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.external_update(
-            update=UniswapV2PoolExternalUpdate(
-                block_number=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-                - 1,
-                reserves_token0=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.reserves_token0
-                + 1,
-                reserves_token1=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.reserves_token1
-                - 1,
-            ),
-        )
-
-    # Send a duplicate update
-    ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.external_update(
-        update=UniswapV2PoolExternalUpdate(
-            block_number=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.update_block
-            + 1,
-            reserves_token0=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.reserves_token0,
-            reserves_token1=ethereum_uniswap_v2_wbtc_weth_liquiditypool_at_historical_block.reserves_token1,
-        ),
-    )

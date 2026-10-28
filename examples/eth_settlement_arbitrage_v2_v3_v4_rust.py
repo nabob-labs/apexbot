@@ -1,10 +1,12 @@
 """Ethereum mainnet settlement-arbitrage bot: Uniswap V2/V3/V4 arbitrage using the Rust engine.
 
 A thin Python entrypoint over the Rust-owned ArbitrageEngine and the
-``apexbot.runner`` driver (epic 5TSYKN). The runtime driver — config,
+``apexbot.runner`` driver. The runtime driver — config,
 path registration, result consumption, dispatch — lives in the
 ``apexbot.runner`` package; this file is an ``argv → BotRunner`` entrypoint
-that owns only the CLI policy (argparse, SIGINT wrapper, dotenv read).
+that owns only the CLI policy (argparse, SIGINT wrapper). Operator identity
+reaches ``ArbitrageConfig.build`` through the process environment, exported by the launch
+shell from ``bot.env``.
 
 Startup sequence (owned by :class:`~apexbot.runner.BotRunner`):
 1. Subscribe to WS (event buffering begins)
@@ -17,23 +19,22 @@ Startup sequence (owned by :class:`~apexbot.runner.BotRunner`):
 
 The old driver code that lived here (``BackrunSession``→``BotRunner``,
 ``build_paths``, ``consume_result_batches``, the dispatch/render helpers, and
-the shared constants) has moved to ``apexbot.runner`` (epic 5TSYKN).
+the shared constants) has moved to ``apexbot.runner``.
 """
 
 import asyncio
 import contextlib
-import os
 import sys
 import time
-
-import dotenv
+from typing import Any, cast
 
 from apexbot._ffi.diagnostics import mark_progress, start_gil_probe
 from apexbot.exceptions import BootRefused
 from apexbot.logging import logger as bot_logger
 from apexbot.runner import BotRunner
+from apexbot.runner.bot_runner import ActivationGateRefused
 from apexbot.runner.cli import build_arbitrage_arg_parser
-from apexbot.runner.config import ArbitrageConfig
+from apexbot.runner.config import ArbitrageConfig, RpcCascadeOverrides
 
 
 async def main() -> None:
@@ -42,141 +43,26 @@ async def main() -> None:
     args = parser.parse_args()
     dry_run = not args.live
 
-    # ergo 66H3KJ: start the GIL-acquire-latency probe + main-loop stuck-
+    # Start the GIL-acquire-latency probe + main-loop stuck-
     # watchdog BEFORE any other work. The probe runs on its own std::thread
     # and never needs the GIL to make progress.
     start_gil_probe(interval_ms=50, threshold_ms=100, stuck_ms=30_000)
     mark_progress()
-
-    # ── Gated incident instrumentation (missed-WS-pong diagnosis) ──────────
-    # With APEXBOT_FAULTHANDLER_TIMEOUT_SECS > 0, arm a faulthandler repeat
-    # dump: whenever ANY thread stalls (main loop busy past the timeout), the
-    # CURRENT native + Python stacks of ALL threads are written to stderr
-    # (tee'd into logs/bot_run.log by run_bot.sh) — including the C/Rust frame
-    # of a GIL holder, which sys._current_frames() / logging cannot reveal.
-    # ── Gated memory instrumentation (RSS-growth diagnosis) ──────────────
-    # With APEXBOT_TRACEMALLOC_SECS > 0, a daemon thread prints a tracemalloc
-    # snapshot diff to stderr every N seconds: total Python-reachable memory +
-    # the top growth sites (depth-1). A flat traced-current under a climbing
-    # RSS would pin the growth OUTSIDE the Python object graph (Rust heaps /
-    # allocator retention), splitting the diagnosis in half.
-    tm_timeout = float(os.environ.get("APEXBOT_TRACEMALLOC_SECS", "0"))
-    if tm_timeout > 0:
-        import ctypes
-        import threading
-        import tracemalloc
-
-        tracemalloc.start(1)
-        mem_state = {"snap": tracemalloc.take_snapshot(), "n": 0}
-        libc = ctypes.CDLL("libc.so.6")
-        libc.fopen.restype = ctypes.c_void_p
-        libc.malloc_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
-        libc.fclose.argtypes = [ctypes.c_void_p]
-        libc.malloc_trim.argtypes = [ctypes.c_size_t]
-
-        def dump_malloc_info() -> None:
-            mem_state["n"] += 1
-            path = f"/workspaces/apexbot/logs/malloc_info_{mem_state['n']}.json"
-            f = libc.fopen(path.encode(), b"w")
-            if f:
-                libc.malloc_info(0, f)
-                libc.fclose(f)
-
-        def mem_reporter() -> None:
-            while True:
-                time.sleep(tm_timeout)
-                snap = tracemalloc.take_snapshot()
-                dump_malloc_info()
-                # glibc compaction: force release of free pages on arena tops.
-                # Evidence probe — if RSS drops after this call the climb is
-                # free-chunk retention, not a logical leak.
-                libc.malloc_trim(0)
-                stats = snap.compare_to(mem_state["snap"], "lineno")
-                mem_state["snap"] = snap
-                current, peak = tracemalloc.get_traced_memory()
-                lines = [
-                    f"[mem] traced-current={current / 1e6:.1f}MB peak={peak / 1e6:.1f}MB "
-                    + f"trim-cycle={mem_state['n']} top-growth:"
-                ]
-                lines.extend(
-                    f"[mem]   +{stat.size_diff / 1e6:8.1f}MB count={stat.count_diff:+7d} "
-                    + f"{stat.traceback[0]}"
-                    for stat in stats[:10]
-                )
-                newline = chr(10)
-                sys.stderr.write(newline.join(lines) + newline)
-                sys.stderr.flush()
-
-        threading.Thread(target=mem_reporter, daemon=True, name="tracemalloc").start()
-
-    # ── Gated proc-mem sampler (mimalloc purge-delay capture, epic AZZDBI) ──
-    # With APEXBOT_PROCMEM_SECS > 0, a daemon thread appends one CSV row every
-    # interval: wall clock, monotonic clock, RSS, VmHWM, and cumulative
-    # minor/major faults from /proc/self. Sibling flag to the tracemalloc probe
-    # above, but deliberately READ-ONLY — no snapshots, no malloc_trim — so it
-    # never perturbs the allocator behavior being measured (fault staircase per
-    # block window is the dependent variable of the purge-delay matrix).
-    pm_interval = float(os.environ.get("APEXBOT_PROCMEM_SECS", "0"))
-    if pm_interval > 0:
-        import csv
-        import threading
-
-        pm_path = os.environ.get("APEXBOT_PROCMEM_CSV", "logs/procmem.csv")
-        if os.path.dirname(pm_path):
-            os.makedirs(os.path.dirname(pm_path), exist_ok=True)
-
-        def proc_mem_sampler() -> None:
-            while True:
-                time.sleep(pm_interval)
-                try:
-                    txt = open("/proc/self/stat", "rb").read()
-                    stat = txt.rsplit(b")", 1)[1].split()
-                    min_flt, maj_flt = int(stat[7]), int(stat[9])  # fields 10, 12
-                    rss_pages = int(open("/proc/self/statm", "rb").read().split()[1])
-                    hwm_kb = 0
-                    with open("/proc/self/status", "rb") as vf:
-                        for line in vf:
-                            if line.startswith(b"VmHWM:"):
-                                hwm_kb = int(line.split()[1])
-                                break
-                    with open(pm_path, "a", newline="") as fh:
-                        if fh.tell() == 0:
-                            csv.writer(fh).writerow(["t_epoch", "t_mono", "rss_kb", "hwm_kb", "min_flt", "maj_flt"])
-                        csv.writer(fh).writerow([
-                            round(time.time(), 3),
-                            round(time.perf_counter(), 3),
-                            rss_pages * os.sysconf("SC_PAGE_SIZE") // 1024,
-                            hwm_kb,
-                            min_flt,
-                            maj_flt,
-                        ])
-                except OSError:
-                    return
-
-        threading.Thread(target=proc_mem_sampler, daemon=True, name="proc-mem-sampler").start()
-        bot_logger.info(f"[diag] proc-mem sampler armed: interval={pm_interval}s path={pm_path}")
-
-    fh_timeout = float(os.environ.get("APEXBOT_FAULTHANDLER_TIMEOUT_SECS", "0"))
-    if fh_timeout > 0:
-        import faulthandler
-
-        faulthandler.enable()
-        faulthandler.dump_traceback_later(fh_timeout, repeat=True, exit=False)
-        bot_logger.info(f"[diag] faulthandler armed: timeout={fh_timeout}s repeat=True")
 
     if args.permutation is not None:
         bot_logger.info(f"[startup] Permutation filter from CLI: {args.permutation}")
     if not dry_run:
         bot_logger.info("\n*** LIVE MODE — BOT WILL SUBMIT REAL TRANSACTIONS! ***\n")
 
-    env = dotenv.dotenv_values("examples/mainnet.env")
+    # Operator/executor identity comes from the process environment, which the
+    # launch shell fills from bot.env — no secret lands in a workspace file. The
+    # injection stance is a declared key (:data:`APEXBOT_INJECT_EXECUTOR_CODE`),
+    # and the retired bare spelling is refused with a loud error.
     try:
-        cfg = ArbitrageConfig.from_env(
-            env,
+        cfg = ArbitrageConfig.build(
             live=not dry_run,
             permutation=args.permutation,
-            cli_http=args.node_http,
-            cli_ws=args.node_ws,
+            rpc=RpcCascadeOverrides(node=args.node),
         )
     except ValueError as exc:
         bot_logger.error(str(exc))
@@ -188,7 +74,7 @@ async def main() -> None:
     # KeyboardInterrupt is caught here so the operator sees a single clean line.
     try:
         async with BotRunner(cfg) as session:
-            # NWTUM3: optional operator command channel on a Unix socket.
+            # Optional operator command channel on a Unix socket.
             operator = None
             operator_task = None
             if args.operator_socket:
@@ -198,7 +84,7 @@ async def main() -> None:
                     step_from_wire,
                 )
 
-                async def operator_handler(op: str, payload: dict) -> dict:
+                async def operator_handler(op: str, payload: dict[str, Any]) -> dict[str, Any]:
                     if op == "add_path":
                         steps = [step_from_wire(s) for s in payload["steps"]]
                         directions = payload.get("directions")
@@ -208,10 +94,10 @@ async def main() -> None:
                         bound = payload.get("bound")
                         n = await session.trigger_discovery(bound=bound)
                         return {"detail": f"discovery processed {n} paths"}
-                    if op in ("set_fleet_posture", "get_fleet_posture"):
-                        # JCI2FW Part B: the live cordon-threshold re-tune
-                        # + read, routed through the shared helper (the
-                        # apexbot.fleet mirror home mints on first use).
+                    if op in {"set_fleet_posture", "get_fleet_posture"}:
+                        # The live cordon-threshold re-tune + read, routed
+                        # through the shared helper (the apexbot.fleet
+                        # mirror home mints on first use).
                         return handle_fleet_posture_op(op, payload)
                     return {"error": f"unknown op {op!r}"}
 
@@ -219,19 +105,24 @@ async def main() -> None:
                 operator_task = asyncio.create_task(operator.serve(), name="operator-server")
                 bot_logger.info(f"[operator] listening on {args.operator_socket}")
             try:
-                await session.run()
+                bot_logger.info(f"[session] ended: {(await session.run()).name}")
             finally:
                 if operator_task is not None:
                     operator_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await operator_task
-                    await operator.close()
+                    await cast("OperatorServer", operator).close()
+    except ActivationGateRefused as exc:
+        # The posture gate refused the fleet: same fail-fast discipline as
+        # the boot refusal — one named line, EX_CONFIG, no partial run().
+        bot_logger.error(f"[activation-gate] REFUSED — {exc}")
+        sys.exit(78)
     except BootRefused as exc:
-        # FF-T1 (BPHR6F): the library surfaced the TYPED fleet boot
-        # refusal (it never aborts the host process); the BINARY owns the
-        # loud fail-fast exit — one named line, non-zero status, the same
-        # message discipline the process abort used to carry. 78 is
-        # sysexits EX_CONFIG: the host cannot host the fleet configuration.
+        # The library surfaces the TYPED fleet boot refusal (it never aborts
+        # the host process); the BINARY owns the loud fail-fast exit — one
+        # named line, non-zero status, the same message discipline as the
+        # abort path. 78 is sysexits EX_CONFIG: the host cannot host the
+        # fleet configuration.
         bot_logger.error(f"[fleet-boot] REFUSED — {exc}")
         sys.exit(78)
     except (KeyboardInterrupt, asyncio.CancelledError):

@@ -1,0 +1,33 @@
+[package]
+name = "apexbot-price"
+description = "Pure-Rust on-chain price readers — Chainlink aggregator + Aave oracle over apexbot-rpc eth_call."
+keywords = ["price", "oracle", "chainlink", "evm"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5" }
+apexbot-core.workspace = true
+apexbot-abi.workspace = true
+apexbot-rpc.workspace = true
+tracing = { version = "^0.1" }
+thiserror = { version = "^2.0" }
+
+# Gated (not default) so pure-Rust consumers build without pulling pyo3.
+# Enables `impl From<apexbot_price::PriceError> for pyo3::PyErr` so the
+# `apexbot-python` binding layer can `?`-propagate reader errors as a
+# `PyErr` (mirrors `apexbot-core`/`apexbot-rpc`'s `pyo3` feature).
+pyo3 = { version = "^0.30", features = ["abi3-py312", "serde"], optional = true }
+
+[features]
+default = []
+# Enables `impl From<PriceError> for pyo3::PyErr`. Enabled by the
+# `apexbot-python` binding crate; never enabled by the umbrella.
+pyo3 = ["dep:pyo3"]

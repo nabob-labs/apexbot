@@ -13,18 +13,18 @@ See: contract_reference/uniswap/V2/UniswapV2Factory.sol (UniswapV2Pair swap/mint
 from __future__ import annotations
 
 from fractions import Fraction
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from apexbot.exceptions import ApexbotValueError
 from apexbot.exceptions.pool import (
     InvalidSwapInputAmount,
     LiquidityPoolError,
 )
-from apexbot.uniswap.math import calc_exact_in_v2, calc_exact_out_v2
+from apexbot.uniswap import SwapRefusalKind, SwapRefused, swap_refusal_to_error
 
 if TYPE_CHECKING:
     from apexbot.erc20 import Erc20Token
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.uniswap.v2_types import UniswapV2PoolState
 
 
@@ -44,15 +44,37 @@ class UniswapV2PoolCalc:
     _fee_token0: Fraction
     _fee_token1: Fraction
 
-    # Attributes provided by the concrete pool class in the MRO
-    reserves_token0: int
-    reserves_token1: int
-    state: UniswapV2PoolState
+    # Read-only views provided by the concrete pool class in the MRO. Declared
+    # as properties because the concrete companions expose them read-only over
+    # Rust-owned state; a writable annotation would make every concrete
+    # read-only property an invalid override.
+    @property
+    def reserves_token0(self) -> int:
+        """Current token0 reserve (concrete pool provides)."""
+        raise NotImplementedError
+
+    @property
+    def reserves_token1(self) -> int:
+        """Current token1 reserve (concrete pool provides)."""
+        raise NotImplementedError
+
+    @property
+    def state(self) -> UniswapV2PoolState:
+        """The pool's current state (concrete pool provides)."""
+        raise NotImplementedError
+
     tokens: tuple[Erc20Token, Erc20Token]
-    # LiquidityPool handle (set by the concrete UniswapV2Pool companion
-    # in MRO — ADR-005 slice 4). Calc delegation (slice 5) routes the
-    # constant-product math through it on the non-override path.
-    _py_pool: LiquidityPool
+
+    @property
+    def update_block(self) -> int:
+        """Block of the last state update (concrete pool provides)."""
+        raise NotImplementedError
+
+    # Pool handle (set by the concrete UniswapV2Pool companion in MRO).
+    # Calc delegation routes the constant-product math through it — the
+    # registered reads by direct delegation, the override reads through the
+    # swap-simulation door.
+    _py_pool: Pool
 
     # These can be overridden by subclasses (e.g., PancakeSwap uses different fee)
     FEE: Fraction = Fraction(3, 1000)
@@ -87,12 +109,12 @@ class UniswapV2PoolCalc:
             )
 
         if override_state is None:
-            # ADR-005 slice 5: delegate the constant-product math to the Rust
-            # pool handle. Rust reads reserves + fee under a single read guard
-            # (no separate Python state read beforehand — no pump-interleave risk).
+            # Delegate the constant-product math to the Rust pool handle. Rust
+            # reads reserves + fee under a single read guard (no separate Python
+            # state read beforehand — no pump-interleave risk).
             # Rust returns 0 on overdraw (amount_out >= reserve_out); convert to
             # the original Python contract's LiquidityPoolError.
-            result = self._py_pool.calculate_tokens_in(
+            result: int = self._py_pool.calculate_tokens_in(
                 zero_for_one=zero_for_one,
                 amount_out=token_out_quantity,
             )
@@ -102,30 +124,27 @@ class UniswapV2PoolCalc:
                 )
             return result
 
-        # Override path: Python constant-product calc against the override
-        # reserves. simulate_* relies on this for delta + final_state
-        # consistency (one local snapshot both reads).
-        if zero_for_one:
-            reserves_in = override_state.reserves_token0
-            reserves_out = override_state.reserves_token1
-            fee = self._fee_token0
-        else:
-            reserves_in = override_state.reserves_token1
-            reserves_out = override_state.reserves_token0
-            fee = self._fee_token1
-
-        if token_out_quantity > reserves_out - 1:
+        # Override path: the exact-output read runs core-side through the
+        # swap-simulation door over the override reserves (the door borrows the
+        # fee fractions from the registration), so the companion holds no swap
+        # math. A refusal is the historical overdraw verdict — the requested
+        # output is not available against those reserves.
+        # The typed read (ADR-037/t2): a refusal is the overdraw verdict.
+        try:
+            read = self._py_pool.simulate(
+                zero_for_one=zero_for_one,
+                amount_specified=token_out_quantity,
+                block=self.update_block,
+                override_state=override_state,
+            )
+        except SwapRefused as exc:
+            reserves_out = (
+                override_state.reserves_token1 if zero_for_one else override_state.reserves_token0
+            )
             raise LiquidityPoolError(
                 message=f"Requested amount out ({token_out_quantity}) >= pool reserves ({reserves_out})",  # ruff:ignore[line-too-long]
-            )
-
-        return calc_exact_out_v2(
-            reserves_in,
-            reserves_out,
-            token_out_quantity,
-            fee.numerator,
-            fee.denominator,
-        )
+            ) from exc
+        return int(read.amount0_delta if zero_for_one else read.amount1_delta)
 
     def calculate_tokens_out_from_tokens_in(
         self,
@@ -142,6 +161,9 @@ class UniswapV2PoolCalc:
             InvalidSwapInputAmount: If token_in_quantity is not positive.
             ApexbotValueError: If token_in is not held by this pool.
             LiquidityPoolError: If `uint256` swap math overflows (on-chain revert).
+            swap_refusal_to_error: Renders a refusal that is not a
+                swap-geometry verdict — the walk entered an unfetched word
+                and the on-demand fetch failed (MissingLiquidityData).
 
         """
         if token_in_quantity <= 0:  # pragma: no cover
@@ -157,9 +179,9 @@ class UniswapV2PoolCalc:
             )
 
         if override_state is None:
-            # ADR-005 slice 5: delegate the constant-product math to the Rust
-            # pool handle. Rust reads reserves + fee under a single read guard
-            # (no separate Python state read beforehand — no pump-interleave).
+            # Delegate the constant-product math to the Rust pool handle. Rust
+            # reads reserves + fee under a single read guard (no separate Python
+            # state read beforehand — no pump-interleave).
             #
             # cdbc03bb: Rust mirrors on-chain `getAmountOut` SafeMath and
             # reverts on `uint256` overflow (e.g. `amount_in = 2**256 - 1`
@@ -169,9 +191,12 @@ class UniswapV2PoolCalc:
             # `calculate_tokens_in_from_tokens_out`'s overdraw-sentinel
             # translation below).
             try:
-                return self._py_pool.calculate_tokens_out(
-                    zero_for_one=zero_for_one,
-                    amount_in=token_in_quantity,
+                return cast(
+                    "int",
+                    self._py_pool.calculate_tokens_out(
+                        zero_for_one=zero_for_one,
+                        amount_in=token_in_quantity,
+                    ),
                 )
             except ValueError as e:
                 raise LiquidityPoolError(
@@ -181,25 +206,31 @@ class UniswapV2PoolCalc:
                     ),
                 ) from e
 
-        # Override path: Python constant-product calc against the override
-        # reserves. simulate_* relies on this for delta + final_state
-        # consistency.
-        if zero_for_one:
-            reserves_in = override_state.reserves_token0
-            reserves_out = override_state.reserves_token1
-            fee = self._fee_token0
-        else:
-            reserves_in = override_state.reserves_token1
-            reserves_out = override_state.reserves_token0
-            fee = self._fee_token1
-
-        return calc_exact_in_v2(
-            reserves_in,
-            reserves_out,
-            token_in_quantity,
-            fee.numerator,
-            fee.denominator,
-        )
+        # Override path: the exact-input read runs core-side through the
+        # swap-simulation door over the override reserves (the door borrows the
+        # fee fractions from the registration), so the companion holds no swap
+        # math. The read's signed deltas ARE the answer: the output side is the
+        # negative of the token that left the pool.
+        # The typed read (ADR-037/t2): a refusal is the overflow verdict.
+        try:
+            read = self._py_pool.simulate(
+                zero_for_one=zero_for_one,
+                amount_specified=-token_in_quantity,
+                block=self.update_block,
+                override_state=override_state,
+            )
+        except SwapRefused as exc:
+            if exc.args[0] is not SwapRefusalKind.NotComputable:
+                # An infrastructure failure (an unfetchable word), not a
+                # swap-geometry verdict — render it honestly.
+                raise swap_refusal_to_error(exc) from exc
+            raise LiquidityPoolError(
+                message=(
+                    f"Input amount ({token_in_quantity}) overflows "
+                    "uint256 swap math (on-chain revert)"
+                ),
+            ) from exc
+        return -int(read.amount1_delta if zero_for_one else read.amount0_delta)
 
     def get_absolute_price(
         self,

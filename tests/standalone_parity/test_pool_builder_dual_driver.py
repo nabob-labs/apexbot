@@ -1,6 +1,6 @@
-"""Tier-2 behavioral dual-driver parity — Rust pool builder identity+state (A2QRWO).
+"""Tier-2 behavioral dual-driver parity — Rust pool builder identity+state.
 
-The behavioral companion to `rust/crates/apexbot/tests/parity_pool_builder.rs`.
+The behavioral companion to `rust/crates/facade/apexbot/tests/parity_pool_builder.rs`.
 Proves the **same** canonical V3 identity+state fixture, driven through the
 **Python consumer** (`Bot`/`register_v3_pool` — the PyO3 binding, the same
 `RegisterV3PoolParams` the Rust `PoolBuilder.build_v3` emits after its I/O),
@@ -10,7 +10,7 @@ state as the **Rust consumer** (`BotState` directly).
 The fixture + expected outputs are loaded from the SHARED file
 `tests/standalone_parity/fixtures/pool_builder.json`, which the Rust parity
 test (`parity_pool_builder.rs`) ALSO loads — a one-sided fixture edit fails
-BOTH sides mechanically (the shared-fixture contract, HRT356).
+BOTH sides mechanically (the shared-fixture contract).
 """
 
 from __future__ import annotations
@@ -78,19 +78,19 @@ def test_python_consumer_pool_builder_identity_state_matches_fixture() -> None:
     assert py_pool is not None, "registered pool must be retrievable by id"
 
     # Identity (the builder's on-chain/DB-resolved immutable values).
-    assert py_pool.fee == _FEE, f"fee identity diverged (got {py_pool.fee}, want {_FEE})"
-    assert py_pool.tick_spacing == _TICK_SPACING, (
-        f"tick_spacing identity diverged (got {py_pool.tick_spacing}, want {_TICK_SPACING})"
+    assert py_pool.concentrated_liquidity().fee == _FEE, f"fee identity diverged (got {py_pool.concentrated_liquidity().fee}, want {_FEE})"
+    assert py_pool.concentrated_liquidity().tick_spacing == _TICK_SPACING, (
+        f"tick_spacing identity diverged (got {py_pool.concentrated_liquidity().tick_spacing}, want {_TICK_SPACING})"
     )
     assert py_pool.get_token0().address.lower() == _TOKEN0, "token0 identity diverged"
     assert py_pool.get_token1().address.lower() == _TOKEN1, "token1 identity diverged"
 
     # State (the builder's live scalars).
-    assert py_pool.sqrt_price_x96 == _SQRT_PRICE_X96, "sqrt_price state diverged"
-    assert py_pool.liquidity == _LIQUIDITY, "liquidity state diverged"
-    assert py_pool.tick == _TICK, "tick state diverged"
+    assert py_pool.concentrated_liquidity().sqrt_price_x96 == _SQRT_PRICE_X96, "sqrt_price state diverged"
+    assert py_pool.concentrated_liquidity().liquidity == _LIQUIDITY, "liquidity state diverged"
+    assert py_pool.concentrated_liquidity().tick == _TICK, "tick state diverged"
 
     # Coverage: a Tracked (dense) registration carries the assembled tick map —
     # the sparse fallback returns an empty snapshot. Proves the builder's
     # DB-tracked decision is identical across consumers.
-    assert len(py_pool.tick_data_snapshot()) != 0, "Tracked pool must carry its tick data"
+    assert len(py_pool.concentrated_liquidity().tick_data) != 0, "Tracked pool must carry its tick data"

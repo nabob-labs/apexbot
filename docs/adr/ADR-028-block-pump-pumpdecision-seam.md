@@ -1,6 +1,7 @@
 # ADR-028: The block-pump `PumpDecision` seam — pure producer + thin executor
 
-**Status: accepted.** Codifies epic A (ergo tasks A1–A5, `FUE5SP`): the block pump's
+**Status: historical — superseded by [ADR-041](ADR-041-block-epoch-pipeline.md); provenance only.**
+(Original status: accepted.) Codifies epic A (ergo tasks A1–A5, `FUE5SP`): the block pump's
 per-event policy is owned by a pure, I/O-free `PumpFSM` producing a `PumpDecision`
 enum, executed by a thin async driver. This is the next step of the ADR-008 (BlockClock)
 deepening — the same "deep module: pure decision producer + thin I/O driver" family as
@@ -9,13 +10,13 @@ timer, no `Instant`, no lock lives in the FSM.
 
 > **Superseded by [ADR-041](ADR-041-block-epoch-pipeline.md) (epic `MROOY7`):** the
 > `PumpFSM` was folded — with this ADR's producer/driver discipline intact — into the
-> unified `StageMachine` (`rust/crates/apexbot-bot/src/bot_core/stage_machine.rs`).
+> unified `StageMachine` (`rust/crates/engine/apexbot-bot/src/bot_core/stage_machine.rs`).
 > The `PumpFSM` type and the `DispatchOwner`/`DrainSink` executors named below are
 > retired (`SZJUKL`). The pure-producer/thin-driver family continues.
 
 ## Context
 
-`BlockPump::run_with_stream` (rust/crates/apexbot-bot/src/bot_core/block_pump.rs) was a
+`BlockPump::run_with_stream` (rust/crates/engine/apexbot-bot/src/bot_core/block_pump.rs) was a
 ~935-line async loop that was the single choreographer of five interacting state machines —
 the registration lifecycle, the `BlockClock`, the solve/drain fan-out, the quiesce-gated
 publish, the reorg coordinator — plus all provider I/O. ADR-008 had already lifted block
@@ -30,7 +31,7 @@ and assert "exactly one publish, never a premature one".
 
 ## Decision
 
-Introduce a pure decision producer, `PumpFSM` (`rust/crates/apexbot-bot/src/bot_core/
+Introduce a pure decision producer, `PumpFSM` (`rust/crates/engine/apexbot-bot/src/bot_core/
 pump_fsm.rs`), that owns **every "which effect, when" rule** of the pump's per-block loop,
 and turn `run_with_stream` into a **thin async driver** that feeds events in and executes
 the returned `PumpDecision`s. The FSM holds NO provider, NO timer, NO `Instant`, NO lock —

@@ -1,0 +1,191 @@
+//! The engine retune value — the typed operator re-parameterization crossing
+//! the driver seam .
+//!
+//! The engine's twin of the fleet's centralized posture feeders + wake
+//! (43121b9): one typed value carries every config-derived knob the engine
+//! packs at construction and the operator can re-apply at runtime through
+//! [`EngineStages::apply_retune`](super::EngineStages::apply_retune).
+//!
+//! NOT named "stance" (the fleet-migration stance, ADR-042, and the
+//! per-construction construction-stance values) and NOT "posture" (the
+//! fleet's cordon concept) — see GLOSSARY.md's "Engine retune" glossary entry.
+use super::detached_cycle::DETACHED_INFLIGHT_CAP;
+use alloy::primitives::U256;
+use hashbrown::HashSet;
+/// The typed operator re-parameterization value crossing the driver seam.
+///
+/// Construction packs the config-derived knobs ONCE ([`Self::from_config`] —
+/// the construction-stance trajectory completed for the
+/// engine); a runtime operator retune overwrites the live values through
+/// `ArbitrageEngine::apply_retune`, reached from [`EngineStages::apply_retune`](super::EngineStages::apply_retune).
+///
+/// `set_result_channel` is deliberately NOT represented here: a channel
+/// install is wiring, not a retune.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineRetune {
+    /// V3/V4 buffered-event max age. `None` disables expiry (the cockpit
+    /// default — the hot-path expiry scan is gated off).
+    pub event_buffer_max_age: Option<u64>,
+    /// Capacity-modulated admission: `true` draws `max(0, target -
+    /// in-flight)` and SHEDS zero-budget cycles; `false` is the take-all
+    /// no-shed operator stance.
+    pub solve_admission: bool,
+    /// Admission target depth (un-merged-result pipe depth, in keys),
+    /// clamped at application to `1..=DETACHED_INFLIGHT_CAP`.
+    pub admission_target_depth: u64,
+    /// Retained (carried) key retention window `W` in blocks.
+    pub admission_retention_blocks: u64,
+    /// Registered-path cap (`None` = unlimited).
+    pub path_cap: Option<usize>,
+    /// Minimum result profit (in wei) for the delivery policy window (strict
+    /// `>`).
+    pub min_profit: U256,
+    /// The concentrated-liquidity-hop clamp margin (wei) subtracted from a hop's committed input
+    /// before the exact-in loop runs. Packed from `solve.clamp_margin_wei`
+    /// (default 1 wei, the maximum-extraction choice).
+    pub clamp_margin: U256,
+    /// Maximum result profit (in wei) for the delivery policy window
+    /// (inclusive).
+    pub max_profit: U256,
+    /// Diagnostic override: force the future-price deferral for these
+    /// path ids. Production leaves it empty.
+    pub force_deferred: Option<HashSet<u64>>,
+}
+impl EngineRetune {
+    /// Pack the config-derived retune from the caller's typed [`BotConfig`]
+    /// (the ONE parse point for the engine's construction knobs).
+    ///
+    /// Only construction/config-derived writes are folded here: the admission
+    /// trio (packed like every other construction-stance value),
+    /// `min_profit_wei`, the declared registered-path cap, and the schema
+    /// defaults for the operator-only knobs ([`Self::event_buffer_max_age`]
+    /// has no Rust config key — the `PyO3` driver sets it, T5's scope).
+    ///
+    /// [`BotConfig`]: ::apexbot_config::BotConfig
+    #[must_use]
+    pub fn from_config(cfg: &::apexbot_config::BotConfig) -> Self {
+        Self {
+            // No Rust config key: the cockpit disables expiry until the
+            // driver configures a max age.
+            event_buffer_max_age: None,
+            // `APEXBOT_SOLVE_ADMISSION` parse matrix (supervisor-confirmed
+            // conservative default): unset/0/false => OFF (byte-identical
+            // degrade); 1/true/on => the capacity-modulated draw. Test builds
+            // always take the OFF arm.
+            solve_admission: !cfg!(test) && cfg.solve.admission_shed,
+            admission_target_depth: u64::try_from(cfg.solve.admission_target_depth)
+                .unwrap_or(DETACHED_INFLIGHT_CAP)
+                .clamp(1, DETACHED_INFLIGHT_CAP),
+            admission_retention_blocks: cfg.solve.admission_retention_blocks,
+            // The declared `pathfinding.max_registered_paths` budget: the
+            // engine enforces it by default, for a standalone Rust bot and the
+            // cockpit alike. `set_path_cap` stays the runtime override
+            // (`None` = unlimited).
+            path_cap: Some(cfg.pathfinding.max_registered_paths),
+            min_profit: U256::from(cfg.solve.min_profit_wei),
+            max_profit: U256::MAX,
+            clamp_margin: U256::from(cfg.solve.clamp_margin_wei),
+            force_deferred: None,
+        }
+    }
+}
+impl Default for EngineRetune {
+    fn default() -> Self {
+        Self {
+            event_buffer_max_age: None,
+            solve_admission: false,
+            admission_target_depth: DETACHED_INFLIGHT_CAP,
+            admission_retention_blocks: 0,
+            path_cap: None,
+            min_profit: U256::ZERO,
+            max_profit: U256::MAX,
+            clamp_margin: U256::from(1u128),
+            force_deferred: None,
+        }
+    }
+}
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::arb_engine::{ArbitrageEngine, EngineStages};
+    use apexbot_config::BotConfigLoader;
+    use apexbot_substrate::state_lock::StateLock;
+    use apexbot_substrate::{BotState, EpochDelta};
+    use std::sync::Arc;
+    /// Build an engine from an EXPLICIT local config (no env/file/process
+    /// layer), wrapped for the stage surface. Only `solve.admission_*` is
+    /// overridden — the fleet-boot hash stays byte-identical to the schema
+    /// default, so the construction is a legal boot rider, and the
+    /// process-global solver floor is untouched.
+    fn engine_and_stages(
+        cli: &[(&str, &str)],
+    ) -> (Arc<parking_lot::Mutex<ArbitrageEngine>>, EngineStages) {
+        let mut loader = BotConfigLoader::new().without_env();
+        for (key, value) in cli {
+            loader = loader.with_cli(*key, *value);
+        }
+        let parsed = loader.load().expect("the local config must load");
+        let cfg = Arc::new(parsed.config);
+        let core = Arc::new(StateLock::new(BotState::new()));
+        let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::with_core_cfg(
+            core, &cfg,
+        )));
+        let stages = EngineStages::new(Arc::clone(&engine), Arc::new(EpochDelta::new(0u64)));
+        (engine, stages)
+    }
+    /// Construction applies the value from the `BotConfig` fields (the
+    /// packing): the admission trio reflects the config, the
+    /// profit window takes `min_profit_wei`, and the operator-only knobs keep
+    /// their schema defaults.
+    #[test]
+    fn construction_applies_the_config_derived_retune() {
+        let (engine, _stages) = engine_and_stages(&[
+            ("solve.admission_target_depth", "3"),
+            ("solve.admission_retention_blocks", "7"),
+        ]);
+        let e = engine.lock();
+        assert_eq!(e.cycle.admission_target_depth, 3);
+        assert_eq!(e.cycle.admission_retention_blocks, 7);
+        // Defaults: the declared path cap, no config key for the max age,
+        // min_profit_wei = 0.
+        assert_eq!(
+            e.registry.cap(),
+            Some(apexbot_config::schema::PathfindingConfig::default().max_registered_paths),
+            "the engine enforces the declared `pathfinding.max_registered_paths` budget"
+        );
+        assert!(!e.event_buffer_expiry_enabled);
+        assert_eq!(e.delivery.min_profit, U256::ZERO);
+        assert_eq!(e.delivery.max_profit, U256::MAX);
+        // The clamp margin default rides the schema (1 wei).
+        assert_eq!(e.cycle.clamp_margin, U256::from(1u128));
+    }
+    /// `EngineStages::apply_retune` overwrites every live value — the runtime
+    /// operator entry (the engine's twin of the fleet's posture feeder).
+    #[test]
+    fn apply_retune_overwrites_the_live_values() {
+        let (engine, stages) = engine_and_stages(&[]);
+        let retune = EngineRetune {
+            event_buffer_max_age: Some(99),
+            solve_admission: true,
+            admission_target_depth: 2,
+            admission_retention_blocks: 5,
+            path_cap: Some(11),
+            min_profit: U256::from(7u64),
+            max_profit: U256::from(9u64),
+            clamp_margin: U256::from(3u64),
+            force_deferred: Some(HashSet::from([42u64])),
+        };
+        stages.apply_retune(&retune);
+        let e = engine.lock();
+        assert!(e.event_buffer_expiry_enabled);
+        assert!(e.cycle.solve_admission);
+        assert_eq!(e.cycle.admission_target_depth, 2);
+        assert_eq!(e.cycle.admission_retention_blocks, 5);
+        assert_eq!(e.registry.cap(), Some(11));
+        assert_eq!(e.delivery.min_profit, U256::from(7u64));
+        assert_eq!(e.delivery.max_profit, U256::from(9u64));
+        assert_eq!(e.cycle.clamp_margin, U256::from(3u64));
+        assert_eq!(e.cycle.force_deferred, Some(HashSet::from([42u64])));
+    }
+}

@@ -3,40 +3,23 @@
 from __future__ import annotations
 
 from fractions import Fraction
-from typing import TYPE_CHECKING, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from apexbot.balancer.libraries.constants import PowVersion
 from apexbot.balancer.libraries.scaling_helpers import (
     _compute_scaling_factor,
-    _downscale_down,
-    _downscale_up,
-    _upscale,
-    _upscale_array,
-)
-from apexbot.balancer.math import (
-    weighted_add_swap_fee_amount as _rs_add_swap_fee_amount,
-)
-from apexbot.balancer.math import (
-    weighted_calc_in_given_out as _rs_calc_in_given_out,
-)
-from apexbot.balancer.math import (
-    weighted_calc_out_given_in as _rs_calc_out_given_in,
-)
-from apexbot.balancer.math import (
-    weighted_subtract_swap_fee_amount as _rs_subtract_swap_fee_amount,
 )
 from apexbot.balancer.types import (
     BalancerV2PoolState,
     BalancerV2WeightedPoolExternalUpdate,
 )
-from apexbot.builders.balancer_builder_base import BalancerBuilderBase
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.erc20 import Erc20Token
 from apexbot.exceptions import ApexbotValueError
 from apexbot.types.abstract import AbstractLiquidityPool
 
 if TYPE_CHECKING:
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.chain import ChecksummedAddress
 
 # Hex representation of the TWO constant (2e18 = 0x1bc16d674ec80000)
@@ -72,8 +55,8 @@ class BalancerV2Pool(AbstractLiquidityPool):
     type PoolState = BalancerV2PoolState
     FEE_DENOMINATOR = 1 * 10**18
 
-    # Instance attributes set in `_from_py_pool` (the only construction seam).
-    _py_pool: LiquidityPool
+    # Instance attributes set in `from_handle` (the only construction seam).
+    _py_pool: Pool
     address: ChecksummedAddress
     pool_id: bytes
     pool_specialization: int
@@ -88,13 +71,13 @@ class BalancerV2Pool(AbstractLiquidityPool):
         """Direct construction is forbidden.
 
         ``BalancerV2Pool`` is a Python companion over a Rust-owned
-        ``LiquidityPool`` handle. Use the registered entry points instead:
+        ``Pool`` handle. Use the registered entry points instead:
 
         - Production: ``Bot.build_pool(address)``
         - Tests: ``make_balancer_weighted_pool(...)``
 
-        Both register the pool in Rust, obtain the ``LiquidityPool``
-        handle, and wrap it via :meth:`_from_py_pool`.
+        Both register the pool in Rust, obtain the ``Pool``
+        handle, and wrap it via :meth:`from_handle`.
 
         Raises:
             TypeError: Always. Direct construction is not supported.
@@ -104,13 +87,13 @@ class BalancerV2Pool(AbstractLiquidityPool):
             f"{type(self).__name__} cannot be constructed directly. "
             "Use Bot.build_pool(address) (production) or "
             "make_balancer_weighted_pool(...) (tests) to register the pool "
-            "in Rust and obtain the LiquidityPool handle to wrap."
+            "in Rust and obtain the Pool handle to wrap."
         )
         raise TypeError(msg)
 
     @classmethod
-    def _from_py_pool(cls, py_pool: LiquidityPool) -> Self:
-        """Wrap a Rust-owned ``LiquidityPool`` handle as a Python companion.
+    def from_handle(cls, py_pool: Pool) -> Self:
+        """Wrap a Rust-owned ``Pool`` handle as a Python companion.
 
         Internal seam (ADR-005, Polars-style ``_from_pydf`` pattern). Every
         identity field (vault, pool_id, tokens, weights, scaling_factors,
@@ -129,7 +112,7 @@ class BalancerV2Pool(AbstractLiquidityPool):
 
         if py_pool.pool_family != "balancer-weighted":
             msg = (
-                "LiquidityPool handle is not a Balancer weighted pool "
+                "Pool handle is not a Balancer weighted pool "
                 f"(got pool_family {py_pool.pool_family!r})"
             )
             raise ApexbotValueError(message=msg)
@@ -146,10 +129,7 @@ class BalancerV2Pool(AbstractLiquidityPool):
                 "(ADR-006): get_balancer_tokens returned None"
             )
             raise ApexbotValueError(message=msg)
-        self._tokens = tuple(
-            Erc20Token._from_py_token(t)  # ruff:ignore[private-member-access]
-            for t in py_tokens
-        )
+        self._tokens = tuple(Erc20Token.from_handle(t) for t in py_tokens)
         self.scaling_factors = tuple(_compute_scaling_factor(t) for t in self._tokens)
         self.fee = Fraction(py_pool.balancer_swap_fee, cls.FEE_DENOMINATOR)
         self.weights = tuple(py_pool.balancer_weights)
@@ -178,11 +158,11 @@ class BalancerV2Pool(AbstractLiquidityPool):
     def balances(self) -> tuple[int, ...]:
         """Balances.
 
-        Read from the Rust core via the ``LiquidityPool`` handle
-        (ADR-005 slice 12b). Rust ``BotState`` is the single source of truth
+        Read from the Rust core via the ``Pool`` handle.
+        Rust ``BotState`` is the single source of truth
         for the mutable ``balances`` slot; this getter returns the live tuple.
         """
-        return tuple(self._py_pool.balancer_balances)
+        return cast("tuple[int, ...]", tuple(self._py_pool.balance_vector().balances))
 
     @property
     def state(self) -> PoolState:
@@ -200,19 +180,15 @@ class BalancerV2Pool(AbstractLiquidityPool):
                 unreachable for a companion built over a registered handle).
 
         """
-        snap = self._py_pool.snapshot_balancer_weighted()
-        # snapshot_balancer_weighted returns None only for a non-Balancer-
-        # weighted pool_id; this companion is always built over a registered
-        # Balancer weighted handle, so the snapshot is always present.
-        # Defensive: treat None as no-state.
-        if snap is None:  # pragma: no cover - defensive, unreachable in practice
+        try:
+            view = self._py_pool.balance_vector()
+        except ValueError as exc:
             msg = f"No Balancer weighted pool state available for {self.address}"
-            raise ApexbotValueError(message=msg)
-        balances, block = snap
+            raise ApexbotValueError(message=msg) from exc
         return BalancerV2PoolState(
             address=self.address,
-            balances=tuple(balances),
-            block=block,
+            balances=tuple(view.balances),
+            block=view.update_block,
         )
 
     @property
@@ -229,41 +205,22 @@ class BalancerV2Pool(AbstractLiquidityPool):
     ) -> int:
         """Calculate tokens out from tokens in.
 
+        Thin driver shell over the Rust core: token resolution stays
+        Python-side, the swap math is fully Rust-owned.
+
         Returns:
             The computed integer value.
 
         """
-        token_in_index = self._tokens.index(token_in)
-        token_out_index = self._tokens.index(token_out)
-
-        fee_scaled = int(self.fee * self.FEE_DENOMINATOR)
-
-        amount_new = _rs_subtract_swap_fee_amount(
-            token_in_quantity,
-            fee_scaled,
-        )
-
-        if override_state is not None:
-            balances = list(override_state.balances)
-        else:
-            balances = list(self.balances)  # make a copy because _upscale_array will mutate it
-
-        _upscale_array(amounts=balances, scaling_factors=self.scaling_factors)
-        amount_new = _upscale(amount_new, scaling_factor=self.scaling_factors[token_in_index])
-
-        amount_out = _rs_calc_out_given_in(
-            int(balances[token_in_index]),
-            self.weights[token_in_index],
-            int(balances[token_out_index]),
-            self.weights[token_out_index],
-            int(amount_new),
-            BalancerBuilderBase.pow_version_to_rust(self.pow_version),
-        )
-
-        return int(
-            _downscale_down(
-                amount=amount_out,
-                scaling_factor=self.scaling_factors[token_out_index],
+        return cast(
+            "int",
+            self._py_pool.calculate_tokens_out_for_pair(
+                index_in=self._tokens.index(token_in),
+                index_out=self._tokens.index(token_out),
+                amount_in=token_in_quantity,
+                override_balances=(
+                    list(override_state.balances) if override_state is not None else None
+                ),
             ),
         )
 
@@ -276,44 +233,23 @@ class BalancerV2Pool(AbstractLiquidityPool):
     ) -> int:
         """Compute how many tokens must be sent to take `token_out_quantity` out.
 
+        Thin driver shell over the Rust core.
+
         Returns:
             The computed integer value.
 
         """
-        token_in_index = self._tokens.index(token_in)
-        token_out_index = self._tokens.index(token_out)
-
-        fee_scaled = int(self.fee * self.FEE_DENOMINATOR)
-
-        if override_state is not None:
-            balances = list(override_state.balances)
-        else:
-            balances = list(self.balances)  # make a copy because _upscale_array will mutate it
-
-        _upscale_array(amounts=balances, scaling_factors=self.scaling_factors)
-        amount_out_scaled = _upscale(
-            token_out_quantity,
-            scaling_factor=self.scaling_factors[token_out_index],
-        )
-
-        amount_in = _rs_calc_in_given_out(
-            int(balances[token_in_index]),
-            self.weights[token_in_index],
-            int(balances[token_out_index]),
-            self.weights[token_out_index],
-            int(amount_out_scaled),
-            BalancerBuilderBase.pow_version_to_rust(self.pow_version),
-        )
-
-        # Downscale first, then add fee — matching Solidity's onSwap GIVEN_OUT path
-        amount_in_token = int(
-            _downscale_up(
-                amount=amount_in,
-                scaling_factor=self.scaling_factors[token_in_index],
+        return cast(
+            "int",
+            self._py_pool.calculate_tokens_in_for_pair(
+                index_in=self._tokens.index(token_in),
+                index_out=self._tokens.index(token_out),
+                amount_out=token_out_quantity,
+                override_balances=(
+                    list(override_state.balances) if override_state is not None else None
+                ),
             ),
         )
-
-        return _rs_add_swap_fee_amount(amount_in_token, fee_scaled)
 
     def external_update(
         self,
@@ -322,10 +258,10 @@ class BalancerV2Pool(AbstractLiquidityPool):
         """Apply an external state update with new balances.
 
         Delegates to the Rust core
-        (``LiquidityPool.apply_balancer_weighted_balance_update``) which
+        (``Pool.apply_balancer_weighted_balance_update``) which
         journals the prior balances (genesis-anchor V2-style discipline) and
-        lands the new balances + ``update_block`` atomically
-        (ADR-005 slice 12b). The ``_state_lock`` + double-check-after-acquire
+        lands the new balances + ``update_block`` atomically. The
+        ``_state_lock`` + double-check-after-acquire
         pattern it used to apply is gone — Rust's internal write lock handles
         atomicity; the registration-state precondition is enforced by the
         Rust core's silent-no-op-on-older-block contract.
@@ -336,7 +272,7 @@ class BalancerV2Pool(AbstractLiquidityPool):
                 for a companion built over a registered handle).
 
         """
-        applied = self._py_pool.apply_balancer_weighted_balance_update(
+        applied = self._py_pool.apply_balances(
             list(update.balances),
             update.block_number,
         )

@@ -1,12 +1,12 @@
 """Tier-2 behavioral dual-driver parity — in-process sim SUCCESS path
-(ADR-005 §4.2).
+(the parity gate, ``docs/architecture/parity-gate.md``).
 
 The behavioral companion to the Rust `parity_evm_sim.rs` test. Proves the
 **same** canonical fixture (the SELFDESTRUCT-gift success path over
 `CacheDB<EmptyDB>`) driven through the **Python consumer** path (the
 `simulate_in_process_success_probe` PyO3 binding) produces the **same**
 `SimResult` (gross/net/gas/priority_fee) recorded in the shared fixture JSON
-— which the Rust consumer test (`rust/crates/apexbot/tests/parity_evm_sim.rs`)
+— which the Rust consumer test (`rust/crates/facade/apexbot/tests/parity_evm_sim.rs`)
 independently also asserts.
 
 Both consumers hit the same `simulate_in_process_with_db` core. The recorded
@@ -33,7 +33,7 @@ reads return real ETH values.
 (the byte-exact gas accounting + the lossy f64 priority-fee path have no closed
 form). The parity contract is: both drivers produce the same recorded
 constants. A deliberately-wrong fixture edit fails BOTH halves (the fixture is
-the shared contract, not copied constants — the HRT356 guard).
+the shared contract, not copied constants — the guard).
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def _load_fixture() -> dict:
 
 
 def test_evm_sim_success_path_dual_driver_parity() -> None:
-    """The Python half of the ADR-005 §4.2 Tier-2 dual-driver parity pair.
+    """The Python half of the Tier-2 dual-driver parity pair.
 
     Drives the SELFDESTRUCT-gift fixture through the
     `simulate_in_process_success_probe` PyO3 binding (in-process revm EVM,
@@ -105,7 +105,7 @@ def test_deliberately_wrong_fixture_fails_both_halves() -> None:
     expected `gas_used` in a mutated fixture copy must fail the Python assertion
     (and, by symmetry, the Rust `parity_evm_sim.rs` guard).
 
-    Guards against the V3/V4 fixture-drift regression (HRT356): copied
+    Guards against the V3/V4 fixture-drift regression: copied
     constants with no mechanical link left both tests green but testing
     *different* fixtures. The shared JSON file is the single source of truth.
     """

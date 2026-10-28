@@ -13,16 +13,22 @@ field-level diff keyed by ``(chain_id, factory)``.
 
 from __future__ import annotations
 
+import os
+import subprocess  # ruff: ignore[suspicious-subprocess-import] - a fresh interpreter is the subject
+import sys
 from operator import itemgetter
 
 import pytest
 
+from apexbot.config import config_file_path
+from apexbot.exceptions.base import ApexbotValueError
 from apexbot.registry.deployment_loader import (
     DeploymentRecord,
     _pool_type_map,
     load_deployments,
     register_from_deployments,
 )
+from apexbot.registry.deployment_records import KNOWN_POOL_TYPES
 from apexbot.registry.pool_type import pool_type_registry
 
 _RECORDS = load_deployments()
@@ -221,6 +227,208 @@ class TestOverlayMerge:
             (r.chain_id, r.factory) for r in shipped
         }
 
+    def test_config_file_overlay_is_read_from_the_selected_file(self, tmp_path) -> None:
+        """The `[deployments] overlay` is read from the file `config_file_path()` selects.
+
+        A real operator file carries `[nodes]`, `[deployments]`, and
+        `[failure_policy]`; the typed loader sanctions all three, and the
+        deployment overlay is read from that same file (not a re-derived
+        path) so both readers share one file.
+        """
+        import json
+
+        factory = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+        overlay = {
+            "deployments": [
+                {
+                    "name": "Config-File Uniswap V2",
+                    "chain_id": 1,
+                    "pool_type": "uniswap-v2",
+                    "variant": None,
+                    "dex_variant": "uniswap-v2",
+                    "family": None,
+                    "factory": factory,
+                    "deployer": None,
+                    "init_hash": "0x" + "ef" * 32,
+                }
+            ]
+        }
+        overlay_file = tmp_path / "overlay.json"
+        overlay_file.write_text(json.dumps(overlay), encoding="utf-8")
+
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            "[nodes]\n"
+            'http = { 1 = "http://localhost:8545" }\n'
+            "\n[deployments]\n"
+            f"overlay = {json.dumps(str(overlay_file))}\n"
+            # A DECLARED bucket: this table is free-form to the typed loader,
+            # which skips it, but the failure-policy reader closes over its
+            # own bucket set and refuses the boot on an undeclared key or
+            # action. It reads the file at import, so a file only written
+            # during the test never reached it.
+            "\n[failure_policy]\n"
+            'sim_failure.revert_economics = "observe"\n',
+            encoding="utf-8",
+        )
+
+        # A fresh interpreter, because the file is selected when the process
+        # installs its config: a `APEXBOT_CONFIG` set after that names a file
+        # this process never read (see the freeze test below for the other
+        # side of the same property).
+        env = dict(os.environ)
+        env["APEXBOT_CONFIG"] = str(config_file)
+        probe = (
+            "import json\n"
+            "from apexbot.registry.deployment_loader import load_deployments\n"
+            "from apexbot.config import config_file_path\n"
+            "print(json.dumps({'file': config_file_path(),"
+            " 'names': [r.name for r in load_deployments()]}))\n"
+        )
+        completed = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true] - fixed argv, no shell
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        assert completed.returncode == 0, completed.stderr
+        answer = json.loads(completed.stdout)
+        assert answer["file"] == str(config_file)
+        assert "Config-File Uniswap V2" in answer["names"]
+
+    def test_a_config_file_named_after_install_is_not_the_file_the_overlay_reads(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A `APEXBOT_CONFIG` set after the process installed its config is not the file read.
+
+        The overlay is a raw-table reader, and it resolves the file the
+        installed verdict selected rather than re-running the discovery rule
+        against a live environment. A raw table's licence to carry a key the
+        typed schema does not declare is a property of the READER, not of when
+        the file was chosen: giving the two readers different files is what
+        would make this a second config authority.
+        """
+        import json
+
+        late_overlay = tmp_path / "late-overlay.json"
+        late_overlay.write_text(
+            json.dumps({
+                "deployments": [
+                    {
+                        "name": "Late-Config DEX",
+                        "chain_id": 424242,
+                        "pool_type": "uniswap-v2",
+                        "variant": None,
+                        "dex_variant": "uniswap-v2",
+                        "family": None,
+                        "factory": "0x" + "ab" * 20,
+                        "deployer": None,
+                        "init_hash": "0x" + "cd" * 32,
+                    }
+                ]
+            }),
+            encoding="utf-8",
+        )
+        late_config = tmp_path / "late-config.toml"
+        late_config.write_text(
+            f"[deployments]\noverlay = {json.dumps(str(late_overlay))}\n", encoding="utf-8"
+        )
+
+        installed = config_file_path()
+        monkeypatch.setenv("APEXBOT_CONFIG", str(late_config))
+
+        assert config_file_path() == installed
+        assert "Late-Config DEX" not in {r.name for r in load_deployments()}
+
+
+class TestOverlayConfigFailsLoudly:
+    """Broken ``[deployments]`` overlay config raises loudly; absent stays quiet.
+
+    A typo'd overlay path or a malformed section must surface (the bot would
+    otherwise silently run without the operator's overlay deployments), while
+    "no config file / no section / no overlay key" remains a quiet ``None``.
+    """
+
+    @staticmethod
+    def _select_config_file(monkeypatch, path) -> None:
+        """Point the raw-table read at a specific operator file.
+
+        The installed verdict is frozen at FFI init (see the freeze test
+        above), so in-process tests swap the data module's ``config_file_path``
+        import — the same seam ``load_deployments`` reads through.
+        """
+        monkeypatch.setattr(
+            "apexbot.registry.deployment_records.config_file_path",
+            lambda: None if path is None else str(path),
+        )
+
+    def test_no_config_file_is_quiet(self, monkeypatch) -> None:
+        """A process with no file layer returns the shipped defaults, quietly."""
+        self._select_config_file(monkeypatch, None)
+        records = load_deployments()
+        assert records == load_deployments(overlay_path=None)
+
+    def test_absent_section_is_quiet(self, tmp_path, monkeypatch) -> None:
+        """A config file without a ``[deployments]`` section returns shipped defaults."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[nodes]\nhttp = { 1 = "http://localhost:8545" }\n', encoding="utf-8"
+        )
+        self._select_config_file(monkeypatch, config_file)
+        records = load_deployments()
+        assert records == load_deployments(overlay_path=None)
+
+    def test_section_without_overlay_key_is_quiet(self, tmp_path, monkeypatch) -> None:
+        """A ``[deployments]`` section with no ``overlay`` key returns shipped defaults."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[deployments]\nother_key = "unrelated"\n', encoding="utf-8")
+        self._select_config_file(monkeypatch, config_file)
+        records = load_deployments()
+        assert records == load_deployments(overlay_path=None)
+
+    def test_unreadable_config_file_raises(self, tmp_path, monkeypatch) -> None:
+        """A config file that cannot be opened raises, naming the file."""
+        # A directory at the selected path: open() fails with IsADirectoryError,
+        # an OSError, regardless of the test user's privileges.
+        config_file = tmp_path / "config.toml"
+        config_file.mkdir()
+        self._select_config_file(monkeypatch, config_file)
+        with pytest.raises(ApexbotValueError, match=r"config\.toml"):
+            load_deployments()
+
+    def test_unparseable_config_file_raises(self, tmp_path, monkeypatch) -> None:
+        """A config file that is not valid TOML raises, naming the file."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("not [valid toml", encoding="utf-8")
+        self._select_config_file(monkeypatch, config_file)
+        with pytest.raises(ApexbotValueError, match=r"config\.toml"):
+            load_deployments()
+
+    def test_non_table_deployments_section_raises(self, tmp_path, monkeypatch) -> None:
+        """A ``[deployments]`` section that is not a table raises, naming the file."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("deployments = 42\n", encoding="utf-8")
+        self._select_config_file(monkeypatch, config_file)
+        with pytest.raises(ApexbotValueError, match=r"config\.toml"):
+            load_deployments()
+
+    def test_non_string_overlay_raises(self, tmp_path, monkeypatch) -> None:
+        """A non-string ``overlay`` value raises, naming the file."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[deployments]\noverlay = 42\n", encoding="utf-8")
+        self._select_config_file(monkeypatch, config_file)
+        with pytest.raises(ApexbotValueError, match=r"config\.toml"):
+            load_deployments()
+
+    def test_empty_overlay_raises(self, tmp_path, monkeypatch) -> None:
+        """An empty-string ``overlay`` value raises, naming the file."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('[deployments]\noverlay = ""\n', encoding="utf-8")
+        self._select_config_file(monkeypatch, config_file)
+        with pytest.raises(ApexbotValueError, match=r"config\.toml"):
+            load_deployments()
+
 
 class TestRegisterFromDeployments:
     """``register_from_deployments`` populates a fresh registry from records."""
@@ -279,3 +487,8 @@ class TestRegisterFromDeployments:
         identity = reg.get_v2_identity(1, "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f")
         assert identity is not None
         assert identity.variant == "uniswap-v2"
+
+
+def test_pool_type_map_keys_match_known_pool_types() -> None:
+    """The loader's companion class map covers exactly the leaf's declared keys."""
+    assert set(_pool_type_map()) == KNOWN_POOL_TYPES

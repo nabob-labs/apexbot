@@ -40,7 +40,11 @@ import pytest
 
 from apexbot._ffi import Bot
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.fork import AnvilFork
+from apexbot.fork import AnvilFork, ForkLaunchConfig
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.contract_compat import make_contract
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v2_pool_factory import make_v2_pool
@@ -140,6 +144,7 @@ def _build_pancake_v2_io_free(cassette: dict[str, Any]) -> UniswapV2Pool:
         reserves_token1=cassette["reserves_token1"],
         chain_id=cassette["chain_id"],
         state_block=cassette["block"],
+        py_bot=_PYBOT,
     )
 
 
@@ -182,8 +187,10 @@ class _RecordFork(AbstractContextManager):
             self.fork = AnvilFork(
                 fork_url=BASE_RPC_URI,
                 fork_block=PANCAKE_V2_PARITY_BLOCK,
-                storage_caching=True,
-                anvil_opts=["--accounts=0", "--optimism"],
+                launch=ForkLaunchConfig(
+                    storage_caching=True,
+                    anvil_opts=["--accounts=0", "--optimism"],
+                ),
             )
         return self
 
@@ -214,7 +221,6 @@ def _get_amounts_out_callable(
     return _call
 
 
-@pytest.mark.base
 @pytest.mark.onchain_oracle
 def test_pancakeswap_v2_router_get_amounts_out(golden_factory) -> None:
     """PancakeSwap V2 router: local calc == golden(getAmountsOut[-1])."""
@@ -244,3 +250,14 @@ def test_pancakeswap_v2_router_get_amounts_out(golden_factory) -> None:
                 token_in_quantity=amount_in,
             )
             assert calc == oracle.value, f"{key}: helper={calc} router={oracle.value}"
+
+
+def test_golden_keys_exactly_match_the_oracle_surface(request: pytest.FixtureRequest) -> None:
+    """The golden file holds exactly the keys this module's replay drives.
+
+    Replay fails loud on a missing key but stays silent on a stale extra one —
+    nothing looks it up. Set-equality against the recorded file closes that
+    drift: a shrunken case list cannot leave orphaned oracle entries behind."""
+    lp = _build_pancake_v2_io_free(_load_cassette())
+    expected = {key for key, *_rest in _parity_cases(lp)}
+    assert_golden_keys_exact(request, "test_pancakeswap_v2_router_get_amounts_out", expected)

@@ -1,4 +1,4 @@
-"""FMO2GE: make_v2_pool + builders pass descriptor params into register_v2_pool.
+"""make_v2_pool + builders pass descriptor params into register_v2_pool.
 
 ``register_v2_pool`` gained ``variant`` / ``stable_swap`` / ``fee_denominator``
 params (Rust commit e80f7574). The builder + test factory must thread these
@@ -18,7 +18,7 @@ from tests.helpers.v2_pool_factory import make_v2_pool
 
 if TYPE_CHECKING:
     from apexbot.erc20.erc20 import Erc20Token
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
 
 _PY_BOT = Bot()
 
@@ -46,7 +46,7 @@ class _RegisterSpy:
     ) -> object:
         return self._py_bot.register_token(address, name, symbol, decimals, chain_id)
 
-    def get_pool(self, pool_id: int) -> LiquidityPool | None:
+    def get_pool(self, pool_id: int) -> Pool | None:
         return self._py_bot.get_pool(pool_id)
 
 

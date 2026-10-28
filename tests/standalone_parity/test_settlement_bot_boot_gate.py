@@ -1,4 +1,4 @@
-"""RSP-8 fixture boot gate — Python-consumer half (ergo 23DLCY).
+"""RSP-8 fixture boot gate — Python-consumer half.
 
 The Python companion to the Rust gate
 (rust/examples/settlement_bot/tests/boot_gate.rs): both read the SAME
@@ -17,12 +17,10 @@ seams the Python driver uses:
   Rust-owned build_path_graph seam the Python pathfinding wrapper
   calls (src/apexbot/pathfinding/_pathfinding.py).
 
-The Rust-example boot applies the 15-token ETH-mainnet discovery
-allowlist (parity ledger row 13), which filters the fixture's
-candidate token out; the Python probe reads the UNFILTERED graph, so
-python_reachable.graph_candidate_tokens is [1] while
-expected.graph.candidate_tokens is 0. That deliberate
-filtered/unfiltered difference is the documented permitted divergence.
+Discovery admits every token as an intermediate hop, so the Rust
+example and the Python probe see the same candidate graph:
+python_reachable.graph_candidate_tokens is [1] and
+expected.graph.candidate_tokens is 1.
 
 A seeded divergence must fail the comparator: mutate one expected
 value in an in-memory copy (the checked-in oracle is never touched)
@@ -34,11 +32,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from apexbot._ffi import Bot, build_path_graph
+from apexbot._ffi import Bot, PathGraph, PoolKind, build_path_graph
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures"
 _ORACLE_PATH = _FIXTURE_DIR / "settlement_bot_boot.json"
-_DB_PATH = Path("rust/crates/apexbot-db/tests/fixtures/parity.db")
+_DB_PATH = Path("rust/crates/foundation/apexbot-db/tests/fixtures/parity.db")
 _DISCOVERY_CHAIN_ID = 8453
 _ALLOWED_STATUSES = {
     "REACHABLE",
@@ -61,12 +59,12 @@ def _python_seed_block() -> int | None:
     return bot.snapshot_seed_block
 
 
-def _python_graph() -> dict:
+def _python_graph() -> PathGraph:
     """The Python driver's candidate-pool graph against the fixture DB."""
     return build_path_graph(
         database_path=str(_DB_PATH),
         chain_id=_DISCOVERY_CHAIN_ID,
-        pool_kinds={0, 1, 2},
+        pool_kinds={PoolKind.V2, PoolKind.V3, PoolKind.V4},
         allowed_intermediate_token_ids=None,
     )
 
@@ -83,10 +81,10 @@ def test_python_consumer_boot_decisions_match_shared_oracle() -> None:
     graph = _python_graph()
     # The Python discovery enumeration count and the Rust discovery count
     # agree on the fixture: one V3 + one V4 pool (ledger row 11).
-    assert len(graph["pool_id_to_kind"]) == expected["discovery_count"]
-    assert len(graph["pool_id_to_kind"]) == python_reachable["graph_nodes"]
-    assert sorted(graph["candidate_tokens"]) == python_reachable["graph_candidate_tokens"]
-    assert len(graph["edges"]) == python_reachable["graph_edges"]
+    assert len(graph.pool_id_to_kind) == expected["discovery_count"]
+    assert len(graph.pool_id_to_kind) == python_reachable["graph_nodes"]
+    assert sorted(graph.candidate_tokens) == python_reachable["graph_candidate_tokens"]
+    assert len(graph.edges) == python_reachable["graph_edges"]
 
 
 def test_oracle_ledger_is_complete_and_typed() -> None:
@@ -112,6 +110,6 @@ def test_seeded_divergence_in_oracle_fails_the_python_comparator() -> None:
 
     graph = _python_graph()
     mutated_nodes = oracle["python_reachable"]["graph_nodes"] + 1
-    assert len(graph["pool_id_to_kind"]) != mutated_nodes, (
+    assert len(graph.pool_id_to_kind) != mutated_nodes, (
         "a mutated expected graph-node count must fail the Python comparator"
     )

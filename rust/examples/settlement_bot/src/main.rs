@@ -1,6 +1,6 @@
-// Slice-1 driver has no panic/unwrap surfaces yet; keep only the lint
-// expectation the operator binary actually triggers (stdout diagnostics),
-// mirroring rust/crates/apexbot/examples/standalone_consumer.rs.
+// The driver has no panic/unwrap surfaces; keep only the lint expectation
+// the operator binary actually triggers (stdout diagnostics),
+// mirroring rust/crates/facade/apexbot/examples/standalone_consumer.rs.
 #![expect(
     clippy::print_stdout,
     reason = "standalone-driver binary whose boot/config/ledger diagnostics are read by the operator"
@@ -20,21 +20,20 @@
 //! every surface the Python driver reaches but a Rust consumer cannot is a
 //! compile wall here — recorded as a numbered gap in the ledger.
 //!
-//! Slice 1 covers ledger rows 1–5 (CLI, driver config, RPC-URI cascade, DB
-//! path, snapshot-load boot slice). Rows 6–8 (the engine handshake, the
-//! result-batch stream, and path registration) are driven through the public
-//! `apexbot::EngineDriver` (ADR-050 / Gap G1, ergo 5XOGRK):
+//! Ledger rows 1–5 (CLI, driver config, RPC-URI cascade, DB path,
+//! snapshot-load boot slice) are driven directly; rows 6–8 (the engine
+//! handshake, the result-batch stream, and path registration) go through the
+//! public `apexbot::EngineDriver` (ADR-050 / Gap G1):
 //! `EngineDriver::start` → `take_result_receiver` → `resume` (the driver owns
-//! the `S+1..W` auto-backfill) → `stop`. The G3 registration pipeline lands
-//! driver-side (ergo XFEJUG). Gap G4 (ergo L4E7RI) adds the driver-side
-//! `consume`/`dispatch`/`sim_submit`/`submission` modules mirroring rows
-//! 15–18. Gap G5 (ergo KPLWUM) adds `session_watch` (the typed end-state
-//! verdict + heartbeat/stall watchdog over the consume loop) and
-//! `operator_channel` (the `--operator-socket` JSON-lines channel; row 19/20).
+//! the `S+1..W` auto-backfill) → `stop`. The G3 registration pipeline is
+//! driver-side; Gap G4's `consume`/`dispatch`/`submission` modules mirror rows
+//! 15–18, and Gap G5's `session_watch` (the typed end-state verdict ranking
+//! over the core session-end detection facts) and `operator_channel` (the
+//! `--operator-socket` JSON-lines channel; row 19/20) cover the operator rows.
 //! The live handshake is gated behind `SMOKE_RPC_URL` so the example
 //! stays CI-runnable; without it (or with `--smoke-offline`) it stops after the
 //! parity-ledger print. Once live registration completes the arm enters the
-//! RSP-10 run-until-shutdown phase (`run_loop`, ergo SGCAJ5) — the
+//! RSP-10 run-until-shutdown phase (`run_loop`,) — the
 //! `BotRunner.run` main-loop shape: consumer + watch + operator channel stay
 //! alive until SIGINT or the bounded `APEXBOT_SMOKE_MAX_SECS` window, with
 //! per-block heartbeats for observation runs. `--operator-inert` (with `--operator-socket`) is the
@@ -42,30 +41,33 @@
 //!
 //! Parity sources (constants + error semantics mirrored byte-for-byte):
 //!   - `src/apexbot/runner/cli.py`       — CLI flags
-//!   - `src/apexbot/runner/config.py`    — `ArbitrageConfig.from_env`
-//!   - `src/apexbot/config.py`           — `resolve_rpc_uris` cascade + db path
+//!   - `src/apexbot/runner/config.py`    — `ArbitrageConfig.build`
+//!   - `src/apexbot/runner/identity.py`  — deployment addresses, dry-run
+//!     placeholders, and the published-key manifest this example mirrors
+//!
+//! The node-endpoint and database-path cascades are NOT mirrored here: they
+//! resolve through `apexbot::config`'s capability-scoped resolvers over the
+//! one operator file + environment (ADR-062), the same four-layer path the
+//! console and the Python driver read.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::ExitCode;
 
 use apexbot::core::address_utils::to_checksum_address_str;
+use apexbot::core::fee_percentiles::{P10_INDEX, P50_INDEX, PRIORITY_FEE_PERCENTILES};
 use apexbot::core::retry::RetryPolicy;
 
-mod claims;
 mod consume;
 mod discovery;
 mod dispatch;
-mod ledger;
 mod live;
 mod operator_channel;
 mod pipeline;
 mod policy;
 mod progress;
-mod retry;
 mod run_loop;
 mod session_watch;
-mod sim_submit;
 mod submission;
 mod telemetry;
 
@@ -75,82 +77,64 @@ use crate::policy::{parse_permutation_filter, PathPolicy};
 use apexbot::pathfinding::PoolKind;
 
 /// The settled arbitration chain for this driver (Ethereum mainnet),
-/// mirroring `ArbitrageConfig.from_env(chain_id=1)`.
+/// mirroring `ArbitrageConfig.build(chain_id=1)`.
 const CHAIN_ID: u64 = 1;
 
-// ── Driver-config defaults (mirrored from runner/config.py) ───────────────
+// ── Driver-config defaults (identity mirrored from runner/identity.py) ────
 
-const MIN_PROFIT_NET: u64 = 1;
 const FEE_HISTORY_WINDOW: u64 = 10;
-const FEE_PERCENTILES: [u64; 2] = [10, 50];
 const TARGET_PROFIT_RATIO: f64 = 1.25;
 const BLOCKS_BEFORE_NONCE_EXPIRES: u64 = 5;
 const MAX_SIMULATE_CONCURRENT: u64 = 50;
 const AGE_DECAY_CONSTANT: f64 = 0.25;
-const MIN_PRIORITY_FEE_PERCENTILE: u64 = 10;
-const MAX_PRIORITY_FEE_PERCENTILE: u64 = 50;
 const PATH_SUPPRESS_THRESHOLD: u64 = 10;
 const PATH_SUPPRESS_RETRY_INTERVAL: u64 = 100;
 
-/// `ETH_MAINNET_ALLOWED_TOKENS` (runner/config.py) — checksummed, lowercase-
-/// compared by the path predicate (row 13; implemented by the `policy` module,
-/// ergo task XFEJUG). Kept here so the config dump reports the same value the
-/// Python config would.
-const ALLOWED_INTERMEDIATE_TOKENS: [&str; 11] = [
-    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
-    "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
-    "0x6B175474E89094C44Da98b954EedeAC495271d0F", // DAI
-    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
-    "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", // UNI
-    "0x514910771AF9Ca656af840dff83E8264EcF986CA", // LINK
-    "0x6B3595068778DD592e39A122f4f5a5cF09C90fE2", // SUSHI
-    "0xD533a949740bb3306d119CC777fa900bA034cd52", // CRV
-    "0xc00e94Cb662C3520282E6f5717214004A7f26888", // COMP
-    "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e", // YFI
-    "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0", // MATIC/POL
-];
-
-/// `_driver_constants.WETH_ADDRESS` (Ethereum mainnet wrapped native).
+/// `WETH_ADDRESS` (runner/identity.py) — Ethereum mainnet wrapped native.
 const WETH_ADDRESS: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 
-/// `_driver_constants.ETH_MAINNET_ALLOWED_TOKENS` — the DISCOVERY allowlist
-/// `build_paths.py::discovery_sweep` passes to `find_paths_async`.
-///
-/// NOTE: Python has two distinct sets. `config.py::_ALLOWED_INTERMEDIATE_TOKENS`
-/// (11 tokens, mirrored by `ALLOWED_INTERMEDIATE_TOKENS` above) is the config
-/// FIELD; the discovery path actually passes the 15-token
-/// `_driver_constants.ETH_MAINNET_ALLOWED_TOKENS` (which includes WETH —
-/// required, because `build_path_graph` intersects the candidate-token set
-/// with it). The example mirrors the DISCOVERY set here so the graph filter is
-/// faithful; the config field stays the 11-token list for row-2 parity.
-const ETH_MAINNET_DISCOVERY_ALLOWED_TOKENS: [&str; 15] = [
-    "0x163f8C2467924be0ae7B5347228CABF260318753", // WLD
-    "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8", // PyUSD
-    "0xB8c77482e45F1F44dE1745F52C74426C631bDD52", // BNB
-    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
-    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
-    "0xdAC17F958D2ee523a2206206994597C13D831ec7", // USDT
-    "0x6B175474E89094C44Da98b954EedeAC495271d0F", // DAI
-    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599", // WBTC
-    "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", // UNI
-    "0x514910771AF9Ca656af840dff83E8264EcF986CA", // LINK
-    "0x6B3595068778DD592e39A122f4f5a5cF09C90fE2", // SUSHI
-    "0xD533a949740bb3306d119CC777fa900bA034cd52", // CRV
-    "0xc00e94Cb662C3520282E6f5717214004A7f26888", // COMP
-    "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e", // YFI
-    "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0", // MATIC/POL
-];
+/// `MULTICALL3_ADDRESS` (runner/identity.py) — the aggregate3 probe target
+/// the simulate fan-out reads balances through.
+const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
+/// `UNISWAP_V4_POOL_MANAGER_ADDRESS` (runner/identity.py).
+const UNISWAP_V4_POOL_MANAGER_ADDRESS: &str = "0x000000000004444c5dc75cB358380D2e3De08A90";
+
+// Deployment identity is an independent parity mirror, not a core re-export:
+// a `cargo add apexbot` consumer deploys its own executor, so the core does
+// not own one deployment's defaults. The Python home is
+// `src/apexbot/runner/identity.py`; a change there must change here to keep
+// the parity twin faithful, and the Python side pins the mirror in
+// `tests/arbitrage/test_published_operator_keys_single_home.py`. If this
+// example stops being a parity twin, delete these defaults rather than extend
+// the mirror.
 const DEFAULT_EXECUTOR_ADDRESS: &str = "0x543C7eF4F2368a9411c94A055e7236E6Dc6f99D5";
 const DEFAULT_INJECTED_ADDRESS: &str = "0x0D6d4c3cF3BD3b769De1821f2BE0d7d99913E4F1";
 const DEFAULT_EXECUTOR_OWNER: &str = "0x9C56a29c7231974c269E24F9FB3c29203039089E";
 
-/// Dry-run operator placeholders (runner/config.py): Anvil account-0 — a
+/// Dry-run operator placeholders (runner/identity.py): Anvil account-0 — a
 /// valid secp256k1 key that never signs; the not-yet-wired submit leaf (G4,
-/// ergo L4E7RI) must keep the same never-sign guarantee.
+///) must keep the same never-sign guarantee.
 const DRY_RUN_OPERATOR_PRIVATE_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const DRY_RUN_OPERATOR_ADDRESS: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+/// The private-key manifest the repository publishes, embedded from its one
+/// declared home so the Rust parity example and the Python driver cannot
+/// drift. Live mode refuses any key it names (`runner/identity.py`).
+const PUBLISHED_OPERATOR_PRIVATE_KEYS: &str =
+    include_str!("../../../../src/apexbot/runner/published_operator_private_keys.txt");
+
+/// Whether `key` is one the repository publishes, compared without case.
+///
+/// The manifest is one 0x-prefixed key per line; blank lines and `#` comments
+/// are ignored.
+fn is_published_operator_private_key(key: &str) -> bool {
+    PUBLISHED_OPERATOR_PRIVATE_KEYS.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#') && line.eq_ignore_ascii_case(key)
+    })
+}
 
 /// `apexbot.constants.ZERO_ADDRESS`.
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
@@ -160,23 +144,22 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 struct Cli {
     live: bool,
     permutation: Option<String>,
-    node_http: Option<String>,
-    node_ws: Option<String>,
+    /// `--node`, repeatable: one endpoint per transport, classified by the
+    /// value's own scheme (ADR-062 D6).
+    node: Vec<String>,
     operator_socket: Option<String>,
     operator_inert: bool,
     smoke_offline: bool,
 }
 
 const USAGE: &str = "usage: settlement-bot [--live] [--permutation V2-V3-V4] \
-[--node-http URL] [--node-ws URL] [--operator-socket PATH] [--operator-inert] \
-[--smoke-offline]";
+[--node URL]... [--operator-socket PATH] [--operator-inert] [--smoke-offline]";
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut cli = Cli {
         live: false,
         permutation: None,
-        node_http: None,
-        node_ws: None,
+        node: Vec::new(),
         operator_socket: None,
         operator_inert: false,
         smoke_offline: false,
@@ -199,8 +182,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         match flag {
             "--live" => cli.live = true,
             "--permutation" => cli.permutation = Some(take_value(&mut i)?),
-            "--node-http" => cli.node_http = Some(take_value(&mut i)?),
-            "--node-ws" => cli.node_ws = Some(take_value(&mut i)?),
+            "--node" => cli.node.push(take_value(&mut i)?),
             "--operator-socket" => cli.operator_socket = Some(take_value(&mut i)?),
             "--operator-inert" => cli.operator_inert = true,
             "--smoke-offline" => cli.smoke_offline = true,
@@ -215,28 +197,6 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     Ok(cli)
 }
 
-// ── Dotenv (mirrors dotenv.dotenv_values("examples/mainnet.env")) ─────────
-
-fn read_dotenv(path: &Path) -> BTreeMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        // Python's dotenv_values on a missing file yields an empty mapping;
-        // the cascade then falls through to defaults/env exactly as here.
-        return BTreeMap::new();
-    };
-    let mut map = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim().trim_matches('"').trim_matches('\'');
-            map.insert(k.trim().to_string(), v.to_string());
-        }
-    }
-    map
-}
-
 // ── Driver config (mirrors runner/config.py::ArbitrageConfig) ─────────────
 
 struct SettlementBotConfig {
@@ -248,18 +208,15 @@ struct SettlementBotConfig {
     executor_owner: String,
     inject_executor_code: bool,
     injected_address: String,
-    min_profit_net: u64,
     fee_history_window: u64,
     fee_percentiles: [u64; 2],
     target_profit_ratio: f64,
     blocks_before_nonce_expires: u64,
-    max_simulate_concurrent: u64,
     age_decay_constant: f64,
     min_priority_fee_percentile: u64,
     max_priority_fee_percentile: u64,
     path_suppress_threshold: u64,
     path_suppress_retry_interval: u64,
-    allowed_intermediate_tokens: BTreeSet<String>,
     permutation_filter: Option<String>,
     verification_retry_policy: RetryPolicy,
     dry_run: bool,
@@ -273,117 +230,47 @@ fn checksum_or_empty(addr: &str) -> Result<String, String> {
     to_checksum_address_str(addr).map_err(|e| format!("invalid address {addr}: {e}"))
 }
 
-fn parse_u64_env(raw: Option<&String>, default: u64, suffix: &str) -> Result<u64, String> {
-    match raw {
-        None => Ok(default),
-        Some(v) if v.is_empty() => Ok(default),
-        Some(v) => v
-            .parse::<u64>()
-            .map_err(|_| format!("VERIFICATION_RETRY_{suffix} must be an integer, got {v:?}")),
-    }
+/// One process-environment value, empty when unset. The launch shell exports
+/// operator and executor identity from `bot.env`.
+fn env_value(name: &str) -> String {
+    std::env::var(name).unwrap_or_default()
 }
 
-fn parse_f64_env(raw: Option<&String>, default: f64, suffix: &str) -> Result<f64, String> {
-    match raw {
-        None => Ok(default),
-        Some(v) if v.is_empty() => Ok(default),
-        Some(v) => v
-            .parse::<f64>()
-            .map_err(|_| format!("VERIFICATION_RETRY_{suffix} must be a float, got {v:?}")),
+/// One process-environment value with a declared fallback for unset/empty.
+fn env_or(name: &str, default: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => default.to_string(),
     }
-}
-
-/// Read the operator config file (`~/.config/apexbot/config.toml`) the way
-/// the Python cascade's `config.toml` layer does; a missing/unparseable file
-/// yields `None` (that layer then simply contributes nothing).
-fn read_config_toml() -> Option<toml::Table> {
-    let home = std::env::var("HOME").ok()?;
-    let path = PathBuf::from(home).join(".config/apexbot/config.toml");
-    let text = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&text).ok()
-}
-
-fn config_toml_entry<'a>(
-    toml_value: Option<&'a toml::Table>,
-    section: &str,
-    key: &str,
-) -> Option<&'a str> {
-    toml_value?.get(section)?.get(key)?.as_str()
-}
-
-/// Mirror `resolve_rpc_uris(chain_id, cli_http, cli_ws)`:
-/// CLI > OS env `APEXBOT_RPC_{HTTP,WS}_CHAINID_1` > config.toml
-/// `rpc[1]`/`ws[1]` > error. **No localhost default** — a chain with no
-/// configured endpoint in any layer is a hard error (Python raises
-/// `RpcNotConfiguredError`; this driver reports + exits, see `main`).
-fn cascade_rpc_uri(
-    kind: &str,
-    cli: Option<&String>,
-    toml_section: &str,
-    config_toml: Option<&toml::Table>,
-) -> Result<String, String> {
-    if let Some(v) = cli.filter(|v| !v.is_empty()) {
-        return Ok(v.clone());
-    }
-    let env_name = format!("APEXBOT_RPC_{kind}_CHAINID_{CHAIN_ID}");
-    if let Ok(v) = std::env::var(&env_name) {
-        if !v.is_empty() {
-            return Ok(v);
-        }
-    }
-    let chain_key = CHAIN_ID.to_string();
-    if let Some(v) = config_toml_entry(config_toml, toml_section, &chain_key) {
-        if !v.is_empty() {
-            return Ok(v.to_string());
-        }
-    }
-    Err(format!(
-        "no {kind} RPC endpoint configured for chain {CHAIN_ID} (cascade: \
-         --node-{kind_lower} > {env_name} > config.toml {toml_section}[{CHAIN_ID}]); \
-         no localhost default",
-        kind_lower = kind.to_lowercase(),
-    ))
-}
-
-/// Mirror `_make_arbitrage_config`'s db path: config.toml `database.path`
-/// else `~/.config/apexbot/apexbot.db`. `APEXBOT_FIXTURE_DB` overrides,
-/// the same CI test seam `standalone_consumer.rs` uses.
-fn resolve_db_path(config_toml: Option<&toml::Table>) -> PathBuf {
-    if let Ok(fixture) = std::env::var("APEXBOT_FIXTURE_DB") {
-        if !fixture.is_empty() {
-            return PathBuf::from(fixture);
-        }
-    }
-    if let Some(v) = config_toml_entry(config_toml, "database", "path") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".config/apexbot/apexbot.db")
 }
 
 impl SettlementBotConfig {
-    /// Mirror of `ArbitrageConfig.from_env(env, live=..., permutation=...)`:
-    /// same defaults, same fail-fast error strings, same cascade order.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "linear env-parse mirror of ArbitrageConfig.from_env; splitting obscures the field-by-field cascade"
-    )]
-    fn from_env(env: &BTreeMap<String, String>, cli: &Cli) -> Result<Self, String> {
+    /// Mirror of `ArbitrageConfig.build(live=..., permutation=...)`: same
+    /// defaults, same fail-fast error strings, same cascade order. Identity is
+    /// read from the process environment, which the launch shell exports from
+    /// `bot.env`.
+    fn build(cli: &Cli, loaded: &apexbot::config::LoadedConfig) -> Result<Self, String> {
         // ── Operator ──
-        let operator_raw = env.get("OPERATOR_ADDRESS").cloned().unwrap_or_default();
+        let operator_raw = env_value("OPERATOR_ADDRESS");
         let mut operator_address = if operator_raw.is_empty() {
             String::new()
         } else {
             checksum_or_empty(&operator_raw)?
         };
-        let mut operator_private_key = env.get("OPERATOR_PRIVATE_KEY").cloned().unwrap_or_default();
+        let mut operator_private_key = env_value("OPERATOR_PRIVATE_KEY");
         if cli.live {
             if operator_address.is_empty() || operator_private_key.is_empty() {
                 return Err(
-                    "OPERATOR_ADDRESS and OPERATOR_PRIVATE_KEY must be set in mainnet.env \
-                     for live mode"
+                    "OPERATOR_ADDRESS and OPERATOR_PRIVATE_KEY must be set in the process \
+                     environment (the launch shell exports them from bot.env) for live mode"
+                        .to_string(),
+                );
+            }
+            if is_published_operator_private_key(&operator_private_key) {
+                return Err(
+                    "OPERATOR_PRIVATE_KEY is a known placeholder (the dry-run throwaway or \
+                     the all-zero scalar): refusing to run live with a key the repository \
+                     publishes"
                         .to_string(),
                 );
             }
@@ -396,89 +283,80 @@ impl SettlementBotConfig {
             }
         }
 
-        // ── Node URLs (standard cascade) ──
-        let config_toml = read_config_toml();
-        let node_http =
-            cascade_rpc_uri("HTTP", cli.node_http.as_ref(), "rpc", config_toml.as_ref())?;
-        let node_ws = cascade_rpc_uri("WS", cli.node_ws.as_ref(), "ws", config_toml.as_ref())?;
+        // ── Node URLs (ADR-062 capability-scoped cascade) ──
+        // One `--node` per transport; the value classifies itself (D6). The
+        // request scope (ipc > ws > http) serves construction and tx IO, the
+        // subscription scope (ipc > ws) serves the engine feed, and both read
+        // the same loaded operator file + environment.
+        let mut overrides = apexbot::config::NodeOverrides::new();
+        for raw in &cli.node {
+            let transport = apexbot::config::NodeTransport::classify(raw).ok_or_else(|| {
+                format!(
+                    "{raw:?} names no node transport; pass an http(s)://, ws(s)://, or ipc:// \
+                     URL or an absolute socket path"
+                )
+            })?;
+            overrides = overrides.with_transport(transport, raw.clone());
+        }
+        let node_http = apexbot::config::resolve_node_request_uri(loaded, CHAIN_ID, &overrides)
+            .map_err(|e| e.to_string())?;
+        let node_ws = apexbot::config::resolve_node_subscription_uri(loaded, CHAIN_ID, &overrides)
+            .map_err(|e| e.to_string())?;
 
         // ── Executor ──
-        let mut executor_address = checksum_or_empty(
-            env.get("EXECUTOR_CONTRACT_ADDRESS")
-                .map_or(DEFAULT_EXECUTOR_ADDRESS, String::as_str),
-        )?;
+        let mut executor_address = checksum_or_empty(&env_or(
+            "EXECUTOR_CONTRACT_ADDRESS",
+            DEFAULT_EXECUTOR_ADDRESS,
+        ))?;
         if executor_address == ZERO_ADDRESS {
             return Err("EXECUTOR_CONTRACT_ADDRESS is the zero address".to_string());
         }
-        let inject_executor_code =
-            env.get("INJECT_EXECUTOR_CODE").map_or("1", String::as_str) == "1";
-        let injected_address = checksum_or_empty(
-            env.get("INJECTED_EXECUTOR_ADDRESS")
-                .map_or(DEFAULT_INJECTED_ADDRESS, String::as_str),
-        )?;
-        let executor_owner = checksum_or_empty(
-            env.get("EXECUTOR_OWNER_ADDRESS")
-                .map_or(DEFAULT_EXECUTOR_OWNER, String::as_str),
-        )?;
+        // The injection stance is a declared key; the retired bare name is
+        // refused rather than re-admitted, mirroring the Python runner.
+        if std::env::var_os("INJECT_EXECUTOR_CODE").is_some() {
+            return Err(
+                "INJECT_EXECUTOR_CODE is retired as an OS environment variable; set \
+                 APEXBOT_INJECT_EXECUTOR_CODE (typed key simulation.inject_executor_code)"
+                    .to_string(),
+            );
+        }
+        let inject_executor_code = loaded.config.simulation.inject_executor_code;
+        let injected_address = checksum_or_empty(&env_or(
+            "INJECTED_EXECUTOR_ADDRESS",
+            DEFAULT_INJECTED_ADDRESS,
+        ))?;
+        let executor_owner =
+            checksum_or_empty(&env_or("EXECUTOR_OWNER_ADDRESS", DEFAULT_EXECUTOR_OWNER))?;
         if inject_executor_code {
             executor_address.clone_from(&injected_address);
         }
-        let executor_runtime = env
-            .get("EXECUTOR_RUNTIME")
-            .filter(|v| !v.is_empty())
-            .cloned();
+        let executor_runtime = std::env::var("EXECUTOR_RUNTIME")
+            .ok()
+            .filter(|v| !v.is_empty());
 
-        // Defaults come from the workspace-canonical policy type; the env
-        // knobs override them field-by-field.
-        let retry_defaults = RetryPolicy::verification_default();
-        let verification_retry_policy = RetryPolicy {
-            max_attempts: u32::try_from(parse_u64_env(
-                env.get("VERIFICATION_RETRY_MAX_ATTEMPTS"),
-                u64::from(retry_defaults.max_attempts),
-                "MAX_ATTEMPTS",
-            )?)
-            .unwrap_or(u32::MAX),
-            base_delay: parse_f64_env(
-                env.get("VERIFICATION_RETRY_BASE_DELAY"),
-                retry_defaults.base_delay,
-                "BASE_DELAY",
-            )?,
-            max_delay: parse_f64_env(
-                env.get("VERIFICATION_RETRY_MAX_DELAY"),
-                retry_defaults.max_delay,
-                "MAX_DELAY",
-            )?,
-            jitter: parse_f64_env(
-                env.get("VERIFICATION_RETRY_JITTER"),
-                retry_defaults.jitter,
-                "JITTER",
-            )?,
-        };
+        // The retry policy is declared in the core schema, and the projection
+        // from that declaration lives beside the retry dance.
+        let verification_retry_policy =
+            apexbot::bot_core::verification_retry::retry_policy_from_config(&loaded.config.verify);
 
         Ok(Self {
             operator_address,
             operator_private_key,
-            node_http,
-            node_ws,
+            node_http: node_http.value,
+            node_ws: node_ws.value,
             executor_address,
             executor_owner,
             inject_executor_code,
             injected_address,
-            min_profit_net: MIN_PROFIT_NET,
             fee_history_window: FEE_HISTORY_WINDOW,
-            fee_percentiles: FEE_PERCENTILES,
+            fee_percentiles: PRIORITY_FEE_PERCENTILES,
             target_profit_ratio: TARGET_PROFIT_RATIO,
             blocks_before_nonce_expires: BLOCKS_BEFORE_NONCE_EXPIRES,
-            max_simulate_concurrent: MAX_SIMULATE_CONCURRENT,
             age_decay_constant: AGE_DECAY_CONSTANT,
-            min_priority_fee_percentile: MIN_PRIORITY_FEE_PERCENTILE,
-            max_priority_fee_percentile: MAX_PRIORITY_FEE_PERCENTILE,
+            min_priority_fee_percentile: PRIORITY_FEE_PERCENTILES[P10_INDEX],
+            max_priority_fee_percentile: PRIORITY_FEE_PERCENTILES[P50_INDEX],
             path_suppress_threshold: PATH_SUPPRESS_THRESHOLD,
             path_suppress_retry_interval: PATH_SUPPRESS_RETRY_INTERVAL,
-            allowed_intermediate_tokens: ALLOWED_INTERMEDIATE_TOKENS
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
             permutation_filter: cli.permutation.clone(),
             verification_retry_policy,
             dry_run: !cli.live,
@@ -490,32 +368,32 @@ impl SettlementBotConfig {
 // ── Parity ledger boot report ─────────────────────────────────────────────
 
 /// Machine-checkable parity ledger rows for the boot report. The RSP-8
-/// running gate (ergo 23DLCY) diffs these lines between the Python and Rust
+/// running gate  diffs these lines between the Python and Rust
 /// drivers; `grep "^parity-ledger"` is the extraction contract.
 fn print_parity_ledger(snapshot_seed_block: Option<u64>) {
     let s = snapshot_seed_block.map_or("None".to_string(), |s| s.to_string());
     #[rustfmt::skip]
     let rows: &[(&str, &str, &str)] = &[
-        ("01-cli", "REACHABLE", "parse_cli (driver-local, mirrors runner/cli.py)"),
-        ("02-driver-config", "REACHABLE", "from_env (mirrors runner/config.py)"),
-        ("03-rpc-cascade", "REACHABLE", "cascade_rpc_uri (mirrors resolve_rpc_uris)"),
-        ("04-db-path", "REACHABLE", "resolve_db_path (+APEXBOT_FIXTURE_DB seam)"),
+        ("01-cli", "REACHABLE", "parse_cli (driver-local, mirrors runner/cli.py); one scheme-classified --node per transport (ADR-062 D6)"),
+        ("02-driver-config", "REACHABLE", "build (mirrors runner/config.py)"),
+        ("03-rpc-cascade", "REACHABLE", "apexbot::config::{resolve_node_request_uri,resolve_node_subscription_uri} (ADR-062 capability-scoped, file+env)"),
+        ("04-db-path", "REACHABLE", "apexbot::config::resolve_database_path (+ offline.fixture_db typed key)"),
         ("05-snapshot-load", "REACHABLE", "SnapshotDb::open + Bot::load_snapshot_from_db"),
         ("06-engine-subscribe-resume", "REACHED-via-EngineDriver", "EngineDriver::start → subscribe → verify-config (stops pre-resume); resume owns the S+1..W auto-backfill via BlockPump::backfill_with_drain"),
         ("07-result-batch-stream", "REACHED-via-EngineDriver", "EngineDriver::take_result_receiver (attach pre-resume); ResultBatch over the existing unbounded channel"),
         ("08-register-and-solve-path", "REACHED-via-EngineDriver", "EngineDriver::register_and_solve_path delegates to EngineStages"),
-        ("09-verify-lifecycles", "REACHABLE", "EngineDriver::run_v3/v4_registration_lifecycle(+_sync) expose the core lifecycles; claims.rs VerifyClaims (tokio at-most-once) + retry.rs + ledger.rs shipped by XFEJUG"),
+        ("09-verify-lifecycles", "REACHABLE", "EngineDriver::run_v3/v4_registration_lifecycle(+_sync) expose the core lifecycles and now carry the at-most-once claim (bot_core::VerifyClaims, ZTEUTA); the outcome ledger is the core's (bot_core::registration_ledger, ZTEUTA); the bounded retry dance is the core's (bot_core::verification_retry)"),
         ("10-pool-construction", "REACHABLE", "probe_pool_type + build_v2/v3/v4/... (umbrella)"),
         ("11-discovery-db-enumeration", "REACHABLE", "apexbot::db::SnapshotDb::fetch_discovery_rows (apexbot-db::discovery_read) + tests/discovery_read_parity.rs"),
         ("12-path-discovery-batching", "REACHABLE", "discovery.rs: graph build over G2 rows + batched lazy OwnedPathFinder (batch_size<=1 per-path; one cooperative async hop per batch)"),
-        ("13-path-policy", "DRIVER-POLICY", "policy.rs (hop bounds 2/3, allow/deny, duplicate-pool, permutation) + discovery allowlist graph filter; config.py 11-token + _driver_constants 15-token sets"),
+        ("13-path-policy", "DRIVER-POLICY", "policy.rs (hop bounds 2/3, allow/deny, duplicate-pool, permutation); discovery admits every token as an intermediate hop"),
         ("14-in-process-sim", "REACHABLE", "simulate_in_process_with_db + SimulateContext"),
-        ("15-dispatch-selection", "REACHABLE", "apexbot::arbitrage::{dispatch_profitable_results,filter_thin_margin_results} + driver dispatch.rs plan_batch typed decisions (skip/suppressed/thin-margin/sim)"),
-        ("16-sim-fanout-submitter", "DRIVER-POLICY", "sim_submit.rs: tokio Semaphore(max_simulate_concurrent) + single ordered FIFO submitter; consume.rs consumes the EngineDriver result stream (row 7); no core lift"),
+        ("15-dispatch-selection", "REACHABLE", "apexbot::batch_executor::BatchExecutor stage-1 assembly: typed AssemblyVerdict pre-sim policy (empty-hops / resolve-miss / payload-served / suppression / thin-margin / divergent-pool / fee-on-transfer); the batch-local payload-served set (derived per BatchWork from the payload rows) and the cross-block suppression registry (ExecutorConfig.suppression) stay DISTINCT policy inputs; dispatch.rs keeps only the seam extraction (raw_row/payload_row/batch_work)"),
+        ("16-sim-fanout-submitter", "REACHABLE", "apexbot::batch_executor::BatchExecutor over apexbot::submission::SimSubmitPipeline: bounded sim fan-out + single ordered FIFO submit lane + fail-loud raise_if_failed; the driver enqueues BatchWork (caps as plain counts) and drains the typed BatchOutcome record stream; consume.rs HeartbeatSink drains it reading only the block clock (row 7 result stream)"),
         ("17-fee-determination", "REACHABLE", "apexbot::arbitrage::compute_priority_fee + apexbot::rpc::{fetch_priority_fee_percentiles,provider::AlloyProvider::eth_fee_history} + apexbot::submission::fetch_fee_history + apexbot_core::eip_1559::next_base_fee"),
         ("18-live-submission", "REACHABLE", "apexbot::submission::{TxSigner,dispatch_and_submit,monitor_pending_transaction,Dispatcher,PathSuppression}; submission.rs dry-run seam never signs"),
-        ("19-session-watch", "DRIVER-POLICY", "session_watch.rs: typed SessionEndVerdict {PumpEnded,RegistrationFailed,WatchdogTripped} + Heartbeat/stall_watchdog observing the live consume loop (watch-as-observer, no core lift) — ergo KPLWUM"),
-        ("20-operator-channel", "DRIVER-POLICY", "operator_channel.rs: tokio UnixListener JSON-lines add_path/discover/set+get_fleet_posture; fleet posture through apexbot::workers::posture::process (reachable via the umbrella) — ergo KPLWUM"),
+        ("19-session-watch", "DRIVER-POLICY", "session_watch.rs ranks the core detection facts (apexbot::session_end::{SessionEndCause,SessionEndFacts,SessionEndDetection} over EngineDriver::wait_session_end + the heartbeat stall watchdog) into SessionEndVerdict {PumpEnded,RegistrationFailed,WatchdogTripped} (watch-as-observer; ranking + teardown stay driver)"),
+        ("20-operator-channel", "DRIVER-POLICY", "operator_channel.rs: tokio UnixListener JSON-lines add_path/discover/set+get_fleet_posture; fleet posture through apexbot::workers::posture::process_owner (reachable via the umbrella)"),
     ];
     for (row, status, note) in rows {
         println!("parity-ledger row={row} status={status} note={note}");
@@ -550,20 +428,36 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = parse_cli(&args)?;
 
-    // ── Telemetry boot prelude (Gap G6, ergo ZOBXVC) ──
+    // One layered load (ADR-062 D1): the operator file + environment +
+    // declared defaults. Every driver-domain resolver below, the installed
+    // typed holder the strategy keys read, and the strategy-arm gate all read
+    // THIS value, so the example cannot drift from the shared cascade.
+    let loaded = apexbot::config::load_process_config()
+        .map_err(|e| format!("load operator config: {e}"))?;
+
+    // Strategy-arm gate (ADR-055): this driver is the settled-block arm.
+    // An inactive settlement facet refuses in both stances, and an
+    // activated per-ecosystem backrun facet must boot via its hosted
+    // driver, not this runner; the loaded schema is the source.
+    if let Some(msg) = strategy_arm_refusal(
+        loaded.config.strategy.settlement.active,
+        loaded.config.strategy.mevblocker_backrun.active,
+        loaded.config.strategy.txpool_backrun.active,
+    ) {
+        return Err(msg);
+    }
+
+    // ── Telemetry boot prelude (Gap G6,) ──
     // The Python driver boots its subscriber / OTLP / metrics stack at `_ffi`
     // import; the standalone parity twin boots the same stack here, before any
     // driver diagnostic. Telemetry failure degrades loudly but never aborts the
     // boot (logging stays up, telemetry is optional — `telemetry` module docs).
     // The binding's `Drop` flushes + shuts the OTel provider and stops the
     // scrape server on every exit path (ADR-043 section 6).
-    let _telemetry_boot = telemetry::init();
+    let _telemetry_boot = telemetry::init(&loaded);
 
-    // The Python example reads `examples/mainnet.env` from the repo root;
-    // CARGO_MANIFEST_DIR is rust/examples/settlement_bot, so ../../../mainnet.env
-    // is that same file.
-    let env_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../mainnet.env");
-    let dotenv = read_dotenv(&env_path);
+    // Operator/executor identity comes from the process environment, which the
+    // launch shell fills from bot.env — the same source the Python example reads.
     if let Some(p) = &cli.permutation {
         println!("[startup] Permutation filter from CLI: {p}");
     }
@@ -571,7 +465,7 @@ fn run() -> Result<(), String> {
         println!("\n*** LIVE MODE — BOT WILL SUBMIT REAL TRANSACTIONS ***\n");
     }
 
-    let cfg = SettlementBotConfig::from_env(&dotenv, &cli)?;
+    let cfg = SettlementBotConfig::build(&cli, &loaded)?;
     // Full (secret-masked) config dump — this line IS the read of every
     // driver-config field, so nothing in the struct is dead state.
     println!(
@@ -593,22 +487,22 @@ fn run() -> Result<(), String> {
         cfg.executor_runtime,
     );
     println!(
-        "[config] min_profit_net={} fee_history_window={} fee_percentiles={:?} \
-        target_profit_ratio={} nonce_expires_blocks={} max_sim_concurrent={} \
+        "[config] fee_history_window={} fee_percentiles={:?} \
+        target_profit_ratio={} nonce_expires_blocks={} sim_pipeline_concurrency={} \
         age_decay={} priority_fee_percentiles=[{},{}] path_suppress=[{},{}] \
-        allowed_intermediate_tokens={} permutation={:?}",
-        cfg.min_profit_net,
+        permutation={:?}",
         cfg.fee_history_window,
         cfg.fee_percentiles,
         cfg.target_profit_ratio,
         cfg.blocks_before_nonce_expires,
-        cfg.max_simulate_concurrent,
+        // The fan-out cap is a declared verdict value now (the conversion
+        // reads it), so the boot report prints the verdict's answer.
+        loaded.config.simulation.pipeline_concurrency,
         cfg.age_decay_constant,
         cfg.min_priority_fee_percentile,
         cfg.max_priority_fee_percentile,
         cfg.path_suppress_threshold,
         cfg.path_suppress_retry_interval,
-        cfg.allowed_intermediate_tokens.len(),
         cfg.permutation_filter,
     );
     println!(
@@ -622,7 +516,17 @@ fn run() -> Result<(), String> {
     // ── Boot slice (ledger row 5): DB snapshot load → seed block S ──
     // The Python path loads the DB snapshot eagerly inside `Bot.__init__`
     // and stashes S on the shared state before `engine.subscribe(...)`.
-    let db_path = resolve_db_path(read_config_toml().as_ref());
+    // Database path (ADR-062 D1/D4): `--database` > `APEXBOT_DB_PATH` >
+    // `database.path` > the state-home default, all through the one loaded
+    // config. The `offline.fixture_db` typed key (the old APEXBOT_FIXTURE_DB
+    // seam) stays available to the fixture tests as the explicit override.
+    let fixture_db = loaded
+        .config
+        .offline
+        .fixture_db
+        .as_deref()
+        .and_then(Path::to_str);
+    let db_path = apexbot::config::resolve_database_path(&loaded, fixture_db).value;
     let (snap, _schema) = apexbot::db::snapshot_db::SnapshotDb::open(&db_path)
         .map_err(|e| format!("open snapshot DB {}: {e}", db_path.display()))?;
     let bot = apexbot::bot_core::Bot::new(CHAIN_ID);
@@ -632,7 +536,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("load_snapshot_from_db on {}: {e}", db_path.display()))?;
     let seed_block = bot
         .state_arc()
-        .read_at(apexbot::bot_core::state_lock::LockSite::Core)
+        .read_at(apexbot::substrate::state_lock::LockSite::Core)
         .snapshot_seed_block();
     println!(
         "[boot] snapshot loaded from {} (chain {CHAIN_ID}) → S={:?}",
@@ -643,7 +547,7 @@ fn run() -> Result<(), String> {
 
     // ── Candidate-pool discovery (ledger row 11): the read-only enumeration
     // `build_paths.py` performs over its SQLAlchemy ORM, now reachable through
-    // the umbrella on the SAME held-tx snapshot handle (Gap G2, ergo YFIOSF).
+    // the umbrella on the SAME held-tx snapshot handle (Gap G2,).
     // The call is the compile-time proof that a `cargo add apexbot` consumer
     // reaches `apexbot::db::SnapshotDb::fetch_discovery_rows`; the count is
     // the runtime witness.
@@ -671,7 +575,7 @@ fn run() -> Result<(), String> {
         "boot: discovery enumerated"
     );
 
-    // ── G3 pipeline (ledger rows 9 + 12 + 13, ergo XFEJUG) ──
+    // ── G3 pipeline (ledger rows 9 + 12 + 13,) ──
     // 1. Permutation filter → per-depth pool-kind filter + requested kinds.
     let perms: BTreeSet<String> = cfg
         .permutation_filter
@@ -685,11 +589,9 @@ fn run() -> Result<(), String> {
     );
 
     // 2. Graph build from the SAME held discovery rows (snapshot discipline).
-    let allowed: BTreeSet<String> = ETH_MAINNET_DISCOVERY_ALLOWED_TOKENS
-        .iter()
-        .map(|t| t.to_lowercase())
-        .collect();
-    let built = build_graph(&discovered, &requested_kinds, Some(&allowed));
+    //    `None` admits every token as an intermediate hop, mirroring the Python
+    //    driver's discovery sweep.
+    let built = build_graph(&discovered, &requested_kinds, None);
     println!(
         "[g3] graph built: {} nodes, {} candidate tokens, {} requested kinds {:?}",
         built.nodes.len(),
@@ -734,8 +636,8 @@ fn run() -> Result<(), String> {
     };
 
     // 5. Driver policy (row 13): hop bounds pinned to the discovery floor/cap,
-    //    duplicate-pool guard on; the token allowlist is applied at the graph
-    //    filter above (mirroring `find_paths_async`'s `allowed_intermediate_tokens`).
+    //    duplicate-pool guard on. Discovery admits every token as an
+    //    intermediate hop, mirroring the Python driver's discovery sweep.
     let policy = PathPolicy {
         min_hops: 2,
         max_hops: 3,
@@ -783,7 +685,7 @@ fn run() -> Result<(), String> {
 
     print_parity_ledger(seed_block);
 
-    // ── G5 operator channel (ledger row 20, ergo KPLWUM) ──
+    // ── G5 operator channel (ledger row 20,) ──
     // A documented inert mode: serve the operator Unix socket WITHOUT RPC so
     // the wire contract is exercisable offline (the live arm needs
     // `SMOKE_RPC_URL`; this is the CI/integration test surface). The default
@@ -796,7 +698,6 @@ fn run() -> Result<(), String> {
             std::sync::Arc::new(operator_channel::PipelinePathOps::new(
                 &discovered,
                 &requested_kinds,
-                &allowed,
                 &params,
                 pipeline.policy.clone(),
                 pipeline.retry_policy,
@@ -843,35 +744,59 @@ fn run() -> Result<(), String> {
         cfg.node_http.clone()
     };
     let bot = std::sync::Arc::new(bot);
-    let driver = apexbot::EngineDriver::new(
+    // Arc: the executor's path resolver shares the driver (its registry is
+    // the one path_info projection the result batch's path ids name).
+    let driver = std::sync::Arc::new(apexbot::EngineDriver::new(
         std::sync::Arc::clone(&bot),
         apexbot::config::holder::config_arc(),
-    );
-    // RSP-11 (KETJNN): bind the registered-path budget from APEXBOT_MAX_PATHS
-    // (default 100000; 0 = uncapped) onto the engine registry BEFORE the crawl,
-    // mirroring build_paths.py's `engine.set_path_cap(MAX_REGISTERED_PATHS or None)`.
-    let max_paths = progress::parse_max_paths(std::env::var("APEXBOT_MAX_PATHS").ok().as_deref())?;
+    ));
+    // Bind the registered-path budget from the loaded schema
+    // (`pathfinding.max_registered_paths`, declared default 100 000; 0 =
+    // uncapped) onto the engine registry BEFORE the crawl, mirroring
+    // build_paths.py's `engine.set_path_cap(MAX_REGISTERED_PATHS or None)`.
+    let max_paths = progress::path_cap(loaded.config.pathfinding.max_registered_paths);
     driver.set_path_cap(max_paths);
-    println!("[registration] path cap = {max_paths:?} (APEXBOT_MAX_PATHS)");
+    println!("[registration] path cap = {max_paths:?} (pathfinding.max_registered_paths)");
     apexbot::op_info!(domain = path, path_cap = ?max_paths, "registration: path cap bound");
     // Attach the result consumer BEFORE resume — the BotRunner ordering
     // invariant (`BotRunner.run`: create the consumer, THEN resume). The
     // receiver is handed to the G4 consumer task (row 7 + row 16).
+    // The wrapper's receiver tally exists for the hub-side depth diagnostic
+    // (`Hub::named_pending`); the sample's own consume loop does not poll it,
+    // so hand it the raw channel end.
     let result_rx = driver
         .take_result_receiver()
+        .map(apexbot_eventhub::NamedReceiver::into_inner)
         .ok_or_else(|| "EngineDriver result receiver already taken".to_string())?;
     let runtime = apexbot::runtime::get_runtime();
     let outcome = runtime.block_on(async {
-        // G4 (ergo L4E7RI): the result-batch consumer runs concurrently with
+        // G4 : the result-batch consumer runs concurrently with
         // the live registration arm; `driver.stop()` below closes the channel
         // so its pending `recv()` sees end-of-stream exactly once (ADR-050 D6).
-        // G5 (ergo KPLWUM): the consumer beats a session-watch heartbeat per
+        // G5 : the consumer beats a session-watch heartbeat per
         // batch and the watch aborts it (`WatchdogTripped`) if the loop stalls.
-        let heartbeat = session_watch::Heartbeat::new();
+        let heartbeat = apexbot::session_end::Heartbeat::new();
         // RSP-10: the shared progress view the run-loop heartbeat reads.
         let progress = consume::SessionProgress::new();
+
+        // ── The core batch executor (ledger rows 15 + 16; the executor
+        // cut-over) ── Value-configured ONCE: the driver injects the plain
+        // caps, the policy values (the cross-block suppression registry
+        // stays DISTINCT from the batch-local payload-served set the
+        // executor derives from each batch's payload rows), and the relay
+        // posture — never choreography code. The consumer's HeartbeatSink
+        // drains the Batch outcome record stream it produces.
+        let provider = apexbot::rpc::provider::AlloyProvider::for_chain(
+            &http,
+            CHAIN_ID,
+            apexbot::rpc::provider::DEFAULT_MAX_RETRIES,
+        )
+        .await
+        .map_err(|e| format!("live construction provider from {http}: {e}"))?;
+        let executor = build_batch_executor(&cfg, &loaded, &provider, &bot, &driver)?;
         let consumer = tokio::spawn(consume::run_result_consumer_watched(
             result_rx,
+            executor,
             Some(heartbeat.clone()),
             Some(progress.clone()),
         ));
@@ -893,7 +818,6 @@ fn run() -> Result<(), String> {
                     std::sync::Arc::new(operator_channel::PipelinePathOps::new(
                         &discovered,
                         &requested_kinds,
-                        &allowed,
                         &params,
                         pipeline.policy.clone(),
                         pipeline.retry_policy,
@@ -901,18 +825,14 @@ fn run() -> Result<(), String> {
                         weth_lower.clone(),
                     ));
                 let running = operator_channel::start_operator_server(Path::new(path), ops)?;
-                println!("[operator] listening on {path} (G5, ergo KPLWUM)");
+                println!("[operator] listening on {path} (G5)");
                 Some(running)
             }
             None => None,
         };
-        // RSP-14: the V4 registration verify lifecycle needs a `StateView`
-        // contract address (`RegistrationLifecycleError::MissingStateView`
-        // otherwise). Python passes the chain deployment's address to
-        // `EngineRegistry.start(..., verify_state_view=...)`
-        // (`runner/bot_runner.py:470`); resolve the same fact from the
-        // enumerated `pool_managers` rows (the column the V4 build path
-        // already trusts) instead of hard-coding a chain constant.
+        // The V4 full-map verifier targets the `PoolManager` + `PoolId` from
+        // the enumerated `pool_managers` rows. `StateView` remains optional
+        // scalar/bootstrap configuration and is not a full-map target.
         let verify_state_view =
             live::resolve_verify_state_view(&discovered).map(|address| format!("{address:#x}"));
         match verify_state_view.as_deref() {
@@ -925,8 +845,8 @@ fn run() -> Result<(), String> {
                 );
             }
             None => println!(
-                "[registration] no V4 StateView in the enumeration; the V4 verify lifecycle \
-                 will refuse MissingStateView"
+                "[registration] no V4 StateView in the enumeration; full-map verification \
+                 will use the PoolManager target"
             ),
         }
         let w = driver
@@ -943,8 +863,11 @@ fn run() -> Result<(), String> {
         // Per-candidate pool build through the core `ConstructionIo`, BotState
         // registration, the ADR-022 verify lifecycle under the tokio claim
         // table + retry dance, then `register_and_solve_path`.
-        let provider = apexbot::rpc::provider::AlloyProvider::new(
+        // Bound to the chain this example signs for: a live node on another
+        // chain is refused before the crawl reads a single pool.
+        let provider = apexbot::rpc::provider::AlloyProvider::for_chain(
             &http,
+            CHAIN_ID,
             apexbot::rpc::provider::DEFAULT_MAX_RETRIES,
         )
         .await
@@ -953,7 +876,9 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("open live construction DB {}: {e}", db_path.display()))?;
         let io = apexbot::bot_core::construction_io::ConstructionIo::new(
             std::sync::Arc::new(
-                apexbot::bot_core::construction_io::ApexbotDbConstruction::new(live_db),
+                apexbot::bot_core::construction_io::ApexbotDbConstruction::new(
+                    std::sync::Arc::new(live_db),
+                ),
             ),
             std::sync::Arc::new(
                 apexbot::bot_core::construction_io::AlloyRpcConstruction::new(provider),
@@ -965,12 +890,11 @@ fn run() -> Result<(), String> {
             io: &io,
             db: Some(&snap),
         };
-        // RSP-11 (KETJNN): the time-throttled registration-progress summary
-        // (APEXBOT_REG_PROGRESS_SECS, default 30s) keeps the crawl visible
-        // even when path_count never crosses a 1000-boundary.
-        let progress_secs = progress::parse_progress_secs(
-            std::env::var("APEXBOT_REG_PROGRESS_SECS").ok().as_deref(),
-        )?;
+        // The time-throttled registration-progress summary
+        // (`pathfinding.reg_progress_secs`, declared default 30s) keeps the
+        // crawl visible even when path_count never crosses a 1000-boundary.
+        let progress_secs =
+            progress::progress_interval(loaded.config.pathfinding.reg_progress_secs)?;
         let mut reg_progress = progress::ProgressCadence::new(progress_secs);
         let live_report = live::run_live(
             &driver,
@@ -1004,7 +928,7 @@ fn run() -> Result<(), String> {
             "g3: live registration arm complete"
         );
 
-        // ── RSP-10 run-until-shutdown phase (ergo SGCAJ5) ──
+        // ── RSP-10 run-until-shutdown phase  ──
         // Registration is done; mirror `BotRunner.run`'s main loop and hold
         // the session (consumer + watch + operator channel) open until SIGINT
         // or the env-gated bounded observation window. `run_live` ran first,
@@ -1124,4 +1048,167 @@ fn run() -> Result<(), String> {
         "engine handshake complete"
     );
     Ok(())
+}
+
+/// The arms the driver refuses. This driver IS the settled-block arm, so:
+/// an inactive `strategy.settlement.active` refuses in both stances (the
+/// parity twin of the hosted runner's stance-independent posture gate), and
+/// an activated pending-transaction facet belongs to its own binary or the
+/// hosted process, not this runner.
+/// Build the session-static core batch executor from the resolved verdict —
+/// the value-configured construction (ledger rows 15 + 16): the policy values
+/// convert from `loaded.config` through the core's ONE typed boundary
+/// (`ExecutorConfig::from_verdict`, which owns every default and clamp — the
+/// driver keeps no twin floor or cap), and the runtime carries the injected
+/// handles the verdict cannot name. The choreography itself (assembly
+/// policy, sim fan-out, ordered submit) is core-owned
+/// (`apexbot::batch_executor::BatchExecutor`).
+fn build_batch_executor(
+    cfg: &SettlementBotConfig,
+    loaded: &apexbot::config::LoadedConfig,
+    provider: &apexbot::rpc::provider::AlloyProvider,
+    bot: &std::sync::Arc<apexbot::bot_core::Bot>,
+    driver: &std::sync::Arc<apexbot::EngineDriver>,
+) -> Result<apexbot::batch_executor::BatchExecutor, String> {
+    use apexbot::batch_executor::{ExecutorConfig, ExecutorRuntime};
+
+    let executor_address = apexbot::core::address_utils::parse_address(&cfg.executor_address)
+        .map_err(|e| format!("executor address {}: {e}", cfg.executor_address))?;
+    let weth_address = apexbot::core::address_utils::parse_address(WETH_ADDRESS)
+        .map_err(|e| format!("WETH address {WETH_ADDRESS}: {e}"))?;
+    let executor_owner = apexbot::core::address_utils::parse_address(&cfg.executor_owner)
+        .map_err(|e| format!("executor owner {}: {e}", cfg.executor_owner))?;
+    // The executor runtime bytecode the sim injects: `EXECUTOR_RUNTIME` (a hex
+    // blob) when set, empty otherwise (the sim then runs against the
+    // on-chain contract — live-only, and `inject_code_guard` refuses
+    // submission while the injected stance is on).
+    let runtime_bytecode = match &cfg.executor_runtime {
+        Some(hex) => alloy::primitives::Bytes::from(
+            apexbot::core::hex_utils::decode_hex(hex)
+                .map_err(|e| format!("EXECUTOR_RUNTIME: {e}"))?,
+        ),
+        None => alloy::primitives::Bytes::new(),
+    };
+    let config = ExecutorConfig::from_verdict(
+        &loaded.config,
+        ExecutorRuntime {
+            // The driver's own per-batch cap (a plain count) — the fan-out
+            // bound itself comes from the verdict's declared
+            // `simulation.pipeline_concurrency`, so both drivers size it the
+            // same way, and the thin-margin floor, the encode axis, and the
+            // inject guards convert inside the boundary.
+            max_candidates: usize::try_from(MAX_SIMULATE_CONCURRENT).unwrap_or(usize::MAX),
+            use_v4_batch: false,
+            dry_run: cfg.dry_run,
+            resolver: std::sync::Arc::new(dispatch::DriverResolver {
+                driver: std::sync::Arc::clone(driver),
+            }),
+            // The cross-block suppression registry is its OWN policy value —
+            // never merged with the batch-local payload-served set the executor
+            // derives from each `BatchWork`'s payload rows.
+            suppression: std::sync::Arc::new(std::sync::Mutex::new(
+                apexbot::submission::PathSuppression::new(),
+            )),
+            divergence: std::sync::Arc::new(std::sync::Mutex::new(
+                apexbot::arbitrage::PoolDivergence::new(),
+            )),
+            fot: std::sync::Arc::new(std::sync::Mutex::new(
+                apexbot::arbitrage::FeeOnTransferRegistry::new(),
+            )),
+            provider: std::sync::Arc::new(provider.clone()),
+            executor_owner,
+            executor_address,
+            weth_address,
+            pool_manager_address: apexbot::core::address_utils::parse_address(
+                UNISWAP_V4_POOL_MANAGER_ADDRESS,
+            )
+            .map_err(|e| format!("V4 PoolManager address: {e}"))?,
+            multicall3_address: apexbot::core::address_utils::parse_address(MULTICALL3_ADDRESS)
+                .map_err(|e| format!("Multicall3 address: {e}"))?,
+            injected_address: cfg
+                .inject_executor_code
+                .then(|| apexbot::core::address_utils::parse_address(&cfg.injected_address))
+                .transpose()
+                .map_err(|e| format!("injected executor address: {e}"))?,
+            runtime_bytecode,
+            warmup: apexbot::cmd_executor::compute_simulation_warmup_slots(
+                executor_address,
+                weth_address,
+            ),
+            bot_state: Some(bot.state_arc()),
+            // No separate warm-code cache in this driver: the sim's cold-miss
+            // fallback DB (the provider) serves the reads.
+            warm_cache: None,
+            dispatcher: std::sync::Arc::new(std::sync::Mutex::new(
+                apexbot::submission::Dispatcher::for_block(0),
+            )),
+            signer: std::sync::Arc::new(
+                apexbot::submission::TxSigner::from_key_hex(&cfg.operator_private_key, CHAIN_ID)
+                    .map_err(|e| format!("operator signer: {e}"))?,
+            ),
+            probe: std::sync::Arc::new(dispatch::ProviderReceiptProbe {
+                provider: std::sync::Arc::new(provider.clone()),
+            }),
+            nonce_lane: std::sync::Arc::new(apexbot::submission::NonceLane::new(
+                std::sync::Arc::new(apexbot::substrate::nonce::NonceAuthority::new(0)),
+                std::sync::Arc::new(apexbot::submission::SubmissionLedger::new()),
+                "settlement",
+            )),
+            extra_broadcast: Vec::new(),
+            target: apexbot::submission::SubmissionTarget::Public,
+        },
+    );
+    Ok(apexbot::batch_executor::BatchExecutor::new(config))
+}
+
+fn strategy_arm_refusal(
+    settlement_active: bool,
+    mevblocker_active: bool,
+    peer_active: bool,
+) -> Option<String> {
+    if !settlement_active {
+        return Some(
+            "an inactive settlement facet (strategy.settlement.active = false): this driver is the settled-block arm; activate it first (apexbot strategy activate settlement)".to_string(),
+        );
+    }
+    (mevblocker_active || peer_active).then(|| {
+        "an activated backrun facet (strategy.mevblocker_backrun / strategy.txpool_backrun): this driver is the settled-block arm; the backrun arms boot as hosted drivers".to_string()
+    })
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "the arm-refusal fixture must fail loudly if the gate stops refusing"
+)]
+mod arm_gate_tests {
+    use super::strategy_arm_refusal;
+
+    #[test]
+    fn active_settlement_with_no_backruns_boots() {
+        assert!(strategy_arm_refusal(true, false, false).is_none());
+    }
+
+    #[test]
+    fn inactive_settlement_refuses_the_settled_arm() {
+        // The parity twin of the hosted runner: the driver IS the settled-block
+        // arm, so a deactivated settlement facet refuses in BOTH stances,
+        // naming the activation remedy the hosted runner names.
+        let msg = strategy_arm_refusal(false, false, false)
+            .expect("an inactive settlement facet must refuse");
+        assert!(msg.contains("strategy.settlement.active"));
+        assert!(msg.contains("apexbot strategy activate settlement"));
+    }
+
+    #[test]
+    fn mevblocker_arm_refuses_on_the_settlement_driver() {
+        let msg = strategy_arm_refusal(true, true, false).expect("mevblocker must refuse");
+        assert!(msg.contains("strategy.mevblocker_backrun"));
+    }
+
+    #[test]
+    fn peer_arm_refuses_on_the_settlement_driver() {
+        let msg = strategy_arm_refusal(true, false, true).expect("peer must refuse");
+        assert!(msg.contains("strategy.txpool_backrun"));
+    }
 }

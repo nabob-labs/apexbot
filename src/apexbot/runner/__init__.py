@@ -1,7 +1,7 @@
 """Settlement-arbitrage runtime driver (``BotRunner``) companion package.
 
-Extracted from ``examples/eth_backrun_v2_v3_v4_rust.py`` / ``eth_backrun_helpers.py``
-(epic 5TSYKN). This is the Python-companion ``stays-python`` cockpit over the
+Extracted from ``examples/eth_backrun_v2_v3_v4_rust.py`` / ``eth_backrun_helpers.py``.
+This is the Python-companion ``stays-python`` cockpit over the
 Rust-owned engine: it owns config, discovery/registration, result consumption,
 and dispatch orchestration — never pool/engine state (ADR-003: ``Bot`` is the
 single Rust state owner; ADR-006: ``Bot`` is the per-chain orchestrator, this
@@ -12,17 +12,15 @@ module re-exports):
 
 - :class:`BotRunner` — the runtime driver facade (the ``start / build_paths /
   consume / dispatch`` seams).
-- :class:`ArbitrageConfig` — the unified frozen config (``from_env``).
-- :func:`classify_revert` — the public revert-taxonimizer leaf.
+- :class:`ArbitrageConfig` — the unified frozen config (``build``).
 - The build family (``build_paths`` / ``PathRegistrationPipeline`` /
   ``ConstructionContext`` / ``resolve_directions``) and the CLI arg parser
   (:mod:`apexbot.runner.cli`). PRG-5: the bounded crawl shell retired —
   the crawl is the fleet-hosted intake now.
 
 Everything else is private by name (``_consume`` / ``_dispatch`` / ``_render``
-/ ``_driver_constants``) and is imported directly by name from its private
-module — nothing is smuggled in via the package root. (Epic Y7PA5A, task
-34XJ6C.)
+/ ``identity``) and is imported directly by name from its private
+module — nothing is smuggled in via the package root.
 """
 
 from apexbot.runner.bot_runner import BotRunner
@@ -32,7 +30,7 @@ from apexbot.runner.build_paths import (
     build_paths,
     resolve_directions,
 )
-from apexbot.runner.config import ArbitrageConfig, classify_revert
+from apexbot.runner.config import ArbitrageConfig
 
 __all__ = [
     "ArbitrageConfig",
@@ -40,6 +38,5 @@ __all__ = [
     "ConstructionContext",
     "PathRegistrationPipeline",
     "build_paths",
-    "classify_revert",
     "resolve_directions",
 ]

@@ -1,6 +1,6 @@
-"""Tier-2 behavioral dual-driver parity — Aerodrome V2 builder identity+state (SSSXG6).
+"""Tier-2 behavioral dual-driver parity — Aerodrome V2 builder identity+state.
 
-The behavioral companion to `rust/crates/apexbot/tests/parity_aerodrome_builder.rs`.
+The behavioral companion to `rust/crates/facade/apexbot/tests/parity_aerodrome_builder.rs`.
 Proves the **same** canonical Aerodrome V2 identity+state fixture, driven through
 the **Python consumer** (`Bot`/`register_aerodrome_pool` — the PyO3 binding,
 the same `RegisterAerodromeV2PoolParams` the Rust `PoolBuilder.build_aerodrome_v2`
@@ -11,7 +11,7 @@ emits after its on-chain `stable()`+`getFee()`+reserves I/O), registers the
 The fixture + expected outputs are loaded from the SHARED file
 `tests/standalone_parity/fixtures/aerodrome_pool_builder.json`, which the Rust
 parity test (`parity_aerodrome_builder.rs`) ALSO loads — a one-sided fixture
-edit fails BOTH sides mechanically (the shared-fixture contract, HRT356).
+edit fails BOTH sides mechanically (the shared-fixture contract).
 
 The factory is a fixture (not in any shipped deployments), so the EIP-1167
 CREATE2 verify in `register_aerodrome_pool` skips (ad-hoc path) — this parity
@@ -101,5 +101,5 @@ def test_python_consumer_aerodrome_builder_identity_state_matches_fixture() -> N
     assert handle.aerodrome_token1_decimals == _TOKEN1_DECIMALS
 
     # State.
-    assert handle.aerodrome_reserve0 == _RESERVE0
-    assert handle.aerodrome_reserve1 == _RESERVE1
+    assert handle.reserve_pair().reserve0 == _RESERVE0
+    assert handle.reserve_pair().reserve1 == _RESERVE1

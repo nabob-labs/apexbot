@@ -1,0 +1,24 @@
+[package]
+name = "apexbot-uniswap"
+description = "Pure-Rust Uniswap-protocol domain crate — DEX identity presets + V2 swap callldata encoding."
+keywords = ["uniswap", "dex", "evm", "swap"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy = { version = "^2.5" }
+apexbot-abi.workspace = true
+apexbot-core.workspace = true
+# The species manifest (ADR-059 D3) lives in `apexbot-db` beside its loader;
+# V4 manager-keyed resolution reads it here. The factory-keyed V2/V3
+# `deployments` table below does not use this edge.
+apexbot-db.workspace = true
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }

@@ -1,0 +1,1133 @@
+//! `PyO3` bindings for the pathfinding graph + DFS.
+//!
+//! Thin translator over `apexbot_pathfinding::graph`. No business logic —
+//! extract args (flat int tuples from Python) → build `OwnedPathFinder` →
+//! yield paths lazily via the Python iterator protocol.
+//!
+//! `build_path_graph` choreographs the DB read
+//! (`apexbot_db::fetch_path_graph_edges` and `fetch_tokens_with_min_degree`),
+//! the candidate-token edge filter, and the core
+//! `apexbot_pathfinding::graph::PathGraph` build + `prune_dead_ends`; the
+//! Python `_prepare_graph` becomes a delegating shell. The DFS half
+//! (`find_paths_rust`) is unchanged.
+
+#![expect(clippy::doc_markdown)]
+
+use crate::prelude::*;
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+// Note: `alloy::primitives::Address` is no longer named in this module
+// after the GIL fix — the address maps are pre-computed to
+// checksum STRINGS inside the `py.detach` span in `build_path_graph`, so
+// `PathGraph` holds no `Address` values. Re-add the import if a
+// downstream helper here regains an `Address`-typed surface.
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+use apexbot_db::ApexbotDb;
+use apexbot_pathfinding::directions::resolve_directions as core_resolve_directions;
+use apexbot_pathfinding::directions::DirectionHop as CoreDirectionHop;
+use apexbot_pathfinding::graph::{OwnedPathFinder, PoolKind as CorePoolKind, SearchSpec};
+use pyo3::exceptions::{PyKeyError, PyStopAsyncIteration, PyValueError};
+use pyo3::types::{PyDict, PyList, PySet, PyTuple};
+use std::collections::{HashMap, HashSet};
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// The pool-family discriminant crossing the FFI.
+///
+/// This is the single source of truth for the numeric pool-kind
+/// discriminants the pathfinding core uses. Python passes these values
+/// through the seam — never bare integers — so a kind change is a compile
+/// error on both sides, not a silently mistranslated constant.
+#[pyclass(eq, hash, frozen, from_py_object, module = "apexbot._ffi")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PoolKind {
+    V2,
+    V3,
+    V4,
+}
+
+impl PoolKind {
+    /// The matching `apexbot_pathfinding` core discriminant.
+    #[must_use]
+    pub const fn to_core(self) -> CorePoolKind {
+        match self {
+            PoolKind::V2 => CorePoolKind::V2,
+            PoolKind::V3 => CorePoolKind::V3,
+            PoolKind::V4 => CorePoolKind::V4,
+        }
+    }
+
+    /// Convert from the core discriminant.
+    ///
+    /// The core enum is `#[non_exhaustive]`, so this routes through its own
+    /// `u8` discriminant (which the core defines exhaustively) rather than
+    /// matching its variants directly. Returns `None` for a discriminant the
+    /// binding does not know (a stale binding meeting a newer core); every
+    /// caller must raise a loud Python exception in that case instead of
+    /// silently mistranslating it to `V4`.
+    #[must_use]
+    pub const fn from_core(kind: CorePoolKind) -> Option<Self> {
+        match kind.as_u8() {
+            0 => Some(PoolKind::V2),
+            1 => Some(PoolKind::V3),
+            2 => Some(PoolKind::V4),
+            _ => None,
+        }
+    }
+}
+
+/// Validate and return one typed Python [`PoolKind`] value.
+///
+/// Unsupported values retain the driver's `ValueError` contract without
+/// consulting model metadata.
+///
+/// # Errors
+///
+/// Returns `ApexbotValueError` when `kind` is not a supported `PoolKind`.
+#[pyfunction]
+pub fn classify_pool_kind<'py>(py: Python<'py>, kind: &Bound<'py, PyAny>) -> PyResult<PoolKind> {
+    extract_pool_kind(py, kind)
+}
+
+/// The canonical pool-family tags, in discriminant order — the list Python
+/// derives its family sets from.
+///
+/// The S12 pattern: the taxonomy has one owner (the `apexbot-pathfinding`
+/// graph enum, whose exhaustive `tag` match forces every family to carry a
+/// spelling), and this seam exports that list instead of Python re-declaring
+/// the set. A family added to the core surfaces here on the next build; a
+/// pyclass binding that does not know a discriminant fails loudly at the
+/// per-value conversion (`from_core` returns `None`) rather than
+/// mistranslating it.
+#[must_use]
+#[pyfunction]
+#[pyo3(name = "pool_family_tags")]
+pub fn pool_family_tags() -> Vec<&'static str> {
+    CorePoolKind::ALL.iter().map(|kind| kind.tag()).collect()
+}
+
+/// Resolve per-hop directions so the cycle closes — the typed-FFI seam over
+/// `apexbot_pathfinding::directions::resolve_directions`.
+///
+/// Each hop is `(token0, token1, identity)`. Raises the Python
+/// `DirectionResolutionError` on a mid-path mismatch or a non-closing cycle
+/// (the fatal invariant); returns one `zero_for_one` per hop otherwise.
+///
+/// # Errors
+///
+/// Raises `apexbot.exceptions.arbitrage.DirectionResolutionError` when the
+/// core refuses the cycle.
+#[pyfunction]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "PyO3 extracts owned argument values"
+)]
+pub fn resolve_directions(
+    py: Python<'_>,
+    hops: Vec<(String, String, String)>,
+    input_token: &str,
+    weth: &str,
+) -> PyResult<Vec<bool>> {
+    let core_hops: Vec<CoreDirectionHop<'_>> = hops
+        .iter()
+        .map(|(token0, token1, identity)| CoreDirectionHop {
+            token0,
+            token1,
+            identity,
+        })
+        .collect();
+    core_resolve_directions(&core_hops, input_token, weth)
+        .map_err(|error| direction_resolution_error(py, error.to_string()))
+}
+
+/// Build a `apexbot.exceptions.arbitrage.DirectionResolutionError(message=..)`.
+fn direction_resolution_error(py: Python<'_>, message: String) -> PyErr {
+    let exc_type = py
+        .import("apexbot.exceptions.arbitrage")
+        .and_then(|module| module.getattr("DirectionResolutionError"));
+    match exc_type {
+        Ok(exc_type) => {
+            let kwargs = PyDict::new(py);
+            // set_item on a fresh dict cannot fail with these key/value types.
+            let _ = kwargs.set_item("message", message);
+            match exc_type.call((), Some(&kwargs)) {
+                Ok(exc) => PyErr::from_value(exc),
+                Err(err) => err,
+            }
+        }
+        // The exceptions module is always importable inside the package; an
+        // import failure here means a broken install, so surface it directly.
+        Err(err) => err,
+    }
+}
+
+fn extract_pool_kind<'py>(py: Python<'py>, kind: &Bound<'py, PyAny>) -> PyResult<PoolKind> {
+    if let Ok(kind) = kind.extract::<PoolKind>() {
+        return Ok(kind);
+    }
+    let repr = kind.repr()?.to_string_lossy().into_owned();
+    Err(apexbot_value_error(
+        py,
+        format!("Unsupported pool kind: {repr}"),
+    )?)
+}
+
+/// Build a `apexbot.exceptions.base.ApexbotValueError(message=..)`.
+fn apexbot_value_error(py: Python<'_>, message: String) -> PyResult<PyErr> {
+    let exc_type = py
+        .import("apexbot.exceptions.base")?
+        .getattr("ApexbotValueError")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("message", message)?;
+    Ok(PyErr::from_value(exc_type.call((), Some(&kwargs))?))
+}
+
+/// Validate a sequence of typed Python [`PoolKind`] values and deduplicate it.
+///
+/// # Errors
+///
+/// Returns `PyValueError` when any value is not a supported `PoolKind`.
+#[pyfunction]
+#[expect(clippy::needless_pass_by_value)]
+pub fn classify_pool_kinds<'py>(
+    _py: Python<'py>,
+    kinds: Vec<Bound<'py, PyAny>>,
+) -> PyResult<HashSet<PoolKind>> {
+    kinds
+        .iter()
+        .map(|kind| {
+            kind.extract::<PoolKind>().map_err(|_| {
+                let repr = kind.repr().map_or_else(
+                    |_| "<unknown>".to_string(),
+                    |value| value.to_string_lossy().into_owned(),
+                );
+                PyValueError::new_err(format!("Unsupported pool kind: {repr}"))
+            })
+        })
+        .collect()
+}
+
+/// Validate and copy a Python per-depth filter of typed [`PoolKind`] sets.
+///
+/// # Errors
+///
+/// Returns `PyValueError` when any declared type has no known pool family.
+#[pyfunction]
+pub fn convert_pool_type_filter(
+    py: Python<'_>,
+    pool_type_per_depth: Option<Bound<'_, PyAny>>,
+) -> PyResult<Option<Vec<Option<HashSet<PoolKind>>>>> {
+    let Some(value) = pool_type_per_depth else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    for depth in value.try_iter()? {
+        let depth = depth?;
+        if depth.is_none() {
+            out.push(None);
+            continue;
+        }
+        let mut allowed = HashSet::new();
+        for pool_kind in depth.try_iter()? {
+            allowed.insert(classify_pool_kind(py, &pool_kind?)?);
+        }
+        out.push(Some(allowed));
+    }
+    Ok(Some(out))
+}
+
+/// Assemble the traversal plan for a search request.
+///
+/// Returns one `(start_token_id, end_token_id, include_reverse, min_depth)`
+/// entry per plan position, in product order with reverse pairs consolidated.
+/// `filter_len` is the per-depth filter length (or `None`); when set it floors
+/// the effective minimum depth at that length.
+#[pyfunction]
+#[must_use]
+#[expect(clippy::needless_pass_by_value)]
+pub fn prepare_traversal_plan(
+    start_token_ids: Vec<u64>,
+    end_token_ids: Vec<u64>,
+    min_depth: usize,
+    filter_len: Option<usize>,
+) -> Vec<(u64, u64, bool, usize)> {
+    apexbot_pathfinding::plan::prepare_traversal_plan(
+        &start_token_ids,
+        &end_token_ids,
+        min_depth,
+        filter_len,
+    )
+    .into_iter()
+    .map(|traversal| {
+        (
+            traversal.start_token_id,
+            traversal.end_token_id,
+            traversal.include_reverse,
+            traversal.min_depth,
+        )
+    })
+    .collect()
+}
+
+/// Resolves typed `(pool_id, pool_kind)` hops into Python `PathStep` objects.
+///
+/// The graph edge already carries the authoritative family discriminant, so
+/// the builder only resolves byte-stable pool identities and instantiates the
+/// Python-owned step class.
+///
+/// Two construction paths: `build_path_graph` builds one from its own address
+/// lookups (the graph value's step builder, so a path and its steps always
+/// share one build call), and synthetic-map callers (probe/tests) build one
+/// directly from hand-written `v2v3_addresses` / `v4_lookups`.
+#[pyclass(module = "apexbot._ffi")]
+pub struct PathStepBuilder {
+    /// V2/V3 pool id → checksummed address.
+    v2v3_addresses: HashMap<u64, String>,
+    /// V4 namespaced pool id → `(manager_address, pool_hash)`.
+    v4_lookups: HashMap<u64, (String, String)>,
+    /// The Python `PathStep` class to instantiate.
+    step_cls: Py<PyAny>,
+}
+
+#[pymethods]
+impl PathStepBuilder {
+    #[new]
+    fn new(
+        v2v3_addresses: HashMap<u64, String>,
+        v4_lookups: HashMap<u64, (String, String)>,
+        step_cls: Py<PyAny>,
+    ) -> Self {
+        Self {
+            v2v3_addresses,
+            v4_lookups,
+            step_cls,
+        }
+    }
+
+    /// Convert a raw `[(pool_id, pool_kind)]` path into `PathStep` objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PyKeyError` when a hop's address is missing from the lookups.
+    fn build(&self, py: Python<'_>, raw_path: Vec<(u64, PoolKind)>) -> PyResult<Vec<Py<PyAny>>> {
+        let mut steps = Vec::with_capacity(raw_path.len());
+        for (pool_id, kind) in raw_path {
+            let is_v4 = kind == PoolKind::V4;
+            let kind = kind.into_pyobject(py)?;
+            if is_v4 {
+                let (manager_address, pool_hash) =
+                    self.v4_lookups.get(&pool_id).ok_or_else(|| {
+                        PyKeyError::new_err(format!("no V4 lookup for pool id {pool_id}"))
+                    })?;
+                steps.push(
+                    self.step_cls
+                        .call1(py, (manager_address.clone(), kind, pool_hash.clone()))?,
+                );
+            } else {
+                let address = self.v2v3_addresses.get(&pool_id).ok_or_else(|| {
+                    PyKeyError::new_err(format!("no V2/V3 address for pool id {pool_id}"))
+                })?;
+                steps.push(
+                    self.step_cls
+                        .call1(py, (address.clone(), kind, py.None()))?,
+                );
+            }
+        }
+        Ok(steps)
+    }
+}
+
+/// One typed `build_path_graph` result: the filtered flat edge list, the
+/// address lookups, the candidate-token set, and the path-step builder,
+/// carried as ONE value so they cannot drift apart.
+///
+/// The invariant this shape makes structural: the edge list and the step
+/// builder always come from the same `build_path_graph` call. The builder
+/// resolves each hop's pool id against the graph's address lookups, and
+/// those mappings are only valid for the database read that produced the
+/// edges — a builder from an earlier build paired with re-built edges (the
+/// updater may have reassigned a pool id) resolves hops to stale addresses
+/// or misses pools entirely. `build_path_graph` constructs the builder from
+/// its own lookups, so Python cannot pair them across calls.
+///
+/// The containers are materialized once inside the build call, so every
+/// getter is an O(1) handout: re-reading `edges` never re-converts the
+/// ~100k-tuple list under the GIL.
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+#[pyclass(module = "apexbot._ffi")]
+pub struct PathGraph {
+    /// The filtered edge list as flat
+    /// `(token0_id, token1_id, pool_id, pool_kind)` tuples.
+    edges: Py<PyList>,
+    /// V2/V3 pool id → checksummed pool address.
+    v2v3_addresses: Py<PyDict>,
+    /// V4 namespaced pool id → `(checksummed manager address, pool hash)`.
+    v4_lookups: Py<PyDict>,
+    /// `pool_id` → family discriminant.
+    pool_id_to_kind: Py<PyDict>,
+    /// Candidate token ids (after the whitelist intersection).
+    candidate_tokens: Py<PySet>,
+    /// The step builder `build_path_graph` derived from the maps above;
+    /// `None` only for probe-style calls that passed no `step_cls`.
+    step_builder: Option<PathStepBuilder>,
+}
+
+#[pymethods]
+impl PathGraph {
+    // The getters hand out `Bound` clones (one refcount bump each): the crate
+    // does not enable pyo3's `py-clone` feature, so `Py<T>::clone` is
+    // unavailable, and a bound clone is equally O(1) on the attached thread
+    // every getter runs on.
+
+    /// The filtered flat edge list, ready for `find_paths_rust`.
+    #[getter]
+    fn edges<'py>(&self, py: Python<'py>) -> Bound<'py, PyList> {
+        self.edges.bind(py).clone()
+    }
+
+    /// V2/V3 pool id → checksummed pool address.
+    #[getter]
+    fn v2v3_addresses<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.v2v3_addresses.bind(py).clone()
+    }
+
+    /// V4 namespaced pool id → `(checksummed manager address, pool hash)`.
+    #[getter]
+    fn v4_lookups<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.v4_lookups.bind(py).clone()
+    }
+
+    /// `pool_id` → family discriminant.
+    #[getter]
+    fn pool_id_to_kind<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.pool_id_to_kind.bind(py).clone()
+    }
+
+    /// Candidate token ids (after the whitelist intersection).
+    #[getter]
+    fn candidate_tokens<'py>(&self, py: Python<'py>) -> Bound<'py, PySet> {
+        self.candidate_tokens.bind(py).clone()
+    }
+
+    /// Build the `PathStep` objects for one raw DFS path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PyValueError` when the graph was built without a `step_cls`
+    /// (probe-style `build_path_graph` calls read the maps only), and the
+    /// builder's `PyKeyError` when a hop's pool id is missing from the
+    /// graph's lookups — which, for edges and steps of one build call,
+    /// means the path does not belong to this graph.
+    fn build_steps(
+        &self,
+        py: Python<'_>,
+        raw_path: Vec<(u64, PoolKind)>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let builder = self.step_builder.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "this graph was built without step_cls; pass step_cls to \
+                 build_path_graph to build steps",
+            )
+        })?;
+        builder.build(py, raw_path)
+    }
+}
+
+/// Find arbitrage paths (cycles) through a liquidity-pool graph.
+///
+/// This is the Rust-backed DFS that replaces the Python ``networkx``-based
+/// ``_dfs``. Returns a **lazy iterator** — paths are yielded one at a time,
+/// so memory usage is bounded even for graphs that produce millions of paths.
+///
+/// Args:
+///     edges: A list of ``(token0_id, token1_id, pool_id, pool_kind)`` tuples,
+///         where ``pool_kind`` is a typed [`PoolKind`].
+///     start_token_id: The token ID where the search begins.
+///     end_token_id: The token ID the path must return to.
+///     min_depth: Minimum number of hops in a completed path.
+///     max_depth: Maximum number of hops, or ``None`` for no limit.
+///     include_reverse: If ``True``, yield each found path again reversed.
+///     pool_type_per_depth: Optional per-depth allowed pool kinds. A list where
+///         each element is ``None`` (all kinds allowed) or a set of
+///         [`PoolKind`] values. Implicitly caps ``max_depth`` at its length.
+///
+/// Returns:
+///     A ``PathIterator`` — iterate it (``for path in iter: ...``) to lazily
+///     yield paths, each a list of ``(pool_id, pool_kind)`` tuples.
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+#[pyfunction]
+#[pyo3(signature = (
+    edges,
+    start_token_id,
+    end_token_id,
+    min_depth,
+    max_depth,
+    include_reverse,
+    pool_type_per_depth=None,
+))]
+pub fn find_paths_rust(
+    edges: Vec<(u64, u64, u64, PoolKind)>,
+    start_token_id: u64,
+    end_token_id: u64,
+    min_depth: usize,
+    max_depth: Option<usize>,
+    include_reverse: bool,
+    pool_type_per_depth: Option<Vec<Option<HashSet<PoolKind>>>>,
+) -> PathIterator {
+    PathIterator {
+        finder: build_owned_finder(
+            edges,
+            start_token_id,
+            end_token_id,
+            min_depth,
+            max_depth,
+            include_reverse,
+            pool_type_per_depth,
+        ),
+        buffer: Vec::new(),
+        batch_lens: Vec::new(),
+        pool_keys: Vec::new(),
+    }
+}
+
+/// Create a batched **async** iterator over the lazy arbitrage DFS.
+///
+/// The async twin of [`find_paths_rust`]: it builds the same owning lazy DFS
+/// but returns a [`PathBatchIterator`] whose `__anext__` yields up to
+/// `batch_size` paths per call on the shared tokio runtime. Python's
+/// `find_paths_async` drives it with `async for`, so the event loop is
+/// suspended on a Rust future — no Python worker thread, queue, or stop flag.
+///
+/// Args:
+///     edges: Same flat `(token0_id, token1_id, pool_id, pool_kind)` list as
+///         [`find_paths_rust`].
+///     start_token_id: The token ID where the search begins.
+///     end_token_id: The token ID the path must return to.
+///     min_depth: Minimum number of hops in a completed path.
+///     max_depth: Maximum number of hops, or `None` for no limit.
+///     include_reverse: If `True`, yield each found path again reversed.
+///     pool_type_per_depth: Optional per-depth allowed pool kinds.
+///     batch_size: Maximum number of paths per `__anext__` batch
+///         (positive-clamped to `>= 1`).
+///
+/// Returns:
+///     A `PathBatchIterator` — `async for batch in iter:` yields
+///     `list[list[tuple[int, int]]]`; exhaustion raises
+///     `StopAsyncIteration`. Dropping the iterator cancels a mid-search DFS.
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+#[expect(clippy::too_many_arguments)] // pyfunction surface mirrors the Python call 1:1
+#[pyfunction]
+#[pyo3(signature = (
+    edges,
+    start_token_id,
+    end_token_id,
+    min_depth,
+    max_depth,
+    include_reverse,
+    pool_type_per_depth=None,
+    batch_size=1000,
+))]
+pub fn find_paths_async_rust(
+    edges: Vec<(u64, u64, u64, PoolKind)>,
+    start_token_id: u64,
+    end_token_id: u64,
+    min_depth: usize,
+    max_depth: Option<usize>,
+    include_reverse: bool,
+    pool_type_per_depth: Option<Vec<Option<HashSet<PoolKind>>>>,
+    batch_size: usize,
+) -> PathBatchIterator {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let finder = build_owned_finder(
+        edges,
+        start_token_id,
+        end_token_id,
+        min_depth,
+        max_depth,
+        include_reverse,
+        pool_type_per_depth,
+    )
+    .with_cancel(Arc::clone(&cancel));
+    PathBatchIterator::new(finder, cancel, batch_size)
+}
+
+/// Parse the flat int tuples + optional per-depth kind filter, build the
+/// pruned `PathGraph`, and return the owning lazy DFS.
+///
+/// Shared by the sync [`find_paths_rust`] and async [`find_paths_async_rust`]
+/// seams so both validate their arguments identically.
+fn build_owned_finder(
+    edges: Vec<(u64, u64, u64, PoolKind)>,
+    start_token_id: u64,
+    end_token_id: u64,
+    min_depth: usize,
+    max_depth: Option<usize>,
+    include_reverse: bool,
+    pool_type_per_depth: Option<Vec<Option<HashSet<PoolKind>>>>,
+) -> OwnedPathFinder {
+    let rust_edges: Vec<(u64, u64, u64, CorePoolKind)> = edges
+        .into_iter()
+        .map(|(t0, t1, pid, kind)| (t0, t1, pid, kind.to_core()))
+        .collect();
+
+    let rust_filter: Option<Vec<Option<Vec<CorePoolKind>>>> = pool_type_per_depth.map(|raw| {
+        raw.into_iter()
+            .map(|allowed| allowed.map(|kinds| kinds.into_iter().map(PoolKind::to_core).collect()))
+            .collect()
+    });
+
+    // Build the graph + create a lazy iterator. The graph is pruned and
+    // node-valid-depths are computed inside OwnedPathFinder::new.
+    let mut graph = apexbot_pathfinding::graph::PathGraph::from_edges(rust_edges);
+    graph.prune_dead_ends();
+
+    OwnedPathFinder::new(
+        graph,
+        SearchSpec::new(
+            start_token_id,
+            end_token_id,
+            min_depth,
+            max_depth,
+            include_reverse,
+            rust_filter,
+        ),
+    )
+}
+
+/// Build the pathfinding edge list + address lookups via the Rust DB core
+///
+/// Choreographs `apexbot_db::fetch_tokens_with_min_degree` (the candidate-
+/// token set, `degree` ≥ #requested pool kinds for a token to anchor a
+/// cycle) → `fetch_path_graph_edges` (the bulk edge + address read) → the
+/// candidate-token edge filter (mirrors Python `_prepare_graph`'s inline
+/// `candidate_tokens` intersection). The filtered edge list is ready to pass
+/// to `find_paths_rust`; the typed edge families and address maps reconstruct
+/// `PathStep`s through `PathStepBuilder`.
+///
+/// This replaces Python's `_prepare_graph` + `_get_tokens_with_min_degree`
+/// inline SQLAlchemy selects with a single GIL-released Rust pass. The DFS
+/// half (`find_paths_rust`) + `_build_path_steps` shape are unchanged.
+///
+/// Args:
+///     database_path: The SQLite file path (resolved by the Python caller
+///         from `db._engine.url.database`).
+///     chain_id: The chain ID to restrict pool + token queries.
+///     pool_kinds: A set of `pool_kind` ints (`0` = V2, `1` = V3, `2` = V4).
+///         Mirrors the `pool_types` input mapped via `_pool_kind_for_type`.
+///     allowed_intermediate_token_ids: Optional set of token IDs; when set,
+///         the candidate-token set is intersected with it before edge
+///         filtering (mirrors Python's `allowed_token_ids` whitelist).
+///
+/// Returns:
+///     A `PathGraph` — one value carrying the filtered edge list, the address
+///     lookups, the candidate-token set, and (when `step_cls` is given) the
+///     step builder resolved from those same lookups:
+///     - ``edges``: ``list[(token0_id, token1_id, pool_id, pool_kind)]``
+///       for `find_paths_rust`, with typed `PoolKind` values.
+///     - ``v2v3_addresses``: ``{pool_id: checksum_address_str}``.
+///     - ``v4_lookups``: ``{pool_id: (manager_address_str, pool_hash_hex)}``.
+///     - ``pool_id_to_kind``: ``{pool_id: pool_kind}``.
+///     - ``candidate_tokens``: ``set[int]`` of candidate token IDs (after the
+///       whitelist intersection) for caller diagnostics.
+///     The step builder is only present when the call carried `step_cls`;
+///     `PathGraph.build_steps` raises a loud `ValueError` otherwise, so a
+///     probe-style call cannot be mistaken for a step-producing one.
+///
+/// # Errors
+///
+/// Returns `PyValueError` if the DB cannot be opened or the bulk read fails
+/// (mirrors `db_err_to_py`'s `ValueError` mapping for the snapshot seam).
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+#[pyfunction]
+#[expect(clippy::implicit_hasher, clippy::needless_pass_by_value)]
+#[pyo3(signature = (database_path, chain_id, pool_kinds, allowed_intermediate_token_ids=None, step_cls=None))]
+pub fn build_path_graph(
+    py: Python<'_>,
+    database_path: &str,
+    chain_id: i64,
+    pool_kinds: HashSet<PoolKind>,
+    allowed_intermediate_token_ids: Option<HashSet<u64>>,
+    step_cls: Option<Py<PyAny>>,
+) -> PyResult<PathGraph> {
+    let kinds: Vec<CorePoolKind> = pool_kinds.into_iter().map(PoolKind::to_core).collect();
+
+    let (edges, v2v3_addresses, v4_lookups, pool_id_to_kind, candidate_tokens) = py
+        .detach(|| -> Result<_, apexbot_db::DbError> {
+            let db = ApexbotDb::open(Path::new(database_path))?.0;
+            fetch_graph_data(
+                &db,
+                chain_id,
+                &kinds,
+                allowed_intermediate_token_ids.as_ref(),
+            )
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    // The step builder is constructed from the SAME checksummed lookups the
+    // edge list indexes into — the same-build-call invariant is structural:
+    // Python cannot obtain a builder whose maps did not come from this graph
+    // (`PathStepBuilder`'s own constructor is the synthetic-map probe path).
+    let step_builder =
+        step_cls.map(|cls| PathStepBuilder::new(v2v3_addresses.clone(), v4_lookups.clone(), cls));
+
+    build_graph_value(
+        py,
+        &edges,
+        &v2v3_addresses,
+        &v4_lookups,
+        &pool_id_to_kind,
+        &candidate_tokens,
+        step_builder,
+    )
+}
+
+/// The Rust-side result of `fetch_graph_data`: the filtered edge list + the
+/// three address/kind maps + the candidate-token set, ready for
+/// `build_graph_value` to materialize into the `PathGraph` value.
+///
+/// The address maps hold PRE-COMPUTED checksum strings (not `Address`) so
+/// `build_graph_value` does no keccak/EIP-55 work under the GIL — the
+/// `to_checksum(None)` calls run inside the `py.detach` span in
+/// `build_path_graph`: the keccak loop over tens of thousands
+/// of V2/V3 addresses previously held the GIL for ~24 s, starving every
+/// tokio worker that needs `PyGILState_Ensure` and triggering the dispatch
+/// circular deadlock during the rolling-start `build_paths` overlap).
+//
+// The maps are STD collections, not the core's `hashbrown` maps: PyO3 (without
+// its `hashbrown` feature) extracts dict arguments into `std::collections`
+// only, so `PathStepBuilder`'s Python-facing constructor is std-shaped, and
+// this projection converts once so the whole seam tail is uniform.
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+type GraphBuildResult = (
+    Vec<(u64, u64, u64, PoolKind)>,
+    HashMap<u64, String>,
+    HashMap<u64, (String, String)>,
+    HashMap<u64, CorePoolKind>,
+    HashSet<u64>,
+);
+
+/// Run the candidate-token fetch + bulk edge read + candidate-token edge
+/// filter inside the GIL-released span (mirrors Python `_prepare_graph`'s
+/// `_get_tokens_with_min_degree` + per-pool-type select + candidate filter).
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+fn fetch_graph_data(
+    db: &ApexbotDb,
+    chain_id: i64,
+    kinds: &[CorePoolKind],
+    allowed_intermediate_token_ids: Option<&HashSet<u64>>,
+) -> Result<GraphBuildResult, apexbot_db::DbError> {
+    // Candidate tokens: those appearing in ≥ `degree` pools across the
+    // requested kinds (mirrors Python `_get_tokens_with_min_degree`).
+    // `degree=2` matches the Python callers (a cycle needs ≥ 2 pools).
+    let mut candidate_tokens: HashSet<u64> = db
+        .fetch_tokens_with_min_degree(chain_id, 2, kinds)?
+        .into_iter()
+        .collect();
+    if let Some(allowed) = allowed_intermediate_token_ids {
+        candidate_tokens.retain(|t| allowed.contains(t));
+    }
+
+    // Bulk edge + address read (ALL chain-filtered edges; the candidate-token
+    // filter is applied below).
+    let data = db.fetch_path_graph_edges(chain_id, kinds)?;
+
+    // Filter edges to those where BOTH tokens are candidate tokens (mirrors
+    // Python `_prepare_graph`'s `candidate_tokens` intersection). An unknown
+    // core discriminant is a stale-binding/newer-core mismatch: refuse it
+    // (the caller's DbError -> PyValueError mapping surfaces it to Python)
+    // instead of silently mistranslating it to V4.
+    let mut edges: Vec<(u64, u64, u64, PoolKind)> = Vec::with_capacity(data.edges.len());
+    for (t0, t1, pid, kind) in data.edges {
+        if !(candidate_tokens.contains(&t0) && candidate_tokens.contains(&t1)) {
+            continue;
+        }
+        let discriminant = kind.as_u8();
+        let Some(kind) = PoolKind::from_core(kind) else {
+            return Err(apexbot_db::DbError::Decode(format!(
+                "unknown core pool-kind discriminant {discriminant} crossing the FFI (pool id {pid})"
+            )));
+        };
+        edges.push((t0, t1, pid, kind));
+    }
+
+    // Pre-compute EIP-55 checksum strings for every V2/V3 pool address +
+    // every V4 manager address inside this GIL-released span .
+    // `Address::to_checksum(None)` is pure Rust (a keccak256 over the
+    // lowercase-hex address) and does NOT need the GIL; doing it here keeps
+    // `build_graph_value`'s materialization loop GIL-light (only `set_item`
+    // calls). Previously the materialization called `to_checksum` PER pool
+    // while holding the GIL, a ~24 s keccak loop that starved tokio workers.
+    let v2v3_checksums: HashMap<u64, String> = data
+        .v2v3_addresses
+        .iter()
+        .map(|(pid, addr)| (*pid, addr.to_checksum(None)))
+        .collect();
+    let v4_checksums: HashMap<u64, (String, String)> = data
+        .v4_lookups
+        .iter()
+        .map(|(pid, (mgr, hash))| (*pid, (mgr.to_checksum(None), hash.clone())))
+        .collect();
+
+    Ok((
+        edges,
+        v2v3_checksums,
+        v4_checksums,
+        data.pool_id_to_kind.into_iter().collect(),
+        candidate_tokens,
+    ))
+}
+
+/// Materialize the Python containers of one `PathGraph` value — the address
+/// maps use checksum strings (the `Address` ↔ Python str boundary the
+/// snapshot seam already uses). Runs under the GIL once per build; the
+/// keccak/EIP-55 work already happened inside the `py.detach` span.
+#[cfg(all(feature = "pathfinding", feature = "db"))]
+fn build_graph_value(
+    py: Python<'_>,
+    edges: &[(u64, u64, u64, PoolKind)],
+    v2v3_addresses: &HashMap<u64, String>,
+    v4_lookups: &HashMap<u64, (String, String)>,
+    pool_id_to_kind: &HashMap<u64, CorePoolKind>,
+    candidate_tokens: &HashSet<u64>,
+    step_builder: Option<PathStepBuilder>,
+) -> PyResult<PathGraph> {
+    let edges_vec: Vec<(u64, u64, u64, PoolKind)> = edges.to_vec();
+    let edges_list = PyList::new(py, edges_vec)?;
+
+    let v2v3 = PyDict::new(py);
+    for (pid, addr) in v2v3_addresses {
+        v2v3.set_item(pid, addr.as_str())?;
+    }
+
+    let v4 = PyDict::new(py);
+    for (pid, (mgr, hash)) in v4_lookups {
+        v4.set_item(pid, (mgr.as_str(), hash.as_str()))?;
+    }
+
+    let kind_map = PyDict::new(py);
+    for (pid, kind) in pool_id_to_kind {
+        let pool_kind = PoolKind::from_core(*kind).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown core pool-kind discriminant {} crossing the FFI (pool id {pid})",
+                kind.as_u8()
+            ))
+        })?;
+        kind_map.set_item(pid, pool_kind)?;
+    }
+
+    let cand = PySet::empty(py)?;
+    for t in candidate_tokens {
+        cand.add(t)?;
+    }
+
+    Ok(PathGraph {
+        edges: edges_list.unbind(),
+        v2v3_addresses: v2v3.unbind(),
+        v4_lookups: v4.unbind(),
+        pool_id_to_kind: kind_map.unbind(),
+        candidate_tokens: cand.unbind(),
+        step_builder,
+    })
+}
+
+/// A lazy Python iterator over arbitrage paths.
+///
+/// Yields ``list[tuple[int, int]]`` — each path is a list of
+/// ``(pool_id, pool_kind_u8)`` tuples. The DFS runs incrementally: each call
+/// to ``__next__`` advances the search until a complete path is found.
+///
+/// To amortize the per-path FFI cost, the iterator internally buffers up to
+/// [`BATCH_SIZE`] paths per GIL-released span (the DFS advances while the
+/// GIL is released, so other Python threads may run between batches). Paths
+/// are held as **flat compact pool indices** (not `EdgeKey`s) in a single
+/// growable buffer — this avoids the per-path `Vec<EdgeKey>` allocation
+/// (~96k small allocs for a typical search) and only converts indices →
+/// `(pool_id, kind_u8)` lazily when building each Python list.
+#[pyclass(module = "apexbot._ffi")]
+pub struct PathIterator {
+    finder: OwnedPathFinder,
+    /// Flat pool-index buffer for the current batch. Consume from the back:
+    /// the last `len` indices form the current path (length in
+    /// `batch_lens`), then the buffer is truncated by `len`.
+    buffer: Vec<u32>,
+    /// Path lengths within `buffer`, in insert order; the back entry is the
+    /// next path to serve.
+    batch_lens: Vec<usize>,
+    /// Lazily built, per-pool `(pool_id, kind_u8)` tuples. Tuples are
+    /// immutable, so sharing one object across every path that traverses the
+    /// pool is semantics-preserving and turns the per-hop conversion from a
+    /// fresh tuple allocation into a reference bump.
+    pool_keys: Vec<Option<Py<PyTuple>>>,
+}
+
+/// Number of paths to fetch per GIL-released span. Tuned so a batch is large
+/// enough to amortize the GIL release (~µs) yet small enough to bound memory
+/// (`BATCH_SIZE` paths × max-depth × 4 B ≈ 100 KB per batch) and give other
+/// threads periodic slices.
+const BATCH_SIZE: usize = 8192;
+
+#[pymethods]
+impl PathIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {
+        if self.batch_lens.is_empty() {
+            // Refill the flat buffer in one GIL-released span — the DFS
+            // advances (appending compact pool indices, no per-path Vec
+            // allocation) while other Python threads may run.
+            let finder = &mut self.finder;
+            let buffer = &mut self.buffer;
+            let batch_lens = &mut self.batch_lens;
+            py.detach(|| {
+                buffer.clear();
+                batch_lens.clear();
+                while batch_lens.len() < BATCH_SIZE {
+                    match finder.next_path_indices_into(buffer) {
+                        Some(len) => batch_lens.push(len),
+                        None => break,
+                    }
+                }
+            });
+        }
+
+        // Serve one path from the back of the flat buffer.
+        let Some(len) = self.batch_lens.pop() else {
+            return Ok(None);
+        };
+        let start = self.buffer.len() - len;
+        // Resolve indices → shared cached (pool_id, kind_u8) tuples.
+        let list = PyList::empty(py);
+        for i in start..self.buffer.len() {
+            let idx = self.buffer[i];
+            if (idx as usize) >= self.pool_keys.len() || self.pool_keys[idx as usize].is_none() {
+                self.materialize_pool_key(py, idx)?;
+            }
+            if let Some(key) = &self.pool_keys[idx as usize] {
+                list.append(key.bind(py))?;
+            }
+        }
+        self.buffer.truncate(start);
+        Ok(Some(list))
+    }
+}
+
+impl PathIterator {
+    /// Materialize the cached tuple for `idx`, filling any gap below it.
+    /// Amortized: only pools that appear on yielded paths cost a tuple.
+    fn materialize_pool_key(&mut self, py: Python<'_>, idx: u32) -> PyResult<()> {
+        materialize_pool_keys(&self.finder, py, &mut self.pool_keys, idx)
+    }
+}
+
+/// Fill the shared per-pool tuple cache up to `idx`: only pools that appear
+/// on yielded paths ever allocate their tuple.
+fn materialize_pool_keys(
+    finder: &OwnedPathFinder,
+    py: Python<'_>,
+    cache: &mut Vec<Option<Py<PyTuple>>>,
+    idx: u32,
+) -> PyResult<()> {
+    let new_len = (idx as usize) + 1;
+    cache.resize_with(new_len, || None);
+    for (i, slot) in cache.iter_mut().enumerate() {
+        if slot.is_none() {
+            let pool_idx = u32::try_from(i).unwrap_or(u32::MAX);
+            let (pool_id, pool_kind) = finder.pool_edge_key(pool_idx);
+            let pool_kind = PoolKind::from_core(pool_kind).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "unknown core pool-kind discriminant {} crossing the FFI (pool id {pool_id})",
+                    pool_kind.as_u8()
+                ))
+            })?;
+            let tuple = PyTuple::new(
+                py,
+                [
+                    pool_id.into_pyobject(py)?.into_any(),
+                    pool_kind.into_pyobject(py)?.into_any(),
+                ],
+            )?;
+            *slot = Some(tuple.unbind());
+        }
+    }
+    Ok(())
+}
+
+/// Mutable state carried across `__anext__` calls.
+struct AsyncPathState {
+    finder: OwnedPathFinder,
+    /// Flat pool-index buffer for the current batch. Consume from the back:
+    /// the last `len` indices form one path (length in `batch_lens`), then the
+    /// buffer is truncated by `len` (mirrors `PathIterator`).
+    buffer: Vec<u32>,
+    /// Path lengths within `buffer`, in insert order.
+    batch_lens: Vec<usize>,
+    /// Lazily built shared `(pool_id, kind_u8)` tuples (see `PathIterator`).
+    pool_keys: Vec<Option<Py<PyTuple>>>,
+}
+
+/// A batched **async** iterator over the lazy DFS.
+///
+/// `__anext__` returns `list[list[tuple[int, int]]]`: up to `batch_size`
+/// paths per call, computed on the shared tokio runtime with the GIL released
+/// (the DFS refill runs in the pyo3-async future body, which is polled without
+/// the GIL; only the Python list construction re-acquires it). Exhaustion
+/// raises `StopAsyncIteration`.
+///
+/// The mutable search state lives behind an `Arc<Mutex<Option<..>>>` and is
+/// taken for the duration of one `__anext__` (mirroring `BlockStream`'s
+/// receiver take/put-back), so a single shared iterator survives across awaits.
+/// Dropping the Python object sets the cooperative `cancel` flag: a consumer
+/// that abandons the sweep (`aclose()` / GC) stops a mid-grind DFS at its next
+/// loop iteration instead of pinning a tokio worker until the search ends.
+#[pyclass(name = "PathBatchIterator", module = "apexbot._ffi")]
+pub struct PathBatchIterator {
+    state: Arc<parking_lot::Mutex<Option<AsyncPathState>>>,
+    cancel: Arc<AtomicBool>,
+    batch_size: usize,
+}
+
+impl PathBatchIterator {
+    fn new(finder: OwnedPathFinder, cancel: Arc<AtomicBool>, batch_size: usize) -> Self {
+        Self {
+            state: Arc::new(parking_lot::Mutex::new(Some(AsyncPathState {
+                finder,
+                buffer: Vec::new(),
+                batch_lens: Vec::new(),
+                pool_keys: Vec::new(),
+            }))),
+            cancel,
+            batch_size: batch_size.max(1),
+        }
+    }
+}
+
+impl Drop for PathBatchIterator {
+    fn drop(&mut self) {
+        // Cooperative cancel: the in-flight `__anext__` future checks this
+        // between DFS advances, so a mid-search abandonment releases the Rust
+        // iterator promptly instead of grinding out the remaining batches.
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+#[pymethods]
+impl PathBatchIterator {
+    /// Return self as the async iterator.
+    #[expect(clippy::missing_const_for_fn)]
+    fn __aiter__(slf: PyClassGuard<'_, Self>) -> PyClassGuard<'_, Self> {
+        slf
+    }
+
+    /// Await the next batch of paths (`list[list[tuple[int, int]]]`).
+    ///
+    /// Raises `StopAsyncIteration` when the DFS is exhausted (or after the
+    /// owning iterator was dropped/cancelled). A producer failure raises here
+    /// at the consumer.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let batch_size = self.batch_size;
+
+        crate::ambient_runtime::future_into_py(py, async move {
+            let mut taken = state
+                .lock()
+                .take()
+                .ok_or_else(|| PyStopAsyncIteration::new_err("pathfinding iterator exhausted"))?;
+
+            // Refill the shared flat buffer only when it is drained, using the
+            // SAME chunk size as the sync `PathIterator`. Both serve paths from
+            // the back of the buffer, so the async stream reproduces the sync
+            // stream's order exactly; a delivery batch is just the next
+            // `batch_size` pops.
+            if taken.batch_lens.is_empty() {
+                let finder = &mut taken.finder;
+                let buffer = &mut taken.buffer;
+                let batch_lens = &mut taken.batch_lens;
+                buffer.clear();
+                batch_lens.clear();
+                while batch_lens.len() < BATCH_SIZE {
+                    match finder.next_path_indices_into(buffer) {
+                        Some(len) => batch_lens.push(len),
+                        None => break,
+                    }
+                }
+            }
+
+            if taken.batch_lens.is_empty() {
+                // Exhausted (or cancelled): drop the finder, never put it back.
+                return Err(PyStopAsyncIteration::new_err(
+                    "pathfinding iterator exhausted",
+                ));
+            }
+
+            // Build the batch under the GIL (indices -> shared cached
+            // `(pool_id, kind_u8)` tuples; tuples are immutable, so sharing
+            // one per pool is semantics-preserving).
+            let finder = &taken.finder;
+            let buffer = &mut taken.buffer;
+            let batch_lens = &mut taken.batch_lens;
+            let take = batch_size.min(batch_lens.len());
+            let batch = Python::attach(|py| -> PyResult<Py<PyList>> {
+                let out = PyList::empty(py);
+                for _ in 0..take {
+                    let Some(len) = batch_lens.pop() else {
+                        break;
+                    };
+                    let start = buffer.len() - len;
+                    let path = PyList::empty(py);
+                    for &idx in &buffer[start..] {
+                        if (idx as usize) >= taken.pool_keys.len()
+                            || taken.pool_keys[idx as usize].is_none()
+                        {
+                            materialize_pool_keys(finder, py, &mut taken.pool_keys, idx)?;
+                        }
+                        if let Some(key) = &taken.pool_keys[idx as usize] {
+                            path.append(key.bind(py))?;
+                        }
+                    }
+                    buffer.truncate(start);
+                    out.append(path)?;
+                }
+                Ok(out.unbind())
+            })?;
+
+            *state.lock() = Some(taken);
+            Ok(batch)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apexbot_pathfinding::graph::PathGraph;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Dropping the async iterator must set its cooperative cancel flag so an
+    /// in-flight `__anext__` DFS can stop at its next advance.
+    #[test]
+    fn drop_sets_cancel_flag() {
+        let graph = PathGraph::from_edges(vec![
+            (1u64, 2u64, 100u64, CorePoolKind::V2),
+            (2u64, 1u64, 200u64, CorePoolKind::V2),
+        ]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finder = OwnedPathFinder::new(graph, SearchSpec::new(1, 1, 2, Some(2), false, None))
+            .with_cancel(Arc::clone(&cancel));
+        let iterator = PathBatchIterator::new(finder, Arc::clone(&cancel), 4);
+        assert!(!cancel.load(Ordering::Acquire));
+        drop(iterator);
+        assert!(
+            cancel.load(Ordering::Acquire),
+            "dropping the iterator must set the cancel flag"
+        );
+    }
+}

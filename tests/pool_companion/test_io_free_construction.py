@@ -28,23 +28,24 @@ import pytest
 from apexbot._ffi import Bot as _Engine
 from apexbot.abi import encode as abi_encode
 from apexbot.bot import Bot
+from apexbot.builders.request import BuildManagedPoolRequest
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.constants import ZERO_ADDRESS
-from apexbot.database.operations import create_new_sqlite_database
+from apexbot.db import db_upgrade_database
 from apexbot.erc20.erc20 import Erc20Token
 from apexbot.provider import OfflineProvider
-from apexbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
+from apexbot.uniswap.concentrated.types import LiquidityAtTick
 from apexbot.uniswap.v2_liquidity_pool import UniswapV2Pool
-from apexbot.uniswap.v2_types import UniswapV2PoolExternalUpdate
 from apexbot.uniswap.v3_liquidity_pool import UniswapV3Pool
-from apexbot.uniswap.v3_types import UniswapV3PoolExternalUpdate
 from apexbot.uniswap.v4_liquidity_pool import UniswapV4Pool
-from apexbot.uniswap.v4_types import UniswapV4PoolExternalUpdate, UniswapV4PoolKey
+from apexbot.uniswap.v4_types import UniswapV4PoolKey
 from apexbot.utils.bytes import to_bytes
 from tests.fakes.curve_data_provider import FakeCurveDataProvider
 from tests.helpers.balancer_pool_factory import make_balancer_stable_pool
 from tests.helpers.curve_pool_factory import make_curve_pool
 from tests.helpers.erc20_factory import make_erc20, make_ether_placeholder
+from tests.helpers.pool_bot import new_pool_bot
+from tests.helpers.synthetic_logs import v2_sync, v3_swap, v4_swap
 from tests.helpers.v2_pool_factory import make_v2_pool
 from tests.helpers.v3_pool_factory import make_v3_pool
 from tests.helpers.v4_pool_factory import make_v4_pool
@@ -65,7 +66,7 @@ from tests.pool_companion._helpers import (
     WETH_ADDR,
     WETH_USDC_V2_POOL,
     make_native_eth,
-    make_test_config,
+    make_test_database,
     make_usdc,
     make_weth,
     v2_offline_provider,
@@ -257,12 +258,8 @@ def _build_curve(bot: Bot) -> Any:
 
 
 def _build_balancer_stable(bot: Bot) -> Any:
-    t0 = make_erc20(
-        bot._py_bot, "0x" + "d4" * 20, chain_id=1, name="S0", symbol="S0", decimals=18
-    )
-    t1 = make_erc20(
-        bot._py_bot, "0x" + "e5" * 20, chain_id=1, name="S1", symbol="S1", decimals=18
-    )
+    t0 = make_erc20(bot._py_bot, "0x" + "d4" * 20, chain_id=1, name="S0", symbol="S0", decimals=18)
+    t1 = make_erc20(bot._py_bot, "0x" + "e5" * 20, chain_id=1, name="S1", symbol="S1", decimals=18)
     return make_balancer_stable_pool(
         address="0x" + "07" * 20,
         pool_id=bytes.fromhex("07" * 20 + "0002" + "0" * 20),
@@ -307,7 +304,7 @@ def test_construction_touches_no_provider(case: NoIOCase, tmp_path: pathlib.Path
     provider = MagicMock()
     provider.chain_id = 1
     provider.is_connected.return_value = True
-    bot = Bot(make_test_config(tmp_path), provider=provider)
+    bot = Bot(database=make_test_database(tmp_path), chain_id=1, provider=provider)
 
     companion = case.build(bot)
 
@@ -338,14 +335,15 @@ class TestV2PoolIOFreeConstructor:
         assert pool.update_block == 18_000_000
 
     def test_io_free_pool_computation_works(self) -> None:
-        pool = _v2_injected()
+        bot = new_pool_bot()
+        pool = _v2_injected(py_bot=bot)
 
-        pool.external_update(
-            UniswapV2PoolExternalUpdate(
-                block_number=18_000_001,
-                reserves_token0=1100 * 10**18,
-                reserves_token1=1_800_000 * 10**6,
-            )
+        # New reserves arrive through the pump's own door: a synthetic
+        # `Sync(uint112,uint112)` log decoded + applied by the bot.
+        bot.dispatch_log(
+            address=pool.address,
+            block_number=18_000_001,
+            **v2_sync(reserve0=1100 * 10**18, reserve1=1_800_000 * 10**6),
         )
         assert pool.reserves_token0 == 1100 * 10**18
 
@@ -364,9 +362,10 @@ class TestBotBuildV2Pool:
         usdc_addr = USDC_ADDR
         factory_addr = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
 
-        config = make_test_config(tmp_path)
+        database = make_test_database(tmp_path)
         bot = Bot(
-            config,
+            database=database,
+            chain_id=1,
             provider=v2_offline_provider(
                 weth_addr=weth_addr,
                 usdc_addr=usdc_addr,
@@ -418,26 +417,27 @@ class TestV3PoolIOFreeConstructor:
             -76080: LiquidityAtTick(liquidity_gross=1000, liquidity_net=-500, block=18_000_000),
             -75960: LiquidityAtTick(liquidity_gross=2000, liquidity_net=300, block=18_000_000),
         }
-        tick_bitmap = {-297: BitmapAtWord(bitmap=3, block=18_000_000)}
-
-        pool = _v3_injected(tick_bitmap=tick_bitmap, tick_data=tick_data)
+        pool = _v3_injected(tick_data=tick_data)
 
         assert pool.sparse_liquidity_map is False
         assert -76080 in pool.tick_data
         assert -75960 in pool.tick_data
 
-    def test_io_free_pool_external_update(self) -> None:
-        pool = _v3_injected()
+    def test_io_free_pool_swap_event_update(self) -> None:
+        bot = new_pool_bot()
+        pool = _v3_injected(py_bot=bot)
 
-        updated = pool.external_update(
-            UniswapV3PoolExternalUpdate(
-                block_number=18_000_001,
+        # A V3 Swap log carries the post-swap scalars; the pumped event moves
+        # the pool's sqrt_price/tick/liquidity.
+        bot.dispatch_log(
+            address=pool.address,
+            block_number=18_000_001,
+            **v3_swap(
                 sqrt_price_x96=2200000000000000000000,
                 tick=-75900,
                 liquidity=9999999999,
-            )
+            ),
         )
-        assert updated is True
         assert pool.tick == -75900
         assert pool.liquidity == 9999999999
 
@@ -454,9 +454,10 @@ class TestBotBuildV3Pool:
         tick = -76020
         liquidity = 1234567890
 
-        config = make_test_config(tmp_path)
+        database = make_test_database(tmp_path)
         bot = Bot(
-            config,
+            database=database,
+            chain_id=1,
             provider=v3_offline_provider(
                 weth_addr=weth_addr,
                 usdc_addr=usdc_addr,
@@ -526,21 +527,28 @@ class TestV4PoolIOFreeConstructor:
         pool = _v4_injected(tick_data=tick_data)
 
         assert pool.sparse_liquidity_map is False
-        assert pool.tick_bitmap[0].bitmap == (1 << 12)
-        assert pool.tick_bitmap[-1].bitmap == (1 << 255)
+        # Keys only: the words the tick rows land in (bit 12 → word 0, bit 255
+        # → word -1). The per-word bitmap VALUE is retired.
+        assert pool.tick_bitmap == {0, -1}
         assert pool.tick_data[120].liquidity_net == 100
         assert pool.tick_data[-10].liquidity_net == 100
 
-    def test_io_free_external_update(self) -> None:
-        pool = _v4_injected()
+    def test_io_free_swap_event_update(self) -> None:
+        bot = new_pool_bot()
+        pool = _v4_injected(py_bot=bot)
 
-        update = UniswapV4PoolExternalUpdate(
+        # The V4 twin: a `PoolManager` Swap log keyed by pool_id, dispatched
+        # at the manager address the pool lives under.
+        bot.dispatch_log(
+            address=pool.address,
             block_number=18_000_001,
-            sqrt_price_x96=2198666895605150000000,
-            tick=-76010,
-            liquidity=1234567999,
+            **v4_swap(
+                pool_id=V4_POOL_ID,
+                sqrt_price_x96=2198666895605150000000,
+                tick=-76010,
+                liquidity=1234567999,
+            ),
         )
-        assert pool.external_update(update) is True
         assert pool.tick == -76010
         assert pool.liquidity == 1234567999
 
@@ -575,9 +583,10 @@ class TestBotBuildV4Pool:
         lp_fee = 500000
         liquidity = 1234567890
 
-        config = make_test_config(tmp_path)
+        database = make_test_database(tmp_path)
         bot = Bot(
-            config,
+            database=database,
+            chain_id=1,
             provider=v4_offline_provider(
                 pool_manager=V4_POOL_MANAGER,
                 state_view=V4_STATE_VIEW,
@@ -600,12 +609,14 @@ class TestBotBuildV4Pool:
 
         pool = bot.build_managed_pool(
             V4_POOL_MANAGER,
-            V4_POOL_ID,
-            state_view_address=V4_STATE_VIEW,
-            fee=V4_FEE,
-            tick_spacing=V4_TICK_SPACING,
-            hook_address=V4_HOOKS,
-            tokens=[ZERO_ADDRESS, USDC_ADDR],
+            BuildManagedPoolRequest(
+                pool_id=V4_POOL_ID,
+                state_view_address=V4_STATE_VIEW,
+                fee=V4_FEE,
+                tick_spacing=V4_TICK_SPACING,
+                hook_address=V4_HOOKS,
+                tokens=[ZERO_ADDRESS, USDC_ADDR],
+            ),
         )
 
         assert isinstance(pool, UniswapV4Pool)
@@ -616,7 +627,11 @@ class TestBotBuildV4Pool:
         assert pool.sqrt_price_x96 == sqrt_price
         assert pool.tick == tick
         assert pool.liquidity == liquidity
-        assert pool.lp_fee == lp_fee
+        # The registered handle's LP fee IS the pool key's static fee (the
+        # engine's swap-fee input; the handle is self-describing, ADR-085
+        # D4). The mock's slot0 lpFee read is a transient, not a registered
+        # fact — it no longer threads across the seam.
+        assert pool.lp_fee == V4_FEE
 
         found = bot.managed_pools.get(
             chain_id=1,
@@ -707,8 +722,8 @@ class TestBotBuildErc20Token:
     """Bot.build_erc20token() fetches metadata and constructs the companion."""
 
     def test_build_token_from_chain(self, tmp_path: pathlib.Path) -> None:
-        config = make_test_config(tmp_path)
-        create_new_sqlite_database(config.database.path)
+        database = make_test_database(tmp_path)
+        db_upgrade_database(database)
         token_address = WETH_ADDR
         offline = OfflineProvider(
             chain_id=1,
@@ -730,7 +745,7 @@ class TestBotBuildErc20Token:
                 }
             },
         )
-        bot = Bot(config, provider=offline)
+        bot = Bot(database=database, chain_id=1, provider=offline)
 
         token = bot.build_erc20token(token_address)
         assert isinstance(token, Erc20Token)

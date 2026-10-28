@@ -1,4 +1,4 @@
-"""Offline §4.2 parity tests for the price-reader PyO3 seam + shells.
+"""Offline parity tests for the price-reader PyO3 seam + shells.
 
 Drives the full ``ChainlinkPriceFeed`` / ``AavePriceOracle`` pyclasses +
 the delegating ``ChainlinkPriceContract`` / ``OraclePriceFetcher`` shells
@@ -6,7 +6,8 @@ through a local in-process JSON-RPC mock that returns canned ABI-encoded
 ``eth_call`` bytes. This exercises the actual ``eth_call`` → Rust ABI decode
 → shell float path end-to-end, with no live RPC and no Anvil fork.
 
-Parity target (ADR-005 §4.2, Python as oracle):
+Parity target (the parity gate,
+``docs/architecture/parity-gate.md``; Python as oracle):
     prior Python ``ChainlinkPriceContract.price`` =
         ``float(answer / 10**decimals)``   (where ``answer`` came from
         ``abi_decode(["uint80","int256","uint256","uint256","uint80"], ...)``)
@@ -27,8 +28,8 @@ from __future__ import annotations
 import json
 import socket
 from contextlib import contextmanager
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -139,10 +140,16 @@ def mock_provider() -> Generator[AlloyProvider, None, None]:
         yield AlloyProvider(url, 0)
 
 
+@dataclass
+class FakeProviderBot:
+    """Bot double carrying the provider slice ``ChainlinkPriceContract`` reads."""
+
+    provider: AlloyProvider
+
+
 @pytest.fixture
-def fake_bot(mock_provider: AlloyProvider) -> SimpleNamespace:
-    # ChainlinkPriceContract only reads ``bot.provider`` → a namespace suffices.
-    return SimpleNamespace(provider=mock_provider)
+def fake_bot(mock_provider: AlloyProvider) -> FakeProviderBot:
+    return FakeProviderBot(provider=mock_provider)
 
 
 def _free_port_plausible() -> bool:
@@ -158,14 +165,14 @@ def _free_port_plausible() -> bool:
 
 
 def test_py_chainlink_feed_decimals_byte_exact(mock_provider: AlloyProvider) -> None:
-    feed = ChainlinkPriceFeed(CHAINLINK_ETH_USD, mock_provider.as_alloy())
+    feed = ChainlinkPriceFeed(CHAINLINK_ETH_USD, mock_provider.to_alloy_provider())
     assert feed.decimals() == CHAINLINK_DECIMALS
 
 
 def test_py_chainlink_feed_latest_round_data_byte_exact(
     mock_provider: AlloyProvider,
 ) -> None:
-    feed = ChainlinkPriceFeed(CHAINLINK_ETH_USD, mock_provider.as_alloy())
+    feed = ChainlinkPriceFeed(CHAINLINK_ETH_USD, mock_provider.to_alloy_provider())
     round_id, answer, started_at, updated_at, answered_in_round = feed.latest_round_data()
     assert round_id == 1
     assert answer == CHAINLINK_ANSWER
@@ -175,7 +182,7 @@ def test_py_chainlink_feed_latest_round_data_byte_exact(
 
 
 def test_chainlink_shell_price_matches_python_float_division(
-    fake_bot: SimpleNamespace,
+    fake_bot: FakeProviderBot,
 ) -> None:
     """Shell ``price`` == ``float(answer) / 10**decimals`` (prior Python path)."""
     contract = ChainlinkPriceContract(CHAINLINK_ETH_USD, bot=fake_bot)
@@ -188,7 +195,7 @@ def test_chainlink_shell_price_matches_python_float_division(
     assert price == pytest.approx(1845.00000005)
 
 
-def test_chainlink_shell_decimals_cached(fake_bot: SimpleNamespace) -> None:
+def test_chainlink_shell_decimals_cached(fake_bot: FakeProviderBot) -> None:
     contract = ChainlinkPriceContract(CHAINLINK_ETH_USD, bot=fake_bot)
     assert contract.decimals == CHAINLINK_DECIMALS
     # Second access uses the cached value (no second eth_call for decimals).
@@ -197,7 +204,7 @@ def test_chainlink_shell_decimals_cached(fake_bot: SimpleNamespace) -> None:
 
 def test_chainlink_py_price_truncates_whole_units(mock_provider: AlloyProvider) -> None:
     """The Rust ``price()`` convenience truncates to whole units (integer div)."""
-    feed = ChainlinkPriceFeed(CHAINLINK_ETH_USD, mock_provider.as_alloy())
+    feed = ChainlinkPriceFeed(CHAINLINK_ETH_USD, mock_provider.to_alloy_provider())
     truncated = feed.price()
     assert truncated == 1845  # int(answer // 10**decimals)
 
@@ -210,7 +217,7 @@ def test_chainlink_py_price_truncates_whole_units(mock_provider: AlloyProvider) 
 def test_py_aave_oracle_get_asset_price_byte_exact(
     mock_provider: AlloyProvider,
 ) -> None:
-    oracle = AavePriceOracle(AAVE_ORACLE, mock_provider.as_alloy())
+    oracle = AavePriceOracle(AAVE_ORACLE, mock_provider.to_alloy_provider())
     assert oracle.get_asset_price(ASSET_ADDRESS) == AAVE_ASSET_PRICE
 
 

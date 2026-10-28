@@ -6,7 +6,8 @@ tags:
   - liquidity
 related_files:
   - ../rust-cli.md
-  - ../../src/apexbot/database/models/aave.py
+  - ../../src/apexbot/db/__init__.py
+  - ../../rust/crates/foundation/apexbot-db/src/schema.rs
 complexity: complex
 ---
 
@@ -76,14 +77,14 @@ The `apexbot aave update` command is designed to rebuild a complete database of 
 
 ## Commands
 
-The command vocabulary is **Rust-owned**: [`apexbot-cli`](../../rust/crates/apexbot-cli/src/argv.rs) declares it over `apexbot-cli-core`'s [aave arms](../../rust/crates/apexbot-cli-core/src/aave.rs). The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the domain behaviour below is unchanged.
+The command vocabulary is **Rust-owned**: [`apexbot-cli`](../../rust/crates/shells/apexbot-cli/src/argv.rs) declares it over `apexbot-cli-core`'s [aave arms](../../rust/crates/shells/apexbot-cli-core/src/aave.rs). The authoritative flag/exit-code reference is the [Rust CLI page](../rust-cli.md); the domain behaviour below is unchanged.
 
 ### `apexbot aave update`
 
 Update positions for all active Aave V3 markets by processing blockchain events.
 
 ```bash
-apexbot aave update [--chunk SIZE] [--to-block BLOCK]
+apexbot aave update [--chunk SIZE] [--max-block-range BLOCKS] [--to-block BLOCK]
 ```
 
 #### Parameters
@@ -91,6 +92,7 @@ apexbot aave update [--chunk SIZE] [--to-block BLOCK]
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--chunk` | 10,000 | Maximum number of blocks to process per database commit |
+| `--max-block-range` | 10,000 | Maximum block range a single `eth_getLogs` request may span, independent of `--chunk`. Lower it for RPC providers that cap the `eth_getLogs` block range |
 | `--to-block` | `latest:-64` | Last block in update range. Format: `TAG[:OFFSET]` |
 
 #### Block Identifiers
@@ -119,6 +121,10 @@ apexbot aave update --to-block "latest:-128"
 
 # Update using smaller chunks for slower machines
 apexbot aave update --chunk 5000
+
+# Cap the per-request block range for an RPC whose eth_getLogs
+# range limit is tighter than the commit chunk (e.g. dRPC free)
+apexbot aave update --max-block-range 100
 
 # Update to a specific block for historical analysis
 apexbot aave update --to-block "18900000"
@@ -160,6 +166,41 @@ Deactivate an Aave market (positions not updated).
 apexbot aave deactivate [--name MARKET]
 ```
 
+### `apexbot aave reset`
+
+Purge one market's populated data, then re-run the cold-boot update a fresh
+empty database takes for that market.
+
+```bash
+apexbot aave reset [--name MARKET] [--dry-run]
+```
+
+The purge removes every row the updater populated for the named market — its
+reserves, users, collateral/debt positions, per-asset and per-user configs, eMode
+categories and contract rows — and rewinds the market's cursor to the activation
+block. It keeps the `aave_v3_markets` row itself, the `POOL_ADDRESS_PROVIDER`
+contract row (the cold-boot bootstrap's fetch anchor), and the chain's GHO token
+rows, so the market stays registered and active. Rows belonging to another market
+and every table no market keys (`erc20_tokens`, `pools`, `exchanges`, price data)
+are untouched, so a reset of one market never disturbs unrelated data.
+
+The purge and the cold-boot re-seed commit inside ONE transaction (the
+market-reset module composes both): a failure part-way through leaves the
+database unchanged, and no kill can land between the two halves. The re-seed
+reads the on-chain market name and the GHO metadata through the configured RPC,
+so a reset needs a working endpoint. `--dry-run` prints the per-table row counts
+the purge would remove and writes nothing. An unknown market name is refused
+rather than registered. Two resets of the same database cannot interleave — the
+second is refused with the lock path the first holds.
+
+```bash
+# Preview the blast radius
+apexbot aave reset --dry-run
+
+# Reset the market and re-sync it
+apexbot aave reset --name "Aave Ethereum Market"
+```
+
 ## Event Processing Details
 
 ### Reserve Initialization (`ReserveInitialized`)
@@ -169,7 +210,7 @@ Tracked from PoolConfigurator contract. Creates new asset entry with:
 - aToken and vToken addresses
 - Token implementation revisions (for encoding compatibility)
 
-**Data models updated**: `Erc20TokenTable`, `AaveV3AssetsTable`
+**Rust tables updated**: `erc20_tokens`, `aave_v3_assets`
 
 ### Reserve Data Update (`ReserveDataUpdated`)
 
@@ -180,13 +221,13 @@ Emitted from Pool when interest rates change. Updates:
 - `borrow_index`: Index for converting debt scaled balances
 - `last_update_block`: Block of last rate update
 
-**Data model updated**: `AaveV3AssetsTable`
+**Rust table updated**: `aave_v3_assets`
 
 ### User E-Mode Set (`UserEModeSet`)
 
 Emitted when user changes their efficiency mode category.
 
-**Data model updated**: `AaveV3UsersTable.e_mode`
+**Rust table updated**: `aave_v3_users.e_mode`
 
 ### Scaled Token Mint (`Mint`)
 
@@ -214,7 +255,7 @@ else:                             # _mintScaled - user action (supply/borrow)
 - `_burnScaled`: Add `event_value` directly as interest
 - All sources create user/position if needed
 
-**Data models**: `AaveV3UsersTable`, position tables, `AaveGhoTokenTable` for GHO
+**Rust tables**: `aave_v3_users`, position tables, and `aave_gho_tokens` for GHO
 
 ### Scaled Token Burn (`Burn`)
 
@@ -236,28 +277,28 @@ Only occurs for aTokens (collateral). Transfers scaled amount directly:
 - Increments recipient's collateral balance (creates user/position if needed)
 - Deletes sender's position if balance reaches zero
 
-**Data models updated**: `AaveV3UsersTable`, `AaveV3CollateralPositionsTable`
+**Rust tables updated**: `aave_v3_users`, `aave_v3_collateral_positions`
 
 ### Token Upgrade (`Upgraded`)
 
 When aToken or vToken implementation changes:
 - Detects which token type (aToken or vToken)
 - Queries new implementation for revision number
-- Updates revision in `AaveV3AssetsTable`
+- Updates revision in `aave_v3_assets`
 
-**Data model updated**: `AaveV3AssetsTable.a_token_revision` or `AaveV3AssetsTable.v_token_revision`
+**Rust table updated**: `aave_v3_assets.a_token_revision` or `aave_v3_assets.v_token_revision`
 
 ### GHO Discount Token Updated (`DiscountTokenUpdated`)
 
 Emitted when the discount token for GHO vToken changes.
 
-**Data model updated**: `AaveGhoTokenTable.v_gho_discount_token`
+**Rust table updated**: `aave_gho_tokens.v_gho_discount_token`
 
 ### GHO Discount Rate Strategy Updated (`DiscountRateStrategyUpdated`)
 
 Emitted when the discount rate strategy for GHO vToken changes. The strategy calculates discount percentages based on user's GHO debt and discount token balances.
 
-**Data model updated**: `AaveGhoTokenTable.v_gho_discount_rate_strategy`
+**Rust table updated**: `aave_gho_tokens.v_gho_discount_rate_strategy`
 
 ## Error Handling & Validation
 
@@ -369,7 +410,7 @@ the mode per token revision + operation.
 
 ## Writer implementation
 
-The Aave V3 writer is **Rust-owned** (`apexbot-aave` core crate). The per-market chunk loop, RPC fetch+decode, DB writes, the per-chunk transaction, and the on-chain-truth verification all live in the Rust core, driven from the `apexbot aave update` arm of the Rust console (`apexbot-cli-core`; the Python driver reaches the same work through the `run_aave_update` PyO3 seam). The former Python writer pipeline (`update_aave_market`, `event_handlers._process_*`, `transaction_processor`/`operations_parser`/`token_processor`, `db_*.py`, the `verify_*` Python invariants) was retired by the §4.2 cutover (task `CZM7TI`) after the Rust path was proven GREEN to the live chain tip with full verification. The `Event Processing Details` and `Algorithm Details` sections above describe domain behavior that remains accurate; the implementation now lives in `rust/crates/apexbot-aave/`.
+The Aave V3 writer is **Rust-owned** (`apexbot-aave` core crate). The per-market chunk loop, RPC fetch+decode, DB writes, the per-chunk transaction, and the on-chain-truth verification all live in the Rust core, driven from the `apexbot aave update` arm of the Rust console (`apexbot-cli-core`; the Python driver reaches the same work through the `run_aave_update` PyO3 seam). The former Python writer pipeline (`update_aave_market`, `event_handlers._process_*`, `transaction_processor`/`operations_parser`/`token_processor`, `db_*.py`, the `verify_*` Python invariants) was retired by the §4.2 cutover (task `CZM7TI`) after the Rust path was proven GREEN to the live chain tip with full verification. The `Event Processing Details` and `Algorithm Details` sections above describe domain behavior that remains accurate; the implementation now lives in `rust/crates/integrations/apexbot-aave/`.
 
 ## Configuration
 
@@ -394,7 +435,7 @@ The command uses Web3 connections from the apexbot config file. Each active chai
 
 ## Dependencies
 
-- **Database**: SQLAlchemy ORM (see `src/apexbot/database/models/aave.py`)
+- **Database**: Rust `apexbot-db` owner, consumed through the stable `apexbot.db` Python mirror
 - **Blockchain**: Web3.py for RPC calls
 - **Math**: Rust `apexbot-aave::wad_ray_math` for scaled balance calculations with rounding mode support (the former Python `aave/libraries/` package was retired)
 - **Logging**: the Rust console (`apexbot-cli`) renders operator output; the Rust core emits throttled `log`-level operator progress lines
@@ -402,7 +443,7 @@ The command uses Web3 connections from the apexbot config file. Each active chai
 
 ## Solidity Reference
 
-The CLI interacts with Aave V3 contracts. Key implementation details in `rust/crates/apexbot-aave/src/updater/` + `apexbot-aave::wad_ray_math`:
+The CLI interacts with Aave V3 contracts. Key implementation details in `rust/crates/integrations/apexbot-aave/src/updater/` + `apexbot-aave::wad_ray_math`:
 
 ### Scaled Balance Pattern
 

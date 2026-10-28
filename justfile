@@ -1,9 +1,44 @@
 # Justfile for apexbot development
 # https://github.com/casey/just
 
+# Cargo target directory — per-environment, like UV_PROJECT_ENVIRONMENT and
+# PYTHONPYCACHEPREFIX. The repo is bind-mounted between host and container, so a
+# shared target dir makes the two sides fight over cargo fingerprints and
+# artifacts; point each environment at its own dir (container: devcontainer.json;
+# host: .envrc). Defaults to rust/target for CI and a bare checkout.
+target_dir := env_var_or_default("CARGO_TARGET_DIR", "rust/target")
+
+# The project-venv command prefix. `--no-sync` skips uv's project build so
+# `uv run` does not re-link the extension before every recipe; a plain `uv sync`
+# now builds the same dev-features extension (pyproject.toml
+# `config-settings-package`), so this is a speed choice, not a correctness
+# guard. Defined once so recipes never hand-write the flag.
+# Recipe argv reaches the body as real positional parameters, so "$@"
+# forwards each argument exactly as the caller typed it (a `{{ args }}` text
+# splice re-splits quoted words in bash and silently runs the wrong thing).
+set positional-arguments := true
+
+py_run := "uv run --no-sync"
+
 # Default recipe - show available commands
 default:
     @just --list
+
+
+# Print the current environment's virtualenv path (host or container, whichever
+# is active — uv resolves it from UV_PROJECT_ENVIRONMENT or a local .venv).
+venv:
+    @{{ py_run }} python -c 'import sys; print(sys.prefix)'
+
+
+# Run a command against the project venv without hand-writing `--no-sync`
+# (ad-hoc use; recipes should use `{{ py_run }}` directly, which preserves
+# argument quoting).
+py *args:
+    # argv is forwarded word-for-word through "$@"; a text splice of the raw
+    # args would re-parse the joined text in bash (`just py python -c 'x=f(1)'`
+    # used to die at the paren).
+    {{ py_run }} "$@"
 
 # Print the project's single source-of-truth version (the [workspace.package]
 # literal in rust/Cargo.toml, inherited by every crate + bridged into the wheel
@@ -21,7 +56,7 @@ version:
 # Bump every crate to a new SEMVER version in one atomic edit (ADR-009 lockstep).
 # cargo-edit updates the [workspace.package] literal, every inherited [package]
 # version, every internal [workspace.dependencies] requirement, and Cargo.lock —
-# the 1-vs-21 drift that felled the 0.6.0-alpha.6 crates.io publish is impossible
+# version drift that felled the 0.6.0-alpha.6 crates.io publish is impossible
 # here. Pass the crates.io SEMVER form (0.6.0-alpha.7), not the PEP440 tag form
 # (0.6.0a7). Requires cargo-edit: cargo install cargo-edit
 bump-version version:
@@ -36,142 +71,406 @@ bump-version version:
 
 # ========== Rust Development ==========
 
+# Local Cargo and maturin development builds intentionally use the workspace
+# [profile.dev]: opt-level = 1, no LTO or stripping, and line-tables-only debug
+# info. This favors representative optimization while keeping rebuilds cheaper
+# than release. Release builds keep thin LTO, stripping, and the intentional
+# per-package codegen-unit policy documented in rust/Cargo.toml.
+
+# Build the native Tauri AppImage for the GUI proof of concept. The app-local
+# npm script supplies the AppImage extraction and linuxdeploy NO_STRIP settings
+# required by modern Fedora ELF libraries.
+tauri-appimage:
+    cd apps/tauri-poc && npm run appimage
+
+# Print the active Rust toolchain and the repository policy. The root
+# rust-toolchain.toml pins development and release builds to Rust 1.98.1;
+# the workspace MSRV is Rust 1.97, checked by `just check-msrv` (CI's msrv job).
+toolchain:
+    @echo "Pinned Rust policy: 1.98.1 (workspace MSRV: 1.97)"
+    @rustc --version
+    @cargo --version
+
+# Classify the active toolchain against the workspace contract and enforce its
+# floor. Tiers, not a hard pin: any toolchain meeting the MSRV certifies the
+# portable contract (build, tests, architecture gates, clippy's deny-by-default
+# lints), while the strict lint/format layer is the reference channel's verdict
+# and runs in CI — a compliant contributor's toolchain vintage must never fail a
+# gate. Classification lives in scripts/toolchain_tier.sh (one owner).
+check-toolchain:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tier="$(scripts/toolchain_tier.sh)"
+    echo "toolchain: $tier tier certified"
+
+# Resolves the reth-vs-anvil ambiguity behind tests reporting an anvil
+# conclusion from a reth response. Ask the node; never infer from PATH.
+# Measured shape matrix and sim-gate implications: /skill:node-identity
+node-identity:
+    @curl -s -X POST -H 'content-type: application/json' \
+        --data '{"jsonrpc":"2.0","id":1,"method":"web3_clientVersion","params":[]}' \
+        "${TEST_ETHEREUM_FULL_NODE_HTTP_URI:?set TEST_ETHEREUM_FULL_NODE_HTTP_URI}"
+
 # Run the standalone-Rust-consumer smoke (ADR-005 standalone claim). Proves a
 # `cargo add apexbot` consumer reaches BotState/DexIdentity/calc math with no
 # Python in the build graph. `examples/standalone_consumer.rs` panic!s on any
 # check failure, so this is the standalone-consumer gate. The example is a
 # `cargo add apexbot` showcase binary AND a CI-runnable assertion.
 test-standalone:
-    cargo run --manifest-path rust/Cargo.toml -p apexbot --example standalone_consumer
-    # MROOY7 5WTYYQ: the WS-ingestion crate's headless boot (no Python, no net).
-    cargo run --manifest-path rust/Cargo.toml -p apexbot-ingestion --example headless_boot
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot --example standalone_consumer
+    # The WS-ingestion crate's headless boot (no Python, no net).
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot-ingestion --example headless_boot
 
 # ========== Tests ==========
 #
 # "Run the tests" is no longer a language choice: Python is a driver shell over
 # the Rust core, so the default gate runs BOTH the native Rust suite and the
 # full pytest suite (which itself drives the core through the PyO3 seam, golden
-# on-chain-oracle replay, and the wrapped `tests/rust`) under one entrypoint.
+# on-chain-oracle replay, and the relocated seam suites) under one entrypoint.
 # CI and the pre-push hook still address the language tracks directly
 # (`test-rust` / `test-python`) so the python-version matrix and job
 # partitioning keep working. Deliberately excluded from `test` (run on demand):
 # toolchain-gated Tier-3 harness rebuilds (`test-tier3` / `verify-tier3-*`) and
-# net-gated suites (`record-golden`, `verify-deployments`).
+# net-gated suites (`test-fork`, `record-golden`, `verify-deployments`).
 
-# Default gate: standalone smoke + cargo workspace + full pytest.
-test: test-rust test-python
+# Default gate: workspace lint (fails fast) + standalone smoke + cargo workspace + full pytest.
+test: lint-rust-check test-rust-nextest test-python check-consumer-probes
 
-# Run every pre-push gate manually, in hook order and fail-fast — the
-# object-DB GC brake, the commitlint push-range re-lint, then the Rust/Python
-# code linters, then the
-# Rust and Python build + test tracks, exactly as the installed prek pre-push
-# hook runs them (prek.toml, stages = ["pre-push"]). The installed hook and
-# ci.yml stay authoritative on an actual push; this is for checking the gates
-# with `just pre-push` before `git push`.
-#
-# Manual pre-push gate check (mirrors prek.toml pre-push stage, fail-fast).
+# Run the pre-push gates before `git push`. prek.toml's
+# `stages = ["pre-push"]` entries are the single owner of the gate list (the
+# push-gate manifest, ADR-074); this recipe only delegates to them, so it can
+# never drift into a shorter list that reports green while the push is blocked
+# by a gate the recipe never ran. prek is a global uv tool (see
+# `just setup-git-hooks`), installed on demand here.
 pre-push:
     #!/usr/bin/env bash
     set -euo pipefail
-
-    run_gate() {
-        local label="$1"
-        shift
-        echo
-        echo "===================================================================="
-        echo "▶ pre-push gate: ${label}"
-        echo "===================================================================="
-        "$@"
-    }
-
-    run_gate "Object DB GC"            scripts/hooks/object-gc.sh
-    run_gate "commitlint (push range)" scripts/hooks/commitlint-push.sh
-    run_gate "Rust clippy"             just lint-rust-check
-    run_gate "Python lint"             just lint-python-check
-    run_gate "Rust build"              just build-rust-extension
-    run_gate "Rust tests"              just test-rust
-    run_gate "Python build (maturin)"  just dev
-    run_gate "Python tests"            just test-python
-
-    echo
-    echo "✓ all pre-push gates passed."
+    command -v prek >/dev/null 2>&1 || uv tool install prek
+    prek run --stage pre-push
 
 # Run only the Rust track (standalone smoke + cargo workspace). CI's rust-test
 # job and the pre-push hook call this subunit directly; humans use `just test`.
-test-rust: test-standalone
+test-rust: check-toolchain test-standalone
     #!/usr/bin/env bash
-    python_libdir="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    set -euo pipefail
+
+    # The venv python's LIBDIR for LD_LIBRARY_PATH (dep-crate test binaries
+    # link libpython). BEST-EFFORT BY CONTRACT, unlike the rest of this recipe
+    # (which fails closed): this is the CI rust job's entrypoint and that job
+    # has no `uv`; an omitted probe just lets rust-lld autoprobe a LIBDIR.
+    # Tolerated ONLY here -- `test-rust-nextest` and the coverage recipe are
+    # uv-required by design and stay strict.
+    python_libdir=""
+    if command -v uv >/dev/null 2>&1; then
+        python_libdir="$({{ py_run }} python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))' || true)"
+    else
+        echo "note: uv not found; skipping the python-libdir probe (best-effort)" >&2
+    fi
     export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     # vendored deployments.json (apexbot-uniswap) must match the canonical
-    # Python-tree registry file byte-for-byte (TGO5ZY: a crate can only
-    # embed in-tarball files, so the embed uses the in-crate mirror)
-    cmp -s src/apexbot/registry/deployments.json rust/crates/apexbot-uniswap/src/deployments.json || { echo 'ERROR: deployments.json vendor drift (canonical vs apexbot-uniswap mirror)' >&2; exit 1; }
-    cargo test --manifest-path rust/Cargo.toml --workspace
+    # Python-tree registry file byte-for-byte: a crate can only embed
+    # in-tarball files, so the embed uses the in-crate mirror
+    cmp -s src/apexbot/registry/deployments.json rust/crates/foundation/apexbot-uniswap/src/deployments.json || { echo 'ERROR: deployments.json vendor drift (canonical vs apexbot-uniswap mirror)' >&2; exit 1; }
+    # The fixture-corpus features ride every workspace lane (ADR-084 D3): the
+    # corpora stay EXECUTED here, never silently skipped behind required-
+    # features, and the assertion-free green exit of a zero-match filter can
+    # not hide a lost corpus.
+    cargo test --locked --manifest-path rust/Cargo.toml --workspace --features apexbot-pools/capture-fixtures,apexbot-bot/executor-ab-probe
+
+# Reproduce CI's test-binary build exactly (ci.yml sets these two globally):
+# a crate-private fn's LAYOUT can depend on profile flags -- the ADR-071 D3
+# entry-row identity gate failed in CI under exactly these while passing
+# locally (2026-10-14). Any "passes here, fails in CI" suspicion gets
+# reproduced with this recipe before anything else is theorized.
+test-rust-ci:
+    CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 just test-rust
+
+
+# The fleet budget-algebra (pure plan/budget tiering) and the
+# binding-parity gates (pinned-vs-serial outcome-corpus identity). NAMED so a
+# fleet-tier regression is readable in any check log, CI's or the hook's.
+test-fleet-parity:
+    cd rust && cargo test --locked -p apexbot-workers -- plan budget
+    # executor-ab-probe: the outcome corpus lives in a feature-gated island
+    # (ADR-084 D3) — without the feature this filter would match zero tests
+    # and exit green over a silently skipped corpus.
+    cd rust && cargo test --locked -p apexbot-bot --features executor-ab-probe -- the_outcome_corpus lane_death
+
+
+# Two-sided golden replay gate (offline, seconds): profit under/over-shoot and
+# nondeterminism across reps, on the single-block anchor + the 156-row heavy
+# corpus. Blocks merge in CI; named here so the pre-push gate runs it too.
+test-golden-replay:
+    cd rust && cargo run --locked -q -p apexbot-pools --features capture-fixtures --example concentrated_liquidity_solve_replay -- crates/foundation/apexbot-pools/tests/fixtures/concentrated_liquidity_capture_offline.jsonl
+    cd rust && cargo run --locked -q -p apexbot-pools --features capture-fixtures --example concentrated_liquidity_solve_replay -- crates/foundation/apexbot-pools/tests/fixtures/heavy_concentrated_liquidity_solve_captures.jsonl
+
+
+# Run the cargo workspace suite under cargo-nextest: per-process test
+# isolation, cross-binary parallelism, and per-test durations as JUnit XML at
+# <cargo target dir>/nextest/ci/nextest-ci.junit.xml. `--no-fail-fast` so one failing
+# test never aborts the whole run.
+# Requires cargo-nextest: cargo install --locked cargo-nextest
+# Extra args forward to `cargo nextest run` (e.g. `just test-rust-nextest -E 'test(foo) or test(bar)'`
+# or `just test-rust-nextest -p apexbot-substrate`). They cross the recipe
+# boundary as real argv (`"$@"` under `set positional-arguments`), so quoted
+# multi-word filters keep their grouping and parens are never bash-parsed.
+# `-p`/`--package` must ALSO drop the trailing `--workspace`: nextest gives
+# --workspace precedence and silently runs every workspace member when both
+# selections are present, so the documented `-p <crate>` narrowing would never
+# narrow.
+test-rust-nextest *args: check-toolchain
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python_libdir="$({{ py_run }} python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # argv rides "$@" — each flag and its value reach cargo intact (`-p <crate>`,
+    # `-E 'test(a) or test(b)'`). `-p`/`--package` must ALSO drop the trailing
+    # `--workspace`: nextest gives --workspace precedence and silently runs
+    # every workspace member when both selections are present.
+    selection="--workspace"
+    for arg in "$@"; do
+        case "$arg" in
+            -p|--package|--package=*) selection="" ;;
+        esac
+    done
+    # Fixture-corpus features ride every lane (ADR-084 D3): the golden corpora
+    # are executed here, never silently skipped behind required-features.
+    cargo nextest run --locked --manifest-path rust/Cargo.toml $selection --profile ci --no-fail-fast --features apexbot-pools/capture-fixtures,apexbot-bot/executor-ab-probe "$@"
+
+# Run the fork/RPC-gated suites — the legs every offline gate (test, pre-push,
+# CI) deliberately deselects:
+#   - the pytest live-RPC tiers (`online_rpc` / `base`, minus `slow`);
+#   - the Rust live revm fork-truth legs: the `#[ignore]`d `live_*` tests in
+#     apexbot-simulation, gated on the chain-1 endpoint env family
+#     `APEXBOT_RPC_HTTP_CHAINID_1` (exported here from the probe target).
+# Fails CLOSED unless the machine DECLARES an endpoint (process env or the
+# gitignored tests.env, resolved through tests/conftest.py: env > tests.env >
+# table default — the same layers the pytest legs dial, so the probe can never
+# green-light one machine while the tests hit another) AND that endpoint answers
+# eth_chainId (probe, don't assume). The conftest table default is not a lane
+# declaration: it serves the offline suite's imports. The devcontainer's reth
+# satisfies both (containerEnv sets http://host.containers.internal:8545/, WS
+# :8546); any reachable archive endpoint works.
+# On demand only: minutes of live-RPC work, never in `test` / pre-push / CI.
+test-fork: dev
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Resolve the probe target through tests/conftest.py's declared layers so
+    # this gate dials exactly what the pytest legs dial.
+    rpc_uri="$({{ py_run }} python -c 'from tests.conftest import declared_rpc_uri; print(declared_rpc_uri("TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI") or "")')"
+    if [ -z "$rpc_uri" ]; then
+        echo "ERROR: no RPC declared — set TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI (process env or tests.env) to a reachable Ethereum endpoint" >&2
+        echo "       (the devcontainer sets http://host.containers.internal:8545/ for its reth)" >&2
+        exit 1
+    fi
+    chain_id=""
+    chain_id="$(curl -sS -m 10 -X POST -H 'Content-Type: application/json' \
+        --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' "$rpc_uri")" \
+        || chain_id=""
+    if [[ ! $chain_id == *'"result"'* ]]; then
+        echo "ERROR: no reachable Ethereum RPC at TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI=$rpc_uri" >&2
+        echo "       (eth_chainId response: ${chain_id:-<none>}) — start the node or re-point the URI" >&2
+        exit 1
+    fi
+    echo "▶ fork lane RPC: $rpc_uri (chain $({{ py_run }} python -c 'import json,sys; print(int(json.load(sys.stdin)["result"], 16))' <<<"$chain_id"))"
+    echo
+    echo "▶ pytest fork legs: -m '(online_rpc or base) and not slow'"
+    pytest_rc=0
+    {{ py_run }} pytest -m '(online_rpc or base) and not slow' -q --no-header || pytest_rc=$?
+    echo
+    echo "▶ Rust live revm fork legs: apexbot-simulation live_* (run-ignored only)"
+    rust_rc=0
+    APEXBOT_RPC_HTTP_CHAINID_1="$rpc_uri" cargo nextest run --locked --manifest-path rust/Cargo.toml \
+        -p apexbot-simulation -E 'test(live_)' --run-ignored only --no-fail-fast || rust_rc=$?
+    echo
+    # Both legs always run: a failing first leg must not starve the lane of
+    # the second leg's evidence. The lane still fails closed on any leg.
+    if [ "$pytest_rc" -ne 0 ] || [ "$rust_rc" -ne 0 ]; then
+        echo "✗ fork lane FAILED (pytest exit ${pytest_rc}, rust exit ${rust_rc})" >&2
+        exit $(( pytest_rc != 0 ? pytest_rc : rust_rc ))
+    fi
+    echo "✓ fork lane complete."
+
+# Rank the slowest tests from the last `just test-rust-nextest` JUnit report.
+test-timing top='30':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ py_run }} python - <<'EOF'
+    import statistics, xml.etree.ElementTree as ET
+    top = int("{{top}}")
+    tree = ET.parse("{{ target_dir }}/nextest/ci/nextest-ci.junit.xml")
+    cases = sorted(
+        ((float(tc.get("time")), f"{tc.get('classname')}. {tc.get('name')}") for tc in tree.iter("testcase")),
+        reverse=True,
+    )
+    serial = sum(d for d, _ in cases)
+    slow = [c for c in cases if c[0] >= 1.0]
+    print(f"tests: {len(cases)}  serial sum: {serial:.1f}s  median: {statistics.median(d for d, _ in cases)*1000:.1f}ms")
+    print(f"tests >= 1s: {len(slow)}  combined: {sum(d for d, _ in slow):.1f}s ({100*sum(d for d, _ in slow)/serial:.0f}% of serial time)")
+    for d, name in cases[:top]:
+        print(f"  {d:8.3f}s  {name}")
+    EOF
+
+# The replay bench (GLOSSARY “replay bench”, ADR-068 D6): the ONE
+# command reproducing the updater per-chunk baseline — the real chunk loops
+# over the committed seed cassettes through the replay transport (zero
+# network), reporting RPC round trips + response bytes, SQL statement count,
+# stage wall times, the write-lock hold, and chunks/sec. The table this
+# prints is the survey doc's Baseline section (docs/updater-rpc-sql-survey.md);
+# the Perf A–E tasks re-rank against it. Uses the bench profile (release-like).
+bench-updaters:
+    cargo bench --locked --manifest-path rust/Cargo.toml -p apexbot --features apexbot/sql-ledger --bench updater_replay_bench
+
+# The wave-2 EVM-oracle capture generator's gate: regenerate the
+# wave-2 cassettes + SQL goldens into a temp home and exit 1 on any byte
+# drift against the committed artifacts. The example only builds under the
+# `sql-ledger` passthrough (its [[example]] required-features, same shape as
+# the updater_replay_bench [[bench]] entry above) — this recipe is the one
+# command that carries the feature.
+check-evm-captures:
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot --features apexbot/sql-ledger --example generate_evm_oracle_captures -- --check tests/fixtures/cassettes/wave2 tests/fixtures/sql_goldens/wave2
+
+# The wave-3 aave-side adversarial capture generator's gate: the
+# same drift gate as check-evm-captures over the wave-3 fixture homes.
+check-aave-captures:
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot --features apexbot/sql-ledger --example generate_aave_adversarial_captures -- --check tests/fixtures/cassettes/wave3 tests/fixtures/sql_goldens/wave3
 
 # crates.io publish oracle (crates-io-publishing-prep handoff §2, gate G1):
 # verification-builds every publishable workspace member in dependency order.
 # ~20-40 min cold. CI's PR gate (check-publish) runs the clean-tree form.
-publish-dry-run:
+publish-dry-run *args:
     #!/usr/bin/env bash
     set -euo pipefail
     cd rust
-    cargo publish --workspace --dry-run --allow-dirty
+    cargo publish --locked --workspace --dry-run --allow-dirty {{ args }}
 
-# Run Rust linter (clippy)
-lint-rust:
-    cargo clippy --fix --all-targets --all-features --allow-dirty --manifest-path rust/Cargo.toml -- --deny warnings
+# Which publishable members are live on crates.io at the workspace version, and
+# which are not — the audit the release workflow's crates.io leg runs before every
+# upload round. The oracle is the crates.io sparse index (what `cargo publish`
+# gates on), not `cargo search`, whose backend lags publication. Prints pending
+# members; pass `--live` or `--classify` for the other views.
+crates-io-pending *args:
+    scripts/crates_io_pending.sh "$@"
 
-# Lint Rust (check-only; non-mutating). Mirrors the clippy gate CI runs,
-# minus `--fix`, so a pre-commit run cannot dirty staged files. Stricter than
-# CI's `lint-rust`: fails on any warning `--fix` would have auto-applied.
-lint-rust-check: check-no-inner-allow check-engine-impl-blocks check-cli-shell-purity
-    cargo clippy --all-targets --all-features --manifest-path rust/Cargo.toml -- --deny warnings
+# Authoritative CI/pre-push Clippy gate. It deliberately checks default
+# features without `--all-features`, so test-only and mutually exclusive build
+# variants cannot hide a default regression; it runs the architecture subset
+# first, matching CI exactly, and never edits the tree.
+# Run the non-mutating Rust Clippy check (CI-identical gate).
+# Default Rust lint lane, tier-aware (scripts/toolchain_tier.sh): on the
+# reference toolchain this is CI-identical (`--deny warnings`); on any other
+# supported toolchain it runs clippy's deny-by-default floor only, because the
+# lint surface drifts with the toolchain and CI is the strict authority.
+lint-rust-check: check-toolchain check-no-inner-allow check-engine-impl-blocks check-cli-shell-purity check-config-derived-statics check-capability-catalog check-dependency-charter
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tier="$(scripts/toolchain_tier.sh)"
+    if [ "$tier" = "strict" ]; then
+        cargo clippy --locked --workspace --all-targets --manifest-path rust/Cargo.toml -- --deny warnings
+    else
+        cargo clippy --locked --workspace --all-targets --manifest-path rust/Cargo.toml
+    fi
+
+# Default Rust lint lane: a CI-identical, non-mutating alias of
+# `lint-rust-check`, so a green run here is exactly what CI will accept.
+# Run the default non-mutating Rust Clippy check (alias of `lint-rust-check`).
+lint-rust: lint-rust-check
+
+# Opt-in Rust lint auto-fixer. It MUTATES the working tree (`clippy --fix`) and
+# is never part of a default gate; re-run `just lint-rust` afterwards to confirm
+# the tree passes the non-mutating CI check.
+# Auto-fix Rust lint findings (mutates the tree; opt-in only).
+lint-rust-fix:
+    cargo clippy --locked --workspace --fix --all-targets --allow-dirty --manifest-path rust/Cargo.toml -- --deny warnings
+
+# Check every workspace member with its declared default features. This is the
+# independent default-feature check; it is not an all-features build.
+check-rust-default:
+    cargo check --locked --workspace --all-targets --manifest-path rust/Cargo.toml
+
+# Check the pure-Rust umbrella consumer surface, including its standalone
+# examples, without selecting the PyO3 binding crate.
+check-rust-consumer:
+    cargo check --locked -p apexbot --all-targets --manifest-path rust/Cargo.toml
+
+# Check the binding crate with its intentionally broad default domain surface,
+# but without the extension-module link mode.
+check-rust-binding-default:
+    cargo check --locked -p apexbot_rs --all-targets --manifest-path rust/Cargo.toml
+
+# Check the dev-wheel feature set. Keep this explicit: these profiling,
+# telemetry, allocator, and allocator-selection features are development-only
+# and are not part of the release-wheel or standalone-default matrix.
+check-rust-dev-features:
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$(scripts/build_extension.sh rustflags)" cargo check --locked -p apexbot_rs --all-targets --manifest-path rust/Cargo.toml --features dev-features
+
+# Check the release-equivalent extension feature set in the release profile.
+# The release maturin command uses `pyo3/extension-module`; this package feature
+# forwards to the same PyO3 feature while retaining the binding crate defaults.
+check-rust-extension-release:
+    cargo check --locked --release -p apexbot_rs --lib --manifest-path rust/Cargo.toml --features extension-module
+
+# Exhaustive all-features compilation is an explicit diagnostic, not the
+# default gate. It intentionally includes test-only and mutually exclusive
+# variants and must never be used to validate default or release behavior.
+check-rust-all-features:
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$(scripts/build_extension.sh rustflags)" cargo check --locked --workspace --all-targets --all-features --manifest-path rust/Cargo.toml
+
+# Hotpath test lane. Tokio's full RuntimeMetrics getters sit behind the
+# unstable API and there is no global rustflag, so any direct hotpath
+# Cargo/maturin invocation must set the cfg explicitly. Extra args forward to
+# `cargo test` (e.g. `just test-hotpath -- frame_pipeline`).
+# Canonical form; do not hand-type the RUSTFLAGS.
+test-hotpath *args:
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$(scripts/build_extension.sh rustflags)" cargo test --locked --manifest-path rust/Cargo.toml -p apexbot-bot --features hotpath {{ args }}
 
 # Forbid file-level inner "#![allow]" - clippy's allow_attributes catches only the
 # outer #[allow] form; this closes the historical inner-attribute loophole it
 # misses. One reasoned outer #[allow(..., reason = "...")] remains permitted for
 # the legitimate cross-target conditional suppressions #[expect] cannot express.
-check-no-inner-allow:
-    @command -v rg >/dev/null 2>&1 || { echo "ERROR: ripgrep (rg) is required for check-no-inner-allow" >&2; exit 1; }
-    @if rg -n '#!\[allow\(' rust/crates -g '*.rs'; then \
-        echo "ERROR: inner #![allow] is forbidden - use #[expect], or a reasoned outer #[allow] for cross-target conditionals" >&2; \
-        exit 1; \
-    else \
-        echo "ok: no inner #![allow] in Rust sources"; \
-    fi
-
-# Check Rust formatting (read-only; fails on drift). Run `just format` to fix.
-fmt-check:
-    cargo fmt --manifest-path rust/Cargo.toml --all -- --check
-
-# Enforce the no-pyo3-in-core invariant (Plan 103). Pure Rust core crates must
-# not depend on pyo3 under their default features. Add new core crates here.
-check-no-pyo3-in-cores:
+# The MSRV compile check CI runs (the `msrv` job): the whole workspace at the
+# `rust-version` floor, all targets. Local name for the job's raw command.
+check-msrv:
     #!/usr/bin/env bash
     set -euo pipefail
-    for crate in apexbot-core apexbot-math apexbot-abi apexbot-rpc apexbot-ingestion apexbot-bot apexbot-cli apexbot-cli-core apexbot-decoders apexbot-uniswap apexbot-pathfinding apexbot apexbot-price apexbot-db apexbot-pool-updater apexbot-aave apexbot-execution apexbot-executor apexbot-submission apexbot-simulation apexbot-pools apexbot-solvers apexbot-order-index apexbot-arbitrage apexbot-fork apexbot-execution-sample; do
-        if cargo tree --manifest-path rust/Cargo.toml -p "$crate" 2>/dev/null | grep -qi 'pyo3 v'; then
-            echo "ERROR: $crate pulls pyo3 under default features (must be feature-gated)." >&2
-            exit 1
-        fi
-    done
-    echo "OK: core crates + umbrella are pyo3-free under default features"
-
-check-cli-core-purity:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # ADR-051 D1/D2: apexbot-cli-core is the semantics home both front ends map
-    # into. It must stay clap-free (argv spelling is the facade's job) and
-    # indicatif-free (progress rendering is the facade's job). Mirrors
-    # check-no-pyo3-in-cores: walk the resolved dep graph, not just the manifest.
-    tree=$(cargo tree --manifest-path rust/Cargo.toml -p apexbot-cli-core --prefix none 2>/dev/null)
-    offenders=$(printf '%s\n' "$tree" | sed 's/ (.*//' | awk '{print $1}' | grep -E '^(clap|clap_derive|clap_builder|indicatif)$' || true)
-    if [ -n "$offenders" ]; then
-        echo "ERROR: apexbot-cli-core must not depend on clap or indicatif (ADR-051 D1/D2)." >&2
-        printf '%s\n' "$offenders" >&2
+    # Fail CLOSED with a clear reason when `cargo +toolchain` cannot work
+    # (cargo not proxied by rustup). Never fall back to the active toolchain:
+    # compiling at 1.98.1 and calling it the MSRV would report a false green.
+    if ! cargo +1.97.0 --version >/dev/null 2>&1; then
+        echo "ERROR: the MSRV check needs rustup with the 1.97.0 toolchain (rustup toolchain install 1.97.0);" >&2
+        echo "this cargo does not accept +toolchain directives. CI's msrv job runs this check." >&2
         exit 1
     fi
-    echo "OK: apexbot-cli-core is clap-free and indicatif-free"
+    cargo +1.97.0 check --manifest-path rust/Cargo.toml --workspace --all-targets --locked
+
+
+check-no-inner-allow:
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- no_inner_allow_attributes --exact --nocapture
+
+# Check Rust formatting (read-only; fails on drift). Run `just format` to fix.
+fmt-check: check-toolchain
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo fmt --manifest-path rust/Cargo.toml --all -- --check || {
+        echo "fmt-check: the diff above is this rustfmt's verdict. The reference formatter" >&2
+        echo "  is the pinned channel's rustfmt (rust-toolchain.toml). If 'just format'" >&2
+        echo "  under it produces no diff, this is a formatter-version artifact." >&2
+        exit 1
+    }
+
+# Enforce the no-pyo3-in-core invariant. Pure Rust core crates must
+# not depend on pyo3 under their default features. Add new core crates here.
+check-no-pyo3-in-cores:
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- core_crates_are_pyo3_free_under_default_features --exact --nocapture
+
+check-cli-core-purity:
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- cli_core_is_clap_and_indicatif_free --exact --nocapture
 
 # Enforce the ADR-051 D2 dependency charter for the argv facade: `apexbot-cli`
 # may name workspace members (the clap-free semantics crate + the sink crates)
@@ -181,39 +480,15 @@ check-cli-core-purity:
 # maps argv into `apexbot-cli-core` and must never reach a domain-engine crate
 # on its own. Mirrors check-cli-core-purity / check-no-pyo3-in-cores.
 check-cli-shell-purity:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    manifest=rust/crates/apexbot-cli/Cargo.toml
-    [ -f "$manifest" ] || { echo "ERROR: $manifest not found" >&2; exit 1; }
-    # The declared allowlist: the facade's argv/interaction/sink plumbing.
-    allow='^(clap|indicatif|tokio|tracing|tracing-subscriber)$'
-    # Walk the dependency tables the crate may name. A workspace member
-    # (`.workspace = true`) is always allowed; every other entry must be on the
-    # allowlist. dev-dependencies are covered too - the charter is about what
-    # the crate may name, not only what the binary links.
-    offenders=$(awk '
-        /^\[(dependencies|build-dependencies|dev-dependencies)\]/ { in_deps = 1; next }
-        /^\[/ { in_deps = 0; next }
-        in_deps && /^[A-Za-z0-9_-]+[[:space:]]*=/ {
-            if ($0 ~ /workspace[[:space:]]*=[[:space:]]*true/) next
-            name = $1
-            sub(/[[:space:]]*=.*/, "", name)
-            print name
-        }
-    ' "$manifest" | grep -Ev "$allow" || true)
-    if [ -n "$offenders" ]; then
-        echo "ERROR: apexbot-cli may depend only on workspace members + the argv/sink allowlist (ADR-051 D2)." >&2
-        echo "  allowlist: clap, indicatif, tokio, tracing, tracing-subscriber" >&2
-        printf '  offender: %s\n' $offenders >&2
-        exit 1
-    fi
-    echo "OK: apexbot-cli lists only workspace members + argv/sink plumbing"
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- cli_shell_names_only_allowlisted_externals --exact --nocapture
 
 
-# Structural gate for epic 5TBT7L (arch review #11, candidate 2): the engine
+# Structural gate: the engine
 # seam deepens until `EngineStages` is the ONE external driver surface and
 # every `impl ArbitrageEngine` block outside `arb_engine/mod.rs` is dissolved.
-# T6 flipped it GREEN and wired it into the Rust hygiene set
+# Wired into the Rust hygiene set
 # (`lint-rust-check` + the `rust-engine-impl-blocks` pre-commit hook + CI).
 # The `{` anchor keeps the prose mention of `impl ArbitrageEngine` in
 # mod.rs's module-tree comment from being counted as a block.
@@ -224,131 +499,206 @@ check-cli-shell-purity:
 #      pyclass `name = "ArbitrageEngine",` compat string (the deliberate
 #      Python-API name exemption). Any other hit is a seam regression.
 check-engine-impl-blocks:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    command -v rg >/dev/null 2>&1 || { echo "ERROR: ripgrep (rg) is required for check-engine-impl-blocks" >&2; exit 1; }
-    matches=$(rg -n 'impl ArbitrageEngine\s*\{' rust/crates/apexbot-bot/src || true)
-    count=$(printf '%s\n' "$matches" | grep -c 'impl ArbitrageEngine' || true)
-    if [ "$count" -ne 1 ] || ! printf '%s\n' "$matches" | grep -q 'arb_engine/mod.rs'; then
-        echo "ERROR: 'impl ArbitrageEngine' is not consolidated to arb_engine/mod.rs (epic 5TBT7L)." >&2
-        echo "  expected exactly 1 block, in arb_engine/mod.rs; found $count" >&2
-        echo "  census (file: blocks):" >&2
-        printf '%s\n' "$matches" | cut -d: -f1 | sort | uniq -c | awk '{printf "    %s: %s\n", $2, $1}' >&2
-        echo "  matches:" >&2
-        printf '%s\n' "$matches" >&2
-        exit 1
-    fi
-    py_matches=$(rg -n 'ArbitrageEngine' rust/crates/apexbot-python/src || true)
-    if [ -z "$py_matches" ]; then
-        py_count=0
-    else
-        py_count=$(printf '%s\n' "$py_matches" | grep -c 'ArbitrageEngine' || true)
-    fi
-    if [ "$py_count" -ne 1 ] || ! printf '%s\n' "$py_matches" | grep -q 'name = "ArbitrageEngine",'; then
-        echo "ERROR: 'ArbitrageEngine' must name the pyclass compat string exactly once in apexbot-python (epic 5TBT7L)." >&2
-        echo "  expected exactly 1 hit, 'name = \"ArbitrageEngine\",'; found $py_count" >&2
-        echo "  census (file: hits):" >&2
-        printf '%s\n' "$py_matches" | cut -d: -f1 | sort | uniq -c | awk '{printf "    %s: %s\n", $2, $1}' >&2
-        echo "  matches:" >&2
-        printf '%s\n' "$py_matches" >&2
-        exit 1
-    fi
-    echo "ok: exactly one impl ArbitrageEngine block, in arb_engine/mod.rs; apexbot-python names ArbitrageEngine only as the pyclass compat string"
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- one_engine_impl_block --exact --nocapture
 
-# Build Rust extension module (correct for Python extension)
+
+# Structural ratchet for the config-holder test seam: every
+# process-once static (`OnceLock`/`LazyLock`/`OnceCell`/`Once`) whose
+# initialization path reads `apexbot_config::holder::config()`/`config_arc()`
+# (or the substrate `stance::config()` delegate) must be classified in
+# rust/crates/facade/apexbot/tests/config_derived_statics_census.txt as
+# per-read | republishable | process-lifetime. The call-site audit is a
+# snapshot in a result doc; this gate makes it durable, so the next
+# holder-derived once-static cannot land silently stale-able. Wired into
+# `lint-rust-check` (hence `just lint` / CI / the pre-push `rust-clippy` hook)
+# plus the pre-push `rust-config-derived-statics` hook.
+check-config-derived-statics:
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- config_derived_statics_are_classified --exact --nocapture
+
+# ADR-084 D1 capability-catalog ratchet: docs/capabilities.md must name every
+# publishable crate at least once, resolve every home path against the module
+# tree, land every umbrella alias on a catalogged crate, and keep the console
+# rows on consumer (v). A new capability without a catalog row fails here.
+# Wired into `lint-rust-check` (hence `just lint` / CI).
+check-capability-catalog:
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- capability_catalog_covers_every_public_crate --exact --nocapture
+
+# ADR-084 D3 dependency-charter gate: every deny rule in
+# rust/crates/facade/apexbot/tests/dependency_charter.txt asserted over
+# `cargo tree -p X -e normal` at single-package, default-feature resolution.
+# A new C-build or pyo3 leak into a seam crate's published dependency set
+# fails here. Wired into `lint-rust-check`.
+check-dependency-charter:
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- dependency_charter_is_respected --exact --nocapture
+
+# ADR-084 D1/C5 consumer probes: each named catalog consumer completes a real
+# task through its own surface. (ii) the pools-only Rust consumer solves a
+# path through the solve door; (iii) the Python driver solves through the FFI
+# seam; (v) the console operator runs the offline `config show --resolved`
+# task. Wired into `just test`; `check-rust-consumer` only checks the umbrella
+# and never runs pools' examples, so it cannot satisfy C5.
+check-consumer-probes:
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot-pools --features capture-fixtures --example solve_path_probe
+    {{py_run}} pytest tests/standalone_parity/test_solve_surface_probe.py -q -p no:cacheprovider
+    {{py_run}} apexbot config show --resolved > /dev/null
+
+# Build Rust extension module in the release-equivalent feature set. This uses
+# the workspace development profile (opt-level = 1, no LTO or stripping) for
+# local validation; the feature set is the same as the release maturin
+# invocation.
 build-rust-extension:
-    cargo build -p apexbot_rs --features extension-module --manifest-path rust/Cargo.toml
-
-# Verify the installed apexbot._ffi extension was built from the current
-# Rust sources: compares the monotonic build number build.rs bakes into the
-# compiled library against the repo counter file (.build-number). The primary
-# stale-.so detector - run this instead of trusting a silent maturin/uv
-# "rebuild" (see AGENTS.md "Rebuilding the Rust .so after edits"). Exit 1 on a
-# stale library:
-verify-build-fresh:
-    uv run --no-sync python -m apexbot.build_info
+    scripts/build_extension.sh build
 
 # ========== Build-Artifact Housekeeping ==========
 
-# Reclaim disk space from the cargo build cache (rust/target). Incremental
-# caches are pure loss and are always removed; deps/examples/build/
-# .fingerprint entries with mtime older than {{age}} days are swept
-# cargo-sweep style - cargo transparently rebuilds anything still referenced
-# on its next use. `target/maturin` is NEVER touched so `uv run maturin
-# develop` stays warm (see the stale-`.so` rule in AGENTS.md before
-# forcing anything colder than that).
-# Running the recipe applies the defaults and frees the space immediately - no
-# preview/dry-run mode:
-#   just gc-target            # sweep artifacts older than the 14-day horizon
-#   AGE=0 just gc-target      # sweep everything except target/maturin
-#   DUPES=1 just gc-target    # also sweep stale duplicate-hash variants, keep newest per basename
-# DUPES=1 also sweeps duplicate-hash test binaries: cargo hashes metadata into
-# each artifact name, so feature-flag/env churn (extension-module, hotpath,
-# CI parity runs) leaves older variants of the same suite piling up at ~0.5 GiB
-# apiece. Only executables >= 10 MiB are considered, and the newest mtime in
-# each basename group is kept - anything else recompiles on its next use.
+# Reclaim disk space under the Cargo target root. Preview first; both modes
+# report every cache family and exact target/reclaimable byte counts:
+#   DRY_RUN=1 just gc-target     # report candidates; delete nothing
+#   AGE=7 just gc-target         # remove artifacts older than seven days
+#   AGE=0 DRY_RUN=1 just gc-target
+#
+# Normal Cargo caches age-sweep deps/examples/build/.fingerprint, always drop
+# incremental state, and dedupe old large test binaries. Separate rebuildable
+# families are age-swept too: coverage reports/builds, LLVM coverage, Criterion,
+# wheels, and rustdoc output. `target/maturin` is always protected. The family
+# policy is this script.
 gc-target:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    age=${AGE:-14}
-    dupes=${DUPES:-}
-    roots=(rust/target/debug rust/target/release rust/target/rust-analyzer/debug)
-    subtrees=(deps examples build .fingerprint)
-    total_kb=0
-    for root in "${roots[@]}"; do
-        [ -d "$root" ] || continue
-        inc="$root/incremental"
-        if [ -d "$inc" ]; then
-            kb=$(du -sk "$inc" | cut -f1)
-            total_kb=$((total_kb + kb))
-            rm -rf "$inc" 2>/dev/null || echo "WARN: could not fully remove $inc (a build may be writing into it)" >&2
-        fi
-        for sub in "${subtrees[@]}"; do
-            dir="$root/$sub"
-            if [ ! -d "$dir" ]; then continue; fi
-            stale=$(find "$dir" -mindepth 1 -maxdepth 1 -mtime +"${age}" 2>/dev/null || true)
-            if [ -z "$stale" ]; then continue; fi
-            kb=$(du -skc $stale 2>/dev/null | tail -1 | cut -f1)
-            total_kb=$((total_kb + kb))
-            rm -rf $stale 2>/dev/null || echo "WARN: partial removal in $dir" >&2
-        done
-    done
-    # Stale duplicate-hash variants (see dupes=1 in the header comment). Only
-    # extensionless executables >= 10 MiB; the newest mtime per basename wins.
-    if [ -n "${dupes}" ] && [ "${dupes}" != "0" ]; then
-        tmp=$(mktemp)
-        for dir in rust/target/debug/deps rust/target/debug/examples rust/target/release/deps rust/target/release/examples rust/target/rust-analyzer/debug/deps; do
-            if [ ! -d "$dir" ]; then continue; fi
-            find "$dir" -maxdepth 1 -type f -size +10M -printf '%T@ %f\n' \
-                | awk '{ b=$2; sub(/-[0-9a-f]{16}$/, "", b); if (b in newest) { if ($1 > newest[b]) { print path[b]; newest[b]=$1; path[b]=$2 } else print $2 } else { newest[b]=$1; path[b]=$2 } }' > "$tmp"
-            if [ -s "$tmp" ]; then
-                dupes_list=$(awk -v d="$dir" '{ print d "/" $0 }' "$tmp")
-                kb=$(du -skc $dupes_list 2>/dev/null | tail -1 | cut -f1)
-                n=$(wc -l < "$tmp")
-                rm -f $dupes_list
-                total_kb=$((total_kb + kb))
-                echo "deduped: $n stale variants in $dir"
-            fi
-        done
-        rm -f "$tmp"
-    fi
-    freed=$(numfmt --to=iec "$((total_kb * 1024))" 2>/dev/null || echo "${total_kb} KiB")
-    now=$(du -sh rust/target 2>/dev/null | cut -f1 || true)
-    echo "swept: ~$freed freed at a ${age}-day horizon (+dupes if requested) (rust/target now: ${now:-n/a})"
+    scripts/gc-target.sh
 
 # ========== Python Development ==========
 
-# Build and install Python extension in development mode
+# Install the locked Python environment without building the project a second
+# time. `dev` is the sole editable-extension install path and selects the
+# canonical Cargo `dev-features` alias explicitly.
+bootstrap:
+    uv sync --locked --dev --no-install-project
+    just dev
+
+# Build and install the Python extension in development mode. Maturin consumes
+# pyproject's `profile = "dev"` setting, which matches rust/Cargo.toml's
+# opt-level = 1 development profile (not an unoptimized debug build). Run
+# `just bootstrap` first; `--no-sync` keeps this build from silently replacing
+# the explicit development feature set with ordinary package defaults.
 dev:
-    uv run maturin develop
+    scripts/build_extension.sh develop
+
+
+# `uv.lock` must match `pyproject.toml` -- the uv mirror of the rust side's
+# `cargo metadata --locked` check (the `test-rust` job's first gate). Runs in
+# the CI `python` job; run it locally after editing dependencies.
+check-uv-lock:
+    uv lock --check
 
 # Run only the Python track (full pytest). CI's python-test matrix job and the
 # pre-push hook call this subunit directly; humans use `just test`. Under the
-# default offline marker filter (`-m "not slow and not base and not online_rpc"`)
-# this covers the PyO3 seam, golden on-chain-oracle replay, AND the wrapped
-# `tests/rust` suite. A focused parity-only run is `uv run pytest -m onchain_oracle`.
-test-python:
-    uv run pytest -x -q --no-header
+# default offline marker filter (`-m "not slow and not base and not online_rpc and not stub_drift"`)
+# this covers the PyO3 seam, golden on-chain-oracle replay, AND the relocated
+# seam suites. A focused parity-only run is `just py pytest -m onchain_oracle`.
+#
+# The `dev` prerequisite builds + installs the extension (incremental `maturin
+# develop`) so the suite always exercises the current Rust sources. This replaces
+# the retired runtime build-receipt/staleness gate: freshness is guaranteed by
+# building the thing we test, not by inspecting whether a build happened.
+test-python: dev
+    {{ py_run }} pytest -x -q --no-header
+
+# Spray tripwire over the Python suite (scripts/pytest_noise_gate.sh). Runs
+# pytest with the whole child-process output captured to a log file, then scans
+# the capture for the two signatures of the historical "exception spray" class:
+# `--- Logging error ---` blocks and raw `Reconnection attempt` lines. Those
+# printed to the real stdout/stderr AFTER the pytest session ended and left the
+# exit code at 0, which is why post-session output is invisible to pytest
+# plugins and the scan has to live at the process/recipe level.
+#
+# The suite's own exit code is captured separately from the signature scan and
+# propagated unchanged, so a genuine test failure is never masked by a clean
+# signature scan; a spray signature instead yields its own distinct nonzero
+# exit. The single positional argument is the pytest keyword filter, quoted as
+# one argument so `just`'s unquoted variadic splicing cannot shred it; the
+# default is empty (full suite). Trailing tokens forward verbatim:
+#   just test-python-noise-gate                  # full suite
+#   just test-python-noise-gate 'not readme'     # skip the README sybil items
+#   just test-python-noise-gate '' tests/golden  # full suite plus a path arg
+#
+# Negative probe (the red path, demonstrable without re-running the suite):
+#   printf '%s\n' 'Reconnection attempt' > /tmp/spray.log
+#   bash scripts/pytest_noise_gate.sh scan /tmp/spray.log   # exits 3, prints it
+#
+# CI: armed as the python job's "Run Tests" step in .github/workflows/ci.yml
+# (it replaced the bare `just test-python` call; that recipe is untouched). The
+# pre-push hook in prek.toml also arms it (`python-test` -> this recipe), so a
+# local push runs the same tripwire; the bare `just test-python` recipe stays
+# for callers that only want the suite's exit code.
+test-python-noise-gate kw="" *args: dev
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Usage: just test-python-noise-gate [KW] [PYTEST_ARGS ...]. KW is the -k
+    # expression (quoted as one word here); everything after it rides "$@" so
+    # extra pytest args and multiple test targets reach pytest exactly as typed
+    # (a raw text splice re-split those words and silently ran the wrong tests).
+    kw="${1-}"; [ $# -eq 0 ] || shift
+    if [ -n "$kw" ]; then
+        exec bash scripts/pytest_noise_gate.sh run -k "$kw" "$@"
+    fi
+    exec bash scripts/pytest_noise_gate.sh run "$@"
+
+# Flake probe for the ordering-sensitive suites (session/operator-channel
+# state machines, where inter-test order leaks surface): run both suites
+# three consecutive times with the cache provider off; ANY failing run fails
+# the recipe. Each invocation is `timeout`-bounded as a process-level backstop
+# beside pytest-timeout's in-process guard, so the probe completes or fails —
+# never hangs.
+# Mirror of the CI python job's NON-floor legs: the suite with `anvil` NOT
+# reachable (CI installs Foundry only on the 3.12 floor leg). Guarded tests
+# must skip cleanly -- an unguarded spawn fails at `AnvilFork(...)`, exactly
+# the regression class this caught once (2026-10-14). The simulation + its
+# fail-closed reachability check live in scripts/no_anvil_run.sh. This full
+# suite is the manual mirror of those CI legs; the pre-push gate runs the
+# spawn-surface slice below instead (~1s vs ~9min: without the binary the
+# anvil-dependent tests skip instantly).
+test-python-no-anvil kw="" *args: dev
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{ kw }}" ]; then
+        exec bash scripts/no_anvil_run.sh -k "{{ kw }}" {{ args }}
+    fi
+    exec bash scripts/no_anvil_run.sh {{ args }}
+
+
+# The no-anvil dimension's pre-push slice: the same simulation scoped to the
+# SPAWN SURFACE -- every test file mentioning AnvilFork / standalone_anvil /
+# anvil_factory, discovered from the tree at invocation time. Self-maintaining:
+# a new spawn site joins automatically, because spawning means mentioning one
+# of those tokens. An unguarded spawn anywhere in the surface fails at
+# construction; guarded tests skip. Discovery failing closed matters: an empty
+# selection would make this gate vacuous.
+test-python-no-anvil-spawn-surface kw="" *args: dev
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mapfile -t files < <(rg -l "AnvilFork|standalone_anvil|anvil_factory" tests/ --glob '**/test_*.py')
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo "ERROR: spawn-surface discovery found nothing -- the pattern or the tree moved" >&2
+        exit 1
+    fi
+    if [ -n "{{ kw }}" ]; then
+        exec bash scripts/no_anvil_run.sh -k "{{ kw }}" {{ args }} "${files[@]}"
+    fi
+    exec bash scripts/no_anvil_run.sh {{ args }} "${files[@]}"
+
+
+test-flake-probe:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for i in 1 2 3; do
+        echo "▶ flake-probe run ${i}/3"
+        timeout 600 {{ py_run }} pytest -q --no-header -p no:cacheprovider \
+            tests/arbitrage/test_arbitrage_session.py tests/operator/test_operator_channel.py
+    done
+    echo "✓ flake-probe: 3/3 green"
 
 # Re-populate golden files for on-chain-oracle parity tests. Requires a working
 # fork (tests.env RPC or local node). Pass a nodeid to refresh a single test:
@@ -358,7 +708,34 @@ test-python:
 # the shared file (last-writer-wins, losing keys). Replay is read-only and safe
 # under xdist, but record accumulates writes.
 record-golden *args:
-    APEXBOT_GOLDEN_MODE=record uv run pytest -m onchain_oracle -q --no-header -n0 {{ args }}
+    {{ py_run }} pytest --golden-mode record -m onchain_oracle -q --no-header -n0 {{ args }}
+
+# Live chain-data drift gate (explicit only — never in test/pre-push/CI lanes):
+# re-records every py_oracle corpus twice and requires byte-identity with disk,
+# per chain, against live archive endpoints. Minutes of paced live RPC and the
+# endpoints rate-limit, so this runs on demand, not in any gate battery:
+#   just live-drift                # all three chains
+#   just live-drift -- -k ethereum # one chain
+live-drift *args:
+    {{ py_run }} pytest -m live_drift -q --no-header tests/golden/test_live_drift.py {{ args }}
+
+
+# Record the README examples' chain surface into the offline replay cassette
+# (`tests/fixtures/chain_data/1/readme_examples.json`). Drives the real
+# `Bot.build_pool` / token-utility surface through a head-pinned recording proxy
+# in front of the archive node, so regeneration is byte-identical (the head is
+# pinned at `scripts/record_readme_cassette.py`'s `PIN`, and every "latest" tag
+# is rewritten to it). The README suite then replays offline via the
+# `Bot(provider=...)` seam (conftest.py). Requires a reachable archive node.
+record-readme-cassette:
+    {{ py_run }} python scripts/record_readme_cassette.py
+
+
+# Drift gate for the README cassette: re-record and require byte-identity with
+# the committed file. Needs a reachable archive node (not a CI gate — CI replays
+# the committed cassette offline).
+check-readme-cassette:
+    {{ py_run }} python scripts/record_readme_cassette.py --check
 
 # Verify every shipped deployment address is actually deployed on-chain (cast).
 # Tier 1 (bytecode presence) by default; escalate via the env var:
@@ -368,7 +745,16 @@ record-golden *args:
 # Requires a reachable RPC per chain (tests.env / env vars). Deselected from the
 # default `test-python` run (online_rpc marker) — run on demand only.
 verify-deployments *args:
-    APEXBOT_VERIFY_DEPLOYMENTS=${APEXBOT_VERIFY_DEPLOYMENTS:-1} uv run pytest -m online_rpc -q --no-header -p no:randomly {{ args }} tests/registry/test_deployment_onchain_verification.py
+    APEXBOT_VERIFY_DEPLOYMENTS=${APEXBOT_VERIFY_DEPLOYMENTS:-1} {{ py_run }} pytest -m online_rpc -q --no-header -p no:randomly {{ args }} tests/registry/test_deployment_onchain_verification.py
+
+# Re-populate the golden deployment-verification capture (tiers 1/2/4 facts for
+# every factory row on a reachable chain) consumed by the hermetic replay
+# tests tests/registry/test_deployment_golden_verification.py (default suite,
+# fully offline). Requires a reachable RPC per chain (tests.env / env vars);
+# unreachable chains contribute no rows. Tier 4 is asserted live while
+# recording, so a capture is only committed when every recorded row verified.
+record-deployment-golden *args:
+    APEXBOT_VERIFY_DEPLOYMENTS=4 {{ py_run }} pytest --golden-mode record -m online_rpc -q --no-header -p no:randomly -n0 {{ args }} tests/registry/test_deployment_onchain_verification.py
 
 # ========== Tier-3 On-Chain Oracles ==========
 #
@@ -378,34 +764,33 @@ verify-deployments *args:
 # Rust-vs-real-EVM test. No family (default `all`) runs EVERY family, in the
 # order listed below.
 #
-# Family notes (harness sources under `tier3-oracle/src*/`, epic UP5NH6 task
-# IDs unless noted):
+# Family notes (harness sources under `tier3-oracle/src*/`):
 #   step      SwapMath.computeSwapStep (V3 + V4) vs the real canonical core
-#             libraries run as EVM bytecode in revm (OZRQS6). V3 via direct
+#             libraries run as EVM bytecode in revm. V3 via direct
 #             solc 0.7.6 (v3-core pragmas <0.8 + foundry can't resolve solc
 #             <0.8 in this env — documented toolchain deviation; the script
 #             caches solc 0.7.6 in the svm dir) + V4 via forge 0.8.26.
 #             Asserts each Rust output field === the on-chain output.
-#   swap      V3 `Pool.swap` end-to-end (2LTKVO). solc 0.7.6 harness, drives
+#   swap      V3 `Pool.swap` end-to-end. solc 0.7.6 harness, drives
 #             `v3_simulate_swap` against real UniswapV3Pool bytecode in revm.
-#   v2        V2 `Pair.swap` (TLBUNW — family 1/3 of SH6HAK). solc 0.5.16
+#   v2        V2 `Pair.swap` (family 1/3 of the Tier-3 cutover). solc 0.5.16
 #             harness; `IntHopState::swap` (V2 getAmountOut) byte-exact via the
 #             K-invariant boundary.
-#   v4        V4 `PoolManager.swap` end-to-end (2LTKVO). solc 0.8.26 harness
+#   v4        V4 `PoolManager.swap` end-to-end. solc 0.8.26 harness
 #             (PoolManager singleton + unlocker + mock tokens);
 #             `v4_simulate_swap` through the unlock/settle dance, with
 #             amount0/amount1 byte-exact to the on-chain BalanceDelta.
-#   path5000  path-5000 V4 CL-hop clamp regression (BHTWBZ): prove the CL-hop
+#   path5000  path-5000 V4 CL-hop clamp regression: prove the CL-hop
 #             input clamp turns the 20.7M-gas EMPTY-HALT into a clean
 #             byte-exact fill under the executor's 5M ceiling. Rebuilds the
 #             shared v4 harness and runs the pair from the umbrella `apexbot`
 #             crate.
-#   curve     Curve stableswap `get_dy` (YXMNWB — family 2/3 of SH6HAK). solc
+#   curve     Curve stableswap `get_dy` (family 2/3 of the Tier-3 cutover). solc
 #             0.8.26 harness — a faithful Solidity port of the STANDARD
 #             stableswap `get_dy` (Curve's canonical source is Vyper, absent
 #             here); the `simulate_swap` standard path is byte-exact to the
 #             on-chain `getDy`.
-#   balancer  Balancer weighted/stable (EZLECC — family 3/3 of SH6HAK). solc
+#   balancer  Balancer weighted/stable (family 3/3 of the Tier-3 cutover). solc
 #             0.7.6 harness over the CANONICAL balancer-v2-monorepo math cores
 #             (FixedPoint/LogExpMath/WeightedMath/StableMath, pinned commit
 #             f8b6f44); the `simulate_swap` weighted + stable
@@ -437,20 +822,20 @@ test-tier3 family='all':
         local harness pkg test
         case "$1" in
             step)     harness=build-tier3-harnesses.sh;           pkg=apexbot-math; test=tier3_compute_swap_step_vs_revm ;;
-            swap)     harness=build-tier3-v3-swap-harness.sh;     pkg=apexbot-simulation; test=tier3_v3_pool_swap_vs_revm ;;  # 5D3YVK: relocated from pools
+            swap)     harness=build-tier3-v3-swap-harness.sh;     pkg=apexbot-simulation; test=tier3_v3_pool_swap_vs_revm ;;
             v2)       harness=build-tier3-v2-swap-harness.sh;     pkg=apexbot-pools; test=tier3_v2_pair_swap_vs_revm ;;
-            v4)       harness=build-tier3-v4-swap-harness.sh;     pkg=apexbot-simulation; test=tier3_v4_pool_swap_vs_revm ;;  # 5D3YVK: relocated from pools
+            v4)       harness=build-tier3-v4-swap-harness.sh;     pkg=apexbot-simulation; test=tier3_v4_pool_swap_vs_revm ;;
             path5000) harness=build-tier3-v4-swap-harness.sh;     pkg=apexbot; test=tier3_path5000_v4_clamp ;;
             curve)    harness=build-tier3-curve-swap-harness.sh;  pkg=apexbot-pools; test=tier3_curve_swap_vs_revm ;;
             balancer) harness=build-tier3-balancer-swap-harness.sh; pkg=apexbot-pools; test=tier3_balancer_swap_vs_revm ;;
-            pancake)  harness=build-tier3-pancake-v3-swap-harness.sh; pkg=apexbot-simulation; test=tier3_pancake_v3_swap_vs_revm ;;  # 5D3YVK: relocated from pools
+            pancake)  harness=build-tier3-pancake-v3-swap-harness.sh; pkg=apexbot-simulation; test=tier3_pancake_v3_swap_vs_revm ;;
             pancake2) harness=build-tier3-pancake-v2-swap-harness.sh; pkg=apexbot-pools; test=tier3_pancake_v2_swap_vs_revm ;;
             *) echo "unknown tier-3 family '$1' (families: step swap v2 v4 path5000 curve balancer pancake pancake2 | all)" >&2; exit 2 ;;
         esac
         tier3-oracle/"$harness"
-        python_libdir="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+        python_libdir="$({{ py_run }} python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
         export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        cargo test --manifest-path rust/Cargo.toml -p "$pkg" --test "$test"
+        cargo test --locked --manifest-path rust/Cargo.toml -p "$pkg" --test "$test"
     }
 
     if [ "{{ family }}" = "all" ]; then
@@ -472,7 +857,7 @@ test-tier3 family='all':
 verify-tier3-artifacts:
     tier3-oracle/verify-tier3-artifacts.sh
 
-# Validate the committed Vyper executor artifact (BHL2R2 / tier-3b): recompile
+# Validate the committed Vyper executor artifact (tier-3b): recompile
 # executor/contracts/cmd_executor.vy with the pinned vyper 0.5.0a3 (into a
 # throwaway dir, PUBLISH=0) and byte-compare against what the Rust tier-3b tests
 # load from `tier3-oracle/artifacts/executor/`. This is the authoritative
@@ -524,12 +909,14 @@ rebuild-tier3-artifacts:
 # fixes land, and `crap-baseline` / `crap-regression` to track the movement
 # while it happens. .cargo-crap.toml holds the threshold + exclusions.
 #
-# Read the output knowing three things (all measured, see ergo DRBR7Z):
+# Read the output knowing three things (all measured):
 #   1. It measures the RUST suite only. pytest drives the same core through the
 #      PyO3 seam and contributes no coverage here, so the binding layer
 #      (`apexbot_rs`, ~60% of the findings) and the Python-driven updaters
-#      score as untested even though pytest exercises them. Merging pytest
-#      coverage (instrumented cdylib + LLVM_PROFILE_FILE) is not built yet.
+#      score as untested even though pytest exercises them. `just coverage`
+#      builds the pytest-driven arm (instrumented cdylib + LLVM_PROFILE_FILE)
+#      — point CRAP_LCOV at its combined LCOV to score the union:
+#        CRAP_LCOV=target/coverage/coverage.lcov just crap
 #   2. `?` counts as a decision point, so `?`-chained plumbing — module
 #      registration, Py-dict conversion — scores far above its real branching.
 #      The CC-141 outlier of the first run was such a function.
@@ -556,8 +943,9 @@ crap_packages := env_var_or_default("CRAP_PACKAGES", "")
 
 # Features for the coverage build. Only apexbot-bot/otel: it compiles the
 # telemetry modules the walker would otherwise see as never-built. Deliberately
-# NOT pyproject's [tool.maturin] dev list — `pyo3/extension-module` must never
-# be set on a test build, and hotpath/allocator-ctrl gate no walked source file.
+# The coverage build intentionally enables only `apexbot-bot/otel`; it is not
+# the development-wheel alias. `pyo3/extension-module` must never be set on a
+# test build, and hotpath/allocator-ctrl gate no walked source file.
 crap_features := env_var_or_default("CRAP_FEATURES", "apexbot-bot/otel")
 
 # CRAP score at or above which `crap-gate` fails. CRAP_THRESHOLD=50 just crap-gate
@@ -576,7 +964,7 @@ crap-coverage *args:
     fi
     # apexbot-python's test harnesses link libpython, same reason `test-rust`
     # exports this (resolve before cd'ing: uv wants the Python project root).
-    python_libdir="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    python_libdir="$({{ py_run }} python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
     export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     # LLVM tool discovery. With a rustup toolchain cargo-llvm-cov locates
     # llvm-tools-preview by itself and these must stay UNSET. On a system-rustc
@@ -666,23 +1054,57 @@ crap-regression *args:
 # CI entrypoint: fresh coverage + the threshold gate in one command.
 crap-ci: crap-coverage crap-gate
 
+# ========== Code Coverage ==========
+#
+# `scripts/coverage.sh` runs three arms over LLVM instrumentation, all writing
+# HTML (for humans) + `coverage.json` (llvm-cov export format, agents) under
+# `rust/target/coverage/`:
+#
+#   just coverage-rust        # cargo workspace suite (cargo-llvm-cov)
+#   just coverage-pyo3        # pytest driving an instrumented apexbot._ffi cdylib
+#   just coverage             # both, merged into one report + coverage.lcov
+#
+# The merged report is also the highest-fidelity LCOV available (cargo suite
+# ∪ pytest-driven binding coverage):
+#   CRAP_LCOV=target/coverage/coverage.lcov just crap
+#
+# Slow (full instrumented rebuilds, ~10-20 min cold) — on-demand, not wired
+# into pre-push/CI. Scoped runs keep the rebuild narrow:
+#   COV_PACKAGES="-p apexbot-config" just coverage-rust
+# Args pass to the pytest arm: just coverage-pyo3 tests/abi -q
+
+coverage-rust *args:
+    scripts/coverage.sh rust {{ args }}
+
+coverage-pyo3 *args:
+    scripts/coverage.sh pyo3 {{ args }}
+
+coverage *args:
+    scripts/coverage.sh all {{ args }}
+
 # ========== Code Quality ==========
 
 # Lint Markdown files
 lint-markdown:
-    npx --yes markdownlint-cli2 --fix "**/*.md" "!node_modules/**" "!.opencode/node_modules/**" "!**/.venv/**" "!tier3-oracle/lib/**"
+    npx --yes markdownlint-cli2 --fix "**/*.md" "!**/node_modules/**" "!**/.venv/**" "!tier3-oracle/lib/**" "!logs/**" "!.scratch/**"
 
 # Lint Python files
 lint-python:
-    uv run ruff check --fix src/ 
-    uv run ty check --fix --no-progress src/
+    uvx ruff check --fix src/ examples/
+    # ty must run under the project environment (it resolves third-party imports
+    # and the apexbot stubs from the venv), so `uvx ty` cannot work; `--with ty`
+    # gives the latest ty without pinning it into the venv.
+    {{ py_run }} --with ty ty check --fix --no-progress src/
 
 # Lint Python (check-only; non-mutating). Mirrors the ruff+ty gate CI runs,
 # minus `--fix`, so a pre-commit run cannot dirty staged files. Stricter than
 # CI's `lint-python`: fails on any issue `--fix` would have auto-applied.
+lint-comment-hygiene:
+    scripts/hooks/comment-hygiene.sh
+
 lint-python-check:
-    uv run ruff check src/
-    uv run ty check --no-progress src/
+    uvx ruff check src/ examples/
+    {{ py_run }} --with ty ty check --no-progress src/
 
 # Dead-code detector (off the gate — output is a triage list). Each hit
 # needs an `rg` call before deletion: vulture is static and can't see
@@ -693,7 +1115,7 @@ lint-python-check:
 # Complements ruff: ruff's F401 rule exempts `if TYPE_CHECKING:` imports
 # and there is no ruff unreachable-code rule, so vulture catches both.
 dead-code:
-    uv run vulture src/apexbot vulture_whitelist.py --min-confidence 80
+    uvx vulture src/apexbot vulture_whitelist.py --min-confidence 80
 
 # Deeper dead-code sweep — catches unused functions/methods/classes too
 # (the 80% tier only catches unused variables, imports, unreachable code).
@@ -702,11 +1124,11 @@ dead-code:
 # for intentional dead-code audits; not a routine gate. Generate whitelist
 # candidates with: vulture src/apexbot --min-confidence 60 --make-whitelist
 dead-code-deep:
-    uv run vulture src/apexbot --min-confidence 60 --make-whitelist
+    uvx vulture src/apexbot --min-confidence 60 --make-whitelist
 
 # Check Python formatting (read-only; fails on drift). Run `just format` to fix.
 fmt-check-python:
-    uv run ruff format --check src/
+    uvx ruff format --check src/
 
 # Lint commit messages across a range (default: everything not yet pushed).
 # Examples: just lint-commits              # @{push}..HEAD
@@ -730,8 +1152,8 @@ lint-commits range="@{push}..HEAD":
 lint: fmt-check fmt-check-python lint-rust lint-python lint-markdown
 
 # Format all code
-format:
-    uv run ruff format src/
+format: check-toolchain
+    uvx ruff format src/
     cargo fmt --manifest-path rust/Cargo.toml --all
 
 # ========== Dependency Updates ==========
@@ -767,22 +1189,25 @@ format:
 update-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    uv run python scripts/bump_python_deps.py
+    {{ py_run }} python scripts/bump_python_deps.py
     uv lock --upgrade
-    uv sync
+    # --no-install-project: skip uv's redundant project build (a plain `uv sync`
+    # now builds the same dev-features extension); `just dev` rebuilds it
+    # explicitly.
+    uv sync --no-install-project
+    just dev
     cargo upgrade --manifest-path rust/Cargo.toml --incompatible
     cargo update --manifest-path rust/Cargo.toml
 
 # ========== Repository Setup ==========
 
 # Refresh the committed APEXBOT_* key-inventory snapshot the
-# apexbot-config schema-completeness test compares against (reviewer note,
-# 7LKJFY sign-off). The exclusion glob keeps the snapshot self-contamination
+# apexbot-config schema-completeness test compares against. The exclusion glob keeps the snapshot self-contamination
 # (regeneration rewriting its own source) out of the sweep.
 env-inventory:
     #!/usr/bin/env bash
     set -euo pipefail
-    target="rust/crates/apexbot-config/tests/apexbot_env_inventory.txt"
+    target="rust/crates/foundation/apexbot-config/tests/apexbot_env_inventory.txt"
     rg -o 'APEXBOT_[A-Z_]+' rust/crates --no-filename \
         -g '!**/apexbot_env_inventory.txt' \
         -g '!**/apexbot-config/tests/**' | sort -u > "$target"
@@ -820,7 +1245,7 @@ setup-git-hooks:
     echo "✓ commit template configured."
 
 
-# ========== Settlement-Bot Parity Gate (RSP-8 / ergo 23DLCY) ==========
+# ========== Settlement-Bot Parity Gate ==========
 #
 # The executable successor to the parity ledger
 # (docs/architecture/rust-settlement-bot-parity.md): the fixture boot gate
@@ -830,11 +1255,11 @@ setup-git-hooks:
 # anvil arm is opt-in via APEXBOT_DUAL_DRIVER_GATE=1 + APEXBOT_FORK_RPC
 # (tests/standalone_parity/dual_driver_gate.py --live).
 test-settlement-parity:
-    cargo test --manifest-path rust/Cargo.toml -p apexbot-settlement-bot-example --test boot_gate
-    uv run pytest tests/standalone_parity/test_settlement_bot_boot_gate.py tests/standalone_parity/test_settlement_bot_dual_driver_gate.py -q
-    uv run python tests/standalone_parity/dual_driver_gate.py --recorded
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot-settlement-bot-example --test boot_gate
+    {{ py_run }} pytest tests/standalone_parity/test_settlement_bot_boot_gate.py tests/standalone_parity/test_settlement_bot_dual_driver_gate.py -q
+    {{ py_run }} python tests/standalone_parity/dual_driver_gate.py --recorded
 
-# ========== No-Python Console Gate (ADR-051 D10 / ergo EA6DY7) ==========
+# ========== No-Python Console Gate (ADR-051 D10) ==========
 #
 # The Rust-owned console (`apexbot`) must build and run with NO Python in the
 # path. This recipe builds the `apexbot-cli` binary, then runs the fixed argv
@@ -856,22 +1281,170 @@ test-settlement-parity:
 # Authoring aid only: APEXBOT_CLI_GATE_DUMP_ACTUAL=1 prints the normalized
 # capture so the oracle can be regenerated deliberately.
 ci-no-python-cli-gate:
-    cargo build -p apexbot-cli --manifest-path rust/Cargo.toml
+    cargo build --locked -p apexbot-cli --manifest-path rust/Cargo.toml
     bash .github/workflows/cli-no-python-gate.sh
 
 # ADR-052 D6: Alembic is retired in-tree. No `alembic` reference may survive in any
 # Python source under src/, and the migration-scripts package must be gone.
 # Mirrors check-no-pyo3-in-cores: a permanent, mechanical sweep gate.
 check-no-alembic:
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- no_alembic_references --exact --nocapture
+
+# Cancelling-async-rust: a `timeout(..)` deadline belongs on the OPERATION
+# boundary, never on the future that carries the value. RFD 400's select-loops
+# case study is the canonical trap —
+# `timeout(Duration, tx.send(value)).await` reads as a deadline on a send but
+# is a deadline on a FUTURE, so a fired timeout drops it mid-await and the moved
+# value is lost with no way to tell cancellation from delivery. The same shape
+# over `AsyncWriteExt::write_all` silently swallows partial progress: bytes the
+# peer accepted vanish from the caller's view, so a retry can duplicate a
+# partial frame. This gate flags a production `timeout(` whose second argument
+# mentions `.send(` or `.write_all(`. Mirrors check-no-pyo3-in-cores: a
+# permanent, mechanical sweep gate (the one legitimate production site is named
+# in the gate's allowlist with its reason, not excused by a looser pattern).
+check-cancel-safety:
+    # C7: the gate body lives as a cargo test on the umbrella crate
+    # (rust/crates/facade/apexbot/tests/architecture_gates.rs).
+    cargo test --locked --manifest-path rust/Cargo.toml -p apexbot --test architecture_gates -- no_timeout_wrapped_value_sends_or_write_all --exact --nocapture
+
+# ADR-052 D7: SQLAlchemy and the Python ORM are retired from the runtime and
+# test-owned Python surfaces. The gate also checks the root dependency and lock
+# declarations and proves its AST detector rejects a synthetic import.
+check-no-sqlalchemy:
+    {{ py_run }} pytest -q tests/test_no_sqlalchemy_test_imports.py
+
+# ========== Stub Generation + Verification (ADR-066) ==========
+#
+# `just gen-stubs` regenerates the committed `src/apexbot/_ffi/` stub tree
+# from the seam's built cdylib (ADR-066 D1/D2): it (1) builds `apexbot_rs`
+# with the named `experimental-inspect` feature — a TEMPORARY toggle per
+# ADR-066 D1; release wheels never select it, and this build exists solely to
+# be introspected — (2) runs the `apexbot-stubgen` generator over that
+# cdylib, and (3) replaces the committed stub tree with the output.
+#
+# Regeneration is deterministic: the same cdylib produces a byte-identical
+# tree, so the second of two consecutive runs must be diff-empty (the drift
+# gate below asserts this continuously). The introspected build lands in its
+# own target dir (`<target_dir>/stubgen-inspect`), so it never churns the
+# canonical cache: the installed development extension and `just dev`'s build
+# plan are untouched, and no follow-up `just dev` is needed.
+#
+# `just gen-stubs --check` (used by tests/ffi/test_ffi_stub_drift.py)
+# generates into a temp dir and FAILS on any diff against the committed tree
+# without writing; `REGEN_STUBS=1` opts the check into writing, mirroring
+# `REGEN_CONFIG_DOCS=1 cargo test -p apexbot-config` (the REGEN pattern of
+# docs/rust-config-keys.md). No hand edits over generated output, ever:
+# generator gaps live only in tests/ffi/stubtest_allowlist.txt (ADR-066 D3).
+gen-stubs check="":
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v rg >/dev/null 2>&1 || { echo "ERROR: ripgrep (rg) is required for check-no-alembic" >&2; exit 1; }
-    if [ -d src/apexbot/migrations ]; then
-        echo "ERROR: src/apexbot/migrations still exists (retired per ADR-052 D6)." >&2
-        exit 1
+    # just does not pass recipe arguments as positional script arguments
+    # (recipe argv is forwarded as `"$@"`), but the flag is read from `{{ check }}` so
+    # its one-token contract is explicit.
+    check=0
+    case "{{ check }}" in
+        "") ;;
+        --check) check=1 ;;
+        *) echo "usage: just gen-stubs [--check]" >&2; exit 2 ;;
+    esac
+    # The generator parses introspection chunks statically (object-file
+    # symbols), so the introspected build is never loaded or installed. Build it
+    # into its own target dir: `experimental-inspect` is a distinct feature set
+    # from `dev-features`, so sharing the canonical dir would churn its
+    # fingerprints. The first run pays a from-scratch workspace compile; later
+    # runs are incremental.
+    inspect_dir="{{ target_dir }}/stubgen-inspect"
+    CARGO_TARGET_DIR="$inspect_dir" cargo build --locked --manifest-path rust/Cargo.toml -p apexbot_rs --features experimental-inspect
+    CARGO_TARGET_DIR="$inspect_dir" cargo build --locked --manifest-path rust/Cargo.toml -p apexbot-stubgen
+    out="$(mktemp -d)"
+    trap 'rm -rf "$out"' EXIT
+    "$inspect_dir/debug/apexbot-stubgen" \
+        "$inspect_dir/debug/libapexbot_rs.so" _ffi "$out"
+    # Pipeline steps: ruff-format then ruff-check-fix the generated tree
+    # BEFORE the diff/copy branch. The generator's raw signatures (long
+    # single-line defs, `X |None`, unsorted imports) are not format- or
+    # lint-clean, and `just fmt-check-python` / `just lint-python-check` fail
+    # on them. Because the steps sit above the branch, `gen-stubs --check`
+    # also applies them — the drift gate's contract (regeneration reproduces
+    # the committed tree byte-for-byte) holds only if the committed tree is
+    # pipeline output inclusive of formatting and lint fixing. `--config`
+    # pins the repo's pyproject: the temp out dir is outside the repo, so
+    # ruff's upward config discovery would otherwise fall back to defaults
+    # and the tree would not be reproducible. The generated-stub rules the
+    # check pass cannot fix (Rust doc-comment prose) are exempted under the
+    # bare `"*.pyi"` per-file-ignores key, which matches the temp dir too.
+    uvx ruff format --config pyproject.toml "$out"
+    uvx ruff check --fix --config pyproject.toml "$out"
+    if [ "$check" = 1 ] && [ -z "${REGEN_STUBS:-}" ]; then
+        if diff -ru src/apexbot/_ffi "$out"; then
+            echo "✓ committed stubs match generator output"
+        else
+            echo "ERROR: src/apexbot/_ffi has drifted from generator output; run \`just gen-stubs\`" >&2
+            exit 1
+        fi
+    else
+        rm -rf src/apexbot/_ffi
+        cp -R "$out" src/apexbot/_ffi
+        echo "✓ committed stubs regenerated (src/apexbot/_ffi)"
     fi
-    if rg -n -i --glob '*.py' 'alembic' src/; then
-        echo "ERROR: Alembic references remain in src/**/*.py (retired per ADR-052 D6)." >&2
-        exit 1
-    fi
-    echo "OK: no Alembic references remain in src/**/*.py"
+
+# ========== Stub-to-Runtime Drift Gate (ADR-053 stubs, ADR-066 D3 cutover) ==========
+#
+# mypy.stubtest is now GENERATOR VERIFICATION (ADR-066 D3): it introspects the
+# INSTALLED apexbot._ffi extension and compares it against the GENERATED
+# src/apexbot/_ffi/*.pyi stubs in BOTH directions, across every class member,
+# with no curated table. Its allowlist (tests/ffi/stubtest_allowlist.txt)
+# carries only generator gaps — the enumerated PyO3-introspection limitations,
+# never hand-edits over generated output. The regenerate-and-diff gate against
+# the generator is tests/ffi/test_ffi_stub_drift.py (via `just gen-stubs
+# --check`). What stubtest cannot see (Python-side surface in driver modules)
+# stays in tests/ffi/test_ffi_registration_surface.py.
+#
+# mypy.stubtest replaces the bespoke drift gate's R1/R3/R4 mechanics (and R2,
+# verified below): it introspects the INSTALLED apexbot._ffi extension and
+# compares it against the generated src/apexbot/_ffi/*.pyi stubs in
+# BOTH directions, across every class member, with no curated table. The
+# allowlist (tests/ffi/stubtest_allowlist.txt) carries only PyO3-
+# introspection noise and stub-only type exemptions, each group annotated with
+# the drift rule it serves. What stubtest cannot see (Python-side surface in
+# driver modules) stays in tests/ffi/test_ffi_registration_surface.py.
+lint-stubtest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # --ignore-disjoint-bases: PEP 800 disjoint-base flags on every #[pyclass]
+    # are PyO3-synthetic runtime semantics, not stub drift. Staleness of the
+    # introspected .so is owned by the build step (the test tracks depend on
+    # `dev`) — stubtest simply checks whatever is installed.
+    {{ py_run }} stubtest --ignore-disjoint-bases \
+        --allowlist tests/ffi/stubtest_allowlist.txt apexbot._ffi
+
+# Dedicated regenerate-and-diff stub gate (ADR-066 D2/D3): the compile-coupled
+# face of the stub-drift ratchet. `just gen-stubs --check` cargo-builds
+# apexbot_rs with the temporary `experimental-inspect` feature + apexbot-stubgen
+# before introspecting the cdylib, so it is NOT in the default pytest selection
+# (the `stub_drift` marker excludes it) — it runs once as the CI `stub-drift`
+# job, and here for an on-demand local run. Run it with exclusive use of the
+# build graph: a concurrent `just dev` / `cargo build` holds the debug lock and
+# can relink the introspected `.so`.
+lint-stub-drift:
+    just gen-stubs --check
+
+# The solve-entry A/B readout (the unification harness): per-path median/p95
+# for the all-CL intake vs the direct entry over a capture corpus, parity-gated
+# (exits 1 on divergence). DR_AB_ITERS / DR_AB_MEMO shape the run.
+entry-ab corpus="heavy_concentrated_liquidity_solve_captures.jsonl":
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot-pools --features capture-fixtures --example entry_ab_readout -- rust/crates/foundation/apexbot-pools/tests/fixtures/{{corpus}}
+
+# The same run instrumented: functions-timing over the concentrated_liquidity_solve.* labels.
+# HOTPATH_OUTPUT_PATH (default hp.json) names the report — a runtime artifact,
+# never committed.
+entry-ab-telemetry corpus="heavy_concentrated_liquidity_solve_captures.jsonl":
+    HOTPATH_OUTPUT_FORMAT=json HOTPATH_OUTPUT_PATH="${HOTPATH_OUTPUT_PATH:-hp.json}" HOTPATH_REPORT=functions-timing,threads cargo run --locked --manifest-path rust/Cargo.toml -p apexbot-pools --features hotpath,capture-fixtures --example entry_ab_readout -- rust/crates/foundation/apexbot-pools/tests/fixtures/{{corpus}}
+
+# The WalkMemo cross-block reuse readout: the fixture A/B (memo off vs on)
+# over the captured corpus. DR_READOUT_EPOCHS sets the epoch count.
+walkmemo-readout:
+    cargo run --locked --manifest-path rust/Cargo.toml -p apexbot-pools --features capture-fixtures --example walkmemo_readout
+

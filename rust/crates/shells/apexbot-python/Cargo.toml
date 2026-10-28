@@ -1,0 +1,194 @@
+[package]
+name = "apexbot_rs"
+description = "Rust implementations used by the apexbot Python package."
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "apexbot_rs"
+crate-type = ["rlib", "cdylib"]
+
+# The PyO3 binding layer (cdylib) over the pyo3-free core crates. It is a
+# workspace member at `rust/crates/shells/apexbot-python/`, beside the Rust-facing
+# core roles rather than implementing product behavior. The workspace
+# root `rust/Cargo.toml` is a pure virtual manifest (ADR-005 deferral —
+# the binding layer lifted out of the workspace root).
+
+[dependencies]
+apexbot-config.workspace = true
+alloy = { version = "^2.5", features = ["full", "transport-throttle"] }
+# The workspace dependency enables the `pyo3` feature so `From<Error> for PyErr`
+# conversions from core are available at this binding layer.
+apexbot-rpc = { workspace = true, optional = true }
+
+apexbot-bot = { workspace = true, optional = true }
+# ADR-067: the state owner + seam types moved to the substrate crate; the
+# bot-driven shell resolves them directly.
+apexbot-substrate = { workspace = true, optional = true }
+# The WS-ingestion event surface the bot-driven pump consumes.
+apexbot-ingestion = { workspace = true, optional = true }
+apexbot-pools.workspace = true
+apexbot-decoders = { workspace = true, optional = true }
+apexbot-uniswap = { workspace = true, optional = true }
+apexbot-abi = { workspace = true, optional = true }
+apexbot-math = { workspace = true, optional = true }
+# ADR-070: the shell's write seams serve the updater shells, so it enables the
+# writer substrate; bot/engine crates never do.
+apexbot-db = { workspace = true, optional = true, features = ["writer"] }
+apexbot-pathfinding = { workspace = true, optional = true }
+apexbot-price = { workspace = true, optional = true, features = ["pyo3"] }
+apexbot-submission = { workspace = true, optional = true, features = ["pyo3"] }
+# The concrete strategy compositions (the backrun arm) the hosted boot
+# registers on the strategy host. Reaches down into the core crates; nothing
+# outside the binding/CLI/umbrella depends on it.
+apexbot-strategy = { workspace = true, optional = true }
+apexbot-simulation = { workspace = true, optional = true }
+apexbot-workers = { workspace = true, optional = true }
+revm = { version = "^43.0", default-features = false }
+apexbot-arbitrage = { workspace = true, optional = true, features = ["order-index"] }
+# The core batch executor: the batch assembly + payload-merge policies the
+# simulation seams delegate to (one home with the executor's stage 1).
+apexbot-batch-executor = { workspace = true, optional = true }
+apexbot-executor = { workspace = true, optional = true }
+apexbot-execution = { workspace = true, optional = true }
+apexbot-fork = { workspace = true, optional = true }
+apexbot-pool-updater = { workspace = true, optional = true }
+apexbot-aave = { workspace = true, optional = true }
+apexbot-core = { workspace = true, features = ["pyo3"] }
+# ADR-051 D3: the Python console is a passthrough, so the binding depends on
+# the argv facade (apexbot-cli, which owns the ONE clap tree + the console
+# sinks). Both are pyo3-free cores; the binding layer reaches UP into the
+# console, never the reverse.
+apexbot-cli.workspace = true
+dashmap = { version = "^6.2" }
+futures-util = { version = "^0.3", default-features = false, features = ["async-await", "std"] }
+log = { version = "^0.4" }
+lru = { version = "^0.19" }
+mimalloc = { version = "0.1", optional = true }
+# Engine-slice map type mirrors the core hashbrown maps.
+hashbrown.workspace = true
+parking_lot = { version = "^0.13" }
+pyo3 = { version = "^0.30", features = [ "abi3-py312", "serde", "multiple-pymethods"] }
+pyo3-async-runtimes = { version = "^0.30", features = ["tokio-runtime"] }
+crossbeam-queue = { version = "^0.3" }
+# argv parsing at the Python seam: the Parser::try_parse_from trait the
+# console's OWN clap tree exposes (the binary uses <Cli as Parser>::parse).
+clap = { version = "4.6", features = ["derive"] }
+tracing = { version = "^0.1" }
+tracing-log = { version = "^0.2" }
+tracing-subscriber = { version = "^0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "registry", "alloc"] }
+rand = { version = "^0.10" }
+serde = { version = "^1.0", features = ["derive"] }
+serde_json = { version = "^1.0" }
+thiserror = { version = "^2.0" }
+tokio = { version = "^1.54", features = ["rt-multi-thread", "time", "macros", "sync"] }
+toml = "1.1.8"
+apexbot-eventhub.workspace = true
+
+[features]
+# Per-domain binding-layer features. Each gates its optional
+# optional core-crate dependency + the corresponding binding module/mod registrations, mirroring
+# how polars gates polars-python with features matching polars-core/-plan/etc.
+# Default = all-on (byte-equivalent to the pre-feature surface). Implicit coupling:
+# `bot` implies `rpc`+`decoders`+`uniswap`
+# (the engine wrapper references apexbot_rpc::provider::AlloyProvider + apexbot_decoders::PoolId
+# + apexbot_uniswap::dex_identity directly), and `rpc` implies `abi` (rpc/contract wraps
+# crate::abi_types). `async` gates the rpc/ async submodules (no new dep).
+# The `apexbot-arbitrage` dep spec carries `features = ["order-index"]`, so
+# every `simulation` build (default) gets ADR-024's deterministic profit-
+# descending pre-sim selection inside `dispatch_profitable`.
+default = ["auto-initialize", "bot", "rpc", "price", "submission", "simulation", "abi", "concentrated-liquidity-math", "balancer-math", "curve-math", "solidly-math", "v2-math", "uniswap", "pathfinding", "async", "db", "executor", "execution", "pool", "aave-updater", "fork"]
+extension-module = ["pyo3/extension-module"]
+# Canonical local development-wheel feature set. Keep this alias out of the
+# package defaults: ordinary Python package builds remain release-equivalent,
+# while `just dev` selects this complete set explicitly.
+dev-features = [
+    "pyo3/extension-module",
+    "apexbot-bot/hotpath",
+    "apexbot-bot/hotpath-prometheus",
+    "apexbot-pools/hotpath",
+    "apexbot-bot/allocator-ctrl",
+    "otel",
+    "mimalloc",
+]
+auto-initialize = ["pyo3/auto-initialize"]
+# ADR-066 D1 (named feature, not a manifest toggle): embeds PyO3
+# introspection chunks in the cdylib so `just gen-stubs` can read the
+# seam's surface out of the built artifact. This build exists solely to
+# be introspected — it is outside `default` and `dev-features`, so
+# release wheels never ship it. The generator (`apexbot-stubgen`) pins
+# `pyo3-introspection` in lockstep with the `pyo3` pin: a pyo3 bump
+# implies a generator bump and a fresh stub diff.
+experimental-inspect = ["pyo3/experimental-inspect"]
+# FF-T1: `bot` also names apexbot-workers — the intake seam maps
+# the workers' typed BootError family onto the BootRefused exception at
+# the pyo3 leaf (the simulation feature already pulled the dep; bot-only
+# builds now name the type too).
+# ADR-070: `bot` includes `db` — the construction DB half is opened by the
+# shell (a writer-enabled crate), so the shell needs its own `apexbot-db` edge.
+bot = ["dep:apexbot-bot", "dep:apexbot-substrate", "dep:apexbot-ingestion", "dep:apexbot-workers", "rpc", "decoders", "uniswap", "db"]
+price = ["dep:apexbot-price", "rpc"]
+submission = ["dep:apexbot-submission", "dep:apexbot-strategy", "rpc"]
+simulation = ["dep:apexbot-simulation", "dep:apexbot-arbitrage", "dep:apexbot-batch-executor", "dep:apexbot-workers", "rpc", "executor", "submission"]
+executor = ["dep:apexbot-executor"]
+execution = ["dep:apexbot-execution", "executor"]
+fork = ["dep:apexbot-fork"]
+rpc = ["dep:apexbot-rpc", "abi"]
+abi = ["dep:apexbot-abi"]
+concentrated-liquidity-math = ["dep:apexbot-math"]
+db = ["dep:apexbot-db"]
+pool = ["dep:apexbot-pool-updater", "db", "rpc"]
+aave-updater = ["dep:apexbot-aave", "db", "rpc"]
+balancer-math = ["dep:apexbot-math"]
+curve-math = ["dep:apexbot-math"]
+solidly-math = ["dep:apexbot-math"]
+v2-math = ["dep:apexbot-math"]
+uniswap = ["dep:apexbot-uniswap"]
+decoders = ["dep:apexbot-decoders"]
+pathfinding = ["dep:apexbot-pathfinding"]
+async = []
+# mimalloc fixes OOM under bursty allocation vs. the default system allocator.
+# local_dynamic_tls is REQUIRED: its default initial-exec TLS model must fit in
+# glibc's ~1664-byte static TLS surplus at dlopen() time, which fails whenever
+# any other extension module (e.g. pytest) is imported first —
+# "ImportError: cannot allocate memory in static TLS block". The dynamic
+# TLS model routes the per-thread heaps through the DTV instead. Do not drop
+# this feature unless the initial-exec relocation count of _ffi.abi3.so
+# (readelf -rW .../abi3.so | grep -c TPOFF64) is verifiably still zero.
+mimalloc = ["dep:mimalloc", "mimalloc/local_dynamic_tls"]
+# OTel span export for the Python-driven path: pulls apexbot-bot
+# with its `otel` feature (OTLP exporter + layer). NOT in `default` -
+# release/CI wheels must not ship the OTLP client footprint (same
+# exclusion story as hotpath; the binding's `dev-features` alias enables it).
+otel = ['bot', 'apexbot-bot/otel']
+
+[dev-dependencies]
+# The console's clap-free semantics crate (also pyo3-free): the seam's tests
+# pin the typed `CliError -> ExitCode` mapping directly.
+apexbot-cli-core.workspace = true
+ctor = "^1"
+proptest = "^1.12"
+# Enable test-only constructors (e.g. `AlloyProvider::from_provider`) for
+# the root crate's tests. Production builds pull apexbot-rpc without this
+# feature.
+apexbot-rpc = { workspace = true, features = ["test-utils"] }
+
+# Seam-C test seam: InMemorySpanExporter. Same version lock as
+# apexbot-bot (tracing-opentelemetry 0.33 <-> opentelemetry(-sdk) 0.32).
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
+
+[[test]]
+name = "python_integration"
+required-features = ["auto-initialize"]
+
+[[test]]
+name = "concurrency_stress"
+required-features = ["auto-initialize"]

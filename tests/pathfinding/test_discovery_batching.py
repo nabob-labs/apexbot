@@ -1,4 +1,4 @@
-"""Discovery delivery batching (4IOEVT): red/green behavioral tests.
+"""Discovery delivery batching: red/green behavioral tests.
 
 find_paths_async is a thin async adapter over the Rust batched async iterator
 (`apexbot._ffi.find_paths_async_rust` -> `PathBatchIterator`): the DFS runs
@@ -21,26 +21,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
-import os
-import subprocess  # ruff: ignore[suspicious-subprocess-import]
-import sys
 import threading
 import time
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
 from apexbot.constants import ZERO_ADDRESS
-from apexbot.database.models import Erc20TokenTable, UniswapV2PoolTable
-from apexbot.database.models.base import ExchangeTable
-from apexbot.database.operations import (
-    create_new_sqlite_database,
-    get_scoped_sqlite_session,
-)
-from apexbot.database.session_manager import DatabaseSessionManager
 from apexbot.exceptions.base import ApexbotValueError
 from apexbot.pathfinding import (
+    PathfindingRequest,
+    PoolKind,
     _pathfinding,
     find_paths,
     find_paths_async,
@@ -49,6 +40,10 @@ from apexbot.pathfinding import (
 )
 from apexbot.runner.build_paths import PathRegistrationPipeline
 from apexbot.types.chain import ChainId
+from tests.deadlock_guard import DEADLOCK_GUARD_S
+from tests.fakes.runner_pipelines import FakeFleetHostedBot, FakePipelineContext
+from tests.helpers import verdict_probe as probe
+from tests.helpers.database import seed_v2_topology
 
 if TYPE_CHECKING:
     import pathlib
@@ -60,62 +55,44 @@ TOKEN_A_ADDR = "0x" + "AA" * 20
 POOL_A_ADDR = "0x" + "11" * 20
 POOL_B_ADDR = "0x" + "12" * 20
 
-_BASE_KWARGS: dict[str, object] = {
-    "chain_id": CHAIN,
-    "start_tokens": [WETH_ADDR],
-    "end_tokens": [WETH_ADDR],
-    "max_depth": 2,
-    "pool_types": [UniswapV2PoolTable],
-}
+
+def _base_request(database_path: pathlib.Path) -> PathfindingRequest:
+    """Build the shared two-pool synthetic search request for the parity tests."""
+    return PathfindingRequest(
+        chain_id=CHAIN,
+        start_tokens=[WETH_ADDR],
+        end_tokens=[WETH_ADDR],
+        max_depth=2,
+        pool_types=[PoolKind.V2],
+        database_path=database_path,
+    )
 
 
-def _seed_two_pool_db(db_path: pathlib.Path) -> DatabaseSessionManager:
+def _adapter_request(database_path: pathlib.Path) -> PathfindingRequest:
+    """Build a path-only request for tests that replace the prep seam."""
+    return PathfindingRequest(
+        chain_id=1,
+        start_tokens=[],
+        end_tokens=[],
+        database_path=database_path,
+    )
+
+
+def _seed_two_pool_db(db_path: pathlib.Path) -> pathlib.Path:
     """Seed a file-backed temp SQLite with a WETH<->A two-pool cycle."""
-    create_new_sqlite_database(db_path)
-    scoped = get_scoped_sqlite_session(database_path=db_path)
-    session = scoped()
-    try:
-        exchange = ExchangeTable(
-            chain_id=CHAIN, name="test", active=True, factory=ZERO_ADDRESS
-        )
-        session.add(exchange)
-        session.flush()
-        weth = Erc20TokenTable(chain=CHAIN, address=WETH_ADDR, symbol="WETH")
-        token_a = Erc20TokenTable(chain=CHAIN, address=TOKEN_A_ADDR, symbol="A")
-        session.add_all([weth, token_a])
-        session.flush()
-        session.add(
-            UniswapV2PoolTable(
-                address=POOL_A_ADDR,
-                chain=CHAIN,
-                token0_id=weth.id,
-                token1_id=token_a.id,
-                exchange_id=exchange.id,
-                fee_token0=3,
-                fee_token1=3,
-                fee_denominator=1000,
-            )
-        )
-        session.add(
-            UniswapV2PoolTable(
-                address=POOL_B_ADDR,
-                chain=CHAIN,
-                token0_id=token_a.id,
-                token1_id=weth.id,
-                exchange_id=exchange.id,
-                fee_token0=3,
-                fee_token1=3,
-                fee_denominator=1000,
-            )
-        )
-        session.commit()
-    finally:
-        session.close()
-    return DatabaseSessionManager(scoped)
+    seed_v2_topology(
+        db_path,
+        [
+            (POOL_A_ADDR, WETH_ADDR, TOKEN_A_ADDR),
+            (POOL_B_ADDR, TOKEN_A_ADDR, WETH_ADDR),
+        ],
+        chain_id=CHAIN,
+    )
+    return db_path
 
 
 @pytest.fixture
-def db(tmp_path: pathlib.Path) -> DatabaseSessionManager:
+def db(tmp_path: pathlib.Path) -> pathlib.Path:
     return _seed_two_pool_db(tmp_path / "discovery_batching.db")
 
 
@@ -146,13 +123,13 @@ async def _drain_into(producer: AsyncGenerator[object, None], sink: list[object]
 # ---------------------------------------------------------------------------
 
 
-def test_batched_async_matches_sync_stream(db: DatabaseSessionManager) -> None:
+def test_batched_async_matches_sync_stream(db: pathlib.Path) -> None:
     """Content + order parity: 1, small, default, and oversized batches."""
-    expected = list(find_paths(db=db, **_BASE_KWARGS))  # type: ignore[arg-type]
+    expected = list(find_paths(request=_base_request(db)))
     assert expected, "fixture graph produced no paths"
 
     for batch_size in (1, 2, 1000, 10**6):
-        got = asyncio.run(_collect(db=db, batch_size=batch_size, **_BASE_KWARGS))
+        got = asyncio.run(_collect(request=_base_request(db), batch_size=batch_size))
         assert _path_signature(got) == _path_signature(expected), (
             f"batched stream diverged at batch_size={batch_size}"
         )
@@ -163,15 +140,15 @@ def test_batched_async_matches_sync_stream(db: DatabaseSessionManager) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _star_edges() -> list[tuple[int, int, int, int]]:
+def _star_edges() -> list[tuple[int, int, int, PoolKind]]:
     """Three parallel WETH(1)<->A(2) pools each way -> 3 * 3 == 9 cycles."""
-    forward = [(1, 2, 100 + i, 0) for i in range(3)]
-    reverse = [(2, 1, 200 + i, 0) for i in range(3)]
+    forward = [(1, 2, 100 + i, PoolKind.V2) for i in range(3)]
+    reverse = [(2, 1, 200 + i, PoolKind.V2) for i in range(3)]
     return [*forward, *reverse]
 
 
 async def _collect_batches(
-    edges: list[tuple[int, int, int, int]], batch_size: int
+    edges: list[tuple[int, int, int, PoolKind]], batch_size: int
 ) -> tuple[list[object], list[int]]:
     iterator = find_paths_async_rust(
         edges,
@@ -212,10 +189,10 @@ def test_rust_async_iterator_batches_cadence() -> None:
 
 
 def test_rust_async_iterator_rejects_bad_pool_kind() -> None:
-    """Constructor-time validation still raises for an unknown pool kind."""
-    with pytest.raises(ValueError, match="pool_kind"):
+    """The typed seam rejects a bare int where a `PoolKind` is required."""
+    with pytest.raises(TypeError):
         find_paths_async_rust(
-            [(1, 2, 1, 3)],
+            [(1, 2, 1, 3)],  # type: ignore[list-item]
             1,
             1,
             2,
@@ -271,12 +248,19 @@ class _BoomError(RuntimeError):
     pass
 
 
+class _FakeGraph:
+    """Pass-through standing in for the Rust `PathGraph` value."""
+
+    def __init__(self) -> None:
+        self.edges: list[object] = []
+
+    def build_steps(self, raw_path: list[object]) -> list[object]:
+        return raw_path
+
+
 def _fake_traversal() -> object:
-    prepared = _pathfinding._PreparedGraph(
-        edges=[], v2v3_addresses={}, v4_lookups={}, pool_id_to_type={}
-    )
     return _pathfinding._Traversal(
-        prepared=prepared,
+        graph=_FakeGraph(),
         start_token_id=1,
         end_token_id=1,
         include_reverse=False,
@@ -285,15 +269,14 @@ def _fake_traversal() -> object:
     )
 
 
-def _install_fake_rust_seam(
-    monkeypatch: pytest.MonkeyPatch,
+def _fake_rust_seam(
     *,
     batches: list[list[object]],
     error: BaseException | None = None,
     dropped: list[bool] | None = None,
     captured: dict[str, object] | None = None,
-) -> None:
-    """Patch the prep + Rust batch seam so no DB is required."""
+) -> dict[str, object]:
+    """The injected prep + Rust batch seams, so no DB is required."""
 
     def factory(*args: object, **kwargs: object) -> _FakeBatchIterator:
         if captured is not None:
@@ -301,17 +284,23 @@ def _install_fake_rust_seam(
             captured["kwargs"] = kwargs
         return _FakeBatchIterator(batches, error=error, dropped=dropped)
 
-    monkeypatch.setattr(_pathfinding, "find_paths_async_rust", factory)
-    monkeypatch.setattr(_pathfinding, "_prepare_traversals", lambda **_: [_fake_traversal()])
+    return {
+        "prepare_traversals": lambda **_: [_fake_traversal()],
+        "find_paths_async_rust": factory,
+    }
 
 
-def test_adapter_forwards_batch_size_to_rust_seam(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_adapter_forwards_batch_size_to_rust_seam(tmp_path: pathlib.Path) -> None:
     """The adapter hands the requested batch_size straight to the Rust seam."""
     captured: dict[str, object] = {}
-    _install_fake_rust_seam(monkeypatch, batches=[[[], []]], captured=captured)
+    seams = _fake_rust_seam(batches=[[[], []]], captured=captured)
 
     got = asyncio.run(
-        _collect(chain_id=1, start_tokens=[], end_tokens=[], db=None, batch_size=7)
+        _collect(
+            request=_adapter_request(tmp_path / "unused.db"),
+            batch_size=7,
+            **seams,  # type: ignore[arg-type]
+        )
     )
     assert got == [[], []]
 
@@ -321,10 +310,9 @@ def test_adapter_forwards_batch_size_to_rust_seam(monkeypatch: pytest.MonkeyPatc
     assert args[7] == 7  # batch_size
 
 
-async def test_producer_exception_reraises_at_consumer(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_producer_exception_reraises_at_consumer(tmp_path: pathlib.Path) -> None:
     """A Rust `__anext__` failure surfaces at the consumer, pending batch first."""
-    _install_fake_rust_seam(
-        monkeypatch,
+    seams = _fake_rust_seam(
         batches=[[[], []]],
         error=_BoomError("producer died"),
     )
@@ -333,7 +321,9 @@ async def test_producer_exception_reraises_at_consumer(monkeypatch: pytest.Monke
     with pytest.raises(_BoomError, match="producer died"):
         await _drain_into(
             find_paths_async(
-                chain_id=1, start_tokens=[], end_tokens=[], db=None, batch_size=2
+                request=_adapter_request(tmp_path / "unused.db"),
+                batch_size=2,
+                **seams,  # type: ignore[arg-type]
             ),
             got,
         )
@@ -341,18 +331,16 @@ async def test_producer_exception_reraises_at_consumer(monkeypatch: pytest.Monke
     assert got == [[], []], "the pending batch must be delivered before the raise"
 
 
-async def test_aclose_releases_the_rust_iterator(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_aclose_releases_the_rust_iterator(tmp_path: pathlib.Path) -> None:
     """aclose clears the adapter's reference so the Rust iterator can drop."""
     dropped: list[bool] = []
-    _install_fake_rust_seam(
-        monkeypatch,
+    seams = _fake_rust_seam(
         batches=[[[], [], []], [[], [], []]],
         dropped=dropped,
     )
 
-    agen = find_paths_async(
-        chain_id=1, start_tokens=[], end_tokens=[], db=None, batch_size=2
-    )
+    request = _adapter_request(tmp_path / "unused.db")
+    agen = find_paths_async(request=request, batch_size=2, **seams)  # type: ignore[arg-type]
     seen = 0
     async for _path in agen:
         seen += 1
@@ -364,8 +352,8 @@ async def test_aclose_releases_the_rust_iterator(monkeypatch: pytest.MonkeyPatch
     assert dropped, "the adapter must release the Rust batch iterator on aclose"
 
 
-async def _partial_sweep(db: DatabaseSessionManager | None, *, take: int) -> int:
-    agen = find_paths_async(db=db, **_BASE_KWARGS)  # type: ignore[arg-type]
+async def _partial_sweep(db: pathlib.Path, *, take: int) -> int:
+    agen = find_paths_async(request=_base_request(db))
     seen = 0
     async for _path in agen:
         seen += 1
@@ -394,12 +382,20 @@ def _persistent_threads() -> dict[int, str]:
     }
 
 
-async def test_aclose_leaves_no_worker_threads(db: DatabaseSessionManager) -> None:
+async def test_aclose_leaves_no_worker_threads(db: pathlib.Path) -> None:
     """Repeated mid-sweep closes leave no stray discovery worker threads."""
-    # Warm any lazily-created runtime/executor threads first.
+    # Warm any lazily-created runtime/executor threads first: sweep until two
+    # consecutive persistent-thread snapshots agree, so the baseline contains
+    # every thread the machinery legitimately keeps alive. Convergence is
+    # structural (lazy factories fire on first use), never a wall-clock wait.
     await _partial_sweep(db, take=1)
-    await asyncio.sleep(0.2)
     baseline = _persistent_threads()
+    for _ in range(20):
+        await _partial_sweep(db, take=1)
+        settled = _persistent_threads()
+        if settled == baseline:
+            break
+        baseline = settled
 
     for _ in range(6):
         await _partial_sweep(db, take=1)
@@ -410,51 +406,83 @@ async def test_aclose_leaves_no_worker_threads(db: DatabaseSessionManager) -> No
 
 
 # ---------------------------------------------------------------------------
-# Prep is lifted off the event loop (FYZMAF).
+# Prep is lifted off the event loop.
 # ---------------------------------------------------------------------------
 
 
-async def test_prep_never_blocks_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_prep_never_blocks_the_event_loop(tmp_path: pathlib.Path) -> None:
     """A slow prep must not stall the asyncio loop (canary keeps ticking).
 
-    Pre-FYZMAF the one-time prep (`_prepare_traversals`: SQLAlchemy token
+    Previously the one-time prep (`_prepare_traversals`: Rust token
     resolution + the `build_path_graph` bulk read) ran INLINE on the event
     loop at first `__anext__`, so a canary coroutine made no progress for the
     whole prep. It now runs on the Rust async seam's blocking pool, so the
     loop keeps turning while the prep is in flight.
     """
+    # Asserted deterministically: the prep records its thread identity (a
+    # blocking-pool thread, never the loop thread) and BLOCKS on a threading
+    # event until the loop-driven waiter observes it and releases it. An
+    # inline prep would stall the waiter into the failure timeout instead of
+    # passing; no wall-clock threshold arbitrates the sequencing.
+    loop_thread_ident = threading.get_ident()
+    prep_idents: list[int] = []
+    prep_started = threading.Event()
+    release_prep = threading.Event()
+
+    def slow_prep(**_: object) -> list[object]:
+        prep_idents.append(threading.get_ident())
+        prep_started.set()
+        # Simulate the slow (blocking) prep: hold a pool thread until the
+        # test proves the loop kept turning, then let the sweep finish.
+        release_prep.wait(timeout=30)
+        return [_fake_traversal()]
+
     ticks = 0
 
     async def canary() -> None:
         nonlocal ticks
         while True:
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
             ticks += 1
 
-    def slow_prep(**_: object) -> list[object]:
-        time.sleep(0.3)
-        return [_fake_traversal()]
-
-    monkeypatch.setattr(_pathfinding, "_prepare_traversals", slow_prep)
-    monkeypatch.setattr(
-        _pathfinding, "find_paths_async_rust", lambda *a, **k: _FakeBatchIterator([[]])
-    )
-
     canary_task = asyncio.ensure_future(canary())
-    agen = find_paths_async(chain_id=1, start_tokens=[], end_tokens=[], db=None)
-    started = time.perf_counter()
-    with pytest.raises(StopAsyncIteration):
-        await anext(agen)
-    elapsed = time.perf_counter() - started
+    agen = find_paths_async(
+        request=_adapter_request(tmp_path / "unused.db"),
+        prepare_traversals=slow_prep,
+        find_paths_async_rust=lambda *a, **k: _FakeBatchIterator([[]]),
+    )
+    # The lazy generator runs its prep only at the first `__anext__`.
+    next_task = asyncio.ensure_future(anext(agen))
+
+    # Turn the loop until the prep thread has started and blocked. The
+    # event-loop turns here (and the canary ticks they interleave) ARE the
+    # invariant: an inline prep would stall this await into the failure
+    # timeout below instead of ever observing prep_started.
+    async def wait_for_prep_started() -> None:
+        while not prep_started.is_set():
+            await asyncio.sleep(0)
+
+    # Deadlock guard only — not an ordering assertion: `prep_started` is set
+    # by the blocking-pool thread itself and the loop turns the await above
+    # performs are the invariant. The budget only converts "the prep never
+    # started" into a named failure instead of a parked worker.
+    await asyncio.wait_for(wait_for_prep_started(), timeout=DEADLOCK_GUARD_S)
+
+    assert prep_idents, "the prep never started"
+    assert all(ident != loop_thread_ident for ident in prep_idents), (
+        "the prep ran on the event-loop thread"
+    )
+    assert ticks >= 1, "event loop stalled while the prep blocked a pool thread"
+
+    release_prep.set()
+    with contextlib.suppress(StopAsyncIteration):
+        await next_task
     canary_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await canary_task
 
-    assert elapsed >= 0.3, "the slow prep did not actually run"
-    assert ticks >= 10, f"event loop stalled during prep: {ticks} canary ticks in {elapsed:.2f}s"
 
-
-async def test_missing_start_token_raises_at_first_next(db: DatabaseSessionManager) -> None:
+async def test_missing_start_token_raises_at_first_next(db: pathlib.Path) -> None:
     """Token-resolution errors keep today's lazy ApexbotValueError shape.
 
     The prep (and therefore the DB token lookup) runs at first `__anext__`,
@@ -463,12 +491,14 @@ async def test_missing_start_token_raises_at_first_next(db: DatabaseSessionManag
     blocking seam.
     """
     agen = find_paths_async(
-        db=db,
-        chain_id=CHAIN,
-        start_tokens=[ZERO_ADDRESS],
-        end_tokens=[WETH_ADDR],
-        max_depth=2,
-        pool_types=[UniswapV2PoolTable],
+        request=PathfindingRequest(
+            database_path=db,
+            chain_id=CHAIN,
+            start_tokens=[ZERO_ADDRESS],
+            end_tokens=[WETH_ADDR],
+            max_depth=2,
+            pool_types=[PoolKind.V2],
+        )
     )
     with pytest.raises(ApexbotValueError, match="was not found in the database"):
         await anext(agen)
@@ -479,56 +509,37 @@ async def test_missing_start_token_raises_at_first_next(db: DatabaseSessionManag
 # ---------------------------------------------------------------------------
 
 
-def _run_ffi_getter(env_overrides: dict[str, str]) -> str:
-    env = dict(os.environ)
-    env.update(env_overrides)
-    out = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from apexbot._ffi import discovery_batch_size as f; print(f())",
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=300,
-    )
-    return out.stdout.strip().splitlines()[-1]
+def _run_ffi_getter(env_overrides: dict[str, str]) -> int:
+    """The resolved batch size for a hypothetical environment."""
+    return probe.build_config(env=env_overrides).discovery_batch_size
 
 
 def test_typed_config_env_override_reaches_the_getter() -> None:
-    assert _run_ffi_getter({"APEXBOT_DISCOVERY_BATCH_SIZE": "7"}) == "7"
+    assert _run_ffi_getter({"APEXBOT_DISCOVERY_BATCH_SIZE": "7"}) == 7
 
 
 def test_typed_config_is_positive_clamped() -> None:
-    assert _run_ffi_getter({"APEXBOT_DISCOVERY_BATCH_SIZE": "0"}) == "1"
+    assert _run_ffi_getter({"APEXBOT_DISCOVERY_BATCH_SIZE": "0"}) == 1
 
 
-def _make_pipeline() -> PathRegistrationPipeline:
-    ctx = SimpleNamespace(
-        bot=SimpleNamespace(registration_fleet_hosted=lambda: True, _py_bot=None),
-        chain_id=1,
-        db=None,
-        uniswap_v3_tracker=None,
-        sushiswap_v3_tracker=None,
-        pancakeswap_v3_tracker=None,
-        weth=None,
+def _make_pipeline(database_path: pathlib.Path) -> PathRegistrationPipeline:
+    ctx = FakePipelineContext(bot=FakeFleetHostedBot(), database_path=database_path)
+    return PathRegistrationPipeline(
+        context=ctx,
+        engine_registry=None,
+        max_paths=0,  # type: ignore[arg-type]
+        discovery_batch_size=1000,
     )
-    return PathRegistrationPipeline(context=ctx, engine_registry=None)  # type: ignore[arg-type]
 
 
-def test_discovery_sweep_passes_typed_batch_size(monkeypatch: pytest.MonkeyPatch) -> None:
-    """discovery_sweep reads the typed key and forwards it to find_paths_async."""
-    build_paths_module = sys.modules["apexbot.runner.build_paths"]
-
-    monkeypatch.setattr(build_paths_module, "_discovery_batch_size", lambda: 42)
+def test_discovery_sweep_passes_typed_batch_size(tmp_path: pathlib.Path) -> None:
+    """discovery_sweep forwards the pipeline's resolved batch size."""
     captured: dict[str, object] = {}
 
     def fake_find_paths_async(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr(build_paths_module, "find_paths_async", fake_find_paths_async)
-
-    _make_pipeline().discovery_sweep()
+    pipeline = _make_pipeline(tmp_path / "unused.db")
+    pipeline.discovery_batch_size = 42
+    pipeline.discovery_sweep(find_paths_async=fake_find_paths_async)  # type: ignore[arg-type]
     assert captured["batch_size"] == 42

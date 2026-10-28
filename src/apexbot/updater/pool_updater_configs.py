@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 
 from apexbot import abi_decode
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.database.models.base import ExchangeTable
-from apexbot.database.models.pools import PoolManagerTable
 from apexbot.db import (
+    ExchangeRow,
+    PoolManagerRow,
     db_apply_v3_liquidity_updates,
     db_apply_v4_liquidity_updates,
     db_fetch_pool_row,
@@ -29,7 +29,7 @@ from apexbot.utils.bytes import to_0x_hex
 # V3 liquidity event topic0 hashes (Mint/Burn). Used by the V3 decode shell
 # (`apply_v3_liquidity_updates`) to recognize the Burn signature + negate the
 # delta. Kept here (not in the retired `cli/pool.py`) so the chunk loop's
-# removal in task JJ232N leaves these decode shells with their topic constants.
+# removal leaves these decode shells with their topic constants.
 UNISWAP_V3_MINT_EVENT_HASH = bytes.fromhex(
     "7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde",
 )
@@ -99,23 +99,32 @@ class V4PoolUpdateConfig:
     fee_denominator: int
 
 
-def update_v2_pools(
-    provider: AlloyProvider,
-    start_block: int,
-    end_block: int,
-    exchange: ExchangeTable,
-    *,
-    database_path: str,
-    config: V2PoolUpdateConfig,
-    get_events_fn: Callable[..., list[LogReceipt]],
-) -> None:
+@dataclass(frozen=True)
+class PoolUpdateRequest[ConfigT: V2PoolUpdateConfig | V3PoolUpdateConfig | V4PoolUpdateConfig]:
+    """Typed request for one pool-creation event update run.
+
+    Bundles the block bounds, Rust-backed exchange row, database path,
+    decode config, and event-fetch callable so each updater shell takes a
+    single argument.
+    """
+
+    provider: AlloyProvider
+    start_block: int
+    end_block: int
+    exchange: ExchangeRow
+    database_path: str
+    config: ConfigT
+    get_events_fn: Callable[..., list[LogReceipt]]
+
+
+def update_v2_pools(request: PoolUpdateRequest[V2PoolUpdateConfig]) -> None:
     """Process V2-style pool creation events for a DEX."""
-    new_pool_events = get_events_fn(
-        provider=provider,
-        start_block=start_block,
-        end_block=end_block,
-        address=get_checksum_address(exchange.factory),
-        event_hash=config.event_hash,
+    new_pool_events = request.get_events_fn(
+        provider=request.provider,
+        start_block=request.start_block,
+        end_block=request.end_block,
+        address=get_checksum_address(request.exchange.factory),
+        event_hash=request.config.event_hash,
     )
 
     if not new_pool_events:
@@ -129,7 +138,7 @@ def update_v2_pools(
         token1 = get_checksum_address(token1)
 
         stable = False
-        if config.has_stable_flag:
+        if request.config.has_stable_flag:
             (stable,) = abi_decode(["bool"], new_pool_event["topics"][3])
 
         pool_address, _ = abi_decode(
@@ -139,22 +148,24 @@ def update_v2_pools(
         pool_address = get_checksum_address(pool_address)
 
         # Determine fee: either from RPC call or constant
-        if config.rpc_fee_call is not None:
-            rpc_args = [pool_address, stable] if config.rpc_fee_includes_stable else [pool_address]
+        if request.config.rpc_fee_call is not None:
+            rpc_args = (
+                [pool_address, stable] if request.config.rpc_fee_includes_stable else [pool_address]
+            )
             (fee,) = raw_call(
-                provider=provider,
-                address=get_checksum_address(exchange.factory),
+                provider=request.provider,
+                address=get_checksum_address(request.exchange.factory),
                 calldata=encode_function_calldata(
-                    function_prototype=config.rpc_fee_call,
+                    function_prototype=request.config.rpc_fee_call,
                     function_arguments=rpc_args,
                 ),
-                return_types=config.rpc_fee_return_types,
+                return_types=request.config.rpc_fee_return_types,
             )
             fee_token0 = fee
             fee_token1 = fee
         else:
-            fee_token0 = config.fee_token0
-            fee_token1 = config.fee_token1
+            fee_token0 = request.config.fee_token0
+            fee_token1 = request.config.fee_token1
 
         rows.append(
             V2PoolRowInput(
@@ -163,37 +174,28 @@ def update_v2_pools(
                 token1_address=token1,
                 fee_token0=fee_token0,
                 fee_token1=fee_token1,
-                stable=stable if config.has_stable_flag else None,
+                stable=stable if request.config.has_stable_flag else None,
             ),
         )
 
     db_upsert_v2_pools(
-        database_path=database_path,
-        chain_id=exchange.chain_id,
-        kind=exchange.name,
-        exchange_id=exchange.id,
-        fee_denominator=config.fee_denominator,
+        database_path=request.database_path,
+        chain_id=request.exchange.chain_id,
+        kind=request.exchange.name,
+        exchange_id=request.exchange.id,
+        fee_denominator=request.config.fee_denominator,
         rows=rows,
     )
 
 
-def update_v3_pools(
-    provider: AlloyProvider,
-    start_block: int,
-    end_block: int,
-    exchange: ExchangeTable,
-    *,
-    database_path: str,
-    config: V3PoolUpdateConfig,
-    get_events_fn: Callable[..., list[LogReceipt]],
-) -> None:
+def update_v3_pools(request: PoolUpdateRequest[V3PoolUpdateConfig]) -> None:
     """Process V3-style pool creation events for a DEX."""
-    new_pool_events = get_events_fn(
-        provider=provider,
-        start_block=start_block,
-        end_block=end_block,
-        address=get_checksum_address(exchange.factory),
-        event_hash=config.event_hash,
+    new_pool_events = request.get_events_fn(
+        provider=request.provider,
+        start_block=request.start_block,
+        end_block=request.end_block,
+        address=get_checksum_address(request.exchange.factory),
+        event_hash=request.config.event_hash,
     )
 
     if not new_pool_events:
@@ -215,15 +217,15 @@ def update_v3_pools(
         pool_address = get_checksum_address(pool_address)
 
         # Aerodrome V3: override fee from RPC
-        if config.rpc_fee_call is not None:
+        if request.config.rpc_fee_call is not None:
             (fee,) = raw_call(
-                provider=provider,
-                address=get_checksum_address(exchange.factory),
+                provider=request.provider,
+                address=get_checksum_address(request.exchange.factory),
                 calldata=encode_function_calldata(
-                    function_prototype=config.rpc_fee_call,
+                    function_prototype=request.config.rpc_fee_call,
                     function_arguments=[pool_address],
                 ),
-                return_types=config.rpc_fee_return_types,
+                return_types=request.config.rpc_fee_return_types,
             )
 
         rows.append(
@@ -237,32 +239,23 @@ def update_v3_pools(
         )
 
     db_upsert_v3_pools(
-        database_path=database_path,
-        chain_id=exchange.chain_id,
-        kind=exchange.name,
-        exchange_id=exchange.id,
-        fee_denominator=config.fee_denominator,
+        database_path=request.database_path,
+        chain_id=request.exchange.chain_id,
+        kind=request.exchange.name,
+        exchange_id=request.exchange.id,
+        fee_denominator=request.config.fee_denominator,
         rows=rows,
     )
 
 
-def update_v4_pools(
-    provider: AlloyProvider,
-    start_block: int,
-    end_block: int,
-    exchange: ExchangeTable,
-    *,
-    database_path: str,
-    config: V4PoolUpdateConfig,
-    get_events_fn: Callable[..., list[LogReceipt]],
-) -> None:
+def update_v4_pools(request: PoolUpdateRequest[V4PoolUpdateConfig]) -> None:
     """Process V4-style pool creation events for a DEX."""
-    new_pool_events = get_events_fn(
-        provider=provider,
-        start_block=start_block,
-        end_block=end_block,
-        address=get_checksum_address(exchange.factory),
-        event_hash=config.event_hash,
+    new_pool_events = request.get_events_fn(
+        provider=request.provider,
+        start_block=request.start_block,
+        end_block=request.end_block,
+        address=get_checksum_address(request.exchange.factory),
+        event_hash=request.config.event_hash,
     )
 
     if not new_pool_events:
@@ -296,10 +289,10 @@ def update_v4_pools(
         )
 
     db_upsert_v4_pools(
-        database_path=database_path,
-        chain_id=exchange.chain_id,
-        pool_manager_address=get_checksum_address(exchange.factory),
-        fee_denominator=config.fee_denominator,
+        database_path=request.database_path,
+        chain_id=request.exchange.chain_id,
+        pool_manager_address=get_checksum_address(request.exchange.factory),
+        fee_denominator=request.config.fee_denominator,
         rows=rows,
     )
 
@@ -308,7 +301,7 @@ def apply_v3_liquidity_updates(
     provider: AlloyProvider,
     pool_address: str,
     liquidity_events: list[LogReceipt],
-    exchanges_in_scope: set[ExchangeTable],
+    exchanges_in_scope: set[ExchangeRow],
     *,
     database_path: str,
 ) -> None:
@@ -363,7 +356,7 @@ def apply_v3_liquidity_updates(
 def apply_v4_liquidity_updates(
     pool_id: bytes,
     liquidity_events: list[LogReceipt],
-    pool_manager: PoolManagerTable,
+    pool_manager: PoolManagerRow,
     *,
     database_path: str,
 ) -> None:

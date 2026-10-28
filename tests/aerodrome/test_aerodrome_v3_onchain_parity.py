@@ -3,7 +3,8 @@
 Golden conversion of the Aerodrome V3 ``quoteExactInputSingle`` exact-equality
 parity (``test_aerodrome_v3_pool_calculation`` in ``test_aerodrome_pools.py``).
 One representative pool (cbETH/WETH, 0.01%) with the full 13-multiplier x
-both-directions loop; the broad live loop stays as a live discovery gate.
+both-directions loop, minus the one input the tick-state cassette cannot
+verify; the broad live loop stays as a live discovery gate.
 
 Unlike the V2 tracers (reserves-only), a V3 (concentrated-liquidity) pool
 needs tick state to simulate a swap, so the pool is built I/O-free (ADR-005)
@@ -19,9 +20,7 @@ replay reproduces the exact inputs the record run used.
 - **Record mode** (``--golden-mode=record``): one Anvil fork of Base at the
   pinned block is shared across the whole loop; each ``quoteExactInputSingle``
   call is recorded. The test's own ``assert`` runs too — a record run is also a
-  live parity gate. Reverts are recorded as ``reverted`` entries and skipped
-  (the 0.75 x balance cbETH->WETH swap exceeds the pool's available liquidity
-  and reverts in the quoter itself).
+  live parity gate. Reverts are recorded as ``reverted`` entries and skipped.
 
 Pinned to Base block 46,875,151 (tip minus ~1M), inside
 ``https://mainnet.base.org``'s keyless archive window.
@@ -39,9 +38,13 @@ import pytest
 from apexbot._ffi import Bot
 from apexbot.aerodrome.pools import AerodromeV3Pool
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.fork import AnvilFork
+from apexbot.fork import AnvilFork, ForkLaunchConfig
 from apexbot.uniswap.math import MAX_SQRT_RATIO, MIN_SQRT_RATIO
 from tests.aerodrome.test_aerodrome_pools import AERODROME_V3_QUOTER_ABI
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.contract_compat import make_contract
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v3_pool_factory import make_v3_pool
@@ -138,12 +141,27 @@ def _parity_cases(
     Amounts derive from the pool's recorded token balances at the pinned block.
     """
     pairs = (
-        (lp.token0, lp.token1, cassette["balance_token0"], MIN_SQRT_RATIO + 1),
-        (lp.token1, lp.token0, cassette["balance_token1"], MAX_SQRT_RATIO - 1),
+        (
+            lp.token0,
+            lp.token1,
+            cassette["balance_token0"],
+            MIN_SQRT_RATIO + 1,
+            # The 0.75 x cbETH-balance input drains past the tick-state
+            # cassette's recorded tick window; the offline helper cannot
+            # verify that swap.
+            _TOKEN_AMOUNT_MULTIPLIERS[:-1],
+        ),
+        (
+            lp.token1,
+            lp.token0,
+            cassette["balance_token1"],
+            MAX_SQRT_RATIO - 1,
+            _TOKEN_AMOUNT_MULTIPLIERS,
+        ),
     )
     cases: list[tuple[str, Any, Any, int, int]] = []
-    for token_in, token_out, balance_in, sqrt_limit in pairs:
-        for mult in _TOKEN_AMOUNT_MULTIPLIERS:
+    for token_in, token_out, balance_in, sqrt_limit, multipliers in pairs:
+        for mult in multipliers:
             amount_in = int(mult * balance_in)
             if amount_in == 0:
                 continue
@@ -172,8 +190,10 @@ class _RecordFork(AbstractContextManager):
             self.fork = AnvilFork(
                 fork_url=BASE_RPC_URI,
                 fork_block=AERODROME_V3_PARITY_BLOCK,
-                storage_caching=True,
-                anvil_opts=["--accounts=0", "--optimism"],
+                launch=ForkLaunchConfig(
+                    storage_caching=True,
+                    anvil_opts=["--accounts=0", "--optimism"],
+                ),
             )
         return self
 
@@ -211,7 +231,6 @@ def _quote_callable(
     return _call
 
 
-@pytest.mark.base
 @pytest.mark.onchain_oracle
 def test_aerodrome_v3_cbeth_weth_quote(golden_factory) -> None:
     """Aerodrome V3 cbETH/WETH: local calc == golden(quoteExactInputSingle)."""
@@ -239,11 +258,21 @@ def test_aerodrome_v3_cbeth_weth_quote(golden_factory) -> None:
                 ),
             )
             if oracle.reverted:
-                # Mirrors the live test's revert handling: the quoter reverts
-                # on swaps exceeding available liquidity (e.g. 0.75 x balance).
+                # A record-mode revert has no oracle int to compare against.
                 continue
             calc = lp.calculate_tokens_out_from_tokens_in(
                 token_in=token_in,
                 token_in_quantity=amount_in,
             )
             assert calc == oracle.value, f"{key}: helper={calc} quoter={oracle.value}"
+
+
+def test_golden_keys_exactly_match_the_oracle_surface(request: pytest.FixtureRequest) -> None:
+    """The golden file holds exactly the keys this module's replay drives.
+
+    Replay fails loud on a missing key but stays silent on a stale extra one —
+    nothing looks it up. Set-equality against the recorded file closes that
+    drift: a shrunken case list cannot leave orphaned oracle entries behind."""
+    lp = _build_aerodrome_v3_cbeth_weth_io_free()
+    expected = {key for key, *_rest in _parity_cases(lp, _load_cassette())}
+    assert_golden_keys_exact(request, "test_aerodrome_v3_cbeth_weth_quote", expected)

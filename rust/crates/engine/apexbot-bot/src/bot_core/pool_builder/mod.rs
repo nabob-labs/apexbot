@@ -1,0 +1,41 @@
+//! Pool-builder construction orchestration.
+//!
+//! The builder-choreography port: the orchestrated encode→call→decode
+//! choreography that the Python `builders/` drove through `PyBotIo` moves
+//! **core-side** here as free async functions over the atomic [`ConstructionIo`]
+//! handle. The `PyO3` wrapper (`apexbot-python`) re-points its public methods
+//! to `block_on` these functions, so a standalone `cargo add apexbot` consumer
+//! and a Python-driven bot share one construction path (no `pyo3` in this
+//! module — the no-pyo3-in-cores invariant).
+//!
+//! This module:
+//! - [`choreography`] — the moved encode→call→decode primitives (V2/V3/V4 +
+//!   ERC-20 + tick), per decision D-C.
+//! - [`builder`] — the `PoolBuilder` orchestration  that composes
+//!   these primitives into core structural pool identity+state (`build_v2/v3/v4`,
+//!   `build_curve_pool`, `build_balancer_*`).
+//! - [`curve_choreography`] — the Curve-specific primitives.
+//!
+//! - [`route`] — the construction route: the core's ONE entry from a
+//!   requested pool to a constructed, registered pool (route order + DB
+//!   two-step identity + get-or-register, classified on the registration
+//!   ledger's build-refusal taxonomy).
+//! - [`construction_door`] — the construction door: the ONE
+//!   [`PoolConstruction`](construction_door::PoolConstruction) request and
+//!   [`ConstructionVerdict`](construction_door::ConstructionVerdict) outcome,
+//!   dispatching INTO [`route`]'s interior (ADR-078 D2).
+//!
+//! Note: `build_curve_pool` / `build_balancer_*` are not yet re-exported from
+//! the `apexbot` umbrella nor exposed on `PyBot` (see ADR-023/D4);
+//! `build_v2`/`build_v3`/`build_v4` are the standalone-reachable set.
+
+pub mod builder;
+pub mod choreography;
+pub mod construction_door;
+pub mod curve_choreography;
+pub mod parity;
+pub mod route;
+pub mod tick_source;
+
+#[cfg(test)]
+mod tests;

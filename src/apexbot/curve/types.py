@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
     from apexbot.erc20 import Erc20Token
     from apexbot.types.aliases import BlockNumber
-    from apexbot.types.chain import ChecksummedAddress, HexAddress
+    from apexbot.types.chain import ChecksummedAddress
     from apexbot.types.rpc_types import BlockIdentifier
 
 
@@ -124,7 +124,7 @@ class LendingRateStyle(Enum):
 class BasePoolPort(Protocol):
     """The slice of the base-pool surface the metapool ``DyCalculator`` needs.
 
-    Names the *real* interface behind the lazy go-between (ADR-005 BQM2OA): a
+    Names the *real* interface behind the lazy go-between (ADR-005): a
     metapool's calc paths call exactly these six members on its base pool —
     ``tokens`` / ``balances`` / ``fee`` for metadata, and
     ``calc_token_amount`` / ``get_dy`` / ``calc_withdraw_one_coin`` for
@@ -330,17 +330,3 @@ class CurveStableswapPoolSimulationResult:
     amount0_delta: int
     amount1_delta: int
     current_state: CurveStableswapPoolState
-    future_state: CurveStableswapPoolState
-
-
-@dataclasses.dataclass(slots=True, frozen=True)
-class CurveStableSwapPoolAttributes:
-    """CurveStableSwapPoolAttributes class."""
-
-    address: HexAddress
-    lp_token_address: HexAddress
-    coin_addresses: list[HexAddress]
-    coin_index_type: str
-    is_metapool: bool
-    underlying_coin_addresses: list[HexAddress] | None = dataclasses.field(default=None)
-    base_pool_address: HexAddress | None = dataclasses.field(default=None)

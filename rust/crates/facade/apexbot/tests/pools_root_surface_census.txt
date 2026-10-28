@@ -1,0 +1,19 @@
+# ADR-084 W5 (phase 1, W5b) — the apexbot-pools root surface after the
+# namespacing execution. The 34 former root modules (33 pre-W2 + `affected`)
+# moved under the four capability modules recorded in the phase-0 snapshot;
+# this file now pins the EXECUTED state.
+#
+# The pin is review-required: `architecture_gates.rs::pools_root_surface_is_pinned`
+# fails when a module is added, removed, or re-homed without a review of this
+# file, and the root `pub` item count (680 after i2's second half deleted
+# the miss-path shim trait and its value/error duplicates) is asserted so
+# untracked surface growth fails loudly.
+#
+# Regenerate: rg -n '^pub mod' rust/crates/foundation/apexbot-pools/src/lib.rs
+# plus rg -c '^\s*pub (fn|struct|enum|trait|mod|const|type|use)' over src/.
+#
+# Format: <module> <capability-role>
+families families
+sim sim
+solve solve
+state state

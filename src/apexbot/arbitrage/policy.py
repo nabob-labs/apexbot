@@ -1,4 +1,4 @@
-"""Path-composition rejection predicates (Plan 102 follow-up, D7KMQO).
+"""Path-composition rejection predicates.
 
 A :class:`~apexbot.arbitrage.EngineRegistry` can refuse an
 :func:`~apexbot.arbitrage.EngineRegistry.register_path` candidate by
@@ -10,8 +10,8 @@ Rust core (ADR-005 standalone-core constraint).
 
 Rejections surface as the typed :class:`~apexbot.exceptions.PathRejectedError`
 family (subclassing :class:`~apexbot.exceptions.ArbitrageError`, NOT
-``ValueError``) so callers classify by type — mirroring the Plan 102
-typed-exception pattern now used for pool admission + verification.
+``ValueError``) so callers classify by type — the same typed-exception
+pattern used for pool admission + verification.
 
 The predicate is a pluggable protocol: callers inject a
 :class:`PathPolicy` (or any structural implementation of

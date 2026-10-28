@@ -1,0 +1,778 @@
+//! The backrun arm's decision layer and typed knobs.
+//!
+//! The arm owns the full edge — `MEVBlocker` feed -> hub classification ->
+//! exact-sim oracle gate -> budgeted bid via the submission leaf — and runs
+//! as the hosted `BackrunDriver` on the one-process `StrategyHost`. The
+//! DECISION layer lives here as a pure function ([`decide`]) so the safety
+//! invariants are testable without a network.
+//!
+//! Safety model (task acceptance):
+//! - observe-only default: no bid unless `bid_mode` is set AND the budget is
+//!   non-zero (bid mode gated behind an explicit flag AND a non-zero budget);
+//! - no bid without a passing sim (the oracle gate is upstream of `decide`);
+//! - hard per-bundle + cumulative budget caps;
+//! - STOP kill-switch file: existence halts all bidding, then the loop;
+//! - a target whose tx already mined never dispatches (the bid-path receipt
+//!   probe observes `already_settled`).
+
+use std::path::PathBuf;
+
+use alloy::primitives::U256;
+use apexbot_config::BotConfig;
+use apexbot_substrate::pool_ingress::VerifyLevel;
+
+use crate::strategy_plane::{Strategy, StrategyName};
+
+/// One ecosystem's submission slot: the half of the strategy composition the
+/// two backrun arms differ in. The reaction machinery (frame feed, anchored
+/// discovery, decide gate, sim, dispatch) is shared; only the values named
+/// here vary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionSlot {
+    /// The `MEVBlocker` bundle auction. The signed backrun is bid through
+    /// `eth_sendBundle` on the searcher WebSocket, and the raw-broadcast
+    /// fan-out leads with the private endpoint (when set) before the read
+    /// provider fallback.
+    Mevblocker {
+        /// The searcher WebSocket the bundle is anchored on.
+        bundle_url: String,
+        /// Private-broadcast RPC. `None` leaves the raw fan-out to the read
+        /// provider alone; the bundle arm is unaffected either way.
+        private_url: Option<String>,
+    },
+    /// The public-mempool composition: no auction, the signed backrun goes raw
+    /// across the public relay fan-out with the read provider as fallback.
+    PublicFanOut {
+        /// The public relay URLs, in fan-out order.
+        relays: Vec<String>,
+    },
+    /// The Flashbots-compatible builder-relay composition: the TARGET's
+    /// verbatim signed bytes + the signed backrun leave as ONE
+    /// `eth_sendBundle` POST to every relay over HTTPS — no auction host
+    /// in the path and deliberately NO public raw fan-out (the bundle POST
+    /// is the entire submission).
+    BuilderRelay {
+        /// The builder relay URLs, in fan-out order.
+        relays: Vec<String>,
+    },
+}
+
+impl SubmissionSlot {
+    /// The ordered raw-broadcast relay URLs this slot names, private-first for
+    /// the `MEVBlocker` slot. Empty means the submit leaf falls back to the read
+    /// provider alone. The `BuilderRelay` slot names none: its bundle POSTs
+    /// are the submission, so a stray raw broadcast would leak the backrun
+    /// outside the bundle.
+    #[must_use]
+    pub fn raw_relay_urls(&self) -> Vec<String> {
+        match self {
+            Self::Mevblocker {
+                private_url: Some(url),
+                ..
+            } => vec![url.clone()],
+            Self::PublicFanOut { relays } => relays.clone(),
+            // Both auction-free-raw arms: the `MEVBlocker` slot without a
+            // private endpoint falls back to the read provider (empty list),
+            // and the builder-relay slot's bundle POST delivers itself.
+            Self::Mevblocker {
+                private_url: None, ..
+            }
+            | Self::BuilderRelay { .. } => Vec::new(),
+        }
+    }
+
+    /// Whether this slot names a private (non-public) broadcast endpoint.
+    #[must_use]
+    pub const fn names_private_endpoint(&self) -> bool {
+        matches!(
+            self,
+            Self::Mevblocker {
+                private_url: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+/// The backrun driver's typed config, built from one per-ecosystem facet plus
+/// the chain-node join its boot resolves.
+///
+/// The key never leaves the signer — only `key_file` is named here.
+#[derive(Debug, Clone)]
+pub struct BackrunConfig {
+    /// The pending-transaction source: the `MEVBlocker` searcher feed (the
+    /// mevblocker arm; the txpool arm leaves it unused — its driver scans the
+    /// chain node's txpool).
+    pub feed_url: String,
+    pub rpc_url: String,
+    pub key_file: Option<PathBuf>,
+    /// Explicit bid-mode flag. Off = observe-only.
+    pub bid_mode: bool,
+    /// Cumulative bid budget cap in wei; bid mode REQUIRES non-zero.
+    pub budget_wei: U256,
+    /// Hard per-submission cap in wei.
+    pub max_bundle_wei: U256,
+    /// Kill-switch path: if the file exists, bidding halts (then the loop).
+    pub stop_file: PathBuf,
+    /// Sign-nothing dispatch (`strategy.*.dry_run`).
+    pub dry_run: bool,
+    /// The builder's bribe share in bips, clamped to the `10_000` ceiling.
+    pub bribe_bips: u16,
+    /// Composed-bundle gas estimate priced into the net-of-gas bid gate.
+    pub bundle_gas_est: u64,
+    /// The envelope gate's profit floor (wei): a declared chain whose solver
+    /// bound tops out below this skips without a simulation.
+    pub gas_floor_wei: u64,
+    /// Chain-sample verification policy for ingress V3 tick-map admission.
+    pub verify_ticks: VerifyLevel,
+    /// The operator's priority fee in gwei.
+    pub priority_fee_gwei: u64,
+    /// Bundle-sim endpoint; unset reuses the chain node.
+    pub sim_url: Option<String>,
+    /// Live deep-pair ranking sanity-probe gate.
+    pub rank_evidence: bool,
+    /// Discovery fan-out cap (cycles per frame).
+    pub connectors: usize,
+    /// Hop-depth cap per discovered cycle (the WETH pin plus up to
+    /// `cycle_max_hops - 1` connectors).
+    pub cycle_max_hops: usize,
+    /// Offline dry-run's pinned head block.
+    pub fixture_head: Option<u64>,
+    /// Executor contract address (validated at the driver boot).
+    pub executor: String,
+    /// Executor owner / sim caller; unset falls back to
+    /// `EXECUTOR_OWNER_ADDRESS`, then the built-in default.
+    pub operator: Option<String>,
+    /// Dry-run fixture frames path (`logging.dry_run_jsonl`).
+    pub dry_run_jsonl: Option<PathBuf>,
+    /// The submission slot this composition binds.
+    pub submission: SubmissionSlot,
+}
+
+/// The knob set shared by both per-ecosystem facets. The two facet types are
+/// distinct, so this is the one place their common fields collapse.
+struct BackrunKnobs {
+    active_endpoints: Option<String>,
+    key_file: Option<PathBuf>,
+    bid_mode: bool,
+    budget_wei: u128,
+    max_bundle_wei: u128,
+    stop_file: PathBuf,
+    dry_run: bool,
+    bribe_bips: u64,
+    bundle_gas_est: u64,
+    gas_floor_wei: u64,
+    verify_ticks: VerifyLevel,
+    priority_fee_gwei: u64,
+    sim_url: Option<String>,
+    rank_evidence: bool,
+    connectors: usize,
+    cycle_max_hops: usize,
+    fixture_head: Option<u64>,
+    executor: String,
+    operator: Option<String>,
+}
+
+impl BackrunKnobs {
+    fn into_config(
+        self,
+        cfg: &BotConfig,
+        rpc_url: String,
+        submission: SubmissionSlot,
+    ) -> BackrunConfig {
+        BackrunConfig {
+            // The source slot is shared: both backrun arms consume the
+            // MEVBlocker searcher pending-tx feed.
+            feed_url: apexbot_config::DEFAULT_BACKRUN_STREAM_URL.to_string(),
+            rpc_url,
+            key_file: self.key_file,
+            bid_mode: self.bid_mode,
+            budget_wei: U256::from(self.budget_wei),
+            max_bundle_wei: U256::from(self.max_bundle_wei),
+            stop_file: self.stop_file,
+            dry_run: self.dry_run,
+            bribe_bips: u16::try_from(self.bribe_bips.min(10_000)).unwrap_or(10_000),
+            bundle_gas_est: self.bundle_gas_est,
+            gas_floor_wei: self.gas_floor_wei,
+            verify_ticks: self.verify_ticks,
+            priority_fee_gwei: self.priority_fee_gwei,
+            sim_url: self.sim_url,
+            rank_evidence: self.rank_evidence,
+            connectors: self.connectors,
+            cycle_max_hops: self.cycle_max_hops,
+            fixture_head: self.fixture_head,
+            executor: self.executor,
+            operator: self.operator,
+            dry_run_jsonl: cfg.logging.dry_run_jsonl.clone(),
+            submission,
+        }
+    }
+}
+
+/// The shared facet projection seam. The public config structs remain
+/// separate operator surfaces, while this trait owns the one field mapping
+/// into the runtime knobs consumed by both backrun compositions.
+trait BackrunFacet {
+    fn backrun_knobs(&self) -> BackrunKnobs;
+}
+
+/// Generate the common projection once for both generated config types.
+///
+/// The schema intentionally keeps two public facet namespaces, but adding a
+/// shared runtime knob must not require maintaining two hand-written field
+/// lists in this module.
+macro_rules! impl_backrun_facet {
+    ($facet:ty) => {
+        impl BackrunFacet for $facet {
+            fn backrun_knobs(&self) -> BackrunKnobs {
+                BackrunKnobs {
+                    active_endpoints: self.endpoints.clone(),
+                    key_file: self.key_file.clone(),
+                    bid_mode: self.bid_mode,
+                    budget_wei: self.budget_wei,
+                    max_bundle_wei: self.max_bundle_wei,
+                    stop_file: self.stop_file.clone(),
+                    dry_run: self.dry_run,
+                    bribe_bips: self.bribe_bips,
+                    bundle_gas_est: self.bundle_gas_est,
+                    gas_floor_wei: self.gas_floor_wei,
+                    verify_ticks: to_verify_level(self.verify_ticks),
+                    priority_fee_gwei: self.priority_fee_gwei,
+                    sim_url: self.sim_url.clone(),
+                    rank_evidence: self.rank_evidence,
+                    connectors: self.connectors,
+                    cycle_max_hops: self.cycle_max_hops,
+                    fixture_head: self.fixture_head,
+                    executor: self.executor.clone(),
+                    operator: self.operator.clone(),
+                }
+            }
+        }
+    };
+}
+
+impl_backrun_facet!(apexbot_config::StrategyMevblockerBackrunConfig);
+impl_backrun_facet!(apexbot_config::StrategyTxpoolBackrunConfig);
+
+/// Project the config facet's `verify_ticks` enum onto the ingress policy.
+fn to_verify_level(v: apexbot_config::VerifyTicks) -> VerifyLevel {
+    match v {
+        apexbot_config::VerifyTicks::Strict => VerifyLevel::Strict,
+        apexbot_config::VerifyTicks::Bootstrap => VerifyLevel::Bootstrap,
+        apexbot_config::VerifyTicks::Off => VerifyLevel::Off,
+    }
+}
+
+impl BackrunKnobs {
+    /// The `MEVBlocker` submission slot: the bundle bound to the facet's
+    /// searcher WebSocket (or the pinned default) plus the private endpoint.
+    fn mevblocker_slot(
+        &self,
+        f: &apexbot_config::StrategyMevblockerBackrunConfig,
+    ) -> SubmissionSlot {
+        SubmissionSlot::Mevblocker {
+            bundle_url: resolve_arm_endpoint(
+                "mevblocker_backrun",
+                self.active_endpoints.as_deref(),
+                apexbot_config::DEFAULT_BACKRUN_STREAM_URL,
+            ),
+            private_url: f.mevblocker_url.clone(),
+        }
+    }
+
+    /// The builder-relay submission slot: the facet's `eth_sendBundle` relay
+    /// list (or the pinned default set).
+    fn txpool_slot(&self) -> SubmissionSlot {
+        SubmissionSlot::BuilderRelay {
+            relays: resolve_arm_endpoints(
+                "txpool_backrun",
+                self.active_endpoints.as_deref(),
+                apexbot_config::DEFAULT_TXPOOL_BACKRUN_RELAYS,
+            ),
+        }
+    }
+}
+
+/// Resolve one activated facet's first endpoint, falling back to a pinned
+/// default. The boots refuse an unsettled active facet before this runs, so
+/// the fallback only serves an inactive or fixture construction.
+fn resolve_arm_endpoint(facet: &'static str, endpoints: Option<&str>, default: &str) -> String {
+    split_arm_endpoints(facet, endpoints, std::slice::from_ref(&default))
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Resolve an activated facet's endpoint list, falling back to a pinned
+/// default set.
+fn resolve_arm_endpoints(
+    facet: &'static str,
+    endpoints: Option<&str>,
+    default: &[&str],
+) -> Vec<String> {
+    split_arm_endpoints(facet, endpoints, default)
+}
+
+fn split_arm_endpoints(
+    _facet: &'static str,
+    endpoints: Option<&str>,
+    default: &[&str],
+) -> Vec<String> {
+    let urls: Vec<String> = endpoints
+        .into_iter()
+        .flat_map(|raw| raw.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if urls.is_empty() {
+        default.iter().map(|url| (*url).to_string()).collect()
+    } else {
+        urls
+    }
+}
+
+/// Shared storage/access surface for the two public backrun compositions.
+///
+/// The ecosystem-specific wrappers below retain their identities and
+/// submission-slot construction; only the common `BackrunConfig` ownership is
+/// factored out here.
+#[derive(Debug, Clone)]
+struct BackrunComposition {
+    config: BackrunConfig,
+}
+
+impl BackrunComposition {
+    fn new(config: BackrunConfig) -> Self {
+        Self { config }
+    }
+
+    fn config(&self) -> &BackrunConfig {
+        &self.config
+    }
+
+    fn into_config(self) -> BackrunConfig {
+        self.config
+    }
+}
+
+/// The MEVBlocker-ecosystem backrun strategy: the shared pending-transaction
+/// reaction composed over per-ecosystem facets.
+///
+/// | Slot | Binding |
+/// |---|---|
+/// | **source** | the MEVBlocker searcher pending-tx feed |
+/// | **infrastructure** | the connector-index route registry |
+/// | **calculation** | the anchored-dfs WETH-closing solver |
+/// | **encoder** | the composed executor calldata |
+/// | **simulator** | the frame replay + `eth_callMany` oracle gate |
+/// | **submission** | the MEVBlocker searcher bundle, private broadcast first |
+#[derive(Debug, Clone)]
+pub struct MevblockerBackrun {
+    composition: BackrunComposition,
+}
+
+impl MevblockerBackrun {
+    /// Build the composition from the loaded config's
+    /// `strategy.mevblocker_backrun` facet plus the chain-node join.
+    #[must_use]
+    pub fn from_config(cfg: &BotConfig, rpc_url: String) -> Self {
+        let facet = &cfg.strategy.mevblocker_backrun;
+        let knobs = facet.backrun_knobs();
+        let submission = knobs.mevblocker_slot(facet);
+        Self {
+            composition: BackrunComposition::new(knobs.into_config(cfg, rpc_url, submission)),
+        }
+    }
+}
+
+impl Strategy for MevblockerBackrun {
+    const NAME: StrategyName = StrategyName::MevblockerBackrun;
+}
+
+/// The builder-relay backrun strategy: the same pending-transaction reaction,
+/// discovering targets in the chain node's txpool and submitting
+/// Flashbots-compatible `eth_sendBundle` bundles (target's verbatim signed
+/// bytes + the signed backrun) to every configured builder relay.
+///
+/// | Slot | Binding |
+/// |---|---|
+/// | **source** | the node txpool feed (`newPendingTransactions` + by-hash fetch) |
+/// | **infrastructure** | the connector-index route registry |
+/// | **calculation** | the anchored-dfs WETH-closing solver |
+/// | **encoder** | the composed executor calldata |
+/// | **simulator** | the frame replay + `eth_callMany` oracle gate |
+/// | **submission** | the Flashbots-compatible builder relay fan-out |
+#[derive(Debug, Clone)]
+pub struct TxpoolBackrun {
+    composition: BackrunComposition,
+}
+
+impl TxpoolBackrun {
+    /// Build the composition from the loaded config's `strategy.txpool_backrun`
+    /// facet plus the chain-node join.
+    #[must_use]
+    pub fn from_config(cfg: &BotConfig, rpc_url: String) -> Self {
+        let facet = &cfg.strategy.txpool_backrun;
+        let knobs = facet.backrun_knobs();
+        let submission = knobs.txpool_slot();
+        Self {
+            composition: BackrunComposition::new(knobs.into_config(cfg, rpc_url, submission)),
+        }
+    }
+}
+
+impl Strategy for TxpoolBackrun {
+    const NAME: StrategyName = StrategyName::TxpoolBackrun;
+}
+
+macro_rules! impl_backrun_composition_accessors {
+    ($composition:ty) => {
+        impl $composition {
+            /// The composed driver config.
+            #[must_use]
+            pub fn config(&self) -> &BackrunConfig {
+                self.composition.config()
+            }
+
+            /// Consume the composition into the driver config.
+            #[must_use]
+            pub fn into_config(self) -> BackrunConfig {
+                self.composition.into_config()
+            }
+        }
+    };
+}
+
+impl_backrun_composition_accessors!(MevblockerBackrun);
+impl_backrun_composition_accessors!(TxpoolBackrun);
+
+impl BackrunConfig {
+    /// The bid-mode legality gate: explicit flag AND non-zero budget.
+    #[must_use]
+    pub fn bid_mode_legal(&self) -> bool {
+        self.bid_mode && !self.budget_wei.is_zero()
+    }
+}
+
+/// Why a candidate was (or was not) bid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// All gates passed; bid the given wei.
+    Bid { bid_wei: U256 },
+    /// Default mode: journal/publish only, never bid.
+    Observe { reason: &'static str },
+    /// Not a bid candidate at all (inert/too old).
+    Drop { reason: &'static str },
+}
+
+/// The bid-path liveness gate: a target whose tx already mined cannot be
+/// backrun, so its dispatch is refused with the truthful observe reason. The
+/// receipt probe runs on the bid path (after `decide`, before dispatch); this
+/// pure gate turns its evidence into the final decision. A probe failure
+/// carries no positive evidence, so it must not kill the bid -- the `MEVBlocker`
+/// bundle's block anchoring is the final backstop.
+#[must_use]
+pub fn gate_mined_target(decision: Decision, target_receipt_found: bool) -> Decision {
+    match decision {
+        Decision::Bid { .. } if target_receipt_found => Decision::Observe {
+            reason: "already_settled",
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The facet knob reaches the driver config: the envelope-gate floor is
+    /// operator-tunable (the compiled-in 5e13 wei stance is retired), and the
+    /// declared default is 1 wei (solve-anything, gate at bid time).
+    #[test]
+    fn gas_floor_knob_flows_from_the_facet() {
+        let c = MevblockerBackrun::from_config(&BotConfig::default(), String::new()).into_config();
+        assert_eq!(c.gas_floor_wei, 1, "declared facet default");
+        let mut cfg = BotConfig::default();
+        cfg.strategy.mevblocker_backrun.gas_floor_wei = 123_456;
+        let c = MevblockerBackrun::from_config(&cfg, String::new()).into_config();
+        assert_eq!(c.gas_floor_wei, 123_456, "the knob is wired, not ignored");
+    }
+
+    /// The chain-sample policy reaches the driver config and maps every facet
+    /// value onto the ingress policy; the default is `Bootstrap`.
+    #[test]
+    fn verify_ticks_knob_flows_from_the_facet() {
+        let c = MevblockerBackrun::from_config(&BotConfig::default(), String::new()).into_config();
+        assert_eq!(c.verify_ticks, VerifyLevel::Bootstrap, "declared default");
+
+        for (facet, expected) in [
+            (apexbot_config::VerifyTicks::Strict, VerifyLevel::Strict),
+            (
+                apexbot_config::VerifyTicks::Bootstrap,
+                VerifyLevel::Bootstrap,
+            ),
+            (apexbot_config::VerifyTicks::Off, VerifyLevel::Off),
+        ] {
+            let mut cfg = BotConfig::default();
+            cfg.strategy.mevblocker_backrun.verify_ticks = facet;
+            let c = MevblockerBackrun::from_config(&cfg, String::new()).into_config();
+            assert_eq!(c.verify_ticks, expected, "the knob is wired, not ignored");
+        }
+
+        let mut cfg = BotConfig::default();
+        cfg.strategy.txpool_backrun.verify_ticks = apexbot_config::VerifyTicks::Strict;
+        let c = TxpoolBackrun::from_config(&cfg, String::new()).into_config();
+        assert_eq!(c.verify_ticks, VerifyLevel::Strict, "peer facet wired too");
+    }
+
+    #[test]
+    fn mined_target_gate_observes_already_settled() {
+        // A mined target can never be backrun: the receipt-gated decision is
+        // `already_settled`, not a Bid, so no dispatch can ever see it.
+        let bid = Decision::Bid {
+            bid_wei: U256::from(9),
+        };
+        assert_eq!(
+            gate_mined_target(bid, true),
+            Decision::Observe {
+                reason: "already_settled"
+            }
+        );
+    }
+
+    #[test]
+    fn pending_target_gate_lets_a_net_positive_bid_dispatch() {
+        let bid = Decision::Bid {
+            bid_wei: U256::from(9),
+        };
+        assert_eq!(gate_mined_target(bid, false), bid);
+        // An observe decision is untouched either way.
+        let observe = Decision::Observe {
+            reason: "observe_only",
+        };
+        assert_eq!(gate_mined_target(observe, true), observe);
+    }
+
+    #[test]
+    fn equivalent_backrun_facets_map_common_knobs_identically() {
+        let mut cfg = BotConfig::default();
+        cfg.strategy.mevblocker_backrun.bid_mode = true;
+        cfg.strategy.mevblocker_backrun.budget_wei = 42;
+        cfg.strategy.mevblocker_backrun.max_bundle_wei = 99;
+        cfg.strategy.mevblocker_backrun.bribe_bips = 9_500;
+        cfg.strategy.mevblocker_backrun.priority_fee_gwei = 7;
+        cfg.strategy.mevblocker_backrun.bundle_gas_est = 333_000;
+        cfg.strategy.mevblocker_backrun.gas_floor_wei = 123;
+        cfg.strategy.mevblocker_backrun.verify_ticks = apexbot_config::VerifyTicks::Strict;
+        cfg.strategy.mevblocker_backrun.dry_run = true;
+        cfg.strategy.mevblocker_backrun.key_file = Some(PathBuf::from("/tmp/shared.key"));
+        cfg.strategy.mevblocker_backrun.executor =
+            "0x00000000000000000000000000000000000000aa".to_string();
+        cfg.strategy.mevblocker_backrun.operator =
+            Some("0x00000000000000000000000000000000000000bb".to_string());
+        cfg.strategy.mevblocker_backrun.sim_url = Some("http://sim.local".to_string());
+        cfg.strategy.mevblocker_backrun.rank_evidence = true;
+        cfg.strategy.mevblocker_backrun.connectors = 5;
+        cfg.strategy.mevblocker_backrun.cycle_max_hops = 6;
+        cfg.strategy.mevblocker_backrun.fixture_head = Some(123);
+        cfg.strategy.mevblocker_backrun.stop_file = PathBuf::from("/tmp/stop");
+
+        cfg.strategy.txpool_backrun.bid_mode = cfg.strategy.mevblocker_backrun.bid_mode;
+        cfg.strategy.txpool_backrun.budget_wei = cfg.strategy.mevblocker_backrun.budget_wei;
+        cfg.strategy.txpool_backrun.max_bundle_wei = cfg.strategy.mevblocker_backrun.max_bundle_wei;
+        cfg.strategy.txpool_backrun.bribe_bips = cfg.strategy.mevblocker_backrun.bribe_bips;
+        cfg.strategy.txpool_backrun.priority_fee_gwei =
+            cfg.strategy.mevblocker_backrun.priority_fee_gwei;
+        cfg.strategy.txpool_backrun.bundle_gas_est = cfg.strategy.mevblocker_backrun.bundle_gas_est;
+        cfg.strategy.txpool_backrun.gas_floor_wei = cfg.strategy.mevblocker_backrun.gas_floor_wei;
+        cfg.strategy.txpool_backrun.verify_ticks = cfg.strategy.mevblocker_backrun.verify_ticks;
+        cfg.strategy.txpool_backrun.dry_run = cfg.strategy.mevblocker_backrun.dry_run;
+        cfg.strategy.txpool_backrun.key_file = cfg.strategy.mevblocker_backrun.key_file.clone();
+        cfg.strategy.txpool_backrun.executor = cfg.strategy.mevblocker_backrun.executor.clone();
+        cfg.strategy.txpool_backrun.operator = cfg.strategy.mevblocker_backrun.operator.clone();
+        cfg.strategy.txpool_backrun.sim_url = cfg.strategy.mevblocker_backrun.sim_url.clone();
+        cfg.strategy.txpool_backrun.rank_evidence = cfg.strategy.mevblocker_backrun.rank_evidence;
+        cfg.strategy.txpool_backrun.connectors = cfg.strategy.mevblocker_backrun.connectors;
+        cfg.strategy.txpool_backrun.cycle_max_hops = cfg.strategy.mevblocker_backrun.cycle_max_hops;
+        cfg.strategy.txpool_backrun.fixture_head = cfg.strategy.mevblocker_backrun.fixture_head;
+        cfg.strategy.txpool_backrun.stop_file = cfg.strategy.mevblocker_backrun.stop_file.clone();
+
+        let rpc_url = "http://node.local".to_string();
+        let mevblocker = MevblockerBackrun::from_config(&cfg, rpc_url.clone()).into_config();
+        let peer = TxpoolBackrun::from_config(&cfg, rpc_url).into_config();
+
+        assert_eq!(mevblocker.bid_mode, peer.bid_mode);
+        assert_eq!(mevblocker.budget_wei, peer.budget_wei);
+        assert_eq!(mevblocker.max_bundle_wei, peer.max_bundle_wei);
+        assert_eq!(mevblocker.bribe_bips, peer.bribe_bips);
+        assert_eq!(mevblocker.priority_fee_gwei, peer.priority_fee_gwei);
+        assert_eq!(mevblocker.bundle_gas_est, peer.bundle_gas_est);
+        assert_eq!(mevblocker.gas_floor_wei, peer.gas_floor_wei);
+        assert_eq!(mevblocker.verify_ticks, peer.verify_ticks);
+        assert_eq!(mevblocker.dry_run, peer.dry_run);
+        assert_eq!(mevblocker.key_file, peer.key_file);
+        assert_eq!(mevblocker.executor, peer.executor);
+        assert_eq!(mevblocker.operator, peer.operator);
+        assert_eq!(mevblocker.sim_url, peer.sim_url);
+        assert_eq!(mevblocker.rank_evidence, peer.rank_evidence);
+        assert_eq!(mevblocker.connectors, peer.connectors);
+        assert_eq!(mevblocker.cycle_max_hops, peer.cycle_max_hops);
+        assert_eq!(mevblocker.fixture_head, peer.fixture_head);
+        assert_eq!(mevblocker.stop_file, peer.stop_file);
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test fixtures fail loudly on an unconstructible prerequisite"
+    )]
+    fn mevblocker_facet_maps_every_knob_and_binds_the_private_slot() {
+        use std::collections::BTreeMap;
+
+        use apexbot_config::{BotConfigLoader, MapEnv};
+
+        let raw = BTreeMap::from([
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_ACTIVE", "1"),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_BID_MODE", "1"),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_BUDGET_WEI", "42"),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_MAX_BUNDLE_WEI", "99"),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_BRIBE_BIPS", "9500"),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_PRIORITY_FEE_GWEI",
+                "7",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_BUNDLE_GAS_EST",
+                "333000",
+            ),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_DRY_RUN", "1"),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_KEY_FILE",
+                "/tmp/k.key",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_EXECUTOR",
+                "0x00000000000000000000000000000000000000aa",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_OPERATOR",
+                "0x00000000000000000000000000000000000000bb",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_SIM_URL",
+                "http://sim.local:8545",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_ENDPOINTS",
+                "wss://stream.local",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_MEVBLOCKER_URL",
+                "http://private.local:8545",
+            ),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_RANK_EVIDENCE", "1"),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_CONNECTORS", "5"),
+            ("APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_CYCLE_MAX_HOPS", "5"),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_FIXTURE_HEAD",
+                "26001272",
+            ),
+            (
+                "APEXBOT_STRATEGY_MEVBLOCKER_BACKRUN_STOP_FILE",
+                "/tmp/stop",
+            ),
+            ("APEXBOT_DRY_RUN_JSONL", "/tmp/f.jsonl"),
+        ])
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let loaded = BotConfigLoader::new()
+            .with_env(Box::new(MapEnv::new(raw)))
+            .load()
+            .expect("typed load");
+        let c = MevblockerBackrun::from_config(&loaded.config, "http://node.local".to_string())
+            .into_config();
+        assert_eq!(c.rpc_url, "http://node.local");
+        assert!(c.bid_mode);
+        assert_eq!(c.budget_wei, U256::from(42));
+        assert_eq!(c.max_bundle_wei, U256::from(99));
+        assert_eq!(c.bribe_bips, 9_500);
+        assert_eq!(c.priority_fee_gwei, 7);
+        assert_eq!(c.bundle_gas_est, 333_000);
+        assert!(c.dry_run);
+        assert_eq!(c.key_file, Some(PathBuf::from("/tmp/k.key")));
+        assert_eq!(c.executor, "0x00000000000000000000000000000000000000aa");
+        assert_eq!(
+            c.operator.as_deref(),
+            Some("0x00000000000000000000000000000000000000bb")
+        );
+        assert_eq!(c.sim_url.as_deref(), Some("http://sim.local:8545"));
+        assert_eq!(c.feed_url, apexbot_config::DEFAULT_BACKRUN_STREAM_URL);
+        assert_eq!(
+            c.submission,
+            SubmissionSlot::Mevblocker {
+                bundle_url: String::from("wss://stream.local"),
+                private_url: Some(String::from("http://private.local:8545")),
+            }
+        );
+        assert!(c.submission.names_private_endpoint());
+        assert!(c.rank_evidence);
+        assert_eq!(c.connectors, 5);
+        assert_eq!(c.cycle_max_hops, 5);
+        assert_eq!(c.fixture_head, Some(26_001_272));
+        assert_eq!(c.stop_file, PathBuf::from("/tmp/stop"));
+        assert_eq!(c.dry_run_jsonl, Some(PathBuf::from("/tmp/f.jsonl")));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test fixtures fail loudly")]
+    fn peer_facet_maps_every_knob_and_binds_the_public_slot() {
+        use std::collections::BTreeMap;
+
+        use apexbot_config::{BotConfigLoader, MapEnv};
+
+        let raw = BTreeMap::from([
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_ACTIVE", "1"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_BID_MODE", "1"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_BUDGET_WEI", "42"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_MAX_BUNDLE_WEI", "99"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_BRIBE_BIPS", "9500"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_PRIORITY_FEE_GWEI", "7"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_BUNDLE_GAS_EST", "333000"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_DRY_RUN", "1"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_KEY_FILE", "/tmp/k.key"),
+            (
+                "APEXBOT_STRATEGY_TXPOOL_BACKRUN_ENDPOINTS",
+                "https://relay.one,https://relay.two",
+            ),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_CONNECTORS", "5"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_CYCLE_MAX_HOPS", "5"),
+            ("APEXBOT_STRATEGY_TXPOOL_BACKRUN_STOP_FILE", "/tmp/stop"),
+        ])
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let loaded = BotConfigLoader::new()
+            .with_env(Box::new(MapEnv::new(raw)))
+            .load()
+            .expect("typed load");
+        let c = TxpoolBackrun::from_config(&loaded.config, "http://node.local".to_string())
+            .into_config();
+        assert_eq!(
+            c.submission,
+            SubmissionSlot::BuilderRelay {
+                relays: vec![
+                    String::from("https://relay.one"),
+                    String::from("https://relay.two"),
+                ],
+            }
+        );
+        assert_eq!(c.cycle_max_hops, 5);
+        assert!(!c.submission.names_private_endpoint());
+        assert!(
+            c.submission.raw_relay_urls().is_empty(),
+            "the builder-relay slot names no raw fan-out"
+        );
+    }
+}

@@ -15,7 +15,7 @@ from apexbot.checksum_cache import get_checksum_address
 from apexbot.curve.types import DVariant, YDVariant, YVariant
 
 if TYPE_CHECKING:
-    from apexbot._ffi import ChecksummedAddress
+    from apexbot.types.chain import ChecksummedAddress
 
 _D_VARIANT_GROUP_0: frozenset[ChecksummedAddress] = frozenset(
     get_checksum_address(addr)

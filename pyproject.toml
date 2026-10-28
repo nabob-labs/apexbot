@@ -11,24 +11,20 @@ name = "apexbot"
 # normalizes the semver form to PEP 440 (e.g. 0.6.0-alpha.3 -> 0.6.0a3).
 dynamic = ["version"]
 authors = [
-    { name="nabob-labs" },
+    { name="nabob-labs", email="astralmoonhalo@gmail.com.com" },
 ]
 description = "Python + Rust building blocks for Uniswap (V2, V3, V4), Curve V1, Solidly V2, Balancer V2 & Aave V3 arbitrage and liquidation bots on EVM-compatible blockchains"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "pydantic ~= 2.13",
-    "pydantic-settings ~= 2.15",
-    "sqlalchemy ~= 2.0",
-    "tenacity ~= 9.1",
-    "tomlkit ~= 0.15",
+    "pydantic ~= 2.14",
 ]
-license = {text = "Apache-2.0 license"}
+license = {text = "MIT"}
 license-files = ["LICENSE"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache-2.0 license",
+    "License :: OSI Approved :: MIT License",
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Natural Language :: English",
@@ -36,9 +32,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://www.apexcode.com"
+Homepage = "https://www.degencode.com"
 Repository = "https://github.com/nabob-labs/apexbot"
 Tracker = "https://github.com/nabob-labs/apexbot/issues"
+Twitter = "https://twitter.com/nabob-labs"
 
 [project.scripts]
 apexbot = "apexbot._cli:main"
@@ -81,12 +78,11 @@ extend-select = [
     "SLF",      # flake8-self
     "SIM",      # flake8-simplify
     "TID",      # flake8-tidy-imports
-    "TCH",      # flake8-type-checking
+    "TC",       # flake8-type-checking
     "ARG",      # flake8-unused-arguments
     "PTH",      # flake8-use-pathlib
     "FLY",      # flynt
     "I",        # isort
-    "NPY",      # numpy-specific
     "N",        # pep8-naming
     "PERF",     # perflint
     "E", "W",   # pycodestyle
@@ -104,15 +100,8 @@ ignore = [
     "multi-line-summary-second-line",
     "missing-trailing-comma",
     "error-suffix-on-exception-name",
-    "too-many-public-methods",
-    "too-many-return-statements",
-    "too-many-branches",
-    "too-many-arguments",
-    "too-many-locals",
-    "too-many-statements",
-    "docstring-in-stub", # required for IDE to show wrapped Rust code info
-    "non-empty-init-module", # asserts are used often, but not as input validation
-    "assert",
+    "non-empty-init-module",  # populated __init__.py facade modules are deliberate
+    "assert",  # asserts are used often, but not as input validation
 ]
 logger-objects = [
     "logging.logger",
@@ -123,107 +112,98 @@ logger-objects = [
 allow-star-arg-any = true
 
 [tool.ruff.lint.per-file-ignores]
-"scripts/aave_replay_diff.py" = [
-    "any-type",   # the drive/compare JSON-report dicts are dict[str, Any]
-    "unused-function-argument",   # CLI dispatchers take unused `args` for argparse's set_defaults
-    "D",        # docstring strictness (Returns:/Raises:/imperative) not enforced on the CLI
-    "DOC",      # pydoclint Returns:/Raises: sections not enforced on the CLI
-    "f-string-in-exception",    # short f-string error messages are fine in a script
-    "import-outside-top-level",  # lazy imports avoid circular dependency with apexbot.provider
-    "too-many-statements-in-try-clause",  # the drive fn's broad try/except is intentional (log+re-raise)
-    "too-many-nested-blocks",  # the bisect loop nests deeply by design
-    "PTH",      # os.path + os.makedirs are fine for the bisect's file-copy logic
-    "unspecified-encoding",  # the JSON-dump file writes use utf-8 implicitly
-    "unnecessary-assign",   # unnecessary-assign for clarity in the drive fn
-    "hardcoded-password-string",     # "APEXBOT_RPC_HTTP_CHAINID_1" is an envvar NAME, not a password
-    "try-except-pass",     # the optional event-fetcher import's try/except/pass is intentional
-    "hardcoded-sql-expression",     # the table-name is from a hardcoded _TABLE_ORDER list, not user input
-    "SIM",      # the compare dict-comprehensions are clarity over comprehension
-    "private-member-access",   # sqlalchemy's `row._mapping` is the documented dict-access API
-    "raise-vanilla-args",   # raise-vanilla-args on the SystemExit messages
-    "raise-within-try",   # re-raising the worker-thread error from within the try is intentional
-    "print",     # the CLI prints its summary to stdout by design
+"src/apexbot/fork/__init__.py" = [
+    # AnvilFork is the deliberate legacy facade (ADR-005 Python shell): it
+    # carries the pre-0.7 constructor knobs + dev-method names on purpose,
+    # and the with-block pair (`__enter__`/`__exit__`, teardown parity with
+    # the rust core's Drop) puts it one method past the default cap.
+    # Shrinking the surface is an API decision, not a lint decision.
+    "too-many-public-methods",
+]
+"tests/pathfinding/fixtures/generate_mainnet_snapshot.py" = [
+    # The snapshot generator copies rows verbatim out of the live operator DB
+    # with raw sql (ATTACH + INSERT SELECT): ORM re-inserts would
+    # re-derive values and lose fidelity, and the selection queries
+    # deliberately mirror the shapes of `apexbot_db::pathfinding`'s SQL so a
+    # schema drift surfaces here first. All identifiers are internal ints /
+    # fixed table names — no user input reaches a query.
+    "hardcoded-sql-expression",
+    "print",     # the generator prints its summary to stdout by design
+    "shebang-not-executable",  # invoked as `uv run python ...`, not directly
 ]
 "tests/*" = [
     "ANN",      # type annotations for tests are low priority
     "ARG",
     "D",
     "DOC",
-    "unconventional-import-alias",   # benchmark scripts may import networkx without alias
-    "implicit-namespace-package",   # benchmark scripts are not part of a package
-    "import-outside-top-level",  # benchmark scripts may import conditionally
     "import-private-name",  # tests may need to import private modules
     "PLR",
-    "suspicious-pickle-usage",
     "suspicious-non-cryptographic-random-usage",
-    "suspicious-pickle-import",
     "private-member-access",   # tests may need to access private attributes to test implementation
     "print",     # print
-]
-"src/apexbot/provider/factory.py" = [
-    "import-outside-top-level",  # lazy import avoids circular dependency with apexbot.provider.__init__
-]
-"src/apexbot/registry/deployment_loader.py" = [
-    "import-outside-top-level",  # lazy imports avoid circular dependency (pool classes → uniswap → this module)
-]
-"src/apexbot/operator/operator_channel.py" = [
-    "import-outside-top-level",  # the fleet mirror home is lazy: the transport module stays independent of the compiled extension and the home mints on the first fleet-posture op
-]
-"src/apexbot/build_info/__init__.py" = [
-    "import-outside-top-level",  # the _ffi import is lazy so the receipt helpers work (and the module imports) even where the extension is stale/broken
-    "print",     # python -m apexbot.build_info prints its summary to stdout/stderr by design
-]
-"src/apexbot/uniswap/deployments.py" = [
-    "import-outside-top-level",  # lazy import avoids circular dependency (deployment_loader → pool classes → this module)
+    "module-import-not-at-top-of-file",
 ]
 "src/apexbot/logging.py" = [
-    "PLR6301",  # `logging.Formatter.format(self, record)` is the protocol-signature override; the body legitimately ignores `self`
+    "no-self-use",  # `logging.Formatter.format(self, record)` is the protocol-signature override; the body legitimately ignores `self`
 ]
 "src/apexbot/runner/**" = [
-    # These rules were carried forward from the ``examples/*`` accommodation the
-    # backrun driver was developed under (epic 5TSYKN relocates it un-rewritten).
-    # The driver is moved with no behavior change, so it inherits the same style
-    # exceptions; each can be re-enabled + cleaned incrementally.
+    # The surviving accommodations, each still live. The retired ones
+    # (docstring style + sections, typing-only imports, unused-argument, and
+    # the never-hit rules) were cleaned in code rather than exempted.
     "any-type",   # driver callables take `Any` (injected builders/consumers, hop dicts)
-    "ARG",      # signatures keep meaningful-but-unused slots (e.g. v4_snapshot symmetry)
-    "function-uses-loop-variable",     # registration _consume's lambdas capture the loop-bound `step`
     "blind-except",   # registration sim-loops catch broad Exception to log + continue per-path
-    "D",        # docstring strictness (imperative / blank-line-after-summary)
-    "DOC",      # pydoclint Return:/Raises: sections
-    "boolean-type-hint-positional-argument",   # boolean flag args (dry_run / live toggles)
     "import-outside-top-level",  # lazy imports where needed
-    "import-private-name",  # imports the private ``apexbot._ffi`` seam (mark_progress)
-    "too-many-positional-arguments",  # public dispatch/consume signatures carry many positional args
     "magic-value-comparison",  # driver constants (revert layout, block/fee thresholds) read cleaner inline
     "global-statement",  # module-top tunables / bytecode cache reassignment (intentional)
     "too-many-statements-in-try-clause",  # guarded verify try-blocks contain many statements by design
-    "TC",       # typing-only imports stay plain (cleaned by TC003 where trivial)
+]
+# Generated stubs (ADR-066): the `_ffi/*.pyi` tree is machine-emitted from the
+# cdylib's PyO3 introspection chunks, then post-processed by the gen-stubs
+# pipeline (ruff format + ruff check --fix). Only rules the pipeline cannot
+# mechanically fix are exempted here. The key is a bare basename glob, not the
+# committed path, because the pipeline's ruff pass runs on the temp output dir
+# outside the repo — a path-anchored pattern would not match there and the
+# drift gate's byte-for-byte contract would break. There are no other .pyi
+# trees in the repository.
+"*.pyi" = [
+    "D",        # prose rules: docstrings are Rust doc-comment prose (IDE hover is the consumer — ADR-053), not Python docstring style
+    "DOC",      # Returns:/Raises: sections: the prose is inherited verbatim from Rust
+    "line-too-long",     # prose lines; ruff format wraps code, never docstring text
+    "any-type",   # the seam surface is Any exactly where Rust is dynamic
+    "ambiguous-unicode-character-docstring",   # Rust prose characters
+    "docstring-in-stub",   # the docstrings are Rust doc-comment prose for IDE hover, not Python docstrings
+    "non-self-return-type",   # __new__ mirrors the Rust constructor's declared return
+    "builtin-variable-shadowing", # stub names mirror the Rust types verbatim (stubtest compares names), so a Rust `Exception` type stays `Exception`
 ]
 "examples/*" = [
-    "any-type",   # the FFI/live-bot callables take `Any` (e.g. injected builders/consumers)
-    "ARG",      # example function signatures keep meaningful-but-unused slots (logging, fakes)
-    "blind-except",   # example sim loops catch broad Exception to log + continue per-path
-    "D",        # docstring strictness (D100/D103/D104/D105/D107/D205/D413) not enforced on demo scripts
-    "DOC",      # pydoclint Return:/Raises: sections not enforced on demo scripts
-    "boolean-type-hint-positional-argument",   # boolean flag args (dry_run / live toggles) are fine in a CLI example
-    "import-outside-top-level",  # lazy imports avoid circular deps + resolve under script-mode sys.path
-    "import-private-name",  # the example intentionally imports the private `apexbot._ffi` seam
-    "too-many-positional-arguments",  # internal example functions carry many positional args (dispatcher plumbing)
-    "magic-value-comparison",  # example constants (revert layout, block/fee thresholds) read cleaner inline
-    "global-statement",  # module-top tunables are reassigned from CLI args (intentional)
-    "too-many-statements-in-try-clause",  # the guarded sim-verify try-blocks contain many statements by design
+    # Demo scripts over the private ``apexbot._ffi`` seam, folded into the
+    # lint gate with only these deliberate relaxations (each verified live):
+    "any-type",   # the FFI seam hands back `Any` (e.g. solve results)
+    "import-outside-top-level",  # lazy imports resolve under script-mode sys.path
+    "import-private-name",  # the demos intentionally import the private `apexbot._ffi` seam
+    "too-many-statements-in-try-clause",  # the demo main's one guarded body is broad by design
 ]
 
 [tool.pytest.ini_options]
+# Serial by design: xdist dropped — 16-way parallel anvil forks outran the RPC
+# tier (spawn timeouts), and wall-clock speed is no longer the binding constraint.
 addopts = [
-    "--numprocesses", "auto",
-    "--dist", "loadgroup",
     "--import-mode", "importlib",
-    "-m", "not slow and not base and not online_rpc",
+    "-m", "not slow and not base and not online_rpc and not stub_drift",
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-pythonpath = ["src", ".", "examples"]
+# pytest-timeout: a hung test FAILS with a timeout report instead of parking
+# its xdist worker with no failure signal. Thread method — signal is unsafe
+# under asyncio/xdist. 300s is orders of magnitude over the slowest default-run
+# test (the pathfinding snapshot enumeration, a few seconds): the compile-coupled
+# stub-drift gate that used to dominate the default run is excluded via the
+# `stub_drift` marker and runs as its own CI gate. No per-test or per-suite
+# headroom is granted: a test that outruns this budget fails loudly so the
+# slowness gets investigated.
+timeout = 300
+timeout_method = "thread"
+pythonpath = ["src", "."]
 python_files = "test_*.py"
 testpaths = ["tests", "README.md"]
 norecursedirs = ["archive", ".hypothesis"]
@@ -231,43 +211,51 @@ filterwarnings = [
     "error", # Fail on all warnings by default
 ]
 markers = [
-    "base: tests requiring a Base mainnet RPC",
+    "base: tests requiring a live Base mainnet RPC or fork — excluded from default runs; run on-demand with `-m base` (offline golden-replay parity tests are marked onchain_oracle instead)",
     "ethereum: tests requiring an Ethereum mainnet RPC",
     "slow: tests that are too slow for routine local runs (e.g. pathfinding)",
     "onchain_oracle: on-chain parity test whose oracle truth is read from a golden file (tests/golden); offline in CI — see docs/architecture/golden-onchain-parity.md",
     "online_rpc: test requiring a live external RPC (mainnet/arbitrum/base archive node) — skipped in CI by default; run on-demand with `-m online_rpc`. See docs/architecture/golden-onchain-parity.md.",
+    "live_drift: explicit-only live drift gate — re-runs the record_py_oracle_corpus --check against live archive endpoints per chain (paced, minutes of RPC); never in default, CI, or pre-push runs; run with `-m live_drift` or `just live-drift`",
+    "stub_drift: compile-coupled regenerate-and-diff stub gate — cargo-builds the cdylib with the temporary experimental-inspect feature, so it is excluded from the default pytest selection and runs once as the dedicated CI `stub-drift` job; run on demand with `-m stub_drift` or `just lint-stub-drift`",
 ]
 
 [dependency-groups]
 dev = [
+    "eth-abi",
+    "eth-hash[pycryptodome]",
     "hypothesis",
     "maturin",
+    "mypy",
     "numpy",
     "prek",
     "pytest-asyncio",
     "pytest-order",
     "pytest-randomly",
-    "pytest-xdist",
+    "pytest-timeout",
     "pytest",
     "python-dotenv",
-    "ruff",
     "sybil",
-    "ty",
-    "vulture",
+    "tomlkit",
+]
+
+[tool.ty.src]
+exclude = [
+    # type stubs are generated by PyO3
+    "src/apexbot/_ffi/*.pyi",    
 ]
 
 [tool.ty.environment]
 python-version = "3.12"
 extra-paths = ["examples"]
 
+[tool.ty.rules]
+dynamic-function-decorator-return = "error"
+missing-type-argument = "error"
+possibly-unresolved-reference = "warn"
+unsound-return-statement = "error"
+
 [tool.vulture]
-# Dead-code detector. Output is a triage list, not a gate: each hit
-# needs a human call (rg for refs) before deletion — vulture is static
-# and can't see FFI-seam callers (Rust core) or framework dispatch
-# (pydantic validators, SQLAlchemy TypeDecorator signatures, protocol
-# params). 80% confidence is the operating point — the 60% tier is
-# mostly framework-dispatched methods (validators, properties on
-# models, enum members referenced dynamically).
 min_confidence = 80
 paths = ["src/apexbot"]
 
@@ -275,35 +263,34 @@ paths = ["src/apexbot"]
 exclude-newer = "14 days"
 link-mode = "copy"
 cache-keys = [
+    # Any uv *project* build (uv build, or a plain uv sync) must invalidate when
+    # a Rust input changes. The test/dev entrypoints build the extension through
+    # maturin (`just dev`) and never rely on uv's project build, but this keeps
+    # `uv build`/`uv sync` from serving a stale cached wheel after a Rust edit.
     {file = "rust/**/Cargo.toml"},
-    {file = "rust/crates/*/src/**/*.rs"},
-    # build.rs bakes the stale-.so counter (APEXBOT_BUILD_NUMBER); a change
-    # to it must invalidate the wheel cache like any other Rust source.
-    {file = "rust/crates/apexbot-python/build.rs"},
+    {file = "rust/Cargo.lock"},
+    {file = "rust/crates/**/src/**/*.rs"},
+    {file = "rust/crates/**/build.rs"},
+    {file = ".cargo/**"},
 ]
 
+# A dev-env project build (`uv sync` / `uv run` without `--no-sync`) must
+# produce the SAME dev-features extension `just dev` installs, so a plain
+# `uv sync` cannot clobber it with a default-features wheel. maturin reads this
+# from the PEP 517 config settings (`maturin.build-args`); the
+# `cfg(tokio_unstable)` it also needs comes from `.cargo/config.toml`. It MUST be
+# scoped with `config-settings-package` to this package only: an unscoped
+# `config-settings` is applied to EVERY build uv runs, so `--features
+# dev-features` would be handed to dependency builds too (e.g. `pydantic-core`,
+# which is also a maturin crate) and fail with "does not contain this feature".
+# CI builds with `--no-install-project` and release uses maturin-action, so
+# neither reads this.
+config-settings-package = { "apexbot" = { "maturin.build-args" = "--features dev-features" } }
+
 [tool.maturin]
-manifest-path = "rust/crates/apexbot-python/Cargo.toml"
+manifest-path = "rust/crates/shells/apexbot-python/Cargo.toml"
 python-source = "src"
 module-name = "apexbot._ffi"
 bindings = "pyo3"
-# Dev/agent loop builds in the `dev` profile (opt-level 0, no LTO) so the
-# uv-sync cdylib rebuild that fires on every Rust edit (via [tool.uv]
-# cache-keys) is ~5x faster: 149s (release) → ~30s (dev). This setting is
-# consumed ONLY by the local editable-install build path (`uv sync` /
-# `maturin develop`); the published wheel is built by the PyO3/maturin-action
-# in .github/workflows/release.yml, which passes `--release`
-# explicitly and OVERRIDES the features list — so the shipped artifact is
-# unaffected by this setting and stays fully optimized. (The detailed lever
-# analysis lived in rust/PERF_RESULTS.md, dropped in `f082db7a7`)
 profile = "dev"
-# Dev builds compile hotpath in (toggle at runtime via APEXBOT_HOTPATH=1 —
-# see rust/crates/apexbot-bot/src/profiling.rs), plus its Prometheus exporter
-# (guard-enabled runs serve profiler /metrics on :6772, see
-# docs/grafana/ALERTS.md). Release wheels override this
-# list with `--features pyo3/extension-module` (see
-# .github/workflows/release.yml) so the shipped artifact excludes
-# hotpath — macros are no-op `lib_off`, zero runtime penalty.
-features = ["pyo3/extension-module", "apexbot-bot/hotpath", "apexbot-bot/hotpath-prometheus", "apexbot-solvers/hotpath", "apexbot-bot/allocator-ctrl", "otel", "mimalloc"]
 python-packages = ["apexbot"]
-

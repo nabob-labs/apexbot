@@ -8,12 +8,12 @@ the Jaeger-side investigation guide.
 
 Sources of truth:
 
-- Spans/events: `rust/crates/apexbot-bot/src/arb_engine/solve_cycle.rs`
+- Spans/events: `rust/crates/engine/apexbot-bot/src/arb_engine/solve_cycle/`
   (the `[solve-phase]` family), `bot_core/block_pump.rs` (`apexbot.epoch.run` root + pre-solve
   gap fields), `bot_core/stage_telemetry.rs` (`apexbot.stage.*` per-transition spans),
   `arb_engine/engine_handle.rs` (`apexbot.arb.solve`).
-- Metrics: `rust/crates/apexbot-bot/src/instruments.rs` (`apexbot_*` families).
-- OTel setup (event cap, exporter): `rust/crates/apexbot-bot/src/otel.rs`.
+- Metrics: `rust/crates/engine/apexbot-bot/src/instruments.rs` (`apexbot_*` families).
+- OTel setup (event cap, exporter): `rust/crates/engine/apexbot-bot/src/otel.rs`.
 
 Incident shorthand used below: `745f21` = trace `745f2122...` (4.6s solve,
 pre-viability-gate), `d3d15a` = `d3d15a5b` (2.2s, first instrumented),
@@ -45,7 +45,7 @@ Span children of `apexbot.arb.solve` (phase spans, MQUKB6-T2 pattern):
 `apexbot.arb.lpt`, `apexbot.arb.merge`. Time between two adjacent child
 spans is a regression signal — on trace `f701ccd3` (block 25906841,
 2026-09-04) 647 ms sat unattributed between resolve and lpt (per-path deep
-clones of the resolved CL tick-range sequences during staging). Fixed by
+clones of the resolved concentrated liquidity tick-range sequences during staging). Fixed by
 Arc-sharing the resolved snapshots into the dispatch (staging is refcount
 bumps; measured 0.3–0.5 µs/path vs 25-30 µs/path steady-state before, and the
 cold-ramp 150-420 µs/path pathology eliminated). If a resolve→lpt gap reappears
@@ -137,7 +137,7 @@ Diagnose by reading the phase split before touching code:
 4. **Resolve wall grows superlinearly** with resolved count → re-projection of
    structurally-invalid paths (see S3).
 
-Tracing locations: `solve_cycle.rs::run_epoch` (all four
+Tracing locations: `solve_cycle/mod.rs::run_epoch` (all four
 phase events); `engine_handle.rs:129` (span open); per-path timing already in
 the closure (`t0`/`micros`, feeds `slowest.paths`).
 
@@ -152,7 +152,8 @@ Hypotheses ranked:
    `ResolvedMixedPath` per work item). Profile allocations if cpu_us itself is
    fine but wall balloons only at large sets.
 3. Something inside `solve_path` taking a lock — audit any new code for
-   `Mutex`/`RwLock` under the par_iter in `solve_cycle.rs`.
+   `Mutex`/`RwLock` under the parallel solve workers
+   (`lane_walk.rs::solve_one_path`).
 
 ### S3. Invalidity rate > ~50% of resolved
 
@@ -176,9 +177,9 @@ per-pool viability flags maintained in BotState — removes them from
 
 ### S4. Clamp phase growing (clamp.phase_us)
 
-Cost model: one twin simulation per CL hop across clamped paths
+Cost model: one twin simulation per concentrated-liquidity hop across clamped paths
 (`clamp.twins`). Observed 10–69ms for 700–2900 twins — linear, cheap.
-Investigate only if twins-per-path jumps (path shape shift toward CL-heavy) or
+Investigate only if twins-per-path jumps (path shape shift toward concentrated-liquidity-heavy) or
 phase exceeds ~100ms. Location: `clamp_cl_hop_capacity` loop after the merge;
 twin simulators are `v3_simulate_swap`/`v4_simulate_swap` in apexbot-pools.
 
@@ -229,13 +230,11 @@ Known incident class, not a bot bug:
    busy solves emit thousands. Fixed at u32::MAX in otel.rs (04637eacf,
    c9dfeb4f1). Symptom if regressed: exactly ≤128 logs per solve span and no
    phase tail.
-2. **Stale binary**: `uv sync` does NOT reinstall an editable package whose
-   version metadata is unchanged — use
-   `uv sync --reinstall-package apexbot` after Rust edits, then restart.
-   Verify the installed build first with `just verify-build-fresh` (it exits 1
-   on a stale `.so`; see AGENTS.md "Verifying freshness with the build
-   receipt"). The `code.line.number` tag comparison in traces remains only as
-   a forensic fallback, not the primary check.
+2. **Stale binary**: use `just dev` after Rust edits, then restart (the test
+   entrypoints build first, so `just test-python` is always current; see
+   AGENTS.md "Building the Rust extension"). The `code.line.number` tag
+   comparison in traces remains only as a forensic fallback, not the primary
+   check.
 3. Batch-exporter lag: last spans of a killed process are lost. Don't trust a
    trace count drop right after a restart as a regression.
 
@@ -275,6 +274,6 @@ RETIRED with the stage machine), `apexbot_stage_streaming_age_seconds`,
    structural waste when invalidity spikes recur.
 2. Per-pool viability flags at activation time (S3 alt) — shrinks the
    affected set itself.
-3. Watch clamp growth if path mix shifts CL-heavy (S4).
+3. Watch clamp growth if path mix shifts concentrated-liquidity-heavy (S4).
 4. If parallelism ever drops below ~7× on quiet boxes, check CPU quota in the
    devcontainer before blaming the solver (S2).

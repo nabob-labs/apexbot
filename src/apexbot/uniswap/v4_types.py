@@ -6,7 +6,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 from apexbot.types.abstract import AbstractPoolState
-from apexbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
+from apexbot.uniswap.concentrated.types import LiquidityAtTick
 from apexbot.uniswap.v3_types import (
     BitmapWord,
     Liquidity,
@@ -19,9 +19,6 @@ if TYPE_CHECKING:
     from apexbot.types.aliases import BlockNumber
     from apexbot.types.chain import ChecksummedAddress
 
-type FeeToProtocol = int
-type SwapFee = int
-
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
 class UniswapV4PoolState(AbstractPoolState):
@@ -30,7 +27,7 @@ class UniswapV4PoolState(AbstractPoolState):
     liquidity: Liquidity
     sqrt_price_x96: SqrtPriceX96
     tick: Tick
-    tick_bitmap: dict[BitmapWord, BitmapAtWord]
+    tick_bitmap: set[BitmapWord]
     tick_data: dict[Tick, LiquidityAtTick]
     id: bytes
     block: BlockNumber | None
@@ -79,5 +76,5 @@ class UniswapV4PoolLiquidityMappingUpdate:
     tick_upper: Tick
 
 
-type InitializedTickMap = dict[BitmapWord, BitmapAtWord]
+type InitializedTickMap = set[BitmapWord]
 type LiquidityMap = dict[Tick, LiquidityAtTick]

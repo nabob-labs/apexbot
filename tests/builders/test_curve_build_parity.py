@@ -1,4 +1,4 @@
-"""WKKMJM step-1: recorded-RPC parity harness for the Rust Curve builder.
+"""Recorded-RPC parity harness for the Rust Curve builder.
 
 Drives the Rust ``Bot.build_curve_pool`` (the FFI adapter over core
 ``builder::build_curve_pool`` + ``RpcCurveDataProvider``) through a
@@ -11,7 +11,7 @@ This is the Python twin of that Rust `ConstructionIo` double. It validates the
 full seam no I/O-free test covers: `Bot` → `attach_construction_io`
 (AlloyRpcConstruction) → core detection choreography (coin discovery, A/fee/
 admin_fee, per-coin decimals, ramping/crypto/lending/lp/metapool probes) →
-`register_curve_pool` → `struct LiquidityPool` handle.
+`register_curve_pool` → `struct Pool` handle.
 
 Cassette semantics that differ from the Rust `FakeRpc` (selector stubs): the
 `OfflineProvider` keys `eth_call` by full `(to, calldata)` and treats an
@@ -23,10 +23,12 @@ registry list, only requires the reads below; every other detection probe
 
 from __future__ import annotations
 
+import pathlib
+
 from apexbot._ffi import Bot
 from apexbot._ffi.provider import AlloyProvider as RustAlloyProvider
 from apexbot.builders.curve_pool_builder import CurvePoolBuilder
-from apexbot.crypto import keccak256
+from apexbot.crypto import function_selector
 
 # 20-byte (40 hex) addresses matching the Rust plain-pool test.
 POOL = "0x" + "a1" + "00" * 19
@@ -40,7 +42,7 @@ _TIMESTAMP = 1_700_000_000
 
 def _selector(signature: str) -> str:
     """4-byte function selector (lowercase hex, no ``0x``)."""
-    return "0x" + keccak256(signature.encode())[:4].hex()
+    return "0x" + function_selector(signature).hex()
 
 
 def _call_key(to: str, signature: str, arg: int | None = None) -> str:
@@ -270,27 +272,24 @@ def _make_curve_builder(
 
     Mirrors `Bot.__init__` wiring (Erc20Builder → BuilderContext →
     CurvePoolBuilder) so `build` runs the full production I/O choreography:
-    detection, ERC20 token building, `register_curve_pool`, `_from_py_pool`.
+    detection, ERC20 token building, `register_curve_pool`, `from_handle`.
     Returns the builder and the shared `Bot`.
     """
     from apexbot.builders.context import BuilderContext
     from apexbot.builders.erc20_builder import Erc20Builder
-    from apexbot.database.session_manager import DatabaseSessionManager
     from apexbot.registry import PoolRegistry, TokenRegistry
 
     py_bot = Bot(chain_id=1)
     py_bot.attach_construction_io(provider, None)
-    fake_db = object.__new__(DatabaseSessionManager)
-    tokens = TokenRegistry()
+    tokens = TokenRegistry(py_bot=py_bot)
     pools = PoolRegistry(py_bot=py_bot)
     erc20 = Erc20Builder(
         default_chain_id=1,
-        db=fake_db,
         tokens=tokens,
         py_bot=py_bot,
     )
     ctx = BuilderContext(
-        db=fake_db,
+        database_path=pathlib.Path("curve.db"),
         pools=pools,
         tokens=tokens,
         erc20_builder=erc20,
@@ -323,7 +322,7 @@ def test_build_curve_pool_plain_over_offline_cassette() -> None:
     assert handle.curve_a_coefficient == 2000
     assert handle.curve_fee == 1_000_000
     assert handle.curve_admin_fee == 500_000_000
-    assert handle.balances == [1_000_000, 2_000_000]
+    assert handle.balance_vector().balances == [1_000_000, 2_000_000]
 
     r30 = 10**30
     r12 = 10**12
@@ -393,7 +392,7 @@ def test_curve_pool_builder_build_matches_rust_path_over_cassette() -> None:
     """Dual-driver: real `CurvePoolBuilder.build` equals the Rust path (plain).
 
     Drives the CURRENT Python `CurvePoolBuilder.build` (detection + ERC20 token
-    building + `register_curve_pool` + `_from_py_pool`) over the full plain
+    building + `register_curve_pool` + `from_handle`) over the full plain
     cassette, and independently drives the Rust `build_curve_pool` over the
     SAME cassette. Asserts the resulting pool identity state is identical on
     both sides — the parity gate that lets `build` be retargeted to the Rust
@@ -427,7 +426,9 @@ def test_curve_pool_builder_build_matches_rust_path_over_cassette() -> None:
     assert pool.a_coefficient == handle_a.curve_a_coefficient == 2000
     assert pool.fee == handle_a.curve_fee == 1_000_000
     assert pool.admin_fee == handle_a.curve_admin_fee == 500_000_000
-    assert tuple(pool.balances) == tuple(handle_a.balances) == (1_000_000, 2_000_000)
+    assert (
+        tuple(pool.balances) == tuple(handle_a.balance_vector().balances) == (1_000_000, 2_000_000)
+    )
     assert tuple(pool.rate_multipliers) == tuple(handle_a.curve_rate_multipliers)
     assert tuple(pool.precision_multipliers) == tuple(handle_a.curve_precision_multipliers)
     assert pool.rate_multipliers[0] == 10**30
@@ -567,4 +568,4 @@ def test_curve_pool_builder_build_metapool_recurses_base_over_cassette() -> None
     assert pool.a_coefficient == handle_a.curve_a_coefficient == 500
     assert pool.fee == handle_a.curve_fee == 1_000_000
     assert pool.admin_fee == handle_a.curve_admin_fee == 500_000_000
-    assert tuple(pool.balances) == tuple(handle_a.balances)
+    assert tuple(pool.balances) == tuple(handle_a.balance_vector().balances)

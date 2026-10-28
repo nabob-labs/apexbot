@@ -1,6 +1,6 @@
 //! Telemetry boot prelude for the standalone settlement-bot driver.
 //!
-//! Gap G6 (ergo ZOBXVC, epic RGZG4S): the pure-Rust parity twin of the Python
+//! Gap G6 : the pure-Rust parity twin of the Python
 //! driver must boot the SAME observability stack the Python driver boots, in
 //! the same order, so the boot census / telemetry announcements are observable
 //! from the standalone binary. Before this module the example exposed no
@@ -8,13 +8,12 @@
 //!
 //! # Boot order (mirrors `apexbot-python`'s pymodule init)
 //!
-//! 1. Typed config install — `BotConfigLoader` (schema defaults +
-//!    `APEXBOT_*` env) is the ONE env-reading site for telemetry keys, so
-//!    `APEXBOT_LOG_LEVEL`, `APEXBOT_TELEMETRY_DIAG`, `APEXBOT_OTEL` and
-//!    `APEXBOT_METRICS_ADDR` take effect. The driver's manual pre-0.6
-//!    `config.toml` cascade (rpc/ws/database) is untouched: the typed loader
-//!    runs env-only here because those file sections are retired layout items
-//!    the validated modern file layer refuses.
+//! 1. Typed config install — the caller's single `load_process_config()`
+//!    (`BotConfigLoader::new().with_standard_file_paths().load()`: the
+//!    standard operator file + `APEXBOT_*` env + schema defaults) is the ONE
+//!    env-reading site for telemetry keys, so `APEXBOT_LOG_LEVEL`,
+//!    `APEXBOT_TELEMETRY_DIAG`, `APEXBOT_OTEL` and `APEXBOT_METRICS_ADDR`
+//!    take effect — and a `[telemetry]` table in the operator file does too.
 //! 2. `tracing_subscriber` console layer — compact fmt on stderr, filtered by
 //!    the shared ADR-043 section 4 plan
 //!    (`bot_telemetry::resolve_filters`). The example is the Python driver's
@@ -104,18 +103,13 @@ impl Drop for TelemetryBoot {
     }
 }
 
-/// Boot the driver telemetry stack (see the module docs for the order and the
-/// degradation rules). Never fails.
-pub(crate) fn init() -> TelemetryBoot {
-    // Step 1: install the typed config (one env-reading site for APEXBOT_*).
-    let config_error = match apexbot::config::BotConfigLoader::new().load() {
-        Ok(loaded) => {
-            // First-wins, mirroring apexbot-python's production boot path.
-            let _ = apexbot::bot_core::stance::install(std::sync::Arc::new(loaded.config));
-            None
-        }
-        Err(error) => Some(error.to_string()),
-    };
+/// Boot the driver telemetry stack from the caller's single layered load (see
+/// the module docs for the order and the degradation rules). Never fails.
+pub(crate) fn init(loaded: &apexbot::config::LoadedConfig) -> TelemetryBoot {
+    // Step 1: install the typed config the caller loaded once (file + env +
+    // defaults) — first-wins, mirroring apexbot-python's production boot
+    // path.
+    let _ = apexbot::substrate::stance::install(std::sync::Arc::new(loaded.config.clone()));
 
     // Step 2: resolve the console/OTel record filters (ADR-043 section 4).
     let plan = bot_telemetry::resolve_filters(bot_telemetry::CONSOLE_WIRING_DEFAULT_PYTHON);
@@ -177,9 +171,6 @@ pub(crate) fn init() -> TelemetryBoot {
     apexbot::core::worker_census::emit_boot_table();
 
     // Step 6: boot census announcements on the closed domain targets.
-    if let Some(error) = config_error {
-        op_warn!(domain = pump, error = %error, "typed BotConfig load failed; telemetry keys fall back to schema defaults");
-    }
     if !installed {
         op_warn!(
             domain = pump,

@@ -1,0 +1,335 @@
+//! `PyO3` wrapper for the engine stage surface — register `#[pymethods]` slice.
+//!
+//! Split out of the former monolithic `py_binding.rs` ,
+//! mirroring `crates/engine/apexbot-bot/src/arb_engine/`'s per-concern
+//! layout. `PyO3` allows multiple `#[pymethods] impl PyArbEngine { … }`
+//! blocks per type, so each concern file contributes one slice.
+
+use super::{Arc, Bot, EngineStages, PoolHop, PyArbEngine, PyBot, PyList};
+use crate::bot::errmap::{map_driver_err, map_path_registration_err};
+use crate::prelude::*;
+
+use apexbot_substrate::session_registry::SessionObjectRegistry;
+use apexbot_substrate::state_lock::StateLock;
+
+#[pymethods]
+impl PyArbEngine {
+    #[new]
+    #[pyo3(signature = (py_bot=None))]
+    #[expect(clippy::needless_pass_by_value)]
+    pub(crate) fn new(py: Python<'_>, py_bot: Option<Py<PyBot>>) -> Self {
+        let py_bot_ref = py_bot.as_ref();
+        // ADR-006 D1+D4: if a `PyBot` is supplied, adopt its shared
+        // `Arc<RwLock<BotState>>` so the engine reads/writes the SAME core that
+        // `PyBot`/`PyLiquidityPool`/`PyErc20Token` share — and clone its `Arc<Bot>`
+        // so `BlockPump`'s `dispatch_log` writes flow through to the engine's
+        // reads (dissolving the dual-`BotState` split —
+        // `rust-owned-bot.md` §17 stale-state root cause). Without one, allocate
+        // a standalone core + wrap it in a fresh `Bot` (no-pyo3 / legacy path).
+        let (core, bot) = if let Some(bot) = py_bot_ref {
+            let bot = bot.borrow(py).bot_arc();
+            (bot.state_arc(), bot)
+        } else {
+            let core = Arc::new(StateLock::new(apexbot_substrate::BotState::new()));
+            // No `PyBot` to adopt, so THIS engine is the session owner: it
+            // resolves the session's one object registry here and hands it to
+            // the adopting `Bot` (`Bot::with_core` never mints one, so a second
+            // adopter over this core cannot fork the session's identity space).
+            // The chain scope is the same placeholder `PyBot::new(chain_id = 0)`
+            // uses on this bare/no-shared-session path — there is no configured
+            // chain to read here — and `Bot` reports the registry's chain, so the
+            // orchestrator and its identity key space cannot disagree.
+            let registry = Arc::new(SessionObjectRegistry::new(0));
+            let bot = Arc::new(Bot::with_core(Arc::clone(&core), registry));
+            (core, bot)
+        };
+        // The stage surface IS the engine
+        // seam — it builds the engine internally from the shared core, so this
+        // crate never names the engine type. The pump drives it through the
+        // stage hooks. Python polls the engine's own cursor
+        // (`last_processed_block`): stage work runs INLINE in the
+        // single-writer driver, so the cursor is drain-consistent by
+        // construction (no `drain_lock` to wait on).
+        // The stage surface consumes the SAME epoch ledger `Bot::dispatch_log`
+        // records into — one dirty-tracking mechanism. The ledger
+        // is injected at construction; the stage surface owns no swap.
+        let stages = Arc::new(EngineStages::with_core(core, bot.active_delta()));
+        // ADR-050 D7: the public Rust `EngineDriver` owns the pump session
+        // (result/block channels, reorg coordinator, shutdown, subscribe
+        // state, verify provider); the PyO3 wrapper is a second adapter onto
+        // it, exactly like a pure-Rust consumer. The block-clock receiver is
+        // taken by `PyBot::block_stream` through the shared `PumpState`.
+        //
+        // C4: the driver attaches to a host-minted hub (the C2 attach
+        // signature) rather than minting a private one, so ONE process-wide
+        // `StrategyHost` owns the hub, the frozen route registry, and the
+        // nonce authority. For a settlement-only boot the host is otherwise
+        // inert: no driver is enabled and no lane namespace is named.
+        let booted = super::strategy::boot_host();
+        let host = booted.host;
+        let attached = booted.attached;
+        // The engine holds the hosted sources for its life: their drop (and the
+        // head-edge/sampler shutdown) is the engine's drop, not this boot's end.
+        let hosted = booted.hosted;
+        let driver = Arc::new(
+            apexbot_bot::arb_engine::EngineDriver::from_stages_with_hub(
+                Arc::clone(&bot),
+                Arc::clone(&stages),
+                attached,
+            ),
+        );
+        let result_rx = driver.take_result_receiver();
+        // Both wrappers share the driver itself.
+        if let Some(parent) = py_bot_ref {
+            parent.borrow(py).attach_pump_state(Arc::clone(&driver));
+        }
+        // The cross-block warm bytecode cache (Option A) — one
+        // shared `Arc<RwLock<WarmCodeCacheInner>>` for the engine's life,
+        // cloned into each per-block `BlockSimHandle::build`. Empty at
+        // construction; warmed lazily by the first block's cold RPCs.
+        let warm_code_cache = apexbot_simulation::WarmCodeCacheInner::shared_default();
+        let supervisor = apexbot_bot::strategy_host::HostSupervisor::new(Arc::clone(&host));
+        Self {
+            stages,
+            driver,
+            host,
+            hosted,
+            supervisor,
+            result_rx: Arc::new(parking_lot::Mutex::new(result_rx)),
+            warm_code_cache,
+        }
+    }
+
+    /// Register a mixed arbitrage path.
+    ///
+    /// Each entry is (`hop_type_str`, `pool_key`, `zero_for_one`) where
+    /// `hop_type_str` is "V2" or "V3".
+    #[pyo3(signature = (pool_refs))]
+    fn register_path(
+        &self,
+        py: Python<'_>,
+        pool_refs: &Bound<'_, PyList>,
+    ) -> PyResult<(u64, bool)> {
+        let mut hops = Vec::with_capacity(pool_refs.len());
+        for item in pool_refs.iter() {
+            let tuple = item.cast::<pyo3::types::PyTuple>()?;
+            if tuple.len() != 2 {
+                let msg = format!(
+                    "Expected 2-tuple (pool_id, zero_for_one), got {} elements",
+                    tuple.len()
+                );
+                return Err(pyo3::exceptions::PyValueError::new_err(msg));
+            }
+            let pool_id: u64 = tuple.get_item(0)?.extract()?;
+            let zero_for_one: bool = tuple.get_item(1)?.extract()?;
+            hops.push(PoolHop {
+                pool_id,
+                zero_for_one,
+            });
+        }
+
+        if hops.len() < 2 {
+            let msg = format!("Need at least 2 pool refs, got {}", hops.len());
+            return Err(pyo3::exceptions::PyValueError::new_err(msg));
+        }
+
+        let stages = Arc::clone(&self.stages);
+        // release the GIL across the stage-surface registration
+        // (which internally takes `core.read()`) so the live pump + asyncio
+        // loop keep making GIL progress. `PoolHop` is `Send`; the error maps
+        // to a `PyErr` OUTSIDE the closure (GIL-held).
+        //
+        // PRG-4: the refusal is TYPED — a full registry surfaces as the
+        // benign `PathRegistryFullError` stop; everything else stays a
+        // `ValueError` with the legacy message. The `created` flag derives
+        // from the path-count delta inside the stage surface (dedup returns
+        // the existing id without growth), so the crawl keeps its
+        // new-vs-duplicate accounting without Python-side dedup state.
+        let (path_id, created) = py.detach(move || {
+            stages
+                .register_path(hops)
+                .map_err(map_path_registration_err)
+        })?;
+        // No engine-side registration. Touched-pool dirty tracking
+        // is a BYPRODUCT of log application (`Bot::dispatch_log` records the
+        // block's `EpochDelta`, which `on_resolve` consumes).
+        Ok((path_id, created))
+    }
+
+    /// Register a mixed arbitrage path and eagerly solve it.
+    ///
+    /// Unlike `register_path`, this method also resolves and solves the path
+    /// immediately, appending any profitable result to the engine's results.
+    /// Used when the engine is already running (after the pump has started)
+    /// so that new paths are immediately available to `latest_results()`.
+    #[pyo3(signature = (pool_refs))]
+    fn register_and_solve_path(
+        &self,
+        py: Python<'_>,
+        pool_refs: &Bound<'_, PyList>,
+    ) -> PyResult<(u64, bool)> {
+        let mut hops = Vec::with_capacity(pool_refs.len());
+        for item in pool_refs.iter() {
+            let tuple = item.cast::<pyo3::types::PyTuple>()?;
+            if tuple.len() != 2 {
+                let msg = format!(
+                    "Expected 2-tuple (pool_id, zero_for_one), got {} elements",
+                    tuple.len()
+                );
+                return Err(pyo3::exceptions::PyValueError::new_err(msg));
+            }
+            let pool_id: u64 = tuple.get_item(0)?.extract()?;
+            let zero_for_one: bool = tuple.get_item(1)?.extract()?;
+            hops.push(PoolHop {
+                pool_id,
+                zero_for_one,
+            });
+        }
+
+        if hops.len() < 2 {
+            let msg = format!("Need at least 2 pool refs, got {}", hops.len());
+            return Err(pyo3::exceptions::PyValueError::new_err(msg));
+        }
+
+        let stages = Arc::clone(&self.stages);
+        // release the GIL across the stage-surface registration +
+        // the single eager `solve_path`. See `register_path`. `PoolHop` is
+        // `Send`; the error maps to a `PyErr` OUTSIDE the closure.
+        let (path_id, created) = py.detach(move || {
+            stages
+                .register_and_solve_path(hops)
+                .map_err(map_path_registration_err)
+        })?;
+        // No engine-side subscription — see `register_path`.
+        Ok((path_id, created))
+    }
+
+    /// Subscribe phase: open WS connections and observe until first complete block.
+    ///
+    /// Returns the first observed block number. Python should:
+    /// 1. Run backfill up to the returned block number
+    /// 2. Call `resume()` to begin normal processing
+    ///
+    /// A "complete" block is one where both a `newHeads` notification and at
+    /// least one log for the same block have been received. This guarantees
+    /// the logs subscription did not miss the start of the block.
+    /// No events are buffered during subscribe — the backfill is the sole
+    /// authority for the gap between snapshot and WS start.
+    ///
+    /// Raises `RuntimeError` if the pump is already started or subscribed.
+    /// PRG-4: the registered-path cap owned by the engine path
+    /// registry. The Python driver sets it once at boot from the typed
+    /// config value; `None` = unlimited. `None` clears any set cap
+    /// (operator override).
+    #[pyo3(signature = (cap=None))]
+    fn set_path_cap(&self, cap: Option<u64>) {
+        self.stages
+            .set_path_cap(cap.map(|c| usize::try_from(c).unwrap_or(usize::MAX)));
+    }
+
+    /// PRG-4: dedup hits counted engine-side — a duplicate registration
+    /// returns the existing id and never surfaces to the driver as a skip,
+    /// so the `dup` telemetry needs this witness.
+    #[getter]
+    fn path_dedups(&self) -> u64 {
+        self.stages.path_dedups()
+    }
+
+    #[expect(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (rpc_url))]
+    fn subscribe(&self, py: Python<'_>, rpc_url: String) -> PyResult<u64> {
+        // ADR-050 D7: the engine-only test-seam twin of
+        // `PyBot::subscribe` — drives the shared `EngineDriver` directly.
+        py.detach(|| apexbot_bot::bot_core::Bot::subscribe(&self.driver, &rpc_url))
+            .map_err(map_driver_err)
+    }
+
+    /// Pre-pump startup ritual: `subscribe(ws)` → verify-config
+    /// (`node_http`, optional `verify_state_view`).
+    ///
+    /// The one-call sibling of `subscribe` / `set_verify_rpc_url` /
+    /// `set_verify_state_view`, delegating to the shared `EngineDriver::start`
+    /// so the boot ordering is authored once. Stops before `resume()`; the
+    /// snapshot seed `S` must already be on the shared `BotState` (the driver
+    /// reads it while subscribing).
+    ///
+    /// Raises `RuntimeError` if the phase is past the subscribe window, the
+    /// pump is already started/subscribed, or the WS subscribe fails.
+    #[expect(clippy::needless_pass_by_value)]
+    #[pyo3(signature = (node_http, node_ws, verify_state_view=None))]
+    fn start(
+        &self,
+        py: Python<'_>,
+        node_http: String,
+        node_ws: String,
+        verify_state_view: Option<String>,
+    ) -> PyResult<u64> {
+        crate::bot::pump::start(
+            py,
+            &self.driver,
+            &node_http,
+            &node_ws,
+            verify_state_view.as_deref(),
+        )
+    }
+
+    /// Resume phase: begin normal pump processing.
+    ///
+    /// Must be called after `subscribe()`. Takes the WS stream from the
+    /// subscribe phase and begins processing events on block boundaries.
+    ///
+    /// After calling `resume()`, the engine processes events autonomously.
+    /// Python reads results via `latest_results()` and awaits new blocks
+    /// via `wait_for_block()`.
+    ///
+    /// Raises `RuntimeError` if `subscribe()` has not been called first.
+    ///
+    /// Resuming the pump is the engine's start flow, and the flow owns the
+    /// enable-then-resume ordering: each named facet enables through the host
+    /// admission gate first, then the pump resumes, then every enabled facet
+    /// owning a hosted loop (the backrun lane) boots with a supervisor per
+    /// driver so a self-halt is queryable. A facet name the host does not
+    /// admit fails the call before the pump resumes.
+    #[pyo3(signature = (facets))]
+    #[expect(clippy::needless_pass_by_value)]
+    fn resume(&self, py: Python<'_>, facets: Vec<String>) -> PyResult<()> {
+        self.enable_facets(py, &facets)?;
+        py.detach(|| apexbot_bot::bot_core::Bot::resume(&self.driver))
+            .map_err(map_driver_err)?;
+        // The start boundary for the deferred hosted I/O: the head-watch WS
+        // connect and each active arm's feed pump launch here, BEFORE the
+        // drivers, because each driver's loop subscribes the hub head source
+        // the head edge registers as it starts. Construction dials nothing.
+        self.start_hosted_sources(py)?;
+        self.start_hosted_strategies()
+            .map_err(super::strategy::map_host_error)?;
+        Ok(())
+    }
+
+    /// Stop the pump and signal the Rust core to clean up (ADR-006 D4).
+    ///
+    /// The symmetric teardown half of `resume()`: sets the shutdown flag and
+    /// aborts the spawned pump task so a Ctrl-C exits promptly — the pump loop
+    /// otherwise blocks up to `BACKFILL_TIMEOUT_SECS` (60s) on a silent WS
+    /// stream before re-checking its shutdown flag, and indefinitely if the WS
+    /// subscription never delivers a final frame. Aborting unblocks the
+    /// `combined.next().await` immediately and drops the WS subscription
+    /// futures (closing the transport). Idempotent — safe from both the
+    /// session teardown path and a signal handler. Delegates to the shared
+    /// `PumpState`.
+    fn stop(&self, _py: Python<'_>) -> PyResult<()> {
+        apexbot_bot::bot_core::Bot::stop(&self.driver).map_err(map_driver_err)
+    }
+
+    /// Awaitable session-end DETECTION FACT: resolves the core
+    /// `SessionEndCause` name once the spawned pump task finishes — cooperative
+    /// timed exit (`HOTPATH_SHUTDOWN_MS`), WS stream end, abort, or panic. The
+    /// Python runner awaits this instead of polling, so a completed pump
+    /// triggers the ordinary graceful shutdown within one event-loop turn. A
+    /// consumer that awaits it AFTER the pump already ended still resolves (the
+    /// completion is a retained broadcast, not a one-shot signal consumed at
+    /// creation).
+    fn session_end_future<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::bot::pump::session_end_future(py, &self.driver)
+    }
+}

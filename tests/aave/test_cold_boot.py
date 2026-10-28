@@ -1,4 +1,4 @@
-"""Cold-boot bootstrap tests for `run_aave_update` (O4BOST).
+"""Cold-boot bootstrap tests for `run_aave_update`.
 
 Verifies the Rust updater self-bootstraps the `POOL`/`POOL_CONFIGURATOR`
 contract rows on a fresh market (only `POOL_ADDRESS_PROVIDER` + the GHO token
@@ -14,12 +14,11 @@ idempotent for `name ∈ {POOL, POOL_CONFIGURATOR}` so no duplicate row appears.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session
 
 from apexbot._ffi.aave import run_aave_update
 from apexbot._ffi.cancel import CancelHandle
@@ -35,13 +34,14 @@ from tests.aave.writer_parity.harness import (
     _u256,
     mock_rpc_server,
 )
+from tests.helpers.database import sqlite_connection
 
 # The ProxyCreated event topic (keccak of the signature) — see
 # `apexbot_decoders::aave_event_decoder::PROXY_CREATED_TOPIC`.
 PROXY_CREATED_TOPIC = "0x4a465a9bd819d9662563c1e11ae958f8109e437e7f4bf1c6ef0b9a7b3f35d478"
 
 # The `id` bytes32 values the bootstrap matches against — right-padded ASCII
-# (NOT keccak — see `match_proxy_id` + the §4.2 finding). b"POOL" = 0x504f4f4c,
+# (NOT keccak — see `match_proxy_id` + the parity-gate finding). b"POOL" = 0x504f4f4c,
 # b"POOL_CONFIGURATOR" = 0x504f4f4c5f434f4e464947555241544f52.
 _POOL_ID = "0x" + b"POOL".hex().ljust(64, "0")
 _POOL_CONFIGURATOR_ID = "0x" + b"POOL_CONFIGURATOR".hex().ljust(64, "0")
@@ -80,71 +80,51 @@ def _seed_cold_boot_db(db_path: Path, *, market_id: int = 1, last_update_block: 
     """Seed a fresh schema with ONLY the market + POOL_ADDRESS_PROVIDER + GHO.
 
     Mirrors `aave activate ethereum_aave_v3`'s thin seed (no POOL/
-    POOL_CONFIGURATOR — the cold-boot gap O4BOST closes).
+    POOL_CONFIGURATOR — the cold-boot gap this closes).
     """
     db_upgrade_database(str(db_path))
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        session.execute(
-            text(
-                "INSERT INTO aave_v3_markets (id, chain_id, name, active, "
-                "last_update_block) VALUES (:id, 1, 'aave', 1, :block)"
-            ),
+    with sqlite_connection(db_path) as connection:
+        connection.execute(
+            "INSERT INTO aave_v3_markets (id, chain_id, name, active, "
+            "last_update_block) VALUES (:id, 1, 'aave', 1, :block)",
             {"id": market_id, "block": last_update_block},
         )
-        session.execute(
-            text(
-                "INSERT INTO aave_v3_contracts (market_id, name, address) "
-                "VALUES (:m, 'POOL_ADDRESS_PROVIDER', :a)"
-            ),
+        connection.execute(
+            "INSERT INTO aave_v3_contracts (market_id, name, address) "
+            "VALUES (:m, 'POOL_ADDRESS_PROVIDER', :a)",
             {"m": market_id, "a": POOL_ADDRESS_PROVIDER_ADDRESS},
         )
-        # The GHO token + aave_gho_tokens row (build_fetch_spec fetches the
-        # chain GHO asset; the Rust treats it as Option but the column must
-        # exist for the chain).
-        session.execute(
-            text("INSERT INTO erc20_tokens (id, chain, address) VALUES (1, 1, :a)"),
+        connection.execute(
+            "INSERT INTO erc20_tokens (id, chain, address) VALUES (1, 1, :a)",
             {"a": "0x" + "55" * 20},
         )
-        session.execute(
-            text(
-                "INSERT INTO aave_gho_tokens (id, token_id, v_token_id, "
-                "v_gho_discount_rate_strategy, v_gho_discount_token) "
-                "VALUES (1, 1, NULL, NULL, NULL)"
-            ),
+        connection.execute(
+            "INSERT INTO aave_gho_tokens (id, token_id, v_token_id, "
+            "v_gho_discount_rate_strategy, v_gho_discount_token) "
+            "VALUES (1, 1, NULL, NULL, NULL)"
         )
-        session.commit()
-    engine.dispose()
 
 
 def _dump_contracts(db_path: Path) -> list[dict[str, Any]]:
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        rows = session.execute(
-            text("SELECT name, address, revision FROM aave_v3_contracts ORDER BY name")
-        ).all()
-        out = [dict(r._mapping) for r in rows]
-    engine.dispose()
-    return out
+    with sqlite_connection(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT name, address, revision FROM aave_v3_contracts ORDER BY name"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def _stamp(db_path: Path) -> int | None:
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        row = session.execute(
-            text("SELECT last_update_block FROM aave_v3_markets WHERE id = 1")
-        ).one()
-        out = row[0]
-    engine.dispose()
-    return out
+    with sqlite_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT last_update_block FROM aave_v3_markets WHERE id = 1"
+        ).fetchone()
+        return None if row is None else row[0]
 
 
-def test_cold_boot_creates_pool_and_configurator_rows() -> None:
+def test_cold_boot_creates_pool_and_configurator_rows(tmp_path: Path) -> None:
     """A fresh market self-bootstraps POOL/POOL_CONFIGURATOR via ProxyCreated."""
-    import tempfile
-
-    tmp = Path(tempfile.mkdtemp(prefix="cold-boot-"))
-    db_path = tmp / "cand.db"
+    db_path = tmp_path / "cand.db"
     _seed_cold_boot_db(db_path, last_update_block=1000)
     # from_block = 1001; the bootstrap fetches [1001, 3001]. The ProxyCreated
     # events land at 1001 (within the window). to_block = 1002 so the chunk
@@ -192,20 +172,16 @@ def test_cold_boot_creates_pool_and_configurator_rows() -> None:
     assert contracts["POOL_CONFIGURATOR"]["revision"] == 1, contracts
     # Exactly ONE row per bootstrap contract (no duplicate from the chunk
     # re-encounter — the idempotent ContractInserted arm).
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        pool_count = session.execute(
-            text("SELECT COUNT(*) FROM aave_v3_contracts WHERE name = 'POOL' AND address = :a"),
+    with sqlite_connection(db_path) as connection:
+        pool_count = connection.execute(
+            "SELECT COUNT(*) FROM aave_v3_contracts WHERE name = 'POOL' AND address = :a",
             {"a": POOL_ADDRESS},
-        ).scalar()
-        cfg_count = session.execute(
-            text(
-                "SELECT COUNT(*) FROM aave_v3_contracts WHERE name = 'POOL_CONFIGURATOR' "
-                "AND address = :a"
-            ),
+        ).fetchone()[0]
+        cfg_count = connection.execute(
+            "SELECT COUNT(*) FROM aave_v3_contracts WHERE name = 'POOL_CONFIGURATOR' "
+            "AND address = :a",
             {"a": POOL_CONFIGURATOR_ADDRESS},
-        ).scalar()
-    engine.dispose()
+        ).fetchone()[0]
     assert pool_count == 1, f"POOL row duplicated: {pool_count}"
     assert cfg_count == 1, f"POOL_CONFIGURATOR row duplicated: {cfg_count}"
     # The Rust advanced the stamp to to_block (the Python doesn't stamp —
@@ -213,7 +189,7 @@ def test_cold_boot_creates_pool_and_configurator_rows() -> None:
     assert _stamp(db_path) == 1002, _stamp(db_path)
 
 
-def test_max_chunks_caps_loop_at_n_committed_chunks() -> None:
+def test_max_chunks_caps_loop_at_n_committed_chunks(tmp_path: Path) -> None:
     """``max_chunks=1`` stops the Rust loop after committing ONE chunk.
 
     The Rust core owns chunking; before the ``max_chunks`` cap the Python
@@ -222,10 +198,7 @@ def test_max_chunks_caps_loop_at_n_committed_chunks() -> None:
     after the Nth committed chunk + ``last_update_block`` is stamped to that
     chunk's end (so the next run resumes from there).
     """
-    import tempfile
-
-    tmp = Path(tempfile.mkdtemp(prefix="max-chunks-"))
-    db_path = tmp / "cand.db"
+    db_path = tmp_path / "cand.db"
     # from_block = 1001; to_block = 1009; chunk_size = 2 → would be
     # chunks [1001-1002],[1003-1004],[1005-1006],[1007-1008],[1009] (5 chunks).
     # max_chunks=1 → must stop after the FIRST committed chunk (1001-1002).

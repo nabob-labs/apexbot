@@ -6,18 +6,20 @@ UniswapV3PoolCalc.
 
 V3 state is significantly different from V2:
 - Concentrated liquidity: tick-based, not reserves-based
-- Has tick_bitmap and tick_data for the liquidity distribution
+- Has tick_bitmap (known word positions) and tick_data for the liquidity distribution
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from apexbot.uniswap.concentrated_liquidity_pool_state import ConcentratedLiquidityPoolState
 
 if TYPE_CHECKING:
     from apexbot.erc20 import Erc20Token
 
 
-class V3PoolState:
+class V3PoolState(ConcentratedLiquidityPoolState):
     """State for V3-style concentrated-liquidity pools.
 
     Immutable data set at construction:
@@ -25,8 +27,8 @@ class V3PoolState:
     - _fee: pool fee in hundredths of a bip (e.g. 3000 = 0.3%)
     - _tick_spacing: granularity of the tick bitmap
 
-    Mutable state (CL scalars + liquidity distribution):
-    - liquidity, sqrt_price_x96, tick, tick_bitmap, tick_data
+    Mutable state (concentrated liquidity scalars + liquidity distribution):
+    - liquidity, sqrt_price_x96, tick, tick_bitmap (word keys), tick_data
     """
 
     # Immutable — set once at construction
@@ -34,9 +36,6 @@ class V3PoolState:
     _token1: Erc20Token
     _fee: int
     _tick_spacing: int
-    # The CL handle (set by the companion's _from_py_pool); the
-    # sparse_liquidity_map property reads Rust coverage through it.
-    _py_pool: Any
 
     @property
     def token0(self) -> Erc20Token:
@@ -57,16 +56,6 @@ class V3PoolState:
     def tick_spacing(self) -> int:
         """Tick spacing."""
         return self._tick_spacing
-
-    @property
-    def sparse_liquidity_map(self) -> bool:
-        """Determine sparse liquidity map.
-
-        Rust ``coverage`` is the fact (T2 FBJTUM: the double-tracked Python
-        flag is retired; the V3/V4 state owns the read).
-
-        """
-        return self._py_pool.coverage == "sparse"
 
     @property
     def tokens(self) -> tuple[Erc20Token, Erc20Token]:

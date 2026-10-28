@@ -1,0 +1,266 @@
+//! Schema constants and the embedded DDL for the fresh-standalone open path.
+//!
+//! The schema is the consolidated DDL the Alembic head produces, captured as
+//! `CREATE TABLE IF NOT EXISTS` (idempotent — safe to re-assert on the
+//! fresh-standalone path). Columns mirror `src/apexbot/database/models/*.py`
+//! exactly: big-int columns are `VARCHAR(78)` (the decimal string of an EVM
+//! value; mirrors Python's `IntMappedToString` `TypeDecorator`), addresses are
+//! `VARCHAR(42)` checksum strings, V4 `pool_hash` is `VARCHAR(66)` 0x-hex.
+
+/// The embedded full-schema DDL, applied ONLY on the fresh-standalone open path
+/// (a `cargo add apexbot-db` consumer's own empty file). A legacy DB carrying
+/// the `alembic_version` marker table is never touched by this — see
+/// [`crate::migrate::ensure_schema`].
+pub const SCHEMA_HEAD: &str = include_str!("schema_head.sql");
+
+/// The private Rust-owned schema-version stamp, written to
+/// `_apexbot_db_schema_version` on the fresh-standalone, cutover, and heal
+/// paths so Rust-owned schema bumps (post-Alembic-retirement) are tracked
+/// independently of Alembic.
+///
+/// # Bump ritual (mechanical — three steps, in this order)
+///
+/// 1. **Bump this constant** (`RUST_SCHEMA_VERSION = N + 1`).
+/// 2. **Append the step** to [`crate::migrations::RUST_MIGRATIONS`]: a
+///    [`crate::migrations::MigrationStep`] with `version = N + 1` and the
+///    `ALTER`/DDL SQL that upgrades schema `N` to `N + 1`. The
+///    registry must stay contiguous from `1` — `apply_forward_migrations`
+///    refuses a gap with [`crate::error::DbError::MissingMigrationStep`].
+/// 3. **Extend the release matrix** (ADR-052 D5): add the `N`-stamped fixture
+///    so the open → version-lock → current chain is proven for the prior
+///    release.
+///
+/// The open path applies pending steps automatically (ADR-052 D2), so no
+/// consumer calls a migration verb; a binary older than the DB refuses with
+/// [`crate::error::DbError::SchemaAhead`] and never writes ahead.
+pub const RUST_SCHEMA_VERSION: u32 = 3;
+
+/// Name of the private Rust-owned schema stamp table.
+pub const SCHEMA_VERSION_TABLE: &str = "_apexbot_db_schema_version";
+
+// ---------------------------------------------------------------------------
+// Table-name constants — single source of truth for the SQL strings in `read.rs`
+// and `snapshot.rs`, so a rename touches one place.
+// ---------------------------------------------------------------------------
+
+pub mod table {
+    //! Canonical table names (mirror `models/*.py` `__tablename__`).
+
+    use apexbot_pathfinding::PoolKind;
+
+    pub const EXCHANGES: &str = "exchanges";
+    pub const ERC20_TOKENS: &str = "erc20_tokens";
+    pub const POOLS: &str = "pools";
+    pub const LIQUIDITY_POSITIONS: &str = "liquidity_positions";
+    pub const POOL_MANAGERS: &str = "pool_managers";
+    pub const MANAGED_POOLS: &str = "managed_pools";
+    pub const UNISWAP_V4_POOLS: &str = "uniswap_v4_pools";
+    pub const MANAGED_POOL_LIQUIDITY_POSITIONS: &str = "managed_pool_liquidity_positions";
+    pub const UNISWAP_V3_POOLS: &str = "uniswap_v3_pools";
+
+    /// The LFJ (Trader Joe Liquidity Book) binned-pair subclass table. LFJ is
+    /// the declared-but-unsupported `lfj_binned` family (ADR-059 D8): the table
+    /// gives the persisted identity a home before any tier reads it.
+    pub const LFJ_POOLS: &str = "lfj_pools";
+
+    /// The subclass table names the schema admits: every V2/V3 species plus
+    /// the declared-but-unsupported LFJ binned family (`lfj_pools`). The
+    /// species manifest ([`crate::species`]) validates every non-V4 `table`
+    /// against this set, so a manifest entry cannot name a table the DDL does
+    /// not create.
+    pub const V2_V3_SUBCLASS_TABLES: &[&str] = &[
+        "uniswap_v2_pools",
+        "sushiswap_v2_pools",
+        "pancakeswap_v2_pools",
+        "camelot_v2_pools",
+        "swapbased_v2_pools",
+        "aerodrome_v2_pools",
+        "uniswap_v3_pools",
+        "sushiswap_v3_pools",
+        "pancakeswap_v3_pools",
+        "aerodrome_v3_pools",
+        "lfj_pools",
+    ];
+
+    /// The per-DEX subclass table for a V2/V3 `kind` discriminator.
+    ///
+    /// Returns `None` for `base`/non-subclass kinds (no subclass row).
+    /// V4 has no V2/V3-style subclass table — it joins `uniswap_v4_pools`
+    /// via the `managed_pools` polymorphic base, handled separately.
+    ///
+    /// Projects [`crate::species`] (ADR-059 D3) so the kind-to-table mapping
+    /// has one home instead of a second hand-listed `match`.
+    #[must_use]
+    pub fn v2_v3_subclass_table(kind: &str) -> Option<&'static str> {
+        crate::species::subclass_table_for_kind(kind)
+    }
+
+    /// `true` if `kind` is a V3 family discriminator
+    /// (a `UniswapV3PoolTableBase` subclass polymorphic identity).
+    ///
+    /// Projects through the graph vocabulary's single kind table
+    /// ([`PoolKind::try_from`]) — ADR-059 D1: the schema helper is a
+    /// view of the taxonomy projection, not a second enumeration.
+    #[must_use]
+    pub fn is_v3_kind(kind: &str) -> bool {
+        matches!(PoolKind::try_from(kind), Ok(PoolKind::V3))
+    }
+
+    /// `true` if `kind` is a V2 family discriminator.
+    #[must_use]
+    pub fn is_v2_kind(kind: &str) -> bool {
+        matches!(PoolKind::try_from(kind), Ok(PoolKind::V2))
+    }
+
+    /// `true` if `kind` is a V4 discriminator (only `uniswap_v4` today — the
+    /// `managed_pools` polymorphic base's `uniswap_v4` identity used by
+    /// `uniswap_v4_pools`).
+    #[must_use]
+    pub fn is_v4_kind(kind: &str) -> bool {
+        matches!(PoolKind::try_from(kind), Ok(PoolKind::V4))
+    }
+
+    /// `true` if `kind` is a declared-but-unsupported family discriminator
+    /// (ADR-059 D8) — projected through the graph vocabulary's declared table,
+    /// so the LFJ kind classifies loudly instead of vanishing. Every
+    /// `is_v*_kind` helper is false for it by construction.
+    #[must_use]
+    pub fn is_lfj_kind(kind: &str) -> bool {
+        PoolKind::is_declared_unsupported(kind)
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    //! ADR-059 D1 golden table: the graph vocabulary's kind table is the
+    //! single source the schema helpers project through, and it covers exactly
+    //! the species the schema admits. A taxonomy species added without a graph
+    //! tag fails here instead of vanishing from every consumer's graph.
+    use super::table::{is_lfj_kind, is_v2_kind, is_v3_kind, is_v4_kind, v2_v3_subclass_table};
+    use apexbot_pathfinding::PoolKind;
+
+    /// The golden projection, independent of the implementation: every
+    /// `pools.kind` / `managed_pools.kind` string and its graph tag.
+    const GOLDEN: &[(&str, PoolKind)] = &[
+        ("uniswap_v2", PoolKind::V2),
+        ("sushiswap_v2", PoolKind::V2),
+        ("pancakeswap_v2", PoolKind::V2),
+        ("aerodrome_v2", PoolKind::V2),
+        ("camelot_v2", PoolKind::V2),
+        ("swapbased_v2", PoolKind::V2),
+        ("uniswap_v3", PoolKind::V3),
+        ("sushiswap_v3", PoolKind::V3),
+        ("pancakeswap_v3", PoolKind::V3),
+        ("aerodrome_v3", PoolKind::V3),
+        ("uniswap_v4", PoolKind::V4),
+    ];
+
+    #[test]
+    fn kind_table_matches_the_golden_projection() {
+        let actual: Vec<(&str, PoolKind)> = PoolKind::KNOWN_KINDS
+            .iter()
+            .map(|(name, kind)| (*name, *kind))
+            .collect();
+        assert_eq!(actual, GOLDEN);
+    }
+
+    #[test]
+    fn schema_helpers_agree_with_the_projection() {
+        for (kind, expected) in GOLDEN {
+            assert_eq!(PoolKind::try_from(*kind), Ok(*expected));
+            assert_eq!(is_v2_kind(kind), *expected == PoolKind::V2);
+            assert_eq!(is_v3_kind(kind), *expected == PoolKind::V3);
+            assert_eq!(is_v4_kind(kind), *expected == PoolKind::V4);
+        }
+    }
+
+    #[test]
+    fn every_kind_has_a_graph_tag_or_is_loudly_refused() {
+        assert!(PoolKind::try_from("lfj_binned").is_err());
+        assert!(PoolKind::try_from("").is_err());
+    }
+
+    #[test]
+    fn lfj_kind_is_declared_but_unsupported() {
+        // D8: the LFJ kind is declared in the graph vocabulary (so a DB row
+        // classifies) without joining the supported graph roster.
+        assert!(PoolKind::is_declared_unsupported("lfj_binned"));
+        assert!(is_lfj_kind("lfj_binned"));
+        assert!(!is_v2_kind("lfj_binned"));
+        assert!(!is_v3_kind("lfj_binned"));
+        assert!(!is_v4_kind("lfj_binned"));
+        assert!(
+            !PoolKind::KNOWN_KINDS
+                .iter()
+                .any(|(k, _)| *k == "lfj_binned"),
+            "a declared-but-unsupported kind must not carry a graph tag"
+        );
+    }
+
+    #[test]
+    fn declared_unsupported_is_exactly_the_lfj_binned_pair() {
+        // The whole taxonomy = the supported roster + the declared-unsupported
+        // set, and nothing else: a kind is either admitted with a graph tag or
+        // explicitly declared absent (ADR-059 D8) — never silently dropped.
+        assert_eq!(PoolKind::DECLARED_UNSUPPORTED_KINDS, &["lfj_binned"]);
+        for kind in PoolKind::DECLARED_UNSUPPORTED_KINDS {
+            assert!(
+                !PoolKind::KNOWN_KINDS.iter().any(|(k, _)| k == kind),
+                "{kind} is declared unsupported but carries a graph tag"
+            );
+            assert!(PoolKind::try_from(*kind).is_err(), "{kind} parses");
+        }
+    }
+
+    #[test]
+    fn every_graph_family_carries_a_persisted_kind() {
+        // The golden tripwire for adding a family: a new `PoolKind` variant
+        // (reached through the canonical `ALL`) fails here until the taxonomy
+        // gives it at least one persisted `kind` string. Adding a family
+        // without touching this vocabulary is therefore a test failure, not a
+        // silent gap in the roster every schema helper projects through.
+        for family in PoolKind::ALL {
+            assert!(
+                PoolKind::KNOWN_KINDS
+                    .iter()
+                    .any(|(_, kind)| *kind == family),
+                "family {family:?} has no persisted kind string"
+            );
+        }
+    }
+
+    #[test]
+    fn u8_discriminants_are_dense_and_round_trip() {
+        // The FFI (PyO3) route converts through these discriminants; the
+        // pyclass binding matches on the raw u8, so the numbering must stay
+        // dense from zero and round-trip exactly — a renumbered discriminant
+        // would mistranslate a stale binding instead of failing loudly.
+        for (family, index) in PoolKind::ALL.iter().zip(u8::MIN..) {
+            assert_eq!(family.as_u8(), index, "discriminant drift on {family:?}");
+            assert_eq!(PoolKind::from_u8(index), Some(*family));
+            assert_eq!(PoolKind::from_u8(family.as_u8()), Some(*family));
+        }
+        assert_eq!(
+            u8::try_from(PoolKind::ALL.len()).map(PoolKind::from_u8),
+            Ok(None),
+            "a discriminant past the taxonomy must refuse, never guess"
+        );
+    }
+
+    #[test]
+    fn every_subclass_species_has_a_graph_tag() {
+        for (kind, _) in GOLDEN {
+            if *kind == "uniswap_v4" {
+                continue;
+            }
+            assert!(
+                v2_v3_subclass_table(kind).is_some(),
+                "{kind} lost its subclass table"
+            );
+            assert!(
+                PoolKind::try_from(*kind).is_ok(),
+                "{kind} lost its graph tag"
+            );
+        }
+    }
+}

@@ -6,12 +6,11 @@ fairly, the verifier errors) are **direct aliases**
 of the ``apexbot._ffi`` pyclasses — never Python subclasses: Rust raises
 the pyclass instances, so ``except`` / ``isinstance`` matching requires the
 exact same class object. The identity contract is pinned by
-``tests/rust/test_exception_reexport_identity.py`` and
-``tests/rust/test_updater_reexport_identity.py``.
+``tests/ffi/test_companion_alias_identity.py``.
 """
 
 from apexbot._ffi import (
-    # FF-T1 (BPHR6F): the typed fleet boot refusal — the library never
+    # The typed fleet boot refusal — the library never
     # aborts the host process on the boot-refusal arm; the binary maps
     # this exception to its loud named fail-fast exit.
     BootRefused,
@@ -20,8 +19,11 @@ from apexbot._ffi import (
     HookedPoolRejectedError,
     PathRegistryFullError,
     PoolAlreadyRegisteredError,
+    PoolBuildDecodeError,
+    PoolBuildRpcError,
     PoolRegistrationError,
     SpecViolationError,
+    UnsupportedPoolFamilyError,
 )
 from apexbot.exceptions.arbitrage import (
     ArbCalculationError,
@@ -46,16 +48,8 @@ from apexbot.exceptions.base import ApexbotError, ApexbotTypeError, ApexbotValue
 from apexbot.exceptions.infrastructure import (
     AnvilError,
     BackupExists,
-    BlockFetchingTimeout,
-    ConnectionTimeout,
-    ApexbotConnectionError,
     Erc20TokenError,
-    FetchingError,
-    IPCSocketTimeout,
     NoPriceOracle,
-    RegistryAlreadyInitialized,
-    RegistryError,
-    Web3ConnectionTimeout,
 )
 from apexbot.exceptions.pool import (
     AddressMismatch,
@@ -72,12 +66,8 @@ from apexbot.exceptions.pool import (
     LiquidityPoolError,
     MissingCurveData,
     NoPoolStateAvailable,
-    PoolCreationFailed,
-    PoolNotAssociated,
     PossibleInaccurateResult,
     StaleRateResult,
-    TrackerAlreadyInitialized,
-    TrackerError,
     UnknownPool,
     UnknownPoolId,
 )
@@ -97,13 +87,10 @@ __all__ = (
     "ArbCalculationError",
     "ArbitrageError",
     "BackupExists",
-    "BlockFetchingTimeout",
     "BootRefused",
     "BrokenPool",
-    "ConnectionTimeout",
     "ContractLogicError",
     "CurveError",
-    "ApexbotConnectionError",
     "ApexbotError",
     "ApexbotTypeError",
     "ApexbotValueError",
@@ -113,13 +100,11 @@ __all__ = (
     "EVMRevertError",
     "Erc20TokenError",
     "ExternalUpdateError",
-    "FetchingError",
     "HighFeePoolRejectedError",
     "HookedPoolRejectedError",
     "HookedPoolResult",
     "HopCountExceededError",
     "HopCountInsufficientError",
-    "IPCSocketTimeout",
     "IncompatiblePoolInvariant",
     "IncompleteSwap",
     "InsufficientLiquidityError",
@@ -139,24 +124,20 @@ __all__ = (
     "PathRegistryFullError",
     "PathRejectedError",
     "PoolAlreadyRegisteredError",
-    "PoolCreationFailed",
-    "PoolNotAssociated",
+    "PoolBuildDecodeError",
+    "PoolBuildRpcError",
     "PoolRegistrationError",
     "PossibleInaccurateResult",
     "RateOfExchangeBelowMinimum",
-    "RegistryAlreadyInitialized",
-    "RegistryError",
     "RpcError",
     "SpecViolationError",
     "StaleRateResult",
     "TokenDenylistedError",
-    "TrackerAlreadyInitialized",
-    "TrackerError",
     "TransactionNotFound",
     "UnknownPool",
     "UnknownPoolId",
     "Unprofitable",
+    "UnsupportedPoolFamilyError",
     "VerificationMismatchError",
     "VerificationRpcError",
-    "Web3ConnectionTimeout",
 )

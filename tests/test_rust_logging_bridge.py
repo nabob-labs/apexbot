@@ -23,7 +23,7 @@ import apexbot  # ruff: ignore[unused-import]  (import triggers base config)
 RUST_BRIDGE_LOGGER_NAMES = (
     "apexbot_bot",
     "apexbot_core",
-    # The PyO3 binding crate lives in ``crates/apexbot-python/`` but its
+    # The PyO3 binding crate lives in ``crates/shells/apexbot-python/`` but its
     # Cargo ``name`` is ``apexbot_rs`` (set in its ``Cargo.toml``), so every
     # bare ``log::info!`` in that crate emits under ``apexbot_rs::...`` →
     # Python logger ``apexbot._ffi.<...>``. The directory name ``apexbot_python``
@@ -34,11 +34,20 @@ RUST_BRIDGE_LOGGER_NAMES = (
     "apexbot_decoders",
     "apexbot_uniswap",
     # The in-process sim engine + the settlement-arbitrage strategy. The divergence probe
-    # (``[sim-divergence]``, ergo task 4C33DP / epic TR6GWT) + the bridge-probe
+    # (``[sim-divergence]``) + the bridge-probe
     # (``[bridge-probe]``) emit ``log::info!`` from these crates; the base
     # config in ``apexbot.logging`` lowers them so the records are visible.
     "apexbot_simulation",
     "apexbot_arbitrage",
+    # The in-process backrun strategy driver (tx 0x3dcfe follow-up): the
+    # frame-decision INFO line (``apexbot_strategy.backrun_driver.driver_loop``)
+    # and the connector-index boot line dropped here until the crate root was
+    # configured.
+    "apexbot_strategy",
+    # The third-party alloy umbrella: its WARN/ERROR records (pubsub reconnect
+    # attempts, transport failures) otherwise escape via stdlib ``lastResort``
+    # as raw unformatted stderr lines that pytest cannot capture or attribute.
+    "alloy",
 )
 
 #: The same contract is exported by ``apexbot.logging`` so other code (e.g. the
@@ -103,7 +112,7 @@ def test_rust_info_record_is_visible() -> None:
         )
 
 
-# ── GTOD23-YBEYKY (T4): arbitrage-subtree visibility ──────────────────────
+# ── (T4): arbitrage-subtree visibility ──────────────────────────
 
 #: Python modules under ``apexbot.arbitrage.*`` (e.g. ``recurring_verify``)
 #: use ``logging.getLogger("apexbot.arbitrage.recurring_verify")`` — they
@@ -121,7 +130,7 @@ _SAMPLE_ARBITRAGE_TARGETS = (
 def test_apexbot_arbitrage_loggers_configured_at_info_or_lower() -> None:
     """Base config lowers the ``apexbot`` package subtree to <= INFO.
 
-    S2 (GTOD23-PB24RX) found the recurring verifier's ``[verify] (recurring)``
+    The S2 probe found the recurring verifier's ``[verify] (recurring)``
     lines were dropped: the module logs under
     ``logging.getLogger("apexbot.arbitrage.recurring_verify")`` which inherits
     from ``apexbot`` — but base config only configured the Rust bridge roots +
@@ -153,7 +162,7 @@ def test_apexbot_arbitrage_info_record_reaches_handler() -> None:
         visible = [r for r in capture.records if r.levelno == logging.INFO]
         assert any("[verify] (recurring)" in r.getMessage() for r in visible), (
             f"INFO record on {target} did NOT reach the `apexbot` package handler "
-            "— recurring-verify lines are silenced (GTOD23-YBEYKY regression)"
+            "— recurring-verify lines are silenced"
         )
 
 
@@ -280,3 +289,65 @@ def test_rust_info_record_still_reaches_handler_via_queue() -> None:
         raise AssertionError(msg)
     finally:
         listener.handlers = tuple(h for h in listener.handlers if h is not capture)
+
+
+def test_stdout_handler_resolves_stream_at_emit_time() -> None:
+    """The console handler must late-bind ``sys.stdout``, never pin it.
+
+    ``apexbot.logging`` is imported while pytest's global capture owns
+    ``sys.stdout``, and pytest closes that capture object at session teardown.
+    A handler that pins the import-time stream then sprays
+    ``--- Logging error ---`` (``ValueError: I/O operation on closed file``)
+    for every record flushed after teardown — swallowed by
+    ``Handler.handleError``, so the suite stays green while logging is broken.
+    Late binding lands each record in the CURRENT stdout: the active capture
+    during the session, the real stdout after it.
+    """
+    import io
+    import sys
+
+    import apexbot.logging as dl
+
+    handler = dl._STDOUT_HANDLER
+    probe = io.StringIO()
+    original = sys.stdout
+    sys.stdout = probe
+    try:
+        assert handler.stream is probe, (
+            "_STDOUT_HANDLER must resolve the CURRENT sys.stdout at emit time, "
+            "not pin the import-time object"
+        )
+        record = logging.LogRecord(
+            "apexbot.test", logging.INFO, __file__, 1, "late-bound emit", (), None
+        )
+        handler.emit(record)
+        assert "late-bound emit" in probe.getvalue(), (
+            "the record must land in the stream that is current at emit time"
+        )
+    finally:
+        sys.stdout = original
+
+
+def test_stdout_handler_never_targets_a_closed_stream() -> None:
+    """A closed active stdout (post-teardown race) falls back, never raises.
+
+    Between the handler resolving the stream and the listener's write, pytest
+    can close the active capture; the property must then return an OPEN stream
+    (the process original) instead of the closed object.
+    """
+    import io
+    import sys
+
+    import apexbot.logging as dl
+
+    handler = dl._STDOUT_HANDLER
+    closed = io.StringIO()
+    closed.close()
+    original = sys.stdout
+    sys.stdout = closed
+    try:
+        stream = handler.stream
+        assert stream is not closed, "_STDOUT_HANDLER must not return a closed stream to emit()"
+        assert not stream.closed
+    finally:
+        sys.stdout = original

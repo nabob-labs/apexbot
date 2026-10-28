@@ -2,7 +2,7 @@
 
 [hotpath-rs](https://hotpath.rs) profiles the block-pump -> solve path (the
 `#[hotpath::measure]` sites across `block_pump`, `SolveCoordinator`,
-`EngineHandle`, and the `cl_solve.*` / `mixed.*` solver internals) and, with
+`EngineHandle`, and the `concentrated_liquidity_solve.*` / `mixed.*` solver internals) and, with
 the `hotpath-prometheus` build feature, exposes every profiling subsystem as
 Prometheus metrics on a dedicated `GET /metrics` endpoint. The companion
 dashboard is [hotpath-profiling.json](hotpath-profiling.json) — imported into
@@ -14,14 +14,14 @@ within ~15 s).
 
 Two gates must both be on:
 
-1. **Build feature** (dev builds already carry it): `pyproject.toml`
-   `[tool.maturin]` features include `apexbot-bot/hotpath-prometheus`.
-   Release wheels override the feature list, so shipped artifacts have zero
-   hotpath footprint. After any Rust-source change rebuild with
-   `uv sync --reinstall-package apexbot` (see AGENTS.md — maturin caching
-   otherwise silently ships a stale `.so`).
+1. **Build feature**: the binding manifest's canonical `dev-features` alias
+   includes `apexbot-bot/hotpath-prometheus`; `just bootstrap` and `just dev`
+   select it explicitly. Release wheels use only
+   `--release --features pyo3/extension-module`, so shipped artifacts have
+   zero hotpath footprint. After any Rust-source change run `just dev` (or
+   `just test-python`, which builds first) — see AGENTS.md.
 2. **Runtime gate**: `APEXBOT_HOTPATH=1`. The guard is constructed by
-   `BlockPump::run_with_stream` (`rust/crates/apexbot-bot/src/profiling.rs`);
+   `BlockPump::run_with_stream` (`rust/crates/engine/apexbot-bot/src/profiling.rs`);
    hotpath starts the exporter automatically with the guard — there is no
    separate exporter flag.
 
@@ -33,7 +33,7 @@ curl -s http://127.0.0.1:6772/metrics | head
 Standalone proof without the bot:
 
 ```
-cd rust && APEXBOT_HOTPATH=1 cargo run -p apexbot-bot \
+cd rust && APEXBOT_HOTPATH=1 RUSTFLAGS=--cfg tokio_unstable cargo run -p apexbot-bot \
     --features hotpath-prometheus --example hotpath_prometheus_probe
 ```
 
@@ -119,8 +119,8 @@ Rules that hold in both modes:
 - **Process & runtime** — `hotpath_build_info`, `hotpath_uptime_seconds`,
   `hotpath_rss_bytes`, `hotpath_threads`, `hotpath_thread_cpu_percent{,_max}`.
 - **Tokio runtime** (ergo 2N6UKZ: `tokio_runtime!` in the pump loop +
-  workspace `tokio_unstable` rustflag) — alive tasks / workers / global
-  queue depth always; steals / worker-local queue / polls export when
+  `RUSTFLAGS=--cfg tokio_unstable` on hotpath builds) — alive tasks / workers /
+  global queue depth always; steals / worker-local queue / polls export when
   nonzero; the blocking pool exports once spawn_blocking work exists.
 - **Function & concurrency profiling** — per-function duration p99/avg/calls/
   alloc rates, future poll duration (`assert_ws_block_complete`, the

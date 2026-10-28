@@ -119,7 +119,7 @@ embedded JSON and verifies the CREATE2 address at registration time. A
 standalone `Bot` verifies with no Python; if the builder carried identity
 in, Rust would trust rather than verify. **The lookup is load-bearing and
 correctly placed; it is not eliminated and not cross-cutting.** (See
-`CONTEXT.md` "deployments" disposition for the deferred Balancer carve-
+`GLOSSARY.md` "deployments" disposition for the deferred Balancer carve-
 out.)
 
 ## Consequences
@@ -161,7 +161,7 @@ out.)
 
 ### Does not change
 
-- The Rust crate structure (`rust/crates/apexbot-*`) is unchanged.
+- The Rust crate structure remains role-grouped under `rust/crates/`.
   This ADR is about **the Python side of the FFI seam**, not the Rust
   crate topology. The standalone-Rust-core constraint (ADR-005) is
   unaffected: Rust owns everything; Python is a driver shell.

@@ -1,0 +1,11 @@
+//! Parity: the feed crate's default searcher WS is the SAME constant the
+//! strategy-readiness resolution hands an activated backrun facet.
+
+#[test]
+fn default_stream_url_is_the_config_default() {
+    assert_eq!(
+        apexbot_rpc::backrun_feed::DEFAULT_STREAM_URL,
+        apexbot_config::DEFAULT_BACKRUN_STREAM_URL,
+        "the two default-WS homes must stay one constant"
+    );
+}

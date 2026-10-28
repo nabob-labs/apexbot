@@ -22,7 +22,7 @@ pools x 2 directions x 9 multipliers).
   mainnet at the pinned block is shared across the whole loop.
 
 Pinned to Ethereum mainnet block 24,407,242, served by a local archive node
-(URI configurable via ``tests.env``; see ``ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
+(URI configurable via ``tests.env``; see ``TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI``).
 """
 
 from __future__ import annotations
@@ -44,10 +44,15 @@ from apexbot.balancer.libraries.constants import PowVersion
 from apexbot.checksum_cache import get_checksum_address
 from apexbot.exceptions import ContractLogicError
 from apexbot.exceptions.pool import EVMRevertError
-from apexbot.fork import AnvilFork
+from apexbot.fork import AnvilFork, ForkLaunchConfig
 from apexbot.utils.bytes import to_bytes
-from tests.conftest import ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.conftest import TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.balancer_pool_factory import make_balancer_weighted_pool
+from tests.helpers.balancer_queries_abi import BALANCERQUERIES_ABI
 from tests.helpers.contract_compat import ContractCompat
 from tests.helpers.erc20_factory import make_erc20
 
@@ -91,42 +96,6 @@ _AMOUNT_MULTIPLIERS = (
     0.125,
     0.25,
 )
-
-# Minimal ABIs for the deferred on-chain oracle calls (record mode only).
-_BALANCERQUERIES_ABI: list[dict[str, Any]] = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"name": "poolId", "type": "bytes32"},
-                    {"name": "kind", "type": "uint8"},
-                    {"name": "assetIn", "type": "address"},
-                    {"name": "assetOut", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                    {"name": "userData", "type": "bytes"},
-                ],
-                "internalType": "struct IVault.SingleSwap",
-                "name": "singleSwap",
-                "type": "tuple",
-            },
-            {
-                "components": [
-                    {"name": "sender", "type": "address"},
-                    {"name": "fromInternalBalance", "type": "bool"},
-                    {"name": "recipient", "type": "address"},
-                    {"name": "toInternalBalance", "type": "bool"},
-                ],
-                "internalType": "struct IVault.FundManagement",
-                "name": "funds",
-                "type": "tuple",
-            },
-        ],
-        "name": "querySwap",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-]
 
 
 def _load_cassette(path: pathlib.Path) -> dict[str, Any]:
@@ -182,10 +151,12 @@ class _RecordFork(AbstractContextManager):
     def __enter__(self) -> Self:
         if self._recording:
             self.fork = AnvilFork(
-                fork_url=ETHEREUM_ARCHIVE_NODE_HTTP_URI,
+                fork_url=TEST_ETHEREUM_ARCHIVE_NODE_HTTP_URI,
                 fork_block=BALANCER_PARITY_BLOCK,
-                storage_caching=True,
-                anvil_opts=["--accounts=0"],
+                launch=ForkLaunchConfig(
+                    storage_caching=True,
+                    anvil_opts=["--accounts=0"],
+                ),
             )
         return self
 
@@ -212,7 +183,7 @@ def _query_swap_callable(
         assert fork.fork is not None
         query_contract = ContractCompat(
             BALANCERQUERIES_CONTRACT_ADDRESS,
-            _BALANCERQUERIES_ABI,
+            BALANCERQUERIES_ABI,
             fork.fork.provider,
         )
         return query_contract.functions.querySwap(
@@ -342,19 +313,24 @@ def _run_expanded_parity(
                     # the original test's ContractLogicError branch.
                     try:
                         if given_out:
-                            lp.calculate_tokens_in_from_tokens_out(
+                            result = lp.calculate_tokens_in_from_tokens_out(
                                 token_in=lp.tokens[token_in_idx],
                                 token_out=lp.tokens[token_out_idx],
                                 token_out_quantity=amount,
                             )
                         else:
-                            lp.calculate_tokens_out_from_tokens_in(
+                            result = lp.calculate_tokens_out_from_tokens_in(
                                 token_in=lp.tokens[token_in_idx],
                                 token_in_quantity=amount,
                                 token_out=lp.tokens[token_out_idx],
                             )
                     except (EVMRevertError, ContractLogicError):
                         pass  # both reverted — OK
+                    else:
+                        pytest.skip(
+                            f"On-chain reverted but Python returned {result} "
+                            f"(likely on-chain-only check like SWAPS_DISABLED)",
+                        )
                     continue
                 if given_out:
                     calc = lp.calculate_tokens_in_from_tokens_out(
@@ -437,3 +413,90 @@ def test_balancer_v2_expanded_multi_token_given_out(
         cassette_path=_EXPANDED_MULTI_TOKEN_CASSETTES[pool_key],
         given_out=True,
     )
+
+
+def _weighted_golden_keys(cassette: dict[str, Any]) -> set[str]:
+    """The oracle keys one base weighted parity run drives: both swap
+    directions over the multiplier grid, keyed by token symbols."""
+    address = cassette["address"]
+    symbols = [token["symbol"] for token in cassette["tokens"]]
+    balances = cassette["balances"]
+    keys: set[str] = set()
+    for i, j in itertools.permutations(range(len(symbols)), 2):
+        for mult in _AMOUNT_MULTIPLIERS:
+            amount = int(mult * balances[i])
+            if amount == 0:
+                continue
+            keys.add(f"{address}|querySwap|GIVEN_IN|{symbols[i]}->{symbols[j]}|{amount}")
+    return keys
+
+
+def _expanded_golden_keys(cassette: dict[str, Any], *, given_out: bool) -> set[str]:
+    """The oracle keys one expanded weighted parity run drives: all token
+    directions over the multiplier grid, keyed by token indices."""
+    address = cassette["address"]
+    balances = cassette["balances"]
+    label = "GIVEN_OUT" if given_out else "GIVEN_IN"
+    keys: set[str] = set()
+    for token_in_idx, token_out_idx in itertools.permutations(range(len(balances)), 2):
+        # GIVEN_IN scales the amount from the token-in balance; GIVEN_OUT from
+        # the token-out balance (the requested output quantity).
+        reserve = balances[token_out_idx] if given_out else balances[token_in_idx]
+        for mult in _AMOUNT_MULTIPLIERS:
+            amount = int(mult * reserve)
+            if amount == 0:
+                continue
+            keys.add(f"{address}|querySwap|{label}|i={token_in_idx}|j={token_out_idx}|{amount}")
+    return keys
+
+
+@pytest.mark.parametrize(
+    ("test_name", "cassette_paths", "given_out"),
+    [
+        ("test_balancer_v2_weth_bal_query_swap", [_WETH_BAL_CASSETTE], None),
+        ("test_balancer_v2_usdc_weth_query_swap", [_USDC_WETH_CASSETTE], None),
+        ("test_balancer_v2_weth_rpl_query_swap", [_WETH_RPL_CASSETTE], None),
+        (
+            "test_balancer_v2_expanded_two_token_given_in",
+            list(_EXPANDED_TWO_TOKEN_CASSETTES.values()),
+            False,
+        ),
+        (
+            "test_balancer_v2_expanded_two_token_given_out",
+            list(_EXPANDED_TWO_TOKEN_CASSETTES.values()),
+            True,
+        ),
+        (
+            "test_balancer_v2_expanded_multi_token_given_in",
+            list(_EXPANDED_MULTI_TOKEN_CASSETTES.values()),
+            False,
+        ),
+        (
+            "test_balancer_v2_expanded_multi_token_given_out",
+            list(_EXPANDED_MULTI_TOKEN_CASSETTES.values()),
+            True,
+        ),
+    ],
+)
+def test_golden_keys_exactly_match_the_oracle_surface(
+    request: pytest.FixtureRequest,
+    test_name: str,
+    cassette_paths: list[pathlib.Path],
+    *,
+    given_out: bool | None,
+) -> None:
+    """The golden files hold exactly the keys this module's replay drives.
+
+    Each expanded golden file aggregates the whole pool parametrization, so
+    the expected surface is the union over its cassettes. Replay fails loud
+    on a missing key but stays silent on a stale extra one — nothing looks it
+    up. Set-equality against the recorded file closes that drift: a shrunken
+    case list cannot leave orphaned oracle entries behind."""
+    expected: set[str] = set()
+    for cassette_path in cassette_paths:
+        cassette = _load_cassette(cassette_path)
+        if given_out is None:
+            expected |= _weighted_golden_keys(cassette)
+        else:
+            expected |= _expanded_golden_keys(cassette, given_out=given_out)
+    assert_golden_keys_exact(request, test_name, expected)

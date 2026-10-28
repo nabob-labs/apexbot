@@ -1,0 +1,82 @@
+# stubtest allowlist for the GENERATED apexbot._ffi stubs (ADR-066 D3).
+#
+# stubtest is GENERATOR VERIFICATION (`just lint-stubtest`): it introspects the
+# INSTALLED apexbot._ffi extension and compares it against the generated
+# src/apexbot/_ffi/*.pyi stubs in BOTH directions, across every class member,
+# with no curated table. Entries are EXACT matches (fullmatch) against the
+# errored object path. This file carries ONLY generator gaps — the enumerated
+# pyo3-introspection emission limitations below — never hand edits over
+# generated output (the committed stubs are `just gen-stubs` output; the
+# regenerate-and-diff gate is tests/ffi/test_ffi_stub_drift.py).
+#
+# Re-triage after a PyO3/pyo3-introspection bump:
+#   uv run --no-sync stubtest --ignore-disjoint-bases --generate-allowlist apexbot._ffi
+#
+# Limitation index — every entry below is tagged with the upstream gap it
+# belongs to; on a bump, look the tag up here, re-run the triage command,
+# and drop an entry only when its limitation closed:
+#
+#   magic-method getattro-slot invisibility
+#     PyO3 installs dunder __getattr__ into the type's tp_getattro slot, not
+#     as a class attribute, so Python-side introspection cannot see it and
+#     the stub member reads as missing at runtime. Permanent — a Python
+#     introspection limit, not an emission bug; no generator bump closes it.
+#   imperative attribute registration
+#     Members bound outside any declarative #[pymethods] block (runtime
+#     setattr on the module) are invisible to pyo3-introspection, which
+#     reads declarative items only. ADR-066 gap list: "imperative U256
+#     attributes".
+#   __all__ emission
+#     The generator emits __all__ from the stub's top-level declarations,
+#     while the runtime __all__ carries members outside that surface.
+#     ADR-066 gap list: "__all__ emission".
+#   parent-stub re-export emission — CLOSED
+#     The generator now emits a `from . import <name> as <name>` re-export
+#     per submodule in the parent stub, so stubtest no longer reports the
+#     runtime submodule objects as absent; its 26 entries were dropped.
+#
+# The #2454 annotation frontier (PyO3 "a first step"; the rest of annotation
+# generation tracked upstream) is VISIBLE in the emitted stubs as `Any`
+# annotations on U256/I256-typed members, but produces no stubtest findings —
+# `Any` is compatible with everything — so it contributes no entries here.
+#
+# The 18 `create_exception!` island types (17 registered in lib.rs, one in
+# fleet.rs) once carried entries here; the stubgen declaration manifest
+# (rust/tools/stubgen/src/exception_manifest.rs) now splices their
+# `class <Name>(<Base>):` declarations into the generated stubs, and the
+# manifest-vs-runtime gate validates every manifested name against the
+# cdylib before generation.
+
+# ==== pyo3 dunder `__getattr__` (1) — PERMANENT RESIDUAL ====
+# A pyo3 magic method installs into the type's getattro slot, not as a class
+# attribute, so introspection cannot see it and stubtest reports the stub
+# member MISSING at runtime. The read works (the typed seam projection's
+# named-property access is exercised by the config suites). The projection's
+# typed face (rust/tools/stubgen/src/config_projection.rs, spliced from the
+# schema macro's SCHEMA/SECTION_PATHS tables) removed ConfigValues' stub
+# `__getattr__` entirely — its entry CLOSED; its sections are typed properties
+# on an inherited `@type_check_only` face base. ConfigSectionValues keeps the
+# machinery `__getattr__` in its stub (it is the path-agnostic runtime view),
+# so this one entry covers the getattro-slot invisibility, which no
+# introspection bump can close.
+apexbot._ffi.ConfigSectionValues.__getattr__  # magic-method getattro-slot invisibility
+
+# ==== Imperative U256 attributes (2) ====
+# MIN_SQRT_RATIO / MAX_SQRT_RATIO are registered imperatively on the
+# concentrated-liquidity module, outside any declarative pymethods block
+# the introspection covers.
+apexbot._ffi.concentrated_liquidity_math.MAX_SQRT_RATIO  # imperative attribute registration
+apexbot._ffi.concentrated_liquidity_math.MIN_SQRT_RATIO  # imperative attribute registration
+
+# ==== __all__ emission (2) ====
+# The generator emits `__all__` from the stub's top-level declarations
+# (ADR-066 D3), which collapses the former 27 per-pymodule entries to the
+# modules whose runtime `__all__` carries members outside introspection:
+# the root also exports the 26 submodules, and
+# concentrated_liquidity_math exports the 2 imperative boundary constants.
+# (The create_exception! islands are spliced from the stubgen declaration
+# manifest, so they now land in the root's and fleet's emitted `__all__`
+# and no longer gap here.)
+apexbot._ffi.__all__  # __all__ emission
+apexbot._ffi.concentrated_liquidity_math.__all__  # __all__ emission
+

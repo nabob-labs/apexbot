@@ -1,4 +1,4 @@
-"""FF-T1 (BPHR6F) — boot refusal is a typed error, never a process abort.
+"""Boot refusal is a typed error, never a process abort.
 
 Red-first: at HEAD, booting the fleet on a host below the pinned-role floor
 aborts the host process ([fleet-reg] unrecoverable — aborting, the
@@ -8,7 +8,7 @@ error instead.
 
 The child shrinks its own affinity to 1 CPU — the fleet quota is
 min(cgroup quota, affinity), floored at 1.0 — simulating the
-sub-SERIAL-floor condition (FF-T4, Z6XTDX: the 2-5-core tier now boots the
+sub-SERIAL-floor condition (the 2-5-core tier now boots the
 serial binding, so the typed refusal fires only below the tier floor).
 The intake station boot is lazy: the first submit is what
 triggers the fleet budget check.
@@ -31,12 +31,12 @@ _CHILD = """
 import os
 import sys
 
-# The stance holder is first-wins at module init: drop any inherited stance
-# env before importing apexbot (the delenv-fixture discipline, applied at
-# the child seam).
+# The fleet-posture holder is first-wins at module init: drop any inherited
+# fleet env before importing apexbot (the delenv-fixture discipline, applied
+# at the child seam).
 os.environ.pop("APEXBOT_FLEET", None)
 
-# Simulate a sub-SERIAL-floor host (FF-T4, Z6XTDX): the 2-5-core tier
+# Simulate a sub-SERIAL-floor host: the 2-5-core tier
 # now boots the serial binding, so the typed refusal fires only below
 # the tier floor — one CPU floors the quota at 1.0 (< HOST_FLOOR_CORES).
 os.sched_setaffinity(0, {0})
@@ -48,7 +48,7 @@ try:
     ArbitrageEngine(py_bot=pre)  # engine construction installs the intake boot
     probe = Bot(1)
     if not probe.registration_fleet_hosted():
-        print("STANCE-NOT-INSTALLED", file=sys.stderr)
+        print("RETUNE-NOT-INSTALLED", file=sys.stderr)
         sys.exit(4)
     # The registration intake station boots lazily: the first submit runs
     # the fleet budget check — the sub-floor refusal fires here.
@@ -65,6 +65,7 @@ sys.exit(0)
 
 def test_boot_refusal_is_typed_never_abort() -> None:
     """A sub-floor boot raises a typed error; the process must survive."""
+    # Process-level: the claim is that the process survives the refusal.
     proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true] — trusted binary, args list, no shell
         [sys.executable, "-c", _CHILD],
         capture_output=True,

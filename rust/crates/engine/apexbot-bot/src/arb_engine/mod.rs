@@ -1,0 +1,776 @@
+//! Arbitrage engine — multi-DEX cyclic arbitrage over a shared `BotState`.
+//!
+//! A unified engine that handles Uniswap V2/V3/V4, Solidly-family
+//! (Aerodrome, Camelot) and (in progress) Curve + Balancer pools in the same
+//! per-block lifecycle. Supports mixed paths (e.g., V2→V3, V3→V4, V4→V2,
+//! V2→Solidly hops).
+//!
+//! # Design
+//!
+//! The engine composes:
+//! - A [`BotState`] for V2 pool state and constant-product solving (ADR-003:
+//!   `BotState` is the single state owner; the engine is a consumer)
+//! - A [`BotState`](apexbot_substrate::BotState) for V2+V3 pool state (ADR-003:
+//!   `BotState` is the single state owner, peer to this engine)
+//! - A [`BotState`](apexbot_substrate::BotState) for all pool state (V2+V3+V4 —
+//!   ADR-003), the single Rust state owner peer to this engine
+//!
+//! V4 pools share identical concentrated-liquidity math with V3. The solver
+//! treats V3 and V4 hops identically — both produce `IntV3TickRangeSequence`.
+//!
+//! On [`ArbitrageEngine::process_block`]:
+//! 1. Decode Sync, V3 Swap, and V4 Swap events from logs
+//! 2. Route V2 Sync events to the V2 engine, V3 Swap events to the V3 engine,
+//!    V4 Swap events to the V4 engine
+//! 3. Solve registered paths using the appropriate solver
+//!
+//! Hook filtering: V4 pools with amount-modifying hooks are rejected at
+//! registration time in the V4 engine. The unified engine never sees them.
+//!
+//! # Module layout
+//!
+//! | Module | Concern |
+//! |--------|---------|
+//! | [`lane_walk`] | THE ONE lane walk: per-bin solve, the pipelined-sim pacing, and the walk-adjacent clamp/flush helpers |
+//! | [`solve_cycle`] | The solve cycle as a deep module (ADR-045): the concentrated-liquidity-hop clamp + profit recompute live here |
+//! | [`delivery_lifecycle`] | Delivery lifecycle: channel open/send/close + the end-of-stream contract (incident 2026-08-20 #2) |
+//! | [`delivery_policy`] | Delivery policy: diff computation, thresholds, delivered-bookkeeping |
+//! | [`block_cursor`] | The engine block cursor — one owner of the engine-side block-coordinate residue |
+//! | [`detached_cycle`] | THE one detached/in-cycle solve-arm machine: per-cycle states, the merge pipe, the gauge pair, the seq counters, the ledger door, the disposition counters, the fan-in tripwire, and the ONE sidecar spawn |
+//! | [`lifecycle`] | Path registration, buffer management, engine accessors |
+//! | [`py_binding`] | PyO3 wrapper (`PyArbitrageEngine`) |
+//! | [`tests`] | Unit tests |
+use self::block_cursor::BlockCursor;
+use self::boot_stamp::BootStamp;
+use self::delivery_policy::DeliveryPolicy;
+use self::path_registry::PathRegistry;
+use self::solve_cycle::{BlockScope, SolveCycle};
+use ::apexbot_pools::solve::{MixedPath, SolvePathResult};
+#[cfg(test)]
+use alloy::primitives::aliases::U112;
+#[cfg(test)]
+use alloy::primitives::Address;
+use dashmap::DashMap;
+use apexbot_substrate::resolve::HopProjectionCache;
+use apexbot_substrate::state_lock::StateLock;
+use apexbot_substrate::BotState;
+use hashbrown::HashMap;
+use std::sync::Arc;
+// THE construction-stamped fleet boot carrier: the engine's own
+// FleetBoot value + the ride ledger the per-role fleet statics consult.
+mod boot_stamp;
+// the ONE engine block cursor — the consolidated owner of the
+// engine-side block-coordinate residue (completes ADR-041 §3 item 5's
+// engine-side anchor fold; see the module's own doc header).
+pub(crate) mod block_cursor;
+// Sub-modules — each contains `impl ArbitrageEngine` or `impl PyArbitrageEngine` blocks.
+mod delivery_lifecycle;
+mod delivery_policy;
+// THE one detached/in-cycle solve-arm machine: the per-cycle
+// states, the merge pipe, the gauge pair, the seq counters, the ledger
+// door, the disposition counters, the fan-in tripwire, and the ONE
+// sidecar spawn — see the module's own doc header.
+pub(crate) mod detached_cycle;
+mod diagnostic;
+// The arb engine's StageHandlers implementation —
+// the ONE surface left between the machine driver and the engine. The
+// dissolved `engine_handle` (wrapper Mutex), `engine_subscriber` (liveness
+// adapter), and `epoch_delta_parity`/`test_oracle` (the parity
+// oracle, GONE now that `EpochDelta` is sole authority) are deleted —
+// hard cutover, Q6.
+pub mod engine_stages;
+// ADR-050: the public Rust driver seam above the one
+// stage seam. The engine type stays `pub(crate)`; this composes
+// `EngineStages` + the pump session state so a `cargo add apexbot`
+// consumer can run the subscribe→resume(+auto-backfill)→stop ritual.
+pub mod driver;
+pub(crate) mod executor;
+
+// The engine-session end DETECTION facts: the cause vocabulary, the heartbeat
+// stall watchdog, and the once-only delivery channel shared by both drivers.
+pub mod fleet_intake;
+mod fleet_registration_executor;
+mod fleet_sim_executor;
+pub(crate) mod fleet_solve_executor;
+pub mod fleet_status;
+pub mod inline_sim;
+pub mod lifecycle;
+pub mod path_info;
+mod path_lifecycle;
+pub mod session_end;
+// ADR-045: the path-identity registry (`PathRegistry`) —
+// registered paths, reverse index, signatures, id allocator, cap, dedups.
+mod path_registry;
+// the session's path-object ADAPTER over that registry — the owner side of
+// `apexbot_substrate::session_registry::PathObjectAdapter`, so the session names
+// canonical paths without a second path store.
+pub mod path_objects;
+// The typed operator re-parameterization value crossing
+// the driver seam — `EngineRetune`, applied at construction and at runtime via
+// `EngineStages::apply_retune`.
+mod retune;
+// The ONE pooled-seat host for the WorkQueue fleet roles (sim +
+// registration) — the executors are thin role descriptors over it; the
+// solve executor's exclusion (per-seat channel model + posture-invariant
+// typed-submit admission) is documented in the module doc.
+pub mod fleet_wake;
+mod seat_host;
+
+// The process-wide boot statics (`install_boot`, `global_executor`, the
+// `BootSlot`/`FleetBootRegistry` keyed boot owner) — process-wide, not
+// seat-scoped (ADR-079 D1).
+mod fleet_boot;
+
+// the per-bin lane walk's home — `solve_one_path` (the per-path
+// solve + diagnostics body the Solver seats' bins execute) lives here; the
+// walk driver and Lane* policy types are later tasks' inhabitants.
+mod lane_walk;
+
+// the solve cycle's single owner of per-path cost accounting (commit 2 of
+// PR C4): the pipeline instruments, the K-slowest retention, and the two
+// heavy-path capture hooks, behind one `record` call from the lane walk.
+mod path_cost_ledger;
+// heavy-path capture diagnostics, extracted from the retired
+// grab file (import-only move; the module owns its honesty probe + test island).
+mod solver_capture;
+// the pure workload-analysis cluster (solve-bin sizing, LPT
+// partition, named cordon-fallback seat plan, resolve-time cost proxies),
+// extracted from the retired grab file (import-only move; the module
+// owns its honesty probe + test islands).
+mod workload_partition;
+// The per-epoch WalkMemoStats tap: drains the
+// engine-owned WalkMemo ONCE per begin_block boundary (drain-then-advance)
+// plus a final drain at EngineDriver::stop, into the logs/walkmemo_stats.jsonl
+// sink and the ADR-043 `apexbot.solver.walk_memo_*` instruments.
+// Observation only — zero behavior change to solving.
+pub(crate) mod walk_telemetry;
+// ADR-045 T1: the solve-cycle data-type seam (`CycleOutcome` /
+// `CycleArm` / `ResolveCensus` / `Registration`) — T3/T4 assemble
+// `SolveCycle` on top of it; nothing consumes the types yet.
+mod solve_cycle;
+// The cycle ticket: the solve cycle's transient-handoff value. The Resolved
+// stage row (`bot_core::AffectedPaths`) carries it from the draw to the epoch,
+// so the stage machine can name its payload without reaching into the module.
+pub(crate) use solve_cycle::CycleTicket;
+// the executor A/B probe fixtures (heavy-concentrated-liquidity corpus loader, shared
+// solve-cycle fixture, production LPT bin packer) live test-only beside their
+// consumers; `#[cfg(all(test, feature = "executor-ab-probe"))]` so the fixtures
+// never compile into production AND the fixture-loading corpus lane (pools'
+// zstd-backed `capture-fixtures`) stays out of the default test build (ADR-084
+// D3). The test lanes enable the feature explicitly.
+#[cfg(all(test, feature = "executor-ab-probe"))]
+mod executor_ab_probe;
+#[cfg(test)]
+mod test_harness;
+#[cfg(test)]
+mod tests;
+pub use diagnostic::{
+    compute_field_diffs, DiagnosticHop, DiagnosticPathState, DiagnosticPoolState, FieldDiff,
+};
+pub use driver::{DriverError, EngineChannelHandles, EngineDriver, PhaseError};
+pub use engine_stages::EngineStages;
+pub use inline_sim::{
+    AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
+    InlineSwapFamily, SimulatedPathResult,
+};
+pub use retune::EngineRetune;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+// Engine phase state machine
+// ---------------------------------------------------------------------------
+/// The engine session's pump-protocol phase: the ordering machine for
+/// `subscribe()`, `load_snapshot()`, `backfill()`, and `resume()`.
+///
+/// This is a protocol-phase machine, NOT the operator-facing lifecycle. The
+/// one operator lifecycle (`Registered -> Enabled -> Running -> Stopped |
+/// Halted | Disabled`) is owned by [`crate::strategy_host::StrategyHost`];
+/// an engine's pump phase is a private protocol sub-state a consumer reads
+/// through [`driver::EngineDriver::current_phase`] and its sibling accessors,
+/// never a peer authority answering "may this strategy run?".
+///
+/// Transitions:
+/// ```text
+/// Created ──subscribe()──► Subscribed ──load_snapshot()──► SnapshotLoaded
+///                                                        ──backfill()──► Backfilled
+///                                                        ──resume()──► Resumed
+///
+/// Construction-time-load path: snapshot loaded at `Bot`
+/// construction BEFORE subscribe. The snapshot lives in the shared core
+/// `BotState` and never advances the engine phase, so `subscribe()` uses
+/// `PumpPhase::after_subscribe(current, core_has_snapshot)` to reflect
+/// reality — landing at `SnapshotLoaded` (not `Subscribed`) so `resume()`
+/// (which requires `>= SnapshotLoaded`) is reachable:
+/// Created ──load_snapshot_from_db()──[core has snapshot]──► subscribe()
+///        ──► SnapshotLoaded ──resume()──► Resumed
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum PumpPhase {
+    /// Engine just created, no connections.
+    Created = 0,
+    /// WS `subscribe()` completed, first block observed.
+    Subscribed = 1,
+    /// Snapshot data loaded into Rust (at least one of V3/V4).
+    SnapshotLoaded = 2,
+    /// Backfill from snapshot block to first WS block completed.
+    Backfilled = 3,
+    /// Pump processing live blocks.
+    Resumed = 4,
+}
+impl PumpPhase {
+    /// Reconstruct a phase from its `u8` discriminant (the inverse of the
+    /// `#[repr(u8)]` representation). Used by `PumpState` (ADR-006 D4) to read
+    /// the phase atomically across PyBot/PyArbitrageEngine wrappers.
+    /// Unknown discriminants fall back to `Created` (the safest default — any
+    /// phase-gated method will re-validate via `require`/`require_before`).
+    #[must_use]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Subscribed,
+            2 => Self::SnapshotLoaded,
+            3 => Self::Backfilled,
+            4 => Self::Resumed,
+            _ => Self::Created,
+        }
+    }
+    /// Check that the current phase allows the given required phase.
+    /// Returns `Err` with a descriptive message if the transition is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` describing the invalid transition when the
+    /// engine's phase is below `required`.
+    pub fn require(self, required: Self, method_name: &str) -> Result<(), String> {
+        if self >= required {
+            Ok(())
+        } else {
+            Err(format!(
+                "Cannot call {method_name}: engine is in phase {self:?}, but requires {required:?}"
+            ))
+        }
+    }
+    /// Require that the engine has not yet reached the given phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` describing the invalid transition when the
+    /// engine has already reached `phase`.
+    pub fn require_before(self, phase: Self, method_name: &str) -> Result<(), String> {
+        if self < phase {
+            Ok(())
+        } else {
+            Err(format!(
+                "Cannot call {method_name}: engine is already in phase {self:?} (requires before {phase:?})"
+            ))
+        }
+    }
+    /// Phase gate for `subscribe()`. Accepts `Created` (the legacy path:
+    /// subscribe first, then load snapshot) OR `SnapshotLoaded` (the
+    /// construction-time-load path: snapshot loaded at `Bot` construction,
+    /// then subscribe). Rejects `Subscribed`/`Backfilled`/`Resumed`.
+    ///
+    /// The numeric ordering cannot express this with `require`/`require_before`
+    /// alone (SnapshotLoaded=2 > Subscribed=1), so this is an explicit match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` when the phase is past the subscribe-allowed
+    /// window.
+    pub fn allow_subscribe(self, method_name: &str) -> Result<(), String> {
+        match self {
+            Self::Created | Self::SnapshotLoaded => Ok(()),
+            other => Err(format!(
+                "Cannot call {method_name}: engine is in phase {other:?}, but subscribe requires Created or SnapshotLoaded"
+            )),
+        }
+    }
+    /// Compute the phase AFTER `subscribe()` completes (regression
+    /// fix for the construction-time-load path).
+    ///
+    /// `PumpState::subscribe` used to unconditionally `set_phase(Subscribed)`,
+    /// which is correct for the legacy path (`Created → subscribe →
+    /// Subscribed → load_*_snapshot_from_py → SnapshotLoaded → resume`) but
+    /// crashes the construction-time-load path: the snapshot
+    /// is loaded into the shared core `BotState` at `Bot` construction —
+    /// BEFORE subscribe — and never advances the engine phase. After
+    /// subscribe, the phase was `Subscribed` (1), and `resume()`'s
+    /// `require(SnapshotLoaded)` guard (needs `>= 2`) crashed the production
+    /// settlement-arbitrage bot:
+    ///
+    /// ```text
+    /// RuntimeError: Cannot call resume: engine is in phase Subscribed,
+    ///               but requires SnapshotLoaded
+    /// ```
+    ///
+    /// This helper reflects reality: if the engine phase is ALREADY at
+    /// `SnapshotLoaded` (the legacy pre-subscribe load via
+    /// `load_*_snapshot_from_py`) OR the core has a snapshot loaded
+    /// (`core_has_snapshot` — the construction-time-load path), the phase
+    /// after subscribe is `SnapshotLoaded`. Otherwise `Subscribed` (the
+    /// legacy path that loads the snapshot AFTER subscribe).
+    ///
+    /// `allow_subscribe` guarantees `current ∈ {Created, SnapshotLoaded}` at
+    /// call time (subscribe rejects `Subscribed`/`Backfilled`/`Resumed`), but
+    /// the `SnapshotLoaded` arm is preserved for completeness so a future
+    /// caller that reaches `after_subscribe` with a higher phase does not
+    /// regress.
+    #[must_use]
+    pub fn after_subscribe(current: Self, core_has_snapshot: bool) -> Self {
+        match current {
+            // Already at or past SnapshotLoaded — subscribe must NOT regress
+            // the phase (the legacy pre-subscribe load + any future path).
+            Self::SnapshotLoaded | Self::Backfilled | Self::Resumed => current,
+            // Created — advance based on whether the core already has a
+            // snapshot (construction-time-load path) or not (legacy path).
+            Self::Created if core_has_snapshot => Self::SnapshotLoaded,
+            Self::Created | Self::Subscribed => Self::Subscribed,
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Coverage & snapshot types
+// ---------------------------------------------------------------------------
+/// Describes the completeness of tick data for a registered pool.
+///
+/// Re-exported from [`crate::bot_core`] where it now lives alongside V3 state
+/// (ADR-003). `Tracked` = complete (may have empty `tick_data` = genuinely
+/// illiquid); `Sparse` = no snapshot data — solver results may be inaccurate.
+pub use crate::bot_core::PoolTickCoverage;
+// ADR-015: the path/snapshot/hop-state value types + INT128_MAX constant
+// now live in `apexbot_pools::solve` (the solver's intake contract). The
+// re-export shim that lived here during the staged relocation has been
+// dropped — callers import the solver types directly from
+// `::apexbot_pools::solve::{...}`. `BlockMetadata`, `PoolTickCoverage`,
+// `V3SnapshotData`/`V4SnapshotData` (if needed) resolve to their original
+// homes (`bot_core`, `apexbot_pools::solve`).
+// `BlockMetadata` lives in `bot_core` (general block data); re-exported here so
+// engine code + external references (`crate::arb_engine::BlockMetadata`)
+// keep working (ADR-006 D4).
+pub use apexbot_substrate::BlockMetadata;
+// ADR-027 completion (2026-08-20 review): the block-clock pipe is
+// coordinator-owned; the type moved to bot_core. Re-exported so external
+// references keep working (same pattern as BlockMetadata above).
+pub use apexbot_core::block_clock_pipe::BlockNotification;
+/// Incremental result batch pushed to Python via the result channel.
+///
+/// Each batch contains only paths that changed since the last batch
+/// Python consumed — unchanged entries stay in Rust.
+#[derive(Clone, Debug)]
+pub struct ResultBatch {
+    /// The block number these results were solved for
+    pub solve_block: u64,
+    /// Block timestamp
+    pub timestamp: u64,
+    /// Base fee per gas (None for pre-EIP-1559 blocks)
+    pub base_fee_per_gas: Option<u64>,
+    /// Gas used in this block
+    pub gas_used: u64,
+    /// Gas limit of this block
+    pub gas_limit: u64,
+    /// Paths above the profit threshold and NOT in the previous delivered set
+    pub fresh: Vec<(u64, SolvePathResult)>,
+    /// Paths above the threshold in both, but any field changed (full `PartialEq`)
+    pub updated: Vec<(u64, SolvePathResult)>,
+    /// Path IDs that were above threshold but are now below (still registered)
+    pub expired: Vec<u64>,
+    /// Path IDs that were de-registered (permanently gone)
+    pub removed: Vec<u64>,
+    /// SIMPIPE2 T3: the inline-sim payloads for the `fresh`/`updated` paths
+    /// (SIMPIPE stance `APEXBOT_SOLVE_INLINE_SIM`). Absent (empty map) = the
+    /// legacy FFI-sim path for every entry — per-entry presence decides.
+    pub payloads: HashMap<u64, inline_sim::SimulatedPathResult>,
+}
+/// the deferred-path re-record hook (the ledger carry). The
+/// dispatch calls it with the deferred paths' hop-pool keys and the cycle's
+/// solve block; the `EngineStages` constructor installs the
+/// `EpochDelta::record` closure so a deferred path re-enters through the
+/// next draw (same freshness ordering, admission budget, retention window —
+/// one deferral concept). `None` on direct engine drives (unit tests, the
+/// cold-start `solve_all`): the deferral then keeps its pre-fold dropped
+/// behavior.
+pub(crate) type DeferredReRecordHook =
+    std::sync::Arc<dyn Fn(&[apexbot_pools::solve::affected::AffectedKey], u64) + Send + Sync>;
+/// The unified Uniswap engine — owns V2, V3, and V4 pool state and solves
+/// mixed arbitrage paths.
+///
+/// V2 pool state lives in [`BotState`] (ADR-003: the single Rust state owner,
+/// peer to this engine). The engine holds the shared `Arc<RwLock<BotState>>`
+/// (ADR-006 D1+D2 — `RwLock` on the core, shared with [`PyBot`] via
+/// [`ArbitrageEngine::with_core`]; `new()` standalone sugar allocates its own)
+/// and reads/writes pool state through it. Lock ordering when nested is
+/// **engine-then-core** — no code path ever nests core-then-engine.
+pub(crate) struct ArbitrageEngine {
+    /// the owner-loaded typed bot config (one loader process-wide;
+    /// never re-read from the environment). Construction stances + capture
+    /// config read from here. ADR-045 T4: the solve cycle owns its own clone
+    /// for the resolve/solve bodies; this field remains for the construction
+    /// stances.
+    #[expect(dead_code)]
+    pub(crate) cfg: std::sync::Arc<::apexbot_config::BotConfig>,
+    /// the instance solver runtime stance, built at construction from
+    /// [`Self::cfg`] and threaded down into every solve cycle. Replaces the
+    /// solve tree's removed process-global RUNTIME `OnceLock`.
+    /// ADR-045 T4: the cycle owns its own copy.
+    #[expect(dead_code)]
+    runtime_cfg: ::apexbot_pools::solve::runtime::SolveRuntimeConfig,
+    /// V2 + V3 + V4 pool state owner (ADR-003). The shared
+    /// `Arc<RwLock<BotState>>` (ADR-006 D1+D2): read methods take a read guard,
+    /// mutations a write guard. Lock ordering when nested is
+    /// engine-then-core; no code path ever nests in the opposite direction.
+    pub(crate) core: Arc<StateLock<BotState>>,
+    /// ADR-045: the engine's path-identity registry — registered
+    /// paths, the `pool_to_paths` reverse index, signature dedup, the path-id
+    /// allocator, the registered-path cap, and the dedup counter. Hot solves
+    /// read it through a shared `&PathRegistry`; only registration takes
+    /// `&mut`. The invariant "`path_pools` is consistent with `pool_to_paths`"
+    /// is internal to [`PathRegistry::commit`] / [`PathRegistry::remove`].
+    pub(crate) registry: PathRegistry,
+    /// ADR-045: the solve cycle's owned state — the resolve
+    /// companions, the cycle-transient stash, the solve output, the admissions
+    /// stance, the detached-arm collaborator, the walk/projection recorders,
+    /// and the seven `for_test` knobs. Fields only at T3; behavior methods move
+    /// at T4. The engine keeps identity (`registry`), the shared core, the
+    /// delivery policy, the lifecycle phase, and the construction stances.
+    pub(crate) cycle: SolveCycle,
+    /// Delivery policy — the optional publish sink that consumes the solve
+    /// output (`latest_results`) and pushes diffs over the result/block
+    /// channels . Owns `delivered`/`deregistered`, the profit
+    /// thresholds, and `result_tx`/`block_tx`; decoupled from solve state so a
+    /// standalone consumer gets raw results without it.
+    pub(crate) delivery: DeliveryPolicy,
+    /// THE construction-stamped fleet boot: the engine's OWN
+    /// `FleetBoot`, derived from the CALLER's cfg at construction and
+    /// stamped with the engine id + a deterministic cfg hash. Packed in
+    /// `with_core_cfg` right beside `streaming_delivery` (the
+    /// construction-stance pattern); the per-role fleet statics courier it
+    /// to the ONE process fleet materialization per role, and any
+    /// divergent-cfg rider is ledgered (`boot_stamp::record_ride`). The
+    /// non-test build carries it write-only (the stamp's consumers are the
+    /// install-time ledger + the per-role statics); test builds read it
+    /// through the white-box probe accessor.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fleet_boot_stamp: BootStamp,
+    /// Engine lifecycle phase (core-owned). Enforces ordering
+    /// `Created → Subscribed → SnapshotLoaded → Backfilled → Resumed`.
+    /// Previously the `AtomicU8` lived on the pyo3 `PumpState` wrapper;
+    /// moving it to the core engine lets a standalone Rust consumer observe +
+    /// guard the lifecycle with no Python in the build. Read/written via
+    /// [`Self::current_phase`] / [`Self::set_phase`]; the engine sits behind
+    /// `Arc<Mutex<..>>` so the atomic read is lock-free across the pyo3
+    /// wrappers and the pump task.
+    phase: std::sync::atomic::AtomicU8,
+    /// Does the core hold a configured `max_age` for the V3/V4
+    /// buffered-event expiry? With the cockpit default (`max_age=None`)
+    /// `expire` is a provable no-op, so the stage cycle must not take a core
+    /// write for it — each one bought a ~2.9s writer-queue slot under the
+    /// block-apply stream. Flipped by [`Self::set_event_buffer_max_age`].
+    event_buffer_expiry_enabled: bool,
+}
+impl Default for ArbitrageEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl ArbitrageEngine {
+    /// Create a new engine with its **own** standalone `BotState` (standard
+    /// allocation). ADR-006 D1: prefer [`ArbitrageEngine::with_core`] on the live
+    /// path so the engine shares one `Arc<RwLock<BotState>>` with `PyBot`/handles;
+    /// this no-arg ctor is the standalone-Rust / no-`pyo3`-test convenience.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_core(Arc::new(StateLock::new(BotState::new())))
+    }
+    /// Adopt an existing shared `Arc<RwLock<BotState>>` (ADR-006 D1+D2). The
+    /// engine reads/writes pool state through the *same* core that
+    /// `PyBot`/`PyLiquidityPool`/`PyErc20Token` share — dissolving the
+    /// dual-`BotState` split the §17 stale-state caveat documented. Lock order
+    /// remains engine-then-core; the engine's `Mutex<ArbitrageEngine>` engine
+    /// state is still engine-local (ADR-006 D2 — engine keeps its own lock
+    /// for path/solver state; only the core lock type/flavor changes).
+    #[must_use]
+    pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
+        // pack from the INSTALLED loader
+        // config (the _ffi module init installs the env/file-loaded BotConfig
+        // before any engine construction). A fresh `BotConfig::default()`
+        // here meant the python-driven pump's engine never observed
+        // construction stances like fleet.stance — schema defaults only
+        // apply when no owner installed one (tests / standalone clean-env
+        // constructions, byte-compatible per the holder docs).
+        Self::with_core_cfg(core, ::apexbot_config::holder::config_arc())
+    }
+    /// config-threaded construction. `cfg` is the typed `BotConfig`
+    /// (loaded ONCE by the owner from the `--config` file / env via the
+    /// apexbot-config loader) — the engine packs its construction stances
+    /// from it and threads the solver runtime stance down per instance.
+    #[must_use]
+    pub fn with_core_cfg(
+        core: Arc<StateLock<BotState>>,
+        cfg: &std::sync::Arc<::apexbot_config::BotConfig>,
+    ) -> Self {
+        // Construction stances come from the CALLER's
+        // own cfg — never from an install-then-read process static. A
+        // parallel construction flips such a static between our install and
+        // a global read (TOCTOU). The install call remains for its process
+        // projections — the construction-STAMPED fleet boots; the
+        // stance statics other consumers observe). LW-T9: there is no
+        // stance — the fleet installs unconditionally, it is the only
+        // behavior.
+        let streaming_delivery = cfg.pump.streaming_delivery;
+        let resolve_par_stance = cfg.solve.solve_resolve_par;
+        // the engine's construction knobs are packed ONCE by
+        // the typed retune value (retune.rs) from the CALLER's own cfg — never
+        // an install-then-read process static. The local value is applied
+        // below, after the engine literal is assembled.
+        let retune = EngineRetune::from_config(cfg);
+        // the engine OWNS its fleet boot — the stamp is
+        // constructed from THIS cfg BEFORE the installer runs, so the
+        // construction hand-off carries the caller's value, identified.
+        let fleet_boot_stamp =
+            BootStamp::of(apexbot_workers::dispatcher::FleetBoot::from_config(cfg));
+        lifecycle::install_engine_stances(cfg, &fleet_boot_stamp);
+        let cycle_core = Arc::clone(&core);
+        let mut engine = Self {
+            cfg: std::sync::Arc::clone(cfg),
+            runtime_cfg: lifecycle::solve_runtime_config_from_cfg(cfg),
+            core,
+            registry: PathRegistry::new(),
+            cycle: SolveCycle {
+                path_resolved: HashMap::new(),
+                path_status: HashMap::new(),
+                hop_projection_cache: HopProjectionCache::new(),
+                hop_projection_count: 0,
+                concentrated_liquidity_projection_memo:
+                    apexbot_substrate::resolve::projection_memo_enabled(),
+                path_description_cache: parking_lot::Mutex::new(HashMap::new()),
+                resolved_update_snapshot: HashMap::new(),
+                cursor: BlockCursor::default(), // (0, None, 0, false) — the pre-cursor init, unchanged
+                transients: solve_cycle::CycleTransients::default(),
+                results: DashMap::new(),
+                inline_payloads: DashMap::new(),
+                solve_admission: retune.solve_admission,
+                admission_target_depth: retune.admission_target_depth,
+                admission_retention_blocks: retune.admission_retention_blocks,
+                // the machine's pre-cycle init lives on the machine
+                // (dormant Unopened, pipe closed, counters at 0).
+                detached_cycle: detached_cycle::DetachedCycle::new(),
+                scope: BlockScope::new(
+                    std::sync::Arc::new(
+                        ::apexbot_pools::solve::concentrated_liquidity::WalkMemo::new(
+                            cfg.solve.solver_walk_memo,
+                            cfg.solve.solver_walk_memo_stats,
+                        ),
+                    ),
+                    std::sync::Arc::new(
+                        ::apexbot_pools::solve::concentrated_liquidity::WalkTelemetry::new(),
+                    ),
+                ),
+                min_profit_floor: alloy::primitives::U256::from(cfg.solve.min_profit_wei),
+                clamp_margin: retune.clamp_margin,
+                inline_sim_enabled: cfg.solve.solve_inline_sim,
+                path_cost_history: std::sync::Arc::new(
+                    crate::arb_engine::path_cost_ledger::PathCostHistory::new(),
+                ),
+                streaming_delivery,
+                deferred_re_record: None,
+                resolve_par_stance,
+                core: cycle_core,
+                cfg: std::sync::Arc::clone(cfg),
+                runtime_cfg: lifecycle::solve_runtime_config_from_cfg(cfg),
+                inline_sim: None,
+                #[cfg(test)]
+                test_solve_delay: None,
+                #[cfg(test)]
+                test_solve_panic: None,
+                force_deferred: retune.force_deferred.clone(),
+                #[cfg(test)]
+                merge_probe: None,
+                #[cfg(test)]
+                test_merge_panic: None,
+                #[cfg(test)]
+                test_sync_merge: true,
+                #[cfg(test)]
+                test_merge_rx: None,
+            },
+            delivery: DeliveryPolicy::default(),
+            fleet_boot_stamp,
+            phase: std::sync::atomic::AtomicU8::new(PumpPhase::Created as u8),
+            event_buffer_expiry_enabled: false,
+        };
+        // apply the config-derived retune ONCE at construction
+        // the engine's per-instance knob values come from the caller's cfg.
+        engine.apply_retune(&retune);
+        engine
+    }
+    /// Apply one [`EngineRetune`] to the live engine — the ONE knob-write
+    /// body, shared by construction ([`Self::with_core_cfg`]) and the runtime
+    /// operator retune entry ([`super::EngineStages::apply_retune`]).
+    ///
+    /// The event-buffer core write is skipped unless a max age is configured
+    /// or one was enabled before (clearing `Some` → `None` must still reach the
+    /// core); every other knob is an in-memory instance value.
+    pub(crate) fn apply_retune(&mut self, retune: &EngineRetune) {
+        if retune.event_buffer_max_age.is_some() || self.event_buffer_expiry_enabled {
+            self.event_buffer_expiry_enabled = retune.event_buffer_max_age.is_some();
+            self.core
+                .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+                .concentrated_liquidity_mut()
+                .set_v3_buffer_max_age(retune.event_buffer_max_age);
+            self.core
+                .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+                .concentrated_liquidity_mut()
+                .set_v4_buffer_max_age(retune.event_buffer_max_age);
+        }
+        // The admission trio.
+        self.cycle.solve_admission = retune.solve_admission;
+        self.cycle.admission_target_depth = retune.admission_target_depth;
+        self.cycle.admission_retention_blocks = retune.admission_retention_blocks;
+        // The registered-path cap (PRG-4).
+        self.registry.set_cap(retune.path_cap);
+        // The delivery profit window.
+        self.delivery
+            .set_profit_thresholds(retune.min_profit, retune.max_profit);
+        // The diagnostic force-deferred override.
+        self.cycle.clamp_margin = retune.clamp_margin;
+        self.cycle.force_deferred.clone_from(&retune.force_deferred);
+    }
+    /// Immutable access to the shared `BotState` `Arc` (ADR-003 / ADR-006
+    /// D1+D2).
+    ///
+    /// The shared `Arc<RwLock<BotState>>` cannot be reassigned through this
+    /// accessor: callers may `read()`/`write()` *through* it, but its identity
+    /// stays pinned to the same `Arc` the `EngineStages` stage surface/pump
+    /// reference (an invariant no downstream crate can break by swapping the
+    /// field).
+    #[must_use]
+    pub fn core(&self) -> &Arc<StateLock<BotState>> {
+        &self.core
+    }
+    /// Immutable read of the registered path→pool map.
+    ///
+    /// Read-only: `path_pools` must stay consistent with the `pool_to_paths`
+    /// reverse index, which only the engine's internal register/deregister
+    /// paths maintain — so no mutable accessor is exposed.
+    #[must_use]
+    pub fn path_pools(&self) -> &HashMap<u64, std::sync::Arc<MixedPath>> {
+        self.registry.path_pools()
+    }
+    /// Read the current engine lifecycle phase (core-owned source of truth).
+    /// Atomic + lock-free (the engine is behind `Arc<Mutex<..>>` across the
+    /// pyo3 wrappers and the pump). Reconstructs from the `u8` discriminant;
+    /// an unknown discriminant falls back to `Created` (the safest default —
+    /// any phase-gated method re-validates via `require`/`require_before`).
+    #[must_use]
+    pub fn current_phase(&self) -> PumpPhase {
+        PumpPhase::from_u8(self.phase.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Advance to `phase` with NO ordering check — the caller validates against
+    /// the gated helpers [`Self::require_phase`] / [`Self::require_phase_before`]
+    /// (or `PumpPhase::allow_subscribe` / `after_subscribe`). Core-owned
+    /// source of truth.
+    pub fn set_phase(&self, phase: PumpPhase) {
+        self.phase
+            .store(phase as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Gate a lifecycle-ordered method: succeed only when the current phase is
+    /// at or past `required`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` describing the invalid transition when the phase
+    /// is below `required`.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn require_phase(&self, required: PumpPhase, method_name: &str) -> Result<(), String> {
+        self.current_phase().require(required, method_name)
+    }
+    /// Gate a lifecycle-ordered method: succeed only when the current phase is
+    /// strictly BEFORE `phase`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` when the engine has already reached `phase`.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn require_phase_before(&self, phase: PumpPhase, method_name: &str) -> Result<(), String> {
+        self.current_phase().require_before(phase, method_name)
+    }
+    // Test-only registration helpers (ADR-006 D3).
+    //
+    // Production code never registers pools via the engine — pool construction
+    // is a `BotState` concern, and the engine discovers pools at `register_path`
+    // time by resolving `pool_id`s against the associated `BotState`. These
+    // helpers exist so no-pyo3 tests can seed the engine's `BotState` (its
+    // `core`) with the same ergonomics the old production `register_v*_pool`
+    // methods had; they delegate straight to `BotState::register_*`.
+    /// Register a V2 pool into the engine's `BotState` and return its `pool_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `BotState::register_v2_pool` rejects the
+    /// params (duplicate address, or spec-violating reserve). This is a test
+    /// convenience — production code goes through `PyBot::register_v2_pool`,
+    /// which surfaces the rejection as a typed Python exception.
+    #[cfg(test)]
+    #[expect(clippy::expect_used)] // test convenience: assert registration succeeds
+    #[must_use]
+    pub fn register_v2_pool(
+        &self,
+        address: Address,
+        reserve0: U112,
+        reserve1: U112,
+        gamma_numer: u64,
+        fee_denom: u64,
+    ) -> u64 {
+        let params = crate::bot_core::RegisterV2PoolParams {
+            address,
+            token0: Address::ZERO,
+            token1: Address::ZERO,
+            reserve0,
+            reserve1,
+            fee_token0: (gamma_numer, fee_denom),
+            fee_token1: (gamma_numer, fee_denom),
+            factory: Address::ZERO,
+            update_block: 0,
+            variant: apexbot_uniswap::dex_identity::DexVariant::UniswapV2,
+            stable_swap: false,
+            fee_denominator: None,
+            ..Default::default()
+        };
+        self.core
+            .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+            .register_v2_pool(&params)
+            .expect("test setup: V2 registration")
+    }
+    /// Register a V3 pool into the engine's `BotState` and return its `pool_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying `BotState::register_v3_pool` rejects the
+    /// params (duplicate address, or spec-violating `sqrt_price_x96` / `tick`
+    /// / `fee` / `tick_spacing`). This is a test convenience — production
+    /// code goes through `PyBot::register_v3_pool`, which surfaces the
+    /// rejection as a typed Python exception.
+    #[cfg(test)]
+    #[expect(clippy::expect_used)] // test convenience: assert registration succeeds
+    #[must_use]
+    pub fn register_v3_pool(&self, params: &crate::bot_core::RegisterV3PoolParams) -> u64 {
+        self.core
+            .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+            .register_v3_pool(params)
+            .expect("test setup: V3 registration")
+    }
+    /// Register a V4 pool into the engine's `BotState` and return its `pool_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `BotState::register_v4_pool` rejects the pool
+    /// (amount-modifying hooks, dynamic fee, or duplicate registration).
+    #[cfg(test)]
+    pub fn register_v4_pool(
+        &self,
+        params: &crate::bot_core::RegisterV4PoolParams,
+    ) -> Result<u64, crate::bot_core::RegisterV4PoolError> {
+        self.core
+            .write_at(apexbot_substrate::state_lock::LockSite::Solver)
+            .register_v4_pool(params)
+    }
+}

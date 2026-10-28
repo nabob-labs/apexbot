@@ -1,7 +1,7 @@
-"""The session watch's end-state matrix (ergo MJJUXL).
+"""The session watch's end-state matrix.
 
 The cockpit's ONE owner of a pump session's end-state
-(``apexbot.runner._session_watch`` — the CONTEXT.md *session watch* term):
+(``apexbot.runner._session_watch`` — the GLOSSARY.md *session watch* term):
 the watch-set assembly ({consumer} + optional {registration, watchdog},
 exactly the task sets the former twin await loops watched), the
 ``SessionEndVerdict`` ranking (a fail-fast registration verdict outranks a
@@ -16,12 +16,18 @@ Pure asyncio — no engine, no RPC (ADR-019: the watch stays inside
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Coroutine
 from typing import Any
 
 import pytest
 
-from apexbot.runner._session_watch import SessionEndVerdict, SessionWatch
+from apexbot.runner._session_watch import (
+    SessionEndVerdict,
+    SessionWatch,
+    _WatchKind,
+    _WatchSet,
+)
 
 
 async def _quick_consumer(ticks: int = 1) -> None:
@@ -65,6 +71,26 @@ def _watch(
     if registration is not None:
         watch.attach_registration(registration)
     return watch
+
+
+async def _cancellation_absorbing_consumer() -> None:
+    """A task that absorbs its cancellation and ends un-cancelled."""
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        return
+
+
+def _absorbing_watchdog_factory() -> Coroutine[Any, Any, None]:
+    """A watchdog that absorbs the reap's cancel instead of unwinding."""
+
+    async def _watchdog() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return
+
+    return _watchdog()
 
 
 class TestVerdictEnum:
@@ -195,7 +221,10 @@ class TestWatchSetMatrix:
         registration = asyncio.create_task(climbing_registration())
         watch = _watch(consumer, lambda: _pump_end_watchdog(consumer), registration)
 
-        verdict = await asyncio.wait_for(watch.wait(), timeout=2.0)
+        # No guard timeout here: the verdict itself is the completion gate
+        # (`_pump_end_watchdog` cancels the consumer, which ends the watch-set),
+        # matching the bare awaits its sibling verdict tests use.
+        verdict = await watch.wait()
         assert verdict is SessionEndVerdict.WatchdogTripped
         assert consumer.cancelled()
         # The watch requested the registration cancel (the former twin's
@@ -235,6 +264,91 @@ class TestWatchSetMatrix:
 
         assert await watch.wait() is SessionEndVerdict.PumpEnded
         assert consumer.done() and not consumer.cancelled()
+
+
+class TestWatchSetTransitions:
+    """The typed task-set record's one-batch decision (R3)."""
+
+    async def test_fail_fast_outranks_watchdog_in_one_batch(self) -> None:
+        consumer = asyncio.create_task(_hanging_consumer())
+        boom = ValueError("reg boom")
+
+        async def failing() -> None:
+            raise boom
+
+        registration = asyncio.create_task(failing())
+        watchdog = asyncio.create_task(_quick_consumer(ticks=0))
+        await asyncio.sleep(0)
+        assert registration.done()
+        assert watchdog.done()
+
+        step = _WatchSet(consumer, watchdog, registration).on_task_done({registration, watchdog})
+        assert step.kind is _WatchKind.REGISTRATION_FAILED
+        assert step.error is boom
+
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+    async def test_clean_registration_is_dropped_from_the_set(self) -> None:
+        consumer = asyncio.create_task(_hanging_consumer())
+        registration = asyncio.create_task(_quick_consumer(ticks=0))
+        watchdog = asyncio.create_task(_quick_consumer(ticks=0))
+        await asyncio.sleep(0)
+
+        step = _WatchSet(consumer, watchdog, registration).on_task_done({registration})
+        assert step.kind is _WatchKind.CONTINUE
+        assert step.watch.registration is None
+        assert step.watch.consumer is consumer
+        assert step.watch.watchdog is watchdog
+
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+
+
+class TestCancellationObservation:
+    """The reap discipline: a cancel the watch requested must be OBSERVED.
+
+    The watch reaps used ``contextlib.suppress(CancelledError)`` with no
+    assertion, so a task that absorbed its cancellation and returned
+    normally was reaped silently. Each reap now ends in
+    ``assert task.cancelled()`` (via ``cancel_and_reap``), so a swallowed
+    cancel fails loudly instead of leaving a lost cancellation invisible.
+    """
+
+    async def test_fail_fast_observes_consumer_cancellation(self) -> None:
+        """The fail-fast reap asserts the consumer's cancellation: a consumer
+        that absorbs the cancel cannot exit ``wait()`` silently."""
+        consumer = asyncio.create_task(_cancellation_absorbing_consumer())
+        boom = ValueError("verification mismatch")
+
+        async def failing_registration() -> None:
+            raise boom
+
+        registration = asyncio.create_task(failing_registration())
+        watch = _watch(consumer, _never_watchdog, registration)
+
+        with pytest.raises(AssertionError, match="cancellation"):
+            await watch.wait()
+
+    async def test_watchdog_reap_observes_cancellation(self) -> None:
+        """``wait()``'s exit reap asserts the watchdog's cancellation."""
+        consumer = asyncio.create_task(_quick_consumer())
+        watch = _watch(consumer, _absorbing_watchdog_factory)
+
+        with pytest.raises(AssertionError, match="cancellation"):
+            await watch.wait()
+
+    async def test_teardown_registration_observes_cancellation(self) -> None:
+        """The registration drain asserts the cancellation it requested."""
+        consumer = asyncio.create_task(_hanging_consumer())
+        registration = asyncio.create_task(_cancellation_absorbing_consumer())
+        watch = _watch(consumer, _never_watchdog, registration)
+        await asyncio.sleep(0)  # start the body so the cancel lands mid-await
+
+        with pytest.raises(AssertionError, match="cancellation"):
+            await watch.teardown_registration()
 
 
 class TestTeardown:

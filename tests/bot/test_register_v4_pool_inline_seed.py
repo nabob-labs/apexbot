@@ -23,7 +23,6 @@ from unittest.mock import MagicMock
 
 from apexbot._ffi import Bot as _Engine
 from apexbot.bot import Bot
-from apexbot.config import DatabaseSettings, ApexbotConfig
 from apexbot.provider import AlloyProvider
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v4_pool_factory import make_v4_pool
@@ -34,12 +33,9 @@ if TYPE_CHECKING:
 V4_POOL_MANAGER = "0x000000000004444c5DC75cB358380D2e3dE08A90"
 
 
-def _make_test_config(tmp_path: pathlib.Path, chain_id: int = 1) -> ApexbotConfig:
-    return ApexbotConfig(
-        database=DatabaseSettings(path=tmp_path / "test.db"),
-        rpc={1: "http://localhost:8545/"},
-        default_chain_id=chain_id,
-    )
+def _test_session(tmp_path: pathlib.Path, chain_id: int = 1) -> dict[str, object]:
+    """The explicit keyword overrides a session under test runs with."""
+    return {"chain_id": chain_id, "database": str(tmp_path / "test.db")}
 
 
 def _fake_provider(chain_id: int = 1) -> AlloyProvider:
@@ -103,7 +99,7 @@ def test_register_v4_pool_seeds_tick_data_inline_without_update_tick_data(
         tick_data={-201000: (100, 1000, 18_000_000)},
     )
 
-    td = pool._py_pool.tick_data_snapshot()
+    td = pool._py_pool.concentrated_liquidity().tick_data
     assert td is not None, "V4 pool must be registered with tick data inline"
     assert -201000 in td, "the seeded tick must be present without a separate update_tick_data"
     assert td[-201000][0] == 100, "inline seed gross matches"
@@ -119,8 +115,8 @@ def test_release_python_state_keeps_rust_v4_pool_registered(tmp_path: pathlib.Pa
     release (the engine still solves against them).
     """
 
-    config = _make_test_config(tmp_path)
-    bot = Bot(config, provider=_fake_provider(1))
+    session = _test_session(tmp_path)
+    bot = Bot(**session, provider=_fake_provider(1))
     py_bot = bot._py_bot
     weth, usdc = _make_tokens(py_bot)
 
@@ -150,5 +146,5 @@ def test_release_python_state_keeps_rust_v4_pool_registered(tmp_path: pathlib.Pa
     bot.release_python_state()
 
     assert py_bot.pool_count() == 1, "V4 pool must stay registered in Rust after release"
-    td = pool._py_pool.tick_data_snapshot()
+    td = pool._py_pool.concentrated_liquidity().tick_data
     assert -201000 in td, "V4 tick data survives release"

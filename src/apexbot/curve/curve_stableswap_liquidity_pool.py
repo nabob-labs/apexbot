@@ -6,13 +6,10 @@ plain pools, metapools, lending pools, and crypto pools.
 
 from __future__ import annotations
 
-import contextlib
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NamedTuple, Self, cast
 
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.curve.per_block_cache import PerBlockCache
-from apexbot.curve.stableswap_pool_state import StableswapPoolState
-from apexbot.curve.strategies import PoolStrategies
+from apexbot.curve.stableswap_pool_state import PoolStrategies, StableswapPoolState
 from apexbot.curve.types import (
     BasePoolPort,
     CurveDataProvider,
@@ -28,43 +25,43 @@ from apexbot.curve.types import (
 )
 from apexbot.erc20 import Erc20Token
 from apexbot.exceptions import ApexbotValueError
-from apexbot.exceptions.arbitrage import NoLiquidity
 from apexbot.exceptions.pool import EVMRevertError, InvalidSwapInputAmount, MissingCurveData
 from apexbot.logging import logger
 from apexbot.types.abstract import AbstractLiquidityPool
+from apexbot.types.concrete import BoundedCache
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.aliases import BlockNumber
     from apexbot.types.chain import ChecksummedAddress
     from apexbot.types.rpc_types import BlockIdentifier
 
 
 class _HandleCurveDataProviderAdapter:
-    """Adapts a ``LiquidityPool`` handle as a stored ``CurveDataProvider``.
+    """Adapts a ``Pool`` handle as a stored ``CurveDataProvider``.
 
-    The (BQM2OA) companion holds no Python data-provider object — the
-    provider is the stored Rust trait object (ADR-005 JFGCHJ). This shim
+    The companion holds no Python data-provider object — the
+    provider is the stored Rust trait object (ADR-005). This shim
     exposes the 13-method ``CurveDataProvider`` read interface by delegating
     each call to the handle's stored provider, mirroring the Balancer
-    ``_HandleRateProviderAdapter`` (MBWSGP). ``MissingCurveData`` is raised on
+    ``_HandleRateProviderAdapter``. ``MissingCurveData`` is raised on
     a missing provider / fetch miss so the calc path's existing error
     handling applies unchanged.
     """
 
-    def __init__(self, py_pool: LiquidityPool) -> None:
+    def __init__(self, py_pool: Pool) -> None:
         self._py_pool = py_pool
 
     def block_number(self) -> int:
-        v = self._py_pool.fetch_curve_block_number()
+        v: int | None = self._py_pool.fetch_curve_block_number()
         if v is None:
             raise MissingCurveData(self._py_pool.address, "block_number", "no data provider stored")
         return v
 
     def block_timestamp(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_block_timestamp(block_number)
+        v: int | None = self._py_pool.fetch_curve_block_timestamp(block_number)
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "block_timestamp", "no data provider stored"
@@ -72,7 +69,9 @@ class _HandleCurveDataProviderAdapter:
         return v
 
     def token_balance(self, token_address: str, holder_address: str, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_token_balance(token_address, holder_address, block_number)
+        v: int | None = self._py_pool.fetch_curve_token_balance(
+            token_address, holder_address, block_number
+        )
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "token_balance", "no data provider stored"
@@ -80,7 +79,7 @@ class _HandleCurveDataProviderAdapter:
         return v
 
     def token_total_supply(self, token_address: str, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_token_total_supply(token_address, block_number)
+        v: int | None = self._py_pool.fetch_curve_token_total_supply(token_address, block_number)
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "token_total_supply", "no data provider stored"
@@ -88,7 +87,7 @@ class _HandleCurveDataProviderAdapter:
         return v
 
     def lending_rates(self, block_number: int) -> tuple[int, ...]:
-        rates = self._py_pool.fetch_curve_lending_rates(block_number)
+        rates: tuple[int, ...] | None = self._py_pool.fetch_curve_lending_rates(block_number)
         if not rates:
             raise MissingCurveData(
                 self._py_pool.address, "lending_rates", "no data provider stored"
@@ -96,25 +95,25 @@ class _HandleCurveDataProviderAdapter:
         return tuple(rates)
 
     def d(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_d(block_number)
+        v: int | None = self._py_pool.fetch_curve_d(block_number)
         if v is None:
             raise MissingCurveData(self._py_pool.address, "d", "no data provider stored")
         return v
 
     def gamma(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_gamma(block_number)
+        v: int | None = self._py_pool.fetch_curve_gamma(block_number)
         if v is None:
             raise MissingCurveData(self._py_pool.address, "gamma", "no data provider stored")
         return v
 
     def price_scale(self, block_number: int) -> tuple[int, ...]:
-        scales = self._py_pool.fetch_curve_price_scale(block_number)
+        scales: tuple[int, ...] | None = self._py_pool.fetch_curve_price_scale(block_number)
         if not scales:
             raise MissingCurveData(self._py_pool.address, "price_scale", "no data provider stored")
         return tuple(scales)
 
     def admin_balances(self, block_number: int) -> tuple[int, ...]:
-        bal = self._py_pool.fetch_curve_admin_balances(block_number)
+        bal: tuple[int, ...] | None = self._py_pool.fetch_curve_admin_balances(block_number)
         if not bal:
             raise MissingCurveData(
                 self._py_pool.address, "admin_balances", "no data provider stored"
@@ -122,7 +121,7 @@ class _HandleCurveDataProviderAdapter:
         return tuple(bal)
 
     def redemption_price(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_redemption_price(block_number)
+        v: int | None = self._py_pool.fetch_curve_redemption_price(block_number)
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "redemption_price", "no data provider stored"
@@ -130,7 +129,7 @@ class _HandleCurveDataProviderAdapter:
         return v
 
     def base_cache_updated(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_base_cache_updated(block_number)
+        v: int | None = self._py_pool.fetch_curve_base_cache_updated(block_number)
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "base_cache_updated", "no data provider stored"
@@ -138,7 +137,7 @@ class _HandleCurveDataProviderAdapter:
         return v
 
     def base_virtual_price(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_base_virtual_price(block_number)
+        v: int | None = self._py_pool.fetch_curve_base_virtual_price(block_number)
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "base_virtual_price", "no data provider stored"
@@ -146,12 +145,45 @@ class _HandleCurveDataProviderAdapter:
         return v
 
     def virtual_price(self, block_number: int) -> int:
-        v = self._py_pool.fetch_curve_virtual_price(block_number)
+        v: int | None = self._py_pool.fetch_curve_virtual_price(block_number)
         if v is None:
             raise MissingCurveData(
                 self._py_pool.address, "virtual_price", "no data provider stored"
             )
         return v
+
+
+class _CryptoFeeCoefficients(NamedTuple):
+    """Normalized crypto-pool fee coefficients (``None`` ⇔ 0)."""
+
+    fee_gamma: int
+    mid_fee: int
+    offpeg_fee_multiplier: int
+    out_fee: int
+    gamma: int
+
+
+def _read_crypto_fee_coefficients(py_pool: Pool) -> _CryptoFeeCoefficients:
+    """Normalize the handle's optional crypto-fee tuple (``None`` ⇔ 0).
+
+    Standard stableswap pools store no crypto fees, so those slots come back
+    ``None`` and mean 0. The caller asserts the curve family, so the tuple
+    itself is never ``None`` off the handle in practice.
+
+    Returns:
+        The normalized coefficients.
+
+    """
+    crypto_fees = py_pool.curve_crypto_fees()
+    assert crypto_fees is not None  # pragma: no cover — curve family asserted
+    fee_gamma, mid_fee, offpeg_fee_multiplier, out_fee, gamma = crypto_fees
+    return _CryptoFeeCoefficients(
+        fee_gamma=fee_gamma if fee_gamma is not None else 0,
+        mid_fee=mid_fee if mid_fee is not None else 0,
+        offpeg_fee_multiplier=(offpeg_fee_multiplier if offpeg_fee_multiplier is not None else 0),
+        out_fee=out_fee if out_fee is not None else 0,
+        gamma=gamma if gamma is not None else 0,
+    )
 
 
 class CurveStableswapPool(
@@ -167,11 +199,11 @@ class CurveStableswapPool(
     PRECISION_DECIMALS: int = 18
     PRECISION: int = 10**PRECISION_DECIMALS
 
-    # Class-scope instance-attribute declarations (red-knot): `_from_py_pool`
+    # Class-scope instance-attribute declarations (red-knot): `from_handle`
     # assigns these on `Self`; declare them at class scope so attribute reads
     # in helper/calc methods resolve (mirrors the Balancer/Aerodrome seams).
     address: ChecksummedAddress
-    _py_pool: LiquidityPool
+    _py_pool: Pool
     _tokens: tuple[Erc20Token, ...]
     _a_coefficient: int
     _fee: int
@@ -194,20 +226,19 @@ class CurveStableswapPool(
     _future_a_coefficient_time: int | None
     _create_timestamp: int | None
     _data_provider: CurveDataProvider | None
-    _cache: PerBlockCache
+    _cache_block_timestamps: BoundedCache[BlockNumber, int]
     _name: str
     FEE_DENOMINATOR: int = 10**10
     A_PRECISION: int = 100
-    # BASE_CACHE_EXPIRES moved to PerBlockCache
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:  # ruff:ignore[unused-method-argument]
         """Direct construction is forbidden.
 
         A ``CurveStableswapPool`` is a companion over a Rust-owned
-        ``LiquidityPool`` handle. The handle can only be produced by
+        ``Pool`` handle. The handle can only be produced by
         registering a pool in a ``Bot`` (production: ``Bot.build_pool()``;
         tests: ``make_curve_pool``), then wrapping via
-        :meth:`_from_py_pool`. Direct constructor calls are rejected so that
+        :meth:`from_handle`. Direct constructor calls are rejected so that
         the only paths to a pool instance are the ones that wire the handle —
         mirroring Polars' ``_from_pydf`` pattern and matching V2/V3/V4/Balancer
         /Aerodrome. Every identity field + the stored I/O trait objects are
@@ -220,18 +251,18 @@ class CurveStableswapPool(
         """
         msg = (
             f"{type(self).__name__} cannot be constructed directly. "
-            "A LiquidityPool handle is wired by Bot.build_pool() "
+            "A Pool handle is wired by Bot.build_pool() "
             "(production) or make_curve_pool (tests); call "
-            f"{type(self).__name__}._from_py_pool(handle) to wrap a "
+            f"{type(self).__name__}.from_handle(handle) to wrap a "
             "registered handle."
         )
         raise TypeError(msg)
 
     @classmethod
-    def _from_py_pool(cls, py_pool: LiquidityPool) -> Self:
-        """Wrap a Rust-owned ``LiquidityPool`` handle as a Python companion.
+    def from_handle(cls, py_pool: Pool) -> Self:
+        """Wrap a Rust-owned ``Pool`` handle as a Python companion.
 
-        Single-arg seam (ADR-005 BQM2OA): reads *every* identity field + the
+        Single-arg seam (ADR-005): reads *every* identity field + the
         stored data-provider trait object off the handle. The cross-pool
         references (base pool companion + underlying/LP tokens) are recovered
         from the handle too — the base pool via the Rust go-between
@@ -251,9 +282,7 @@ class CurveStableswapPool(
         # Family assertion — a V2/V3/V4/Balancer handle must raise, not crash.
         family = py_pool.pool_family
         if family != "curve":
-            msg = (
-                f"LiquidityPool handle is not a Curve stableswap pool (got pool_family {family!r})"
-            )
+            msg = f"Pool handle is not a Curve stableswap pool (got pool_family {family!r})"
             raise ApexbotValueError(message=msg)
 
         self._py_pool = py_pool
@@ -267,10 +296,7 @@ class CurveStableswapPool(
                 "register them via Bot.build_pool() / make_erc20 first."
             )
             raise ApexbotValueError(message=msg)
-        self._tokens = tuple(
-            Erc20Token._from_py_token(t)  # ruff:ignore[private-member-access]
-            for t in py_tokens
-        )
+        self._tokens = tuple(Erc20Token.from_handle(t) for t in py_tokens)
 
         self._a_coefficient = py_pool.curve_a_coefficient
         self._fee = py_pool.curve_fee
@@ -282,19 +308,16 @@ class CurveStableswapPool(
         self._rate_multipliers = tuple(py_pool.curve_rate_multipliers)
         self._precision_multipliers = tuple(py_pool.curve_precision_multipliers)
 
-        # Crypto-pool fees (None ⇔ 0 for standard stableswap pools). Guard narrows
-        # the tuple[...] | None handle return (family asserted above, so never
-        # None in practice).
-        crypto_fees = py_pool.curve_crypto_fees()
-        assert crypto_fees is not None  # pragma: no cover — curve family asserted
-        fee_gamma, mid_fee, offpeg_fee_multiplier, out_fee, gamma = crypto_fees
-        self._fee_gamma = fee_gamma if fee_gamma is not None else 0
-        self._mid_fee = mid_fee if mid_fee is not None else 0
-        self._offpeg_fee_multiplier = (
-            offpeg_fee_multiplier if offpeg_fee_multiplier is not None else 0
-        )
-        self._out_fee = out_fee if out_fee is not None else 0
-        self._gamma = gamma if gamma is not None else 0
+        # Crypto-pool fees (None ⇔ 0 for standard stableswap pools). The
+        # normalization lives in the cohesive helper; the family is asserted
+        # above, so the tuple itself is never None in practice.
+        (
+            self._fee_gamma,
+            self._mid_fee,
+            self._offpeg_fee_multiplier,
+            self._out_fee,
+            self._gamma,
+        ) = _read_crypto_fee_coefficients(py_pool)
 
         # Strategies — reconstruct from the 7 u8 discriminants stored in Rust.
         # auto()-based enums: .value is forwarded verbatim, so Enum(value)
@@ -319,14 +342,10 @@ class CurveStableswapPool(
         # Underlying + LP tokens — recovered as companion handles.
         underlying = py_pool.get_curve_tokens_underlying()
         self._tokens_underlying = (
-            tuple(Erc20Token._from_py_token(t) for t in underlying)  # ruff:ignore[private-member-access]
-            if underlying is not None
-            else None
+            tuple(Erc20Token.from_handle(t) for t in underlying) if underlying is not None else None
         )
         lp = py_pool.get_curve_lp_token()
-        self._lp_token = (
-            Erc20Token._from_py_token(lp) if lp is not None else self._tokens[0]  # ruff:ignore[private-member-access]
-        )
+        self._lp_token = Erc20Token.from_handle(lp) if lp is not None else self._tokens[0]
 
         ul = tuple(py_pool.curve_use_lending)
         self._use_lending = ul or tuple(False for _ in self._tokens)
@@ -350,22 +369,14 @@ class CurveStableswapPool(
             _HandleCurveDataProviderAdapter(py_pool) if py_pool.curve_has_data_provider else None
         )
 
-        # Per-block on-chain caches (cache depth is companion-owned mutable
-        # cache config; the always-8 default applies — no caller passes a
-        # non-default value (verified at task time), so this stays companion-side
-        # and single-arg is preserved).
-        self._cache = PerBlockCache(
-            data_provider=self._data_provider,
-            address=self.address,
-            base_pool_is_set=self.base_pool is not None,
-        )
-
-        # The registration block (genesis journal delta). Used to pre-populate
-        # base-cache virtual-price values for metapools at construction time.
-        registration_block = py_pool.update_block
-        if self.base_pool is not None and registration_block != 0:
-            with contextlib.suppress(Exception):
-                self._cache.get_cached_virtual_price(block_number=registration_block)
+        # Per-block on-chain caches (companion-owned cache depth; the always-8
+        # default applies — no caller passes a non-default value). Nothing is
+        # resolved at build time: the metapool base-cache freshness rule lives
+        # only in the Rust core
+        # (`apexbot_pools::curve_dy_io::resolve_metapool_base_rate`), which
+        # resolves the virtual price at calc time — so a provider-less pool is
+        # legal.
+        self._cache_block_timestamps = BoundedCache(max_items=8)
 
         fee_string = f"{100 * self.fee / self.FEE_DENOMINATOR:.2f}"
         token_string = "-".join([token.symbol for token in self._tokens])
@@ -386,11 +397,11 @@ class CurveStableswapPool(
     def balances(self) -> tuple[int, ...]:
         """Balances.
 
-        Read from the Rust core via the ``LiquidityPool`` handle
-        (ADR-005 slice 11b). Rust ``BotState`` is the single source of truth
+        Read from the Rust core via the ``Pool`` handle.
+        Rust ``BotState`` is the single source of truth
         for the mutable ``balances`` slot; this getter returns the live tuple.
         """
-        return tuple(self._py_pool.balances)
+        return cast("tuple[int, ...]", tuple(self._py_pool.balance_vector().balances))
 
     @property
     def state(self) -> CurveStableswapPoolState:
@@ -406,24 +417,21 @@ class CurveStableswapPool(
                 companion built over a registered handle).
 
         """
-        snap = self._py_pool.snapshot_curve()
-        # snapshot_curve returns None only for a non-Curve pool_id; this
-        # companion is always built over a registered Curve handle, so the
-        # snapshot is always present. Defensive: treat None as no-state.
-        if snap is None:  # pragma: no cover - defensive, unreachable in practice
+        try:
+            view = self._py_pool.balance_vector()
+        except ValueError as exc:
             msg = f"No Curve pool state available for {self.address}"
-            raise ApexbotValueError(message=msg)
-        balances, block = snap
+            raise ApexbotValueError(message=msg) from exc
         return CurveStableswapPoolState(
             address=self.address,
-            balances=tuple(balances),
-            block=block,
+            balances=tuple(view.balances),
+            block=view.update_block,
         )
 
     @property
     def update_block(self) -> BlockNumber:
         """Update block (from Rust via the handle)."""
-        return self._py_pool.update_block
+        return self._py_pool.balance_vector().update_block
 
     @property
     def requires_io_at_calculation_time(self) -> bool:
@@ -454,10 +462,10 @@ class CurveStableswapPool(
     def external_update(self, update: CurveStableswapPoolExternalUpdate) -> None:
         """Apply an external state update with new balances.
 
-        Delegates to the Rust core (``LiquidityPool.apply_curve_balance_update``)
+        Delegates to the Rust core (``Pool.apply_curve_balance_update``)
         which journals the prior balances (genesis-anchor V2-style discipline)
-        and lands the new balances + ``update_block`` atomically
-        (ADR-005 slice 11b). The ``StateCache`` temporal-navigation layer it
+        and lands the new balances + ``update_block`` atomically. The
+        ``StateCache`` temporal-navigation layer it
         used to write is gone — the Rust reorg journal handles rollback now.
 
         Raises:
@@ -466,7 +474,7 @@ class CurveStableswapPool(
                 built over a registered handle).
 
         """
-        applied = self._py_pool.apply_curve_balance_update(
+        applied = self._py_pool.apply_balances(
             list(update.balances),
             update.block_number,
         )
@@ -495,6 +503,26 @@ class CurveStableswapPool(
             "Use Bot.update() or pass an explicit block number.",
         )
 
+    def _get_cached_block_timestamp(self, block_number: BlockNumber) -> int:
+        """Fetch or retrieve the cached block timestamp.
+
+        Returns:
+            The block timestamp as an integer.
+
+        Raises:
+            MissingCurveData: If the value is not cached and no provider is available.
+
+        """
+        cached = self._cache_block_timestamps.get(block_number)
+        if cached is not None:
+            return cached
+        if self._data_provider is None:
+            msg = "block_timestamp requires a data_provider. Provide one via Bot.build_pool()."
+            raise MissingCurveData(self.address, "block_timestamp", msg)
+        result = self._data_provider.block_timestamp(block_number)
+        self._cache_block_timestamps[block_number] = result
+        return result
+
     def _a(self, timestamp: int | None = None) -> int:
         """Handle ramping A up or down.
 
@@ -519,7 +547,7 @@ class CurveStableswapPool(
             return self.future_a_coefficient
 
         if timestamp is None:
-            timestamp = self._cache.get_cached_block_timestamp(0)
+            timestamp = self._get_cached_block_timestamp(0)
 
         a_1 = self.future_a_coefficient
         t_1 = self.future_a_coefficient_time
@@ -556,10 +584,13 @@ class CurveStableswapPool(
 
         """
         block_number = self._resolve_block_number(block_identifier)
-        # Rust-owned (task `WKKMJM`): D computation + LP-total-supply I/O + the
+        # Rust-owned: D computation + LP-total-supply I/O + the
         # deposit/reduction scaling all run in the Rust core on this pool's
         # current balances.
-        return self._py_pool.curve_calc_token_amount(list(amounts), deposit, block_number)
+        return cast(
+            "int",
+            self._py_pool.curve_calc_token_amount(list(amounts), deposit, block_number),
+        )
 
     def calc_withdraw_one_coin(
         self,
@@ -574,12 +605,12 @@ class CurveStableswapPool(
 
         """
         block_number = self._resolve_block_number(block_identifier)
-        # Rust-owned (task `WKKMJM`): D + get_y_d + the LP-total-supply I/O all
+        # Rust-owned: D + get_y_d + the LP-total-supply I/O all
         # run in the Rust core. The companion's extra tuple fields (`dy_0 - dy`,
         # `total_supply`) are not consumed by any caller, so only `dy` is
         # returned.
         dy = self._py_pool.curve_calc_withdraw_one_coin(_token_amount, i, block_number)
-        return (dy,)
+        return (cast("int", dy),)
 
     def get_dy(
         self,
@@ -599,9 +630,9 @@ class CurveStableswapPool(
 
         Reference: https://github.com/curveresearch/notes/blob/main/stableswap.pdf
 
-        Delegates to the Rust-owned `LiquidityPool.curve_get_dy` (task
-        `V5X2YP`): the I/O orchestration (amp/rates/xp + provider fetches) and
-        the pure dy math both run in the Rust core, so this is a single handle
+        Delegates to the Rust-owned `Pool.curve_get_dy`: the I/O orchestration
+        (amp/rates/xp + provider fetches) and the pure dy math both run in the
+        Rust core, so this is a single handle
         call with no Python provider / cache / calculator on the swap path.
 
         Returns:
@@ -614,7 +645,10 @@ class CurveStableswapPool(
         block_number = self._resolve_block_number(block_identifier)
         override_balances = list(override_state.balances) if override_state is not None else None
         try:
-            return self._py_pool.curve_get_dy(i, j, dx, block_number, override_balances)
+            return cast(
+                "int",
+                self._py_pool.curve_get_dy(i, j, dx, block_number, override_balances),
+            )
         except ValueError as e:
             raise EVMRevertError(error=str(e)) from e
 
@@ -628,9 +662,9 @@ class CurveStableswapPool(
     ) -> int:
         """Metapool underlying `dy` — Rust-owned base-pool delegation.
 
-        Delegates to `LiquidityPool.curve_get_dy_underlying` (task
-        `V5X2YP`): the metapool snapshot + the base-pool `calc_token_amount` /
-        `get_dy` / `calc_withdraw_one_coin` ops run through the Rust
+        Delegates to `Pool.curve_get_dy_underlying`: the metapool snapshot +
+        the base-pool `calc_token_amount` / `get_dy` /
+        `calc_withdraw_one_coin` ops run through the Rust
         `BotCurveBasePoolPort`, retiring the Python `_LazyBasePool` go-between
         for the swap path.
 
@@ -644,7 +678,10 @@ class CurveStableswapPool(
         block_number = self._resolve_block_number(block_identifier)
         override_balances = list(override_state.balances) if override_state is not None else None
         try:
-            return self._py_pool.curve_get_dy_underlying(i, j, dx, block_number, override_balances)
+            return cast(
+                "int",
+                self._py_pool.curve_get_dy_underlying(i, j, dx, block_number, override_balances),
+            )
         except ValueError as e:
             raise EVMRevertError(error=str(e)) from e
 
@@ -658,13 +695,16 @@ class CurveStableswapPool(
     ) -> int:
         """Calculate the expected token OUTPUT for a target INPUT at current pool reserves.
 
+        The zero-balance refusal is core-owned: the direct-pool arm delegates to
+        `get_dy` -> the Rust `curve_get_dy`, which raises the typed `NoLiquidity`
+        where the balances are read (the Python-side raise is gone).
+
         Returns:
             The computed integer value.
 
         Raises:
             ApexbotValueError: See function documentation.
             InvalidSwapInputAmount: See function documentation.
-            NoLiquidity: See function documentation.
 
         """
         block_number = self._resolve_block_number(block_identifier)
@@ -689,9 +729,8 @@ class CurveStableswapPool(
             ]
 
         if all(tokens_used_this_pool):
-            if any(balance == 0 for balance in self.balances):
-                raise NoLiquidity(message="One or more of the tokens has a zero balance.")
-
+            # The zero-balance refusal is core-owned: `curve_get_dy` raises the
+            # typed `NoLiquidity` where the balances are read, so this delegates.
             return self.get_dy(
                 i=self._tokens.index(token_in),
                 j=self._tokens.index(token_out),
@@ -700,54 +739,12 @@ class CurveStableswapPool(
                 override_state=override_state,
             )
         if any(tokens_used_this_pool) and any(tokens_used_in_base_pool):
-            if TYPE_CHECKING:
-                assert self.base_pool is not None
-                assert self.tokens_underlying is not None
-
-            # TODO:  # ruff:ignore[line-contains-todo] see if any of these checks are unnecessary (partial zero balance OK?)
-            if any(balance == 0 for balance in self.base_pool.balances):
-                raise NoLiquidity(message="One or more of the base pool tokens has a zero balance.")
-            if any(balance == 0 for balance in self.balances):
-                raise NoLiquidity(message="One or more of the tokens has a zero balance.")
-
-            token_in_from_metapool = token_in in self._tokens
-            token_out_from_metapool = token_out in self._tokens
-            assert token_in_from_metapool or token_out_from_metapool
-
-            if token_in_from_metapool and self.balances[self._tokens.index(token_in)] == 0:
-                raise NoLiquidity(message=f"{token_in} has a zero balance.")
-            if token_out_from_metapool and self.balances[self._tokens.index(token_out)] == 0:
-                raise NoLiquidity(message=f"{token_out} has a zero balance.")
-
-            token_in_from_basepool = token_in in self.base_pool.tokens
-            token_out_from_basepool = token_out in self.base_pool.tokens
-            assert token_in_from_basepool or token_out_from_basepool
-
-            if (
-                token_in_from_basepool
-                and self.base_pool.balances[self.base_pool.tokens.index(token_in)] == 0
-            ):
-                raise NoLiquidity(message=f"{token_in} has a zero balance.")
-            if (
-                token_out_from_basepool
-                and self.base_pool.balances[self.base_pool.tokens.index(token_out)] == 0
-            ):
-                raise NoLiquidity(message=f"{token_out} has a zero balance.")
-
-            return self._get_dy_underlying(
-                i=(
-                    self._tokens.index(token_in)
-                    if token_in_from_metapool
-                    else self.tokens_underlying.index(token_in)
-                ),
-                j=(
-                    self._tokens.index(token_out)
-                    if token_out_from_metapool
-                    else self.tokens_underlying.index(token_out)
-                ),
-                dx=token_in_quantity,
-                block_identifier=block_number,
-                override_state=override_state,
+            return self._get_dy_metapool_with_base(
+                token_in,
+                token_out,
+                token_in_quantity,
+                block_number,
+                override_state,
             )
         if all(tokens_used_in_base_pool):
             if TYPE_CHECKING:
@@ -768,31 +765,71 @@ class CurveStableswapPool(
             message="Tokens not held by pool or in underlying base pool",
         )  # pragma: no cover
 
+    def _get_dy_metapool_with_base(
+        self,
+        token_in: Erc20Token,
+        token_out: Erc20Token,
+        token_in_quantity: int,
+        block_number: int,
+        override_state: CurveStableswapPoolState | None,
+    ) -> int:
+        """Resolve a swap that spans this metapool and its underlying base pool.
+
+        The zero-balance refusal is core-owned (`curve_get_dy_underlying`
+        raises the typed `NoLiquidity` where the balance vectors are read), so
+        this only maps the combined underlying indices and delegates.
+
+        Returns:
+            The computed integer value.
+
+        """
+        if TYPE_CHECKING:
+            assert self.tokens_underlying is not None
+
+        token_in_from_metapool = token_in in self._tokens
+        token_out_from_metapool = token_out in self._tokens
+
+        return self._get_dy_underlying(
+            i=(
+                self._tokens.index(token_in)
+                if token_in_from_metapool
+                else self.tokens_underlying.index(token_in)
+            ),
+            j=(
+                self._tokens.index(token_out)
+                if token_out_from_metapool
+                else self.tokens_underlying.index(token_out)
+            ),
+            dx=token_in_quantity,
+            block_identifier=block_number,
+            override_state=override_state,
+        )
+
 
 class _LazyBasePool:
     """Production adapter satisfying ``BasePoolPort`` for a metapool's base pool.
 
-    Holds the base pool's ``LiquidityPool`` handle (resolved by the Rust
+    Holds the base pool's ``Pool`` handle (resolved by the Rust
     go-between ``curve_base_pool()`` — same shared ``BotState`` core, no
     Python registry lookup) and memoises the base companion on first use.
     Defers construction so a metapool that never takes the base swap path
     pays zero base-pool cost, and at most one companion across a full calc
-    (ADR-005 BQM2OA). Satisfies the ``BasePoolPort`` surface — the six
+    (ADR-005). Satisfies the ``BasePoolPort`` surface — the six
     members the ``DyCalculator`` actually calls.
 
     Defined after ``CurveStableswapPool`` (forward reference); resolved as a
-    module global at call time from within ``CurveStableswapPool._from_py_pool``.
+    module global at call time from within ``CurveStableswapPool.from_handle``.
     """
 
     __slots__ = ("_built", "_handle")
 
-    def __init__(self, handle: LiquidityPool) -> None:
+    def __init__(self, handle: Pool) -> None:
         self._handle = handle
         self._built = None
 
     def _pool(self) -> CurveStableswapPool:
         if self._built is None:
-            self._built = CurveStableswapPool._from_py_pool(self._handle)  # ruff:ignore[private-member-access]
+            self._built = CurveStableswapPool.from_handle(self._handle)
         return self._built
 
     @property

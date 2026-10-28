@@ -1,6 +1,7 @@
 # ADR-008: Per-block state machine for the pump's block clock
 
-**Status: implemented (core).** Recorded during the block-state-machine review, June 2026.
+**Status: historical — superseded as a live design by [ADR-041](ADR-041-block-epoch-pipeline.md); provenance only.**
+Recorded during the block-state-machine review, June 2026.
 Resolves the verify-race class of bugs (V2-V2-V3 crash at block 25397049: a Mint at 25397047
 un-applied when 25397049's `newHeads` advanced the cursor while N's liquidity log was still
 in-flight). Full design note and rationale live in `docs/architecture/block-state-machine.md`;
@@ -13,7 +14,7 @@ this ADR records the settled shape only.
 
 ## Implementation status
 
-Implemented in `rust/crates/apexbot-bot/src/bot_core/` (commits `5673f8ce`, `440b848`,
+Implemented in `rust/crates/engine/apexbot-bot/src/bot_core/` (commits `5673f8ce`, `440b848`,
 `c4d21b1e`, `cdac7363`, `0baed1e`):
 
 - **D1 (tombstone via successor log)** — `BlockClock` + pump wiring. A `newHeads` header
@@ -249,5 +250,5 @@ family-specific work — the SM is family-agnostic (it's about block completenes
 - `docs/architecture/block-state-machine.md` — full design note and rationale.
 - `docs/adr/ADR-006-bot-as-per-chain-orchestrator.md` — `Bot` as state owner; the SM is the
   per-block clock layer above `SolveCoordinator`.
-- `rust/crates/apexbot-bot/src/bot_core/block_pump.rs` (line refs in the design note) —
+- `rust/crates/engine/apexbot-bot/src/bot_core/block_pump.rs` (line refs in the design note) —
   current scattered-boolean invariants the SM replaces.

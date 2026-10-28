@@ -1,4 +1,4 @@
-"""FF-T5 (NT7HJC): the runtime fleet status - budget, plan, census.
+"""The runtime fleet status - budget, plan, census.
 
 "apexbot.runtime_status()" is the operator's live-process view. These
 tests pin the FF-T5 contract, PARAMETRIZED over the fleet profile (the CI
@@ -94,6 +94,14 @@ import sys
 # Determinism (the FF-T5 addendum): the child controls its own env - pop
 # the retired stance key, then apply THIS leg's profile.
 os.environ.pop("APEXBOT_FLEET", None)
+# Hermetic ambient pins (the cc0ffcd93 lesson): the backrun node join
+# resolves from the operator env (APEXBOT_RPC_HTTP_CHAINID_*), and a join
+# resolving DID change what engine construction materializes (the hosted
+# registry built the shared io runtime; a joinless host left the census
+# EMPTY). Pop BOTH join layers so every leg sees the JOINLESS host and the
+# census pin cannot pass on one developer machine and fail on clean CI.
+os.environ.pop("APEXBOT_RPC_HTTP_CHAINID_1", None)
+os.environ.pop("APEXBOT_RPC_WS_CHAINID_1", None)
 if @SET_PROFILE@:
     os.environ["APEXBOT_FLEET_PROFILE"] = @SET_PROFILE@
 else:
@@ -154,10 +162,12 @@ print("STATUS-OK " + s["binding"])
 def test_runtime_status_reports_the_plan_budget_and_census(profile: str) -> None:
     """The status dict: profile, tier binding, budget, census (per leg)."""
     child = (
-        _CHILD.replace("@PROFILE@", repr(profile))
+        _CHILD
+        .replace("@PROFILE@", repr(profile))
         .replace("@SET_PROFILE@", repr(None if profile == "auto" else profile))
         .replace("@QUOTA@", repr(_fractional_quota_cpus()))
     )
+    # Process-level: the fleet boot and census are process-global.
     proc = subprocess.run(
         [sys.executable, "-c", child],
         capture_output=True,
@@ -166,9 +176,7 @@ def test_runtime_status_reports_the_plan_budget_and_census(profile: str) -> None
         timeout=120,
         check=False,
     )
-    assert "STATUS-OK" in proc.stdout, (
-        f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"
-    )
+    assert "STATUS-OK" in proc.stdout, f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"
 
 
 def test_runtime_status_before_any_engine_is_the_default_projection() -> None:
@@ -182,9 +190,12 @@ s = apexbot.runtime_status()
 assert s["fleet_booted"] is False, s
 assert s["profile"] == "auto", s
 assert s["binding"] in ("pinned", "serial"), s
-assert s["census"], "the census is always present"
+# Import installs no runtimes or threads, so the census is EMPTY until
+# driver_boot() — that emptiness IS the default projection.
+assert s["census"] == [], s
 print("PRE-OK")
 """
+    # Process-level: the pre-construction projection is process-global.
     proc = subprocess.run(
         [sys.executable, "-c", child],
         capture_output=True,
@@ -193,6 +204,39 @@ print("PRE-OK")
         timeout=120,
         check=False,
     )
-    assert "PRE-OK" in proc.stdout, (
-        f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"
+    assert "PRE-OK" in proc.stdout, f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"
+
+
+def test_runtime_status_after_driver_boot_populates_the_census() -> None:
+    """driver_boot() installs the shared runtime; the census row appears."""
+    child = """
+import os
+os.environ.pop("APEXBOT_FLEET", None)
+os.environ.pop("APEXBOT_FLEET_PROFILE", None)
+import apexbot
+from apexbot.bot import driver_boot
+before = apexbot.runtime_status()["census"]
+driver_boot()
+after = apexbot.runtime_status()["census"]
+assert before == [], before
+assert any(row["resource"] == "io_runtime_workers" for row in after), after
+print("BOOT-OK")
+"""
+    # Process-level: driver_boot installs process-global runtimes.
+    proc = subprocess.run(
+
+        [sys.executable, "-c", child],
+
+        capture_output=True,
+
+        text=True,
+
+        cwd=str(Path(__file__).parents[2]),
+
+        timeout=120,
+
+        check=False,
+
     )
+
+    assert "BOOT-OK" in proc.stdout, f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"

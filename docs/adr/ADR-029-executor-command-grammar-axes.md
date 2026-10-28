@@ -194,6 +194,6 @@ fan-out is the intended trade.
   become general axis values/ledger strategies honored across families.
 
 Implementation, terminology, and the matrix live under ergo epic `463V2C`;
-vocabulary is recorded in `CONTEXT.md` ("Executor command layer"). The runtime
-harness is `rust/crates/apexbot-simulation/tests/harness_declarative.rs`;
-grammar is `rust/crates/apexbot-executor/src/grammar.rs`.
+vocabulary is recorded in `GLOSSARY.md` ("Executor command layer"). The runtime
+harness is `rust/crates/engine/apexbot-simulation/tests/harness_declarative.rs`;
+grammar is `rust/crates/foundation/apexbot-executor/src/grammar.rs`.

@@ -1,6 +1,7 @@
 # ADR-023: `PyBotIo` end-state is a shrunk translator + documented `stays-python` seam; full retirement deferred to the ERC-20/Curve core port (VK3YDM)
 
-**Status: accepted (architecture).** Recorded during the `LWKLMP` grilling
+**Status: accepted (architecture); D0/D1/D2 disposition superseded 2026-10-10 (see
+Post-adoption).** Recorded during the `LWKLMP` grilling
 (2026-08-06), settling decisions D0–D5: the disposition of `PyBotIo` and the
 Python `builders/` tree once the construction choreography moved core-side.
 
@@ -45,11 +46,22 @@ route through the `ConstructionIo` handle as the single path (with the transient
 support. Tag support is a core-trait change tracked in `VK3YDM`, not a LWKLMP
 blocker. Legacy Mock/MagicMock test doubles move onto alloy fixtures.
 
-### D2 — `Py*Row` mirrors are `stays-python` for this epic.
+### D2 — `Py*Row` mirrors are retired with their consumers (closed 2026-10-10).
 
-`Erc20TokenRow` + the six `db/pool_read.py` classes are live (Python builders
-read `.id/.address/.decimals/.kind/.token0`). They stay; their retirement folds
-into `VK3YDM` with their consumers.
+`Erc20TokenRow` + the six `db/pool_read.py` classes (`LiquidityPoolRow`,
+`PoolKindRow`, `ExchangeRow`, `PoolManagerRow`, `LiquidityPositionRow`,
+`InitializationMapRow`) were the Python mirror of `apexbot-db`'s row records,
+read by the Python pool builders (`.id/.address/.decimals/.kind/.token0`).
+**Closed under `UWA7ZH` (PC6): no Python mirror class remains.** As the builders'
+DB reads moved behind the `PyBotIo` seam, each mirror became a thin `#[pyclass]`
+over the `apexbot-db` typed record, so `apexbot-db` owns the record in both
+directions. The three records no remaining consumer needed (`PoolKindRow`,
+`LiquidityPositionRow`, `InitializationMapRow`) were deleted with their `PyBotIo`
+methods. The four that are still the DB read shape (`LiquidityPoolRow`,
+`ExchangeRow`, `PoolManagerRow`, `Erc20TokenRow`) stay as the FFI face of the
+core-owned records, because live Python consumers (`builders/type_resolution.py`,
+`builders/erc20_builder.py`, `updater/pool_updater_configs.py`) read their
+fields — deleting them would change DB read behaviour, not retire a mirror.
 
 ### D3 — Delete the inlined `self.alloy` RPC duplication; keep the `alloy_provider()` accessor.
 
@@ -73,7 +85,7 @@ from the umbrella (`apexbot` lib.rs) and exposed `PyBot.build_curve_pool`
 ### D5 — Delete the vestigial Python surface + fix doc rot.
 
 `v2_builder_base.py` (dead in `src/`) is deleted. Stale pointers are corrected:
-`pool_builder/mod.rs`'s "future, task 3FVZF4" comment; `CONTEXT.md`'s "retires
+`pool_builder/mod.rs`'s "future, task 3FVZF4" comment; `GLOSSARY.md`'s "retires
 fully once the 27 wrappers move core-side" (now false); and `LWKLMP`'s
 References claim that builders "receive `&ConstructionIo`" (they receive
 `PyBotIo`).
@@ -89,5 +101,58 @@ References claim that builders "receive `&ConstructionIo`" (they receive
   live tests already run on offline alloy fixtures (where the transient
   `(NoDb, AlloyRpcConstruction)` handle serves them). D1/D3 remove the path
   those doubles modeled, so no test change was required (S1).
-- `_bot.py` remains a hybrid: a delegating shell for the Rust-built families and
-  a `PyBotIo`-driven host for Curve/ERC-20/Balancer-update until `VK3YDM` lands.
+- ~~`_bot.py` remains a hybrid: a delegating shell for the Rust-built families and
+  a `PyBotIo`-driven host for Curve/ERC-20/Balancer-update until `VK3YDM` lands.~~
+  _Superseded 2026-10-10; see Post-adoption A4._
+
+## Post-adoption (2026-10-10) — the deferral premise is overtaken; disposition upgrades from "scope cut" to "finish the collapse"
+
+Recorded from the 2026-10-10 architecture review (Pool construction deepening), which
+followed this ADR's `VK3YDM` tracking pointer and found it dangling.
+
+### A1 — `VK3YDM` is not a tracking entity; its work landed anyway.
+
+Zero occurrences in `.ergo/plans.jsonl` / `.ergo/backlog.jsonl`. The code work is
+recorded in-tree: D4 (S2/S3), `parity_erc20.rs` (S6), `standalone_consumer.rs` (S2).
+The epic ID survives only as comment provenance — a future reader should not look for
+it in the task tracker.
+
+### A2 — D0's disposition is superseded: the end-state is full `PyBotIo` retirement.
+
+The stated blocker ("full retirement… is blocked behind the live ERC-20/Curve core
+port") does not exist anymore. The core entries shipped; the Python call paths were
+never collapsed onto them:
+
+| Core entry (shipped) | Python residue to collapse |
+| --- | --- |
+| `PyBot.build_curve_pool` | `builders/curve_pool_builder.py`, the `from_handle` prefetch path |
+| `PyBot.build_erc20_token` | `builders/erc20_builder.py` |
+| `PyBot.build_balancer_{weighted,stable}_pool` | `builders/balancer_builder{,_base}.py` (update path) |
+
+Per-field `stays-python` markings (D2) describe residue, not a terminal state.
+
+### A3 — Re-home the orphaned follow-ups.
+
+D1's block-tag support ("tracked in `VK3YDM`") and D2's `Py*Row` retirement ("folds into
+`VK3YDM`") have no tracking home. Both are re-homed under the Pool construction
+deepening, ergo epic **`GZPPS3`** (opened 2026-10-10): block-tag support as task
+`YCUSGZ` (PC10), `Py*Row` retirement as task `UWA7ZH` (PC6 — closed 2026-10-10,
+see D2).
+
+**Both closed 2026-10-10** (epic `GZPPS3`, 12/12 done): `UWA7ZH` landed the mirror-retirement
+pin + D2 close-out (commit `c2f35dafd`); `YCUSGZ` landed typed `BlockSelector` at the seam —
+`extract_block_u64` and all 24 silent tag-to-head coercions deleted (commit `37d6d1c2e`).
+
+### A4 — The Consequences bullet above is superseded.
+
+"`_bot.py` remains a hybrid … until `VK3YDM` lands" is stale twice: the port landed,
+and the hybrid persists anyway. Replacement text: *`_bot.py` is a delegating shell for
+the Rust-built families and a `PyBotIo`-hosted residue for Curve/ERC-20/Balancer-update —
+residue because the collapse onto the shipped core entries was never finished, not
+because the entries are missing.*
+
+### A5 — What stands.
+
+D1's fallback deletion, D3's `alloy_provider()` accessor (caution: provider
+*construction* moves to injection as the updater seam deepens; the accessor survives for
+chain-arm wiring), D4 as history, D5's doc-rot fixes.

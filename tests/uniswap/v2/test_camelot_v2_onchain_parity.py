@@ -29,7 +29,11 @@ from apexbot._ffi import Bot
 from apexbot._ffi.dex_identity import dex_identity
 from apexbot.camelot.abi import CAMELOT_POOL_ABI
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.fork import AnvilFork
+from apexbot.fork import AnvilFork, ForkLaunchConfig
+from tests.golden.oracle import (
+    assert_golden_keys_exact,
+    replay_makes_no_network_calls,  # ruff: ignore[unused-import]
+)
 from tests.helpers.contract_compat import make_contract
 from tests.helpers.erc20_factory import make_erc20
 from tests.helpers.v2_pool_factory import make_v2_pool
@@ -85,6 +89,7 @@ def _build_camelot_weth_usdc_io_free() -> object:
         reserves_token1=_RESERVES_USDC,
         chain_id=42161,
         state_block=CAMELOT_PARITY_BLOCK,
+        py_bot=_PYBOT,
     )
 
 
@@ -98,11 +103,15 @@ def _record_get_amount_out() -> int:
     fork = AnvilFork(
         fork_url=ARBITRUM_RPC_URI,
         fork_block=CAMELOT_PARITY_BLOCK,
-        storage_caching=True,
-        anvil_opts=["--accounts=0"],
+        launch=ForkLaunchConfig(
+            storage_caching=True,
+            anvil_opts=["--accounts=0"],
+        ),
     )
     try:
-        contract_compat = make_contract(fork.http_url, CAMELOT_WETH_USDC_LP_ADDRESS, CAMELOT_POOL_ABI)
+        contract_compat = make_contract(
+            fork.http_url, CAMELOT_WETH_USDC_LP_ADDRESS, CAMELOT_POOL_ABI
+        )
         return contract_compat.functions.getAmountOut(
             amountIn=_AMOUNT_IN_USDC,
             tokenIn=_USDC_ADDRESS,
@@ -135,3 +144,15 @@ def test_create_camelot_v2_pool(golden_factory) -> None:
         token_in_quantity=_AMOUNT_IN_USDC,
     )
     assert calc_amount_out == oracle.value
+
+
+_PARITY_TEST_NAME = "test_create_camelot_v2_pool"
+
+
+def test_golden_keys_exactly_match_the_oracle_surface(request: pytest.FixtureRequest) -> None:
+    """The golden file holds exactly the keys this module's replay drives.
+
+    Replay fails loud on a missing key but stays silent on a stale extra one —
+    nothing looks it up. Set-equality against the recorded file closes that
+    drift: a shrunken case list cannot leave orphaned oracle entries behind."""
+    assert_golden_keys_exact(request, _PARITY_TEST_NAME, {_ORACLE_KEY})

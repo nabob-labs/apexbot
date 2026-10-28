@@ -1,22 +1,27 @@
-"""§4.2 parity + §4.5 delegation tests for the V3/V4 snapshot DB seam.
+"""Parity + delegation tests for the V3/V4 snapshot DB seam.
 
-Driven by SLHSM4's frozen `parity_expected.json` oracle (dumped from the
-prior SQLAlchemy-backed `DatabaseSnapshot`) + a freshly-regenerated
+Driven by the frozen `parity_expected.json` oracle (dumped from the
+prior legacy reader-backed `DatabaseSnapshot`) + a freshly-regenerated
 `parity.db` fixture: the Rust-backed `DatabaseSnapshot` (delegating through
-`DatabaseSnapshot`) produces identical results to the frozen SQLAlchemy
-oracle. Plus a §4.5 delegation spy proving the Python reader hits Rust with
-the right args.
+`DatabaseSnapshot`) produces identical results to the frozen legacy reader
+oracle. Plus round-trip tests pinning that each PUBLIC read returns exactly
+the family's own Rust engine read — the seam wiring, by value: a seam
+re-pointed at another family's reader (the pair-keyed V4 one) changes the
+value or the key shape, never just a call name.
 """
 
 import json
 import pathlib
+from collections.abc import Iterator
 
 import pytest
 
+from apexbot.checksum_cache import get_checksum_address
+from apexbot.db import DatabaseSnapshot as EngineSnapshot
 from apexbot.uniswap.v3_snapshot import DatabaseSnapshot as V3DatabaseSnapshot
 from apexbot.uniswap.v4_snapshot import DatabaseSnapshot as V4DatabaseSnapshot
 
-FIXTURE_DIR = pathlib.Path("rust/crates/apexbot-db/tests/fixtures")
+FIXTURE_DIR = pathlib.Path("rust/crates/foundation/apexbot-db/tests/fixtures")
 DB_PATH = FIXTURE_DIR / "parity.db"
 EXPECTED_PATH = FIXTURE_DIR / "parity_expected.json"
 
@@ -26,20 +31,28 @@ def _expected() -> dict:
 
 
 @pytest.fixture(scope="module")
-def v3_snapshot() -> V3DatabaseSnapshot:
-    return V3DatabaseSnapshot(chain_id=8453, database_path=DB_PATH)
+def v3_snapshot() -> Iterator[V3DatabaseSnapshot]:
+    snapshot = V3DatabaseSnapshot(chain_id=8453, database_path=DB_PATH)
+    try:
+        yield snapshot
+    finally:
+        snapshot.close()
 
 
 @pytest.fixture(scope="module")
-def v4_snapshot() -> V4DatabaseSnapshot:
-    return V4DatabaseSnapshot(chain_id=8453, database_path=DB_PATH)
+def v4_snapshot() -> Iterator[V4DatabaseSnapshot]:
+    snapshot = V4DatabaseSnapshot(chain_id=8453, database_path=DB_PATH)
+    try:
+        yield snapshot
+    finally:
+        snapshot.close()
 
 
-# ── §4.2 parity: Rust-backed reads == frozen SQLAlchemy oracle ─────────
+# ── parity: Rust-backed reads == frozen legacy reader oracle ─────────
 
 
 class TestV3SnapshotParity:
-    """V3 DatabaseSnapshot (Rust-backed) matches the frozen SQLAlchemy oracle."""
+    """V3 DatabaseSnapshot (Rust-backed) matches the frozen legacy reader oracle."""
 
     def test_get_newest_block(self, v3_snapshot: V3DatabaseSnapshot) -> None:
         """get_newest_block matches the oracle."""
@@ -59,17 +72,19 @@ class TestV3SnapshotParity:
             assert {int(t): tuple(map(int, v)) for t, v in ticks.items()} == rust[addr]
 
     def test_get_liquidity_map_match_oracle(self, v3_snapshot: V3DatabaseSnapshot) -> None:
-        """get_liquidity_map returns pydantic BitmapAtWord/LiquidityAtTick matching the oracle."""
+        """get_liquidity_map returns pydantic LiquidityAtTick rows matching the oracle."""
         oracle = _expected()["v3_liquidity_map"]
         if oracle is None:
             pytest.skip("oracle has no V3 liquidity map")
         addr = _expected()["v3_pool_address"]
         result = v3_snapshot.get_liquidity_map(addr)
         assert result is not None
+        # The word-VALUE machinery is retired: the DB stores no per-word bitmap
+        # (the `initialization_maps` tables are dropped), so the seam emits a
+        # WORD-KEY set that is empty for every DB-backed pool.
+        assert result["tick_bitmap"] == set()
         # The tick values are pydantic models (attribute access) — proves the
-        # seam wraps into BitmapAtWord(**entry) / LiquidityAtTick(**entry).
-        for word, entry in result["tick_bitmap"].items():
-            assert int(entry.bitmap) == int(oracle["tick_bitmap"][str(word)]["bitmap"])
+        # seam wraps into LiquidityAtTick(**entry).
         for tick, entry in result["tick_data"].items():
             exp = oracle["tick_data"][str(tick)]
             assert int(entry.liquidity_gross) == int(exp["liquidity_gross"])
@@ -77,7 +92,7 @@ class TestV3SnapshotParity:
 
 
 class TestV4SnapshotParity:
-    """V4 DatabaseSnapshot (Rust-backed) matches the frozen SQLAlchemy oracle."""
+    """V4 DatabaseSnapshot (Rust-backed) matches the frozen legacy reader oracle."""
 
     def test_get_newest_block(self, v4_snapshot: V4DatabaseSnapshot) -> None:
         """get_newest_block matches the oracle."""
@@ -99,42 +114,31 @@ class TestV4SnapshotParity:
             assert {int(t): tuple(map(int, v)) for t, v in entry["ticks"].items()} == rust_ticks
 
 
-# ── §4.5 delegation: Python reader hits the Rust seam with the right args ─
+# ── delegation: each public read round-trips the family's engine read ─────
 
 
 class TestSnapshotDelegation:
-    """§4.5: the Python DatabaseSnapshot delegates to the Rust DatabaseSnapshot."""
+    """The Python DatabaseSnapshot returns exactly the V3 engine read.
 
-    def test_get_newest_block_delegates_to_rust(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_newest_block calls DatabaseSnapshot.get_newest_block_v3.
+    The family declares its Rust read seam once (``DatabaseSnapshotSeams``), so
+    the public read and the engine's own V3 read are the two sides of one
+    delegation: equality proves the declared seam is the V3 one AND pins what
+    the facade adds on top (V3's checksum normalization of stored pool keys).
+    """
 
-        Patches the lazily-cached `_rust` handle to a recording wrapper so the
-        pyclass (whose methods are read-only) need not be monkeypatched.
-        """
-        calls: list[str] = []
-        snap = V3DatabaseSnapshot(chain_id=8453, database_path=DB_PATH)
-        real_rust = snap._rust()
+    def test_get_newest_block_round_trips_the_engine_read(self) -> None:
+        """get_newest_block returns the engine's V3 newest-block read."""
+        engine = EngineSnapshot(chain_id=8453, database_path=str(DB_PATH))
+        engine_block = engine.get_newest_block_v3()
+        assert engine_block is not None, "the fixture holds a V3 update block"
+        with V3DatabaseSnapshot(chain_id=8453, database_path=DB_PATH) as snap:
+            assert snap.get_newest_block() == engine_block
 
-        class _Spy:
-            def get_newest_block_v3(self) -> int | None:
-                calls.append("get_newest_block_v3")
-                return real_rust.get_newest_block_v3()
-
-        monkeypatch.setattr(snap, "_rust_snapshot", _Spy())
-        snap.get_newest_block()
-        assert calls == ["get_newest_block_v3"]
-
-    def test_get_pools_delegates_to_rust(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """get_pools calls DatabaseSnapshot.get_pools_v3."""
-        calls: list[str] = []
-        snap = V3DatabaseSnapshot(chain_id=8453, database_path=DB_PATH)
-        real_rust = snap._rust()
-
-        class _Spy:
-            def get_pools_v3(self) -> set[str]:
-                calls.append("get_pools_v3")
-                return real_rust.get_pools_v3()
-
-        monkeypatch.setattr(snap, "_rust_snapshot", _Spy())
-        snap.get_pools()
-        assert calls == ["get_pools_v3"]
+    def test_get_pools_round_trips_the_engine_read(self) -> None:
+        """get_pools returns the engine's V3 pool set, checksum-normalized."""
+        engine = EngineSnapshot(chain_id=8453, database_path=str(DB_PATH))
+        engine_pools = engine.get_pools_v3()
+        assert engine_pools, "the fixture holds V3 pools; an empty read proves nothing"
+        expected = {get_checksum_address(pool) for pool in engine_pools}
+        with V3DatabaseSnapshot(chain_id=8453, database_path=DB_PATH) as snap:
+            assert snap.get_pools() == expected

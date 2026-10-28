@@ -1,7 +1,7 @@
 """Factory helper for I/O-free Aerodrome V2 pool construction in tests.
 
 Every direct ``AerodromeV2Pool(...)`` construction in the test suite routes
-through ``make_aerodrome_v2_pool`` so the ``LiquidityPool`` handle is wired
+through ``make_aerodrome_v2_pool`` so the ``Pool`` handle is wired
 through ``Bot.register_aerodrome_pool`` → ``get_pool`` → companion, matching
 the ``Bot.build_pool()`` flow (ADR-005 Aerodrome state port).
 """
@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from apexbot._ffi import Bot
 from apexbot.aerodrome.pools import AerodromeV2Pool
 from apexbot.checksum_cache import get_checksum_address
+from tests.helpers.pool_bot import new_pool_bot
 
 if TYPE_CHECKING:
     from fractions import Fraction
 
+    from apexbot._ffi import Bot
     from apexbot.erc20 import Erc20Token
 
 
@@ -35,14 +36,14 @@ def make_aerodrome_v2_pool(
     py_bot: Bot | None = None,
     pool_class: type[AerodromeV2Pool] = AerodromeV2Pool,
 ) -> AerodromeV2Pool:
-    """Construct an I/O-free Aerodrome V2 companion over a fresh LiquidityPool handle.
+    """Construct an I/O-free Aerodrome V2 companion over a fresh Pool handle.
 
-    Registers the pool in a short-lived ``Bot`` (the returned handle holds an
-    ``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``),
-    then wraps via ``_from_py_pool``. Tokens must be registered in the same
-    ``Bot`` (ADR-006).
+    Mints a fresh ``Bot`` unless ``py_bot`` is injected, so each pool is
+    isolated; registration is get-or-register (a same-identity re-build
+    answers the EXISTING handle). A caller that wants to share one bot passes
+    ``py_bot=``. Tokens must be registered in the same ``Bot`` (ADR-006).
     """
-    bot = py_bot or Bot()
+    bot = py_bot if py_bot is not None else new_pool_bot()
     address = get_checksum_address(address)
 
     # ADR-006: tokens must be in the same Bot as the pool.
@@ -69,7 +70,7 @@ def make_aerodrome_v2_pool(
     handle = bot.get_pool(pool_id)
     assert handle is not None, "register_aerodrome_pool returned no handle"
 
-    pool = pool_class._from_py_pool(handle)
+    pool = pool_class.from_handle(handle)
     if deployer_address is not None:
         pool.deployer_address = get_checksum_address(deployer_address)
     return pool

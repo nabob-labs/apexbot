@@ -1,34 +1,38 @@
 """Factory helpers for I/O-free Balancer V2 pool construction in tests.
 
 Mirrors ``tests/helpers/curve_pool_factory.py`` (and ``v3_pool_factory.py``
-/ ``v4_pool_factory.py``) — ADR-005 slice 12b (weighted) + 12d (stable):
-every direct ``BalancerV2Pool(...)`` / ``BalancerV2StablePool(...)``
+/ ``v4_pool_factory.py``): every direct ``BalancerV2Pool(...)`` /
+``BalancerV2StablePool(...)``
 construction in the test suite routes through ``make_balancer_weighted_pool``
-/ ``make_balancer_stable_pool`` so the ``LiquidityPool`` handle is wired
+/ ``make_balancer_stable_pool`` so the ``Pool`` handle is wired
 through ``Bot::register_balancer_weighted_pool`` /
 ``register_balancer_stable_pool`` → ``get_pool`` → companion, matching the
 ``Bot.build_pool()`` flow (ADR-005).
 
-Each call creates its own short-lived ``Bot`` (the returned handle holds
-an ``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``) — so
-each test pool is fully isolated (no shared mutable state across tests).
+Each call mints a FRESH ``Bot`` (via ``new_pool_bot``) so every built pool is
+isolated. The register entry is get-or-register — a same address + same
+family + same identity build answers the EXISTING handle — while a genuine
+conflict (a different family, or a mismatched identity = wire drift) still
+refuses loudly. Pools are MUTABLE, so isolation is the default; a caller that
+WANTS to share one bot passes ``py_bot=`` explicitly.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from apexbot._ffi import Bot
 from apexbot.balancer.libraries.scaling_helpers import _compute_scaling_factor
 from apexbot.balancer.pools import BalancerV2Pool
 from apexbot.balancer.stable_pools import INVARIANT_V2, BalancerV2StablePool
 from apexbot.builders.balancer_builder_base import BalancerBuilderBase
 from apexbot.checksum_cache import get_checksum_address
+from tests.helpers.pool_bot import new_pool_bot
 
 if TYPE_CHECKING:
+    from apexbot._ffi import Bot
     from apexbot.balancer.stable_pools import BalancerRateProvider
     from apexbot.erc20.erc20 import Erc20Token
-    from apexbot.types import LiquidityPool
+    from apexbot.types import Pool
     from apexbot.types.aliases import BlockNumber
 
 
@@ -51,14 +55,15 @@ def make_balancer_weighted_pool(
     py_bot: Bot | None = None,
     pool_class: type[BalancerV2Pool] = BalancerV2Pool,
 ) -> BalancerV2Pool:
-    """Construct an I/O-free Balancer V2 weighted companion over a fresh LiquidityPool handle.
+    """Construct an I/O-free Balancer V2 weighted companion over a fresh Pool handle.
 
-    Registers the pool in a short-lived ``Bot`` (the returned handle holds an
-    ``Arc`` clone of the underlying ``Bot``, so it outlives the ``Bot``) — so
-    each test pool is fully isolated (no shared mutable state across tests).
-    The token companions passed in may live in a different ``Bot`` (their own
-    ``make_erc20`` ``Bot``); that's fine — the pool reads balances from its
-    own ``Bot`` and token metadata from the token handle, independently.
+    Mints a fresh ``Bot`` unless ``py_bot`` is injected, so each pool is
+    isolated. Registration is get-or-register (a same-identity re-build
+    answers the EXISTING handle); a caller that wants to share one bot passes
+    ``py_bot=``. The token companions passed in may live in a different
+    ``Bot`` (their own ``make_erc20`` ``Bot``); that's fine — the pool reads
+    balances from its own ``Bot`` and token metadata from the token handle,
+    independently.
 
     ``Bot.build_pool()`` is the production path (registers in the session's
     shared ``_py_bot``); this helper is the test-only equivalent.
@@ -74,7 +79,7 @@ def make_balancer_weighted_pool(
     address_checksum = get_checksum_address(address)
     state_block_int = state_block if state_block is not None else 0
 
-    bot = py_bot if py_bot is not None else Bot()
+    bot = py_bot if py_bot is not None else new_pool_bot()
 
     scaling_factors = [_compute_scaling_factor(token) for token in tokens]
     # encode the Fraction fee the Python-side companion keeps target-perfect as
@@ -95,14 +100,14 @@ def make_balancer_weighted_pool(
         balances=list(balances),
         update_block=state_block_int,
     )
-    handle: LiquidityPool | None = bot.get_pool(pool_id_int)
+    handle: Pool | None = bot.get_pool(pool_id_int)
     assert handle is not None, "register_balancer_weighted_pool returned a pool_id with no handle"
 
     # ADR-005 sealed seam: register tokens in the same Bot as the pool.
     for tok in tokens:
         if bot.get_token(tok.address) is None:
             bot.register_token(tok.address, tok.name, tok.symbol, tok.decimals, tok.chain_id)
-    return pool_class._from_py_pool(handle)
+    return pool_class.from_handle(handle)
 
 
 def make_balancer_stable_pool(
@@ -123,14 +128,15 @@ def make_balancer_stable_pool(
     py_bot: Bot | None = None,
     pool_class: type[BalancerV2StablePool] = BalancerV2StablePool,
 ) -> BalancerV2StablePool:
-    """Construct an I/O-free Balancer V2 stable companion over a fresh LiquidityPool handle.
+    """Construct an I/O-free Balancer V2 stable companion over a fresh Pool handle.
 
-    Production-path twin of ``BalancerBuilder._build_stable`` (ADR-005
-    slice 12d): registers the pool in a short-lived ``Bot`` (the returned
-    handle holds an ``Arc`` clone of the underlying ``Bot``, so it outlives
-    the ``Bot``) — so each test pool is fully isolated. The token
-    companions may live in a different ``Bot``; that's fine — the pool reads
-    balances from its own ``Bot`` and token metadata from the token handle.
+    Production-path twin of ``BalancerBuilder._build_stable``: mints a fresh
+    ``Bot`` unless ``py_bot`` is injected, so each
+    pool is isolated; registration is get-or-register (a same-identity
+    re-build answers the EXISTING handle). A caller that wants to share one
+    bot passes ``py_bot=``. The token companions may live in a different
+    ``Bot``; that's fine — the pool reads balances from its own ``Bot`` and
+    token metadata from the token handle.
 
     The immutable config (tokens, amp, scaling_factors, swap_fee, bpt_idx,
     invariant_version, base_scaling_factors, rate_provider) stays Python-side
@@ -144,10 +150,10 @@ def make_balancer_stable_pool(
     address_checksum = get_checksum_address(address)
     state_block_int = state_block if state_block is not None else 0
 
-    bot = py_bot if py_bot is not None else Bot()
+    bot = py_bot if py_bot is not None else new_pool_bot()
 
     # The sealed seam ignores ``base_scaling_factors`` (the companion derives
-    # base SF from token decimals in ``_from_py_pool``); retained on the
+    # base SF from token decimals in ``from_handle``); retained on the
     # factory signature for API compatibility with callers that pass it.
 
     # encode the Fraction fee the Python-side companion keeps, target-perfect
@@ -178,10 +184,10 @@ def make_balancer_stable_pool(
         update_block=state_block_int,
         rate_provider=rate_provider,
     )
-    handle: LiquidityPool | None = bot.get_pool(pool_id_int)
+    handle: Pool | None = bot.get_pool(pool_id_int)
     assert handle is not None, "register_balancer_stable_pool returned a pool_id with no handle"
 
-    return pool_class._from_py_pool(handle)
+    return pool_class.from_handle(handle)
 
 
 __all__ = [

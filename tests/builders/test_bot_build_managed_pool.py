@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 
 from apexbot.bot import Bot
+from apexbot.builders.request import BuildManagedPoolRequest
 from apexbot.uniswap.v4_liquidity_pool import UniswapV4Pool
 
 
@@ -15,16 +17,18 @@ class TestBuildManagedPoolSignature:
         """Bot class has a build_managed_pool method."""
         assert hasattr(Bot, "build_managed_pool")
 
-    def test_build_managed_pool_pool_id_is_required_positional(self):
-        """build_managed_pool() requires pool_id as the second positional arg."""
+    def test_build_managed_pool_takes_address_and_request(self):
+        """build_managed_pool() takes (address, request) positionally after self."""
         sig = inspect.signature(Bot.build_managed_pool)
         params = list(sig.parameters.values())
-        # self (positional), address (positional), pool_id (positional-or-keyword)
-        assert params[0].name == "self"
         assert params[1].name == "address"
-        assert params[2].name == "pool_id"
-        # pool_id has no default — it's required
+        assert params[2].name == "request"
         assert params[2].default is inspect.Parameter.empty
+
+    def test_build_managed_pool_request_requires_pool_id(self):
+        """BuildManagedPoolRequest has a required pool_id (no default)."""
+        fields = {f.name: f for f in dataclasses.fields(BuildManagedPoolRequest)}
+        assert fields["pool_id"].default is dataclasses.MISSING
 
     def test_build_managed_pool_has_no_deployer_or_init_hash_kwargs(self):
         """build_managed_pool() does not accept deployer_address or init_hash."""
@@ -33,15 +37,14 @@ class TestBuildManagedPoolSignature:
         assert "deployer_address" not in param_names
         assert "init_hash" not in param_names
 
-    def test_build_managed_pool_has_v4_kwargs(self):
-        """build_managed_pool() has V4-specific keyword arguments."""
-        sig = inspect.signature(Bot.build_managed_pool)
-        param_names = set(sig.parameters.keys())
-        assert "state_view_address" in param_names
-        assert "tokens" in param_names
-        assert "fee" in param_names
-        assert "tick_spacing" in param_names
-        assert "hook_address" in param_names
+    def test_build_managed_pool_request_has_v4_fields(self):
+        """The request carries the V4-specific identity overrides."""
+        field_names = {f.name for f in dataclasses.fields(BuildManagedPoolRequest)}
+        assert "state_view_address" in field_names
+        assert "tokens" in field_names
+        assert "fee" in field_names
+        assert "tick_spacing" in field_names
+        assert "hook_address" in field_names
 
     def test_build_managed_pool_returns_uniswap_v4_pool_type(self):
         """build_managed_pool() return annotation is UniswapV4Pool."""
@@ -57,11 +60,11 @@ class TestBuildManagedPoolSignature:
             assert return_annotation is UniswapV4Pool
 
     def test_build_pool_still_exists(self):
-        """Bot.build_pool() still exists (not removed in Slice 1)."""
+        """Bot.build_pool() still exists."""
         assert hasattr(Bot, "build_pool")
 
     def test_build_pool_no_longer_accepts_pool_id(self):
-        """build_pool() no longer accepts pool_id kwarg after Slice 3."""
+        """build_pool() does not accept a pool_id kwarg."""
         sig = inspect.signature(Bot.build_pool)
         param_names = set(sig.parameters.keys())
         assert "pool_id" not in param_names
@@ -72,3 +75,10 @@ class TestBuildManagedPoolSignature:
         param_names = set(sig.parameters.keys())
         assert "deployer_address" not in param_names
         assert "init_hash" not in param_names
+
+    def test_build_pool_no_longer_accepts_tick_map_kwargs(self):
+        """build_pool() no longer accepts tick_bitmap/tick_data kwargs (retired with the V3 builder)."""
+        sig = inspect.signature(Bot.build_pool)
+        param_names = set(sig.parameters.keys())
+        assert "tick_bitmap" not in param_names
+        assert "tick_data" not in param_names

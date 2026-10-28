@@ -7,16 +7,32 @@ from typing import TYPE_CHECKING
 from apexbot.types.address_comparable import AddressComparable
 
 if TYPE_CHECKING:
-    from apexbot._ffi import ChecksummedAddress
+    from apexbot.types.chain import ChecksummedAddress
 
 
 class AbstractErc20Token(AddressComparable):
     """AbstractErc20Token class."""
 
     address: ChecksummedAddress
-    symbol: str
-    name: str
-    decimals: int
+
+    # Token metadata is read-only: concrete tokens (``Erc20Token``) surface it
+    # from Rust-owned state, so the abstract contract is property-shaped. A
+    # writable annotation here would make every concrete read-only property an
+    # invalid override.
+    @property
+    def symbol(self) -> str:
+        """Token symbol."""
+        raise NotImplementedError
+
+    @property
+    def name(self) -> str:
+        """Token name."""
+        raise NotImplementedError
+
+    @property
+    def decimals(self) -> int:
+        """Token decimals."""
+        raise NotImplementedError
 
     def __str__(self) -> str:
         """Return a string representation.

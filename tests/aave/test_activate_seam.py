@@ -1,4 +1,4 @@
-"""Rust-path market-activation tests (MPI6Q3).
+"""Rust-path market-activation tests.
 
 Exercises the PyO3 seam `apexbot._ffi.activate_aave_market` /
 `deactivate_aave_market` against the mock JSON-RPC harness — verifies the
@@ -11,23 +11,22 @@ mock server).
 
 from __future__ import annotations
 
-import tempfile
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session
-
 from apexbot._ffi.aave import activate_aave_market, deactivate_aave_market
+from apexbot.crypto import function_selector
 from apexbot.db import db_upgrade_database
 from tests.aave.writer_parity.harness import mock_rpc_server
+from tests.helpers.database import sqlite_connection
 
-# The 4-byte selectors the activation path RPCs (keccak256 of the canonical
-# signatures, first 4 bytes).
-GET_MARKET_ID_SELECTOR = "0x568ef470"
-NAME_SELECTOR = "0x06fdde03"
-SYMBOL_SELECTOR = "0x95d89b41"
-DECIMALS_SELECTOR = "0x313ce567"
+# The 4-byte selectors the activation path RPCs, derived from the canonical
+# signatures so a transposed digit cannot survive review.
+GET_MARKET_ID_SELECTOR = "0x" + function_selector("getMarketId()").hex()
+NAME_SELECTOR = "0x" + function_selector("name()").hex()
+SYMBOL_SELECTOR = "0x" + function_selector("symbol()").hex()
+DECIMALS_SELECTOR = "0x" + function_selector("decimals()").hex()
 
 # Canonical Aave V3 Ethereum mainnet addresses (check the real deployments
 # module).
@@ -59,35 +58,32 @@ def _activate_responses(market_name: str = "Aave Ethereum Market") -> dict[str, 
     }
 
 
-def _fresh_db() -> Path:
-    tmp = Path(tempfile.mkdtemp(prefix="activate-"))
-    db_path = tmp / "act.db"
+def _fresh_db(tmp_path: Path) -> Path:
+    db_path = tmp_path / "act.db"
     db_upgrade_database(str(db_path))
     return db_path
 
 
 def _dump_market(db_path: Path) -> dict[str, Any]:
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        row = session.execute(
-            text("SELECT id, chain_id, name, active, last_update_block FROM aave_v3_markets")
-        ).one()
-        out = dict(row._mapping)
-    engine.dispose()
-    return out
+    with sqlite_connection(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT id, chain_id, name, active, last_update_block FROM aave_v3_markets"
+        ).fetchone()
+        assert row is not None
+        return dict(row)
 
 
 def _count_rows(db_path: Path, table_and_where: str) -> int:
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        n = session.execute(text(f"SELECT COUNT(*) FROM {table_and_where}")).scalar()
-    engine.dispose()
-    return int(n)
+    with sqlite_connection(db_path) as connection:
+        row = connection.execute(f"SELECT COUNT(*) FROM {table_and_where}").fetchone()
+        assert row is not None
+        return int(row[0])
 
 
-def test_activate_seeds_market_contract_gho_token() -> None:
+def test_activate_seeds_market_contract_gho_token(tmp_path: Path) -> None:
     """activate_aave_market seeds all 4 row types in one transaction."""
-    db_path = _fresh_db()
+    db_path = _fresh_db(tmp_path)
     responses = _activate_responses()
     with mock_rpc_server(logs=[], block_number=100, eth_call_responses=responses) as rpc_url:
         result = activate_aave_market(
@@ -121,15 +117,13 @@ def test_activate_seeds_market_contract_gho_token() -> None:
     )
 
     # GHO erc20 row with metadata.
-    engine = create_engine(f"sqlite:///{db_path}")
-    with Session(engine) as session:
-        sym, dec = session.execute(
-            text(
-                "SELECT symbol, decimals FROM erc20_tokens "
-                f"WHERE chain = 1 AND address = '{GHO_TOKEN_ADDRESS}'"
-            )
-        ).one()
-    engine.dispose()
+    with sqlite_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT symbol, decimals FROM erc20_tokens "
+            f"WHERE chain = 1 AND address = '{GHO_TOKEN_ADDRESS}'"
+        ).fetchone()
+        assert row is not None
+        sym, dec = row
     assert sym == "GHO", sym
     assert dec == 18, dec
 
@@ -144,9 +138,9 @@ def test_activate_seeds_market_contract_gho_token() -> None:
     )
 
 
-def test_activate_reactivation_is_idempotent() -> None:
+def test_activate_reactivation_is_idempotent(tmp_path: Path) -> None:
     """Re-activating an existing market flips active=true + inserts no dup rows."""
-    db_path = _fresh_db()
+    db_path = _fresh_db(tmp_path)
     responses = _activate_responses()
     with mock_rpc_server(logs=[], block_number=100, eth_call_responses=responses) as rpc_url:
         first = activate_aave_market(
@@ -196,9 +190,9 @@ def test_activate_reactivation_is_idempotent() -> None:
     )
 
 
-def test_deactivate_sets_active_false() -> None:
+def test_deactivate_sets_active_false(tmp_path: Path) -> None:
     """deactivate_aave_market flips active to 0."""
-    db_path = _fresh_db()
+    db_path = _fresh_db(tmp_path)
     responses = _activate_responses()
     with mock_rpc_server(logs=[], block_number=100, eth_call_responses=responses) as rpc_url:
         result = activate_aave_market(

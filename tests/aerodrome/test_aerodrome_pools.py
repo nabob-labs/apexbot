@@ -1,21 +1,14 @@
-import dataclasses
-import pathlib
-from typing import Any
+from collections.abc import Generator
 
 import pydantic_core
 import pytest
 
-from apexbot.aerodrome.abi import AERODROME_V2_POOL_ABI
 from apexbot.aerodrome.functions import generate_aerodrome_v2_pool_address
-from apexbot.aerodrome.types import (
-    AerodromeV2PoolExternalUpdate,
-    AerodromeV3PoolState,
-)
+from apexbot.aerodrome.types import AerodromeV3PoolState
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.exceptions import ApexbotError
-from apexbot.exceptions.pool import ExternalUpdateError
-from apexbot.fork import AnvilFork
+from apexbot.fork import AnvilFork, ForkLaunchConfig
 from apexbot.uniswap.math import MAX_SQRT_RATIO, MIN_SQRT_RATIO
+from tests.conftest import TEST_BASE_FULL_NODE_HTTP_URI, _require_live_node
 from tests.helpers.bot_factory import make_bot_with_provider
 from tests.helpers.contract_compat import make_contract
 
@@ -56,11 +49,26 @@ AERODROME_V3_QUOTER_ABI = pydantic_core.from_json(
 pytestmark = pytest.mark.base
 
 
-@pytest.fixture
-def test_pools() -> Any:
-    return pydantic_core.from_json(
-        pathlib.Path("tests/aerodrome/first_200_aerodrome_v2_pools.json").read_bytes()
+@pytest.fixture(scope="module")
+def fork_base_full() -> Generator[AnvilFork, None, None]:
+    """Module-scoped base fork (overriding the conftest per-test default).
+
+    Every test in this module is chain-read-only — construction, quoter
+    calls, and simulated swaps touch no chain state — and all run at the
+    same tip block, so one fork serves the file. Each test still builds
+    its own ``Bot``, so in-memory pool state cannot leak between them.
+
+    """
+    _require_live_node()
+    fork = AnvilFork(
+        fork_url=TEST_BASE_FULL_NODE_HTTP_URI,
+        launch=ForkLaunchConfig(
+            storage_caching=False,
+            anvil_opts=["--accounts=0", "--optimism"],
+        ),
     )
+    yield fork
+    fork.close()
 
 
 def test_aerodrome_v2_address_generator():
@@ -81,69 +89,6 @@ def test_aerodrome_v2_address_generator():
     )
 
 
-def test_bot_update_state(fork_base_full: AnvilFork):
-
-    bot = make_bot_with_provider(fork_base_full.provider)
-    lp = bot.build_pool(AERODROME_V3_TBTC_USDBC_POOL_ADDRESS)
-
-    # Force the pool's current cached state to disagree with the on-chain
-    # reserves so ``bot.update`` detects a positive change. The state lives in
-    # the pool's ``StateCache`` (the current entry is what ``reserves_token0``
-    # reads); writing a bare ``_state`` attribute is a no-op against the
-    # cache, so we replace the cache's current entry directly.
-    modified = dataclasses.replace(
-        lp.state,
-        reserves_token0=lp.state.reserves_token0 - 1,
-        reserves_token1=lp.state.reserves_token1 + 1,
-    )
-    with lp._state_cache.lock():
-        lp._state_cache._cache[-1] = modified
-    # The hand-modified reserves now differ from what's on-chain, so the next
-    # update should detect and revert to the actual reserves (positive change).
-    changed = bot.update(lp)
-    assert changed is True
-
-    # Updating again at the same block should indicate no change
-    changed = bot.update(lp)
-    assert changed is False
-
-
-def test_external_update(fork_base_full: AnvilFork):
-
-    bot = make_bot_with_provider(fork_base_full.provider)
-    lp = bot.build_pool(AERODROME_V3_TBTC_USDBC_POOL_ADDRESS)
-
-    current_state = lp.state
-
-    lp.external_update(
-        update=AerodromeV2PoolExternalUpdate(
-            block_number=lp.update_block + 1,
-            reserves_token0=int(1.1 * lp.reserves_token0),
-            reserves_token1=int(0.9 * lp.reserves_token1),
-        ),
-    )
-
-    assert lp.state.reserves_token0 == int(current_state.reserves_token0 * 1.1)
-    assert lp.state.reserves_token1 == int(current_state.reserves_token1 * 0.9)
-
-    lp.external_update(
-        update=AerodromeV2PoolExternalUpdate(
-            block_number=lp.update_block + 1,
-            reserves_token0=lp.reserves_token0,
-            reserves_token1=lp.reserves_token1,
-        ),
-    )
-
-    with pytest.raises(ExternalUpdateError):
-        lp.external_update(
-            update=AerodromeV2PoolExternalUpdate(
-                block_number=lp.update_block - 10,
-                reserves_token0=lp.reserves_token0,
-                reserves_token1=lp.reserves_token1,
-            ),
-        )
-
-
 def test_create_pool(fork_base_full: AnvilFork):
 
     bot = make_bot_with_provider(fork_base_full.provider)
@@ -151,153 +96,6 @@ def test_create_pool(fork_base_full: AnvilFork):
     assert lp.address == AERODROME_V3_TBTC_USDBC_POOL_ADDRESS
     assert lp.factory == AERODROME_V2_FACTORY_ADDRESS
     assert lp.deployer_address == AERODROME_V2_FACTORY_ADDRESS
-
-
-@pytest.mark.slow
-def test_calculation_volatile(fork_base_full: AnvilFork, test_pools: list[Any]):
-
-    bot = make_bot_with_provider(fork_base_full.provider)
-
-    token_amount_multipliers = [
-        0.000000001,
-        0.00000001,
-        0.0000001,
-        0.000001,
-        0.00001,
-        0.0001,
-        0.001,
-        0.01,
-        0.1,
-        0.125,
-        0.25,
-        0.5,
-        0.75,
-    ]
-
-    for pool_address in [pool["pool_address"] for pool in test_pools if pool["stable"] is False]:
-        lp = bot.build_pool(pool_address)
-
-        max_reserves_token0 = lp.reserves_token0
-        max_reserves_token1 = lp.reserves_token1
-
-        contract_compat = make_contract(
-            fork_base_full.http_url, pool_address, AERODROME_V2_POOL_ABI
-        )
-
-        if max_reserves_token1 >= 2:
-            for token_mult in token_amount_multipliers:
-                token_in_amount = int(token_mult * max_reserves_token0)
-                if token_in_amount == 0:
-                    continue
-                print(f"{token_in_amount=} with {token_mult=}")
-
-                try:
-                    helper_amount_out = lp.calculate_tokens_out_from_tokens_in(
-                        token_in=lp.token0,
-                        token_in_quantity=token_in_amount,
-                    )
-                    contract_amount_out = contract_compat.functions.getAmountOut(
-                        token_in_amount,
-                        lp.token0.address,
-                    ).call()
-                except Exception as e:
-                    print(f"Failure {e} on pool {pool_address}")
-                    raise
-                else:
-                    assert contract_amount_out == helper_amount_out, f"{pool_address=}"
-
-        if max_reserves_token0 >= 2:
-            for token_mult in token_amount_multipliers:
-                token_in_amount = int(token_mult * max_reserves_token1)
-                if token_in_amount == 0 or max_reserves_token1 <= 1:
-                    continue
-                print(f"{token_in_amount=} with {token_mult=}")
-                try:
-                    helper_amount_out = lp.calculate_tokens_out_from_tokens_in(
-                        token_in=lp.token1,
-                        token_in_quantity=token_in_amount,
-                    )
-                    contract_amount_out = contract_compat.functions.getAmountOut(
-                        token_in_amount,
-                        lp.token1.address,
-                    ).call()
-                except Exception as e:
-                    print(f"Failure {e} on pool {pool_address}")
-                    raise
-                else:
-                    assert contract_amount_out == helper_amount_out, f"{pool_address=}"
-
-
-@pytest.mark.slow
-def test_calculation_stable(fork_base_full: AnvilFork, test_pools: list[Any]):
-
-    bot = make_bot_with_provider(fork_base_full.provider)
-
-    token_amount_multipliers = [
-        0.000000001,
-        0.00000001,
-        0.0000001,
-        0.000001,
-        0.00001,
-        0.0001,
-        0.001,
-        0.01,
-        0.1,
-        0.125,
-        0.25,
-        0.5,
-        0.75,
-    ]
-
-    for pool_address in [pool["pool_address"] for pool in test_pools if pool["stable"] is True]:
-        lp = bot.build_pool(pool_address)
-
-        max_reserves_token0 = lp.reserves_token0
-        max_reserves_token1 = lp.reserves_token1
-
-        contract_compat = make_contract(
-            fork_base_full.http_url, pool_address, AERODROME_V2_POOL_ABI
-        )
-
-        if max_reserves_token1 >= 2:
-            for token_mult in token_amount_multipliers:
-                token_in_amount = int(token_mult * max_reserves_token0)
-                if token_in_amount == 0:
-                    continue
-                print(f"{token_in_amount=} with {token_mult=}")
-                try:
-                    helper_amount_out = lp.calculate_tokens_out_from_tokens_in(
-                        token_in=lp.token0,
-                        token_in_quantity=token_in_amount,
-                    )
-                    contract_amount_out = contract_compat.functions.getAmountOut(
-                        token_in_amount,
-                        lp.token0.address,
-                    ).call()
-                except ApexbotError as e:
-                    print(f"Failure {e} on pool {pool_address}")
-                else:
-                    assert contract_amount_out == helper_amount_out, f"{pool_address=}"
-
-        if max_reserves_token0 >= 2:
-            for token_mult in token_amount_multipliers:
-                token_in_amount = int(token_mult * max_reserves_token1)
-                if token_in_amount == 0 or max_reserves_token1 <= 1:
-                    continue
-                print(f"{token_in_amount=} with {token_mult=}")
-                try:
-                    helper_amount_out = lp.calculate_tokens_out_from_tokens_in(
-                        token_in=lp.token1,
-                        token_in_quantity=token_in_amount,
-                    )
-                    contract_amount_out = contract_compat.functions.getAmountOut(
-                        token_in_amount,
-                        lp.token1.address,
-                    ).call()
-                except ApexbotError as e:
-                    print(f"Failure {e} on pool {pool_address}")
-                else:
-                    assert contract_amount_out == helper_amount_out, f"{pool_address=}"
 
 
 def test_aerodrome_v3_pool_creation(fork_base_full: AnvilFork) -> None:

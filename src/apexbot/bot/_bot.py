@@ -7,23 +7,26 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 from apexbot._ffi import Bot as _Engine
 from apexbot._ffi import BotIo
-from apexbot.aerodrome.pools import AerodromeV2Pool
-from apexbot.balancer.deployments import BALANCER_V2_VAULT_ADDRESS, BROKEN_BALANCER_V2_POOLS
-from apexbot.balancer.pools import BalancerV2Pool
-from apexbot.balancer.stable_pools import BalancerV2StablePool
+
+# Import-order anchor: the aerodrome package must initialize before the
+# builders below pull in `apexbot.uniswap`; the facade does not name the
+# class directly.
+from apexbot.aerodrome.pools import AerodromeV2Pool  # ruff:ignore[unused-import]
+from apexbot.balancer.deployments import BALANCER_V2_VAULT_ADDRESS
+from apexbot.bot import driver_boot as _driver_boot
 from apexbot.bot_lifecycle import close as _close_handles
 from apexbot.bot_lifecycle import (
     release_python_state as _release_python_state,
 )
-from apexbot.builders.balancer_builder import BalancerBuilder
+from apexbot.builders.construction import PoolConstructionRequest, request_for
 from apexbot.builders.context import BuilderContext
 from apexbot.builders.curve_pool_builder import CurvePoolBuilder
 from apexbot.builders.erc20_builder import Erc20Builder
-from apexbot.builders.request import BuildManagedPoolRequest, BuildPoolRequest, BuildRequest
-from apexbot.builders.tick_data_fetcher import (
-    FetchedTickData,
-    TickDataTypes,
-    make_tick_data_fetcher,
+from apexbot.builders.request import (
+    BuildManagedPoolRequest,
+    BuildPoolRequest,
+    BuildRequest,
+    ConstructionRoute,
 )
 from apexbot.builders.type_resolution import (
     pool_class_for_descriptor,
@@ -32,28 +35,30 @@ from apexbot.builders.type_resolution import (
     resolve_pool_type as _resolve_pool_type_impl,
 )
 from apexbot.checksum_cache import get_checksum_address
-from apexbot.config import ApexbotConfig, _init_config
+from apexbot.config import resolve_chain_id, resolve_database_path
 from apexbot.curve.curve_stableswap_liquidity_pool import CurveStableswapPool
-from apexbot.database.operations import get_scoped_sqlite_session
-from apexbot.database.session_manager import DatabaseSessionManager
+from apexbot.curve.deployments import CURVE_V1_FACTORY_ADDRESS, CURVE_V1_REGISTRY_ADDRESS
+from apexbot.discovery import PoolRef
+from apexbot.discovery import pools_for_tokens as _pools_for_tokens
 from apexbot.exceptions.base import ApexbotValueError
-from apexbot.exceptions.pool import BrokenPool, TrackerAlreadyInitialized
 from apexbot.logging import logger
-from apexbot.pancakeswap.pools import PancakeswapV3Pool
 from apexbot.provider import (
     AlloyProvider,  # ruff:ignore[typing-only-first-party-import]
     AsyncAlloyProvider,  # ruff:ignore[typing-only-first-party-import]
 )
 from apexbot.provider.factory import get_provider_from_config
 from apexbot.registry import ManagedPoolRegistry, PoolRegistry, TokenRegistry
-from apexbot.uniswap.concentrated.types import BitmapAtWord, LiquidityAtTick
-from apexbot.uniswap.v2_liquidity_pool import UniswapV2Pool
-from apexbot.uniswap.v2_types import UniswapV2PoolExternalUpdate
-from apexbot.uniswap.v3_liquidity_pool import UniswapV3Pool
-from apexbot.uniswap.v3_types import UniswapV3PoolExternalUpdate
-from apexbot.uniswap.v4_liquidity_pool import ProtocolFee, UniswapV4Pool
-from apexbot.uniswap.v4_types import UniswapV4PoolExternalUpdate
+from apexbot.types.pool_type import (
+    PoolFamily,
+    PoolTypeDescriptor,
+    PoolVariant,
+    classify_pool_variant,
+    derive_kind,
+)
+from apexbot.uniswap.v4_liquidity_pool import UniswapV4Pool
 from apexbot.utils.bytes import to_0x_hex, to_bytes
+
+from ._account_queries import AccountQueryMixin
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -61,235 +66,216 @@ if TYPE_CHECKING:
     from apexbot._ffi import BlockStream, IntakeReceipt
     from apexbot.builders.protocol import PoolBuilder
     from apexbot.erc20.erc20 import Erc20Token
+    from apexbot.pathfinding import PoolKind
     from apexbot.types.abstract.liquidity_pool import AbstractLiquidityPool
-    from apexbot.types.abstract.pool_tracker import AbstractPoolTracker
     from apexbot.types.chain import ChecksummedAddress
     from apexbot.types.rpc_types import BlockIdentifier
 
 from apexbot.types.aliases import ChainId  # ruff:ignore[typing-only-first-party-import]
 
-
-def _update_pool(
-    pool: AbstractLiquidityPool,
-    *,
-    block_number: BlockIdentifier | None,
-    io: BotIo,
-) -> bool:
-    """Fetch the current chain state and push an update to a V2/V3/V4 pool.
-
-    T4 / 4GQWZ4 (builder-deletion blocker): the per-family refresh that
-    previously lived on the `V2PoolBuilder` / `V3PoolBuilder` /
-    `V4PoolBuilder` `update()` methods now lives in this single dispatcher in
-    the `Bot` delegating shell — all I/O flows through the `BotIo` Rust seam
-    (`fetch_v2_reserves` / `fetch_v3_slot0_liquidity` /
-    `fetch_v4_slot0_liquidity`), matching the archival behavior. The builders'
-    `update()` therefore become orphaned and can be retired with the builders.
-
-    Returns:
-        ``True`` if the state changed (an ``external_update`` was applied),
-        ``False`` if the on-chain state matches the pool's current state.
-
-    Raises:
-        TypeError: If ``pool`` is not a V2/V3/V4 pool (callers dispatch only
-            those families here; Aerodrome/Curve/Balancer refresh permanently
-            through their Python builders' `update()` — SSSXG6 delegated the
-            build path only).
-
-    """
-    if not isinstance(pool, (UniswapV2Pool, UniswapV3Pool, UniswapV4Pool)):
-        msg = f"_update_pool cannot update {type(pool).__name__}"
-        raise TypeError(msg)
-    block_number_ = block_number if block_number is not None else io.get_block_number()
-    block_number_ = int(block_number_) if not isinstance(block_number_, int) else block_number_
-
-    if isinstance(pool, UniswapV2Pool):
-        reserves0, reserves1 = io.fetch_v2_reserves(pool.address, block=block_number_)
-        if pool.reserves_token0 == reserves0 and pool.reserves_token1 == reserves1:
-            return False
-        pool.external_update(
-            UniswapV2PoolExternalUpdate(
-                block_number=block_number_,
-                reserves_token0=reserves0,
-                reserves_token1=reserves1,
-            )
-        )
-        return True
-
-    if isinstance(pool, UniswapV4Pool):
-        sqrt_price_x96, tick_raw, _protocol_fee_raw, _lp_fee, liquidity = (
-            io.fetch_v4_slot0_liquidity(
-                pool._state_view_address,  # ruff:ignore[private-member-access]
-                pool.pool_id,
-                block=block_number_,
-            )
-        )
-        tick = int(tick_raw)
-        if (
-            pool.sqrt_price_x96 == int(sqrt_price_x96)
-            and pool.liquidity == liquidity
-            and pool.tick == tick
-        ):
-            return False
-        pool.external_update(
-            UniswapV4PoolExternalUpdate(
-                block_number=block_number_,
-                sqrt_price_x96=int(sqrt_price_x96),
-                tick=tick,
-                liquidity=liquidity,
-            )
-        )
-        return True
-
-    # V3 (last family).
-    sqrt_price_x96, tick, liquidity = io.fetch_v3_slot0_liquidity(
-        pool.address,
-        block=block_number_,
-    )
-    if pool.sqrt_price_x96 == sqrt_price_x96 and pool.liquidity == liquidity and pool.tick == tick:
-        return False
-    pool.external_update(
-        UniswapV3PoolExternalUpdate(
-            block_number=block_number_,
-            sqrt_price_x96=sqrt_price_x96,
-            tick=tick,
-            liquidity=liquidity,
-        )
-    )
-    return True
+# The Curve registry/factory addresses the Curve construction arm's LP-token +
+# metapool lookups consult — the driver-supplied deployment list (like the V3
+# route's factory rungs), never a core-side constant.
+_CURVE_REGISTRIES = (CURVE_V1_REGISTRY_ADDRESS, CURVE_V1_FACTORY_ADDRESS)
 
 
-class Bot:
+class Bot(AccountQueryMixin):
     """Explicit session object that owns the runtime state for a apexbot run.
 
-    Replaces the four module-level singletons (`config`, `db_session`,
-    `connection_manager`, `pool_registry`/`token_registry`/`managed_pool_registry`)
-    with per-session instances owned by this class.
+    Owns the per-session configuration, Rust database path, provider,
+    registries, and engine handles instead of exposing module-level
+    singletons.
 
     Bot is:
     - **Factory** — creates pools/tokens via managers, doing all I/O to fetch data
     - **Registry** — tracks what it's created
     - **I/O boundary** — all RPC calls and database access flow through Bot
     - **Session** — the lifetime scope for the entire run
+    - **Account queries** — ERC-20/native balance, approval, and supply reads,
+      inherited from `AccountQueryMixin` so this class body stays under the
+      public-method complexity bar; the facade surface is unchanged
     """
 
-    def __init__(
+    def __init__(  # ruff:ignore[too-many-arguments]
         self,
-        config: ApexbotConfig,
         *,
+        chain_id: int | None = None,
+        node: str | None = None,
+        database: str | None = None,
         provider: AlloyProvider | None = None,
+        py_bot: _Engine | None = None,
+        io: BotIo | None = None,
+        erc20_builder: Erc20Builder | None = None,
+        provider_factory: Callable[..., Any] | None = None,
     ) -> None:
         """Initialize the single-chain Bot session.
 
-        One Bot per chain (ADR-006 D5). The chain identity comes from
-        ``config.default_chain_id`` — a ``Bot`` refuses to construct without
-        it. Two construction modes:
+        One Bot per chain (ADR-006 D5). The three keyword overrides are the
+        explicit layer of the installed typed config's cascade; with none
+        supplied, the chain id, the endpoint, and the database path all resolve
+        through ``apexbot-config``'s four layers and report the layer that won.
+
+        Two construction modes:
 
         - ``provider`` given (injection seam — for fork tests or a caller-built
-          Web3/Alloy backend): enforce `provider.chain_id` ==
-          ``config.default_chain_id`` (fail-fast), use it directly.
-        - ``provider`` omitted: build one from ``config.rpc[default_chain_id]``
-          via :func:`get_provider_from_config`, which itself enforces the match.
+          Web3/Alloy backend): enforce `provider.chain_id` == the resolved chain
+          (fail-fast), use it directly.
+        - ``provider`` omitted: build one through :func:`get_provider_from_config`
+          with the resolved chain and the ``node`` override; the factory hands
+          the chain to the core, which enforces the match itself.
+
+        ``py_bot``/``io``/``erc20_builder`` are DI constructor seams:
+        tests inject doubles at construction instead of patching module
+        privates or assigning ``bot._*`` attributes; omitted kwargs keep
+        the production bindings. An injected object skips the
+        construction-time wiring that belongs to the default instance
+        (engine DB snapshot load + ``ConstructionIo`` attach; ``BotIo``
+        ``ConstructionIo`` attach) — the injector owns that wiring.
+
+        Args:
+            chain_id: The explicit session chain override.
+            node: The explicit endpoint override, classified by its own value.
+            database: The explicit database-path override.
+            provider: An already-built provider to bind instead of resolving one.
+            py_bot: An injected Rust engine handle.
+            io: An injected ``BotIo`` handle.
+            erc20_builder: An injected ERC-20 builder.
+            provider_factory: The factory called as
+                ``provider_factory(chain_id=..., node=...)`` when ``provider``
+                is omitted (tests inject a recording factory to observe the
+                override keywords); the default is
+                :func:`~apexbot.provider.factory.get_provider_from_config`.
+
+        The chain and database refusals (no layer names one) come from the
+        cascade's :func:`resolve_chain_id` / :func:`resolve_database_path` as a
+        :class:`ValueError`, each naming what to declare, export, or pass.
 
         Raises:
-            ApexbotValueError: If ``config.default_chain_id`` is ``None``, or
-                an injected provider's ``chain_id`` mismatches the configured
-                chain.
+            ApexbotValueError: If an injected provider serves another chain
+                than the resolved one, or provider boot fails — typed on the
+                build-refusal taxonomy and immediate (a host that does not
+                resolve is not retried).
 
         """
-        self.config = config
+        # A driver session is constructing its engine: bind the shared
+        # runtime + telemetry stack now (idempotent), not at import time.
+        _driver_boot()
 
-        if config.default_chain_id is None:
-            msg = (
-                "Bot requires a default_chain_id in the config. Set "
-                "`default_chain_id` in your config file or pass a config with it set."
-            )
-            raise ApexbotValueError(message=msg)
-        self._chain_id: ChainId = config.default_chain_id
+        self._chain_id: ChainId = resolve_chain_id(chain_id)
+        self.database_path = Path(resolve_database_path(database))
 
         if provider is not None:
-            # Explicit injection — enforce chain_id == config.default_chain_id.
+            # Explicit injection — enforce chain_id == the resolved session chain.
             self._enforce_provider_chain(provider, self._chain_id)
             self._provider = provider
         else:
-            # Build from config — the factory enforces the chain match itself.
-            self._provider = get_provider_from_config(chain_id=self._chain_id, config=config)
+            # Resolved from the cascade — the factory hands the chain to the core,
+            # which enforces the match itself.
+            try:
+                self._provider = (provider_factory or get_provider_from_config)(
+                    chain_id=self._chain_id, node=node
+                )
+            except ApexbotValueError:
+                raise
+            except Exception as exc:
+                msg = (
+                    f"Bot: cannot build a provider for chain {self._chain_id} "
+                    f"(node={node!r}): {exc}"
+                )
+                raise ApexbotValueError(message=msg) from exc
 
         # Polars-inspired three-layer architecture (ADR-005): a the Rust ``Bot`` engine
         # PyO3 wrapper owns the Rust ``Bot`` state behind an ``RwLock``.
         # Multiple Python handles (this session, plus any ``Pool``/``Token``
         # handles it vends) share the same Rust-owned ``Bot`` thread-safely.
         #
-        # ADR-006 slice 8b: the facade is single-chain, so the configured
-        # ``default_chain_id`` is wired into the Rust ``Bot`` here (D4).
-        self._py_bot = _Engine(self._chain_id)
+        # The facade is single-chain, so the configured ``default_chain_id`` is
+        # wired into the Rust ``Bot`` here (D4).
+        if py_bot is None:
+            self._py_bot = _Engine(self._chain_id)
 
-        # JUCFCB (epic P73ER6): eagerly load the V3+V4 DB snapshot into the
-        # core ``BotState`` at construction time (Shape 2). This makes the DB
-        # a construction-time property of the Bot — correct use is structural:
-        # the Bot is born with its snapshot or born cold-start, nothing in
-        # between. The core ``Bot::load_snapshot_from_db`` streams V3+V4 into
-        # the core ``SnapshotStore`` + records ``S = min(newest_update_block)``.
-        # ``None``/cold-start (no pools) is NOT an error. The file/memory
-        # snapshot path stays non-DB-only (loaded at ``engine_registry.start``
-        # via ``load_*_from_py``).
-        if config.database.path is not None:
-            db_path = config.database.path
-            # The DB file may not exist yet (SQLAlchemy creates it lazily on
-            # the first write). A missing file is a cold-start: no snapshot
-            # pools to load, `S = None`. The store stays empty; pool
-            # registration falls back to sparse. The file will be created by
-            # the first write, at which point a `Bot` restart will load it.
-            if Path(db_path).exists():
-                self._py_bot.load_snapshot_from_db(str(db_path), self._chain_id)
+            # Eagerly load the V3+V4 DB snapshot into the
+            # core ``BotState`` at construction time (Shape 2). This makes the DB
+            # a construction-time property of the Bot — correct use is structural:
+            # the Bot is born with its snapshot or born cold-start, nothing in
+            # between. The core ``Bot::load_snapshot_from_db`` streams V3+V4 into
+            # the core ``SnapshotStore`` + records ``S = min(newest_update_block)``.
+            # ``None``/cold-start (no pools) is NOT an error. The DB snapshot is
+            # the sole S source on both real paths: the injected
+            # ``load_*_from_py`` seam is retired (P2b), so no separate
+            # file/memory snapshot path remains to load.
+            # The DB file may not exist yet (the Rust database owner creates it on first
+            # write). A missing file is a cold-start: no snapshot pools to load,
+            # `S = None`. The store stays empty; pool registration falls back to
+            # sparse. The file will be created by the first write, at which point a
+            # `Bot` restart will load it.
+            if Path(self.database_path).exists():
+                self._py_bot.load_snapshot_from_db(str(self.database_path), self._chain_id)
             else:
                 logger.debug(
                     "DB file %s does not exist; cold-start (no snapshot loaded).",
-                    db_path,
+                    self.database_path,
                 )
+        else:
+            # Injection seam (see __init__ docstring): the injector owns
+            # this engine's construction-time wiring (DB snapshot load +
+            # ``ConstructionIo`` attach), which runs for the default
+            # engine only.
+            self._py_bot = py_bot
 
-        self.db = DatabaseSessionManager(
-            get_scoped_sqlite_session(database_path=config.database.path),
-        )
-        # Architecture review 2025-07-18 / candidate 1: attach the core
-        # `ConstructionIo` handle to the `Bot` engine (built from the extracted
-        # `AlloyProvider` + an optional held `ApexbotDb`). The 7 generic RPC
-        # + 12 DB atomic methods on `BotIo` delegate through this; the 27
-        # choreography wrappers stay on `BotIo` for now (deleted with the
-        # builder-choreography port). Alloy-only — a non-alloy provider raises
-        # `RuntimeError`.
-        self._py_bot.attach_construction_io(
-            provider=self._provider,
-            database_path=str(config.database.path) if config.database.path else None,
-        )
-        # The single I/O seam for this Bot (architecture review candidate #2):
-        # built once here and reused by every build/update/balance method instead
-        # of reconstructing BotIo per call. Swapping the I/O seam (fork tests,
-        # a different executor) changes one site, not eight.
-        self._io = BotIo(
-            provider=self._provider,
-            db=self.db,
-            database_path=str(config.database.path),
-        )
-        # Wire the `ConstructionIo` handle attached above onto `BotIo` so its
-        # 12 DB + 7 generic RPC methods delegate through the core trait objects.
-        self._io.attach_construction_io(self._py_bot)
-        self.pools = PoolRegistry(py_bot=self._py_bot)
-        self.tokens = TokenRegistry()
-        self.managed_pools = ManagedPoolRegistry()
-        self._trackers: dict[str, AbstractPoolTracker[Any]] = {}
+        if py_bot is None:
+            # Architecture review 2025-07-18 / candidate 1: attach the core
+            # `ConstructionIo` handle to the `Bot` engine (built from the extracted
+            # `AlloyProvider` + an optional held `ApexbotDb`). The 7 generic RPC
+            # + 12 DB atomic methods on `BotIo` delegate through this; the 27
+            # choreography wrappers stay on `BotIo` for now (deleted with the
+            # builder-choreography port). Alloy-only — a non-alloy provider raises
+            # `RuntimeError`.
+            self._py_bot.attach_construction_io(
+                provider=self._provider,
+                database_path=str(self.database_path),
+            )
+        if io is not None:
+            # Injection seam (see __init__ docstring): the injector owns
+            # this I/O seam's ``ConstructionIo`` attach, which runs for
+            # the default-constructed BotIo only.
+            self._io = io
+        else:
+            # The single I/O seam for this Bot (architecture review candidate #2):
+            # built once here and reused by every build/update/balance method instead
+            # of reconstructing BotIo per call. Swapping the I/O seam (fork tests,
+            # a different executor) changes one site, not eight.
+            self._io = BotIo(
+                provider=self._provider,
+                database_path=str(self.database_path),
+            )
+            # Wire the `ConstructionIo` handle attached above onto `BotIo` so its
+            # 12 DB + 7 generic RPC methods delegate through the core trait objects.
+            self._io.attach_construction_io(self._py_bot)
+        # Identity for the session's pools and tokens is the Rust session
+        # registry's; these three are the Python companion side of it. The V4
+        # companion store is constructed once and handed to `PoolRegistry` so
+        # `bot.managed_pools` and `bot.pools`'s V4 branch are one store — a V4
+        # pool registered through either is the same companion.
+        self.managed_pools = ManagedPoolRegistry(py_bot=self._py_bot)
+        self.pools = PoolRegistry(py_bot=self._py_bot, managed_pool_registry=self.managed_pools)
+        self.tokens = TokenRegistry(py_bot=self._py_bot)
         # Idempotency flag for close(); mirrored by bot_lifecycle.close.
         self._closed: bool = False
 
         # Builders own I/O orchestration; Bot hands them its I/O dependencies.
         # Erc20Builder is a leaf — constructed before BuilderContext.
-        self._erc20_builder = Erc20Builder(
-            default_chain_id=self._chain_id,
-            db=self.db,
-            tokens=self.tokens,
-            py_bot=self._py_bot,
+        self._erc20_builder = (
+            erc20_builder
+            if erc20_builder is not None
+            else Erc20Builder(
+                default_chain_id=self._chain_id,
+                tokens=self.tokens,
+                py_bot=self._py_bot,
+            )
         )
         ctx = BuilderContext(
-            db=self.db,
+            database_path=self.database_path,
             pools=self.pools,
             tokens=self.tokens,
             erc20_builder=self._erc20_builder,
@@ -297,20 +283,9 @@ class Bot:
             default_chain_id=self._chain_id,
         )
         self._curve_builder = CurvePoolBuilder(ctx)
-        self._balancer_builder = BalancerBuilder(ctx)
-
-        # Builder registry: concrete pool type → builder
-        # Used by update() for O(1) dict lookup instead of isinstance chain
-        self._builders: dict[type, PoolBuilder] = {}
 
         # Async adapter for subscriptions (single chain; created on demand)
         self._async_adapter: AsyncAlloyProvider | None = None
-        self.register_builder(CurveStableswapPool, self._curve_builder)
-        self.register_builder(BalancerV2Pool, self._balancer_builder)
-        self.register_builder(BalancerV2StablePool, self._balancer_builder)
-        # All V2-family DEXes (Uniswap/Sushi/Pancake/Swapbased/Camelot) now
-        # register the canonical ``UniswapV2Pool`` for their factories
-        # (ADR-005 slice 7 step 4b) — the single V2 builder handles them.
 
     def registration_fleet_hosted(self) -> bool:
         """Return the construction-time registration-intake stance (PRG-3/5).
@@ -335,7 +310,7 @@ class Bot:
         lifecycles + path registration) ride the fleet's duty-counted
         ``PoolStateUpdater`` seats through this seam (PRG-5).
 
-        FF-T1 (BPHR6F): on a host whose fleet boot was refused (detected
+        On a host whose fleet boot was refused (detected
         CPU budget below the pinned-role floor, or a boot invariant), this
         submit — and every submit after it — raises the typed, sticky
         ``BootRefused`` from the FFI seam: the library never aborts the host
@@ -377,64 +352,16 @@ class Bot:
     @property
     def provider(self) -> AlloyProvider:
         """The single RPC provider for this Bot's chain."""
-        return self._provider
-
-    @classmethod
-    def from_config_file(cls) -> Bot:
-        """From config file.
-
-        Builds a single-chain Bot from the config's ``default_chain_id``
-        (ADR-006 D5). The provider is constructed from ``config.rpc`` and its
-        ``eth_chainId`` is enforced to match.
-
-        Returns:
-            An instance wrapping the given config_file.
-
-        """
-        return cls(config=_init_config())
-
-    def add_tracker[M: AbstractPoolTracker[Any]](
-        self,
-        manager_cls: type[M],
-        *,
-        factory_address: str,
-        **kwargs: Any,
-    ) -> M:
-        """Create a pool manager within this bot's session.
-
-        Returns:
-            The computed value.
-
-        Raises:
-            TrackerAlreadyInitialized: See function documentation.
-
-        """
-        factory_address = get_checksum_address(factory_address)
-
-        key = factory_address
-        if key in self._trackers:
-            raise TrackerAlreadyInitialized(
-                message="A manager has already been initialized for this address. "
-                "Access it using the bot's manager registry.",
-            )
-
-        manager = manager_cls(
-            factory_address=factory_address,
-            chain_id=self.chain_id,
-            bot=self,
-            **kwargs,
-        )
-        self._trackers[key] = manager
-        return manager
+        return cast("AlloyProvider", self._provider)
 
     def block_stream(self) -> BlockStream:
         """Fresh async iterator over ``newHeads`` block notifications.
 
-        The settlement bot's authoritative block clock (epic 6W35AI): ticked
+        The settlement bot's authoritative block clock: ticked
         once per accepted header by the pump — NOT derived from
         ``ResultBatch.solve_block``, which lags by the send debounce.
 
-        ADR-027 completion (ergo 6VGMLY): the block-clock pipe is
+        ADR-027: the block-clock pipe is
         coordinator-owned, so this surfaces on the ``Bot`` (the
         pump-lifecycle handle) rather than on the arbitrage engine, which is
         out of the block path entirely. Once-only: a second call raises
@@ -449,18 +376,16 @@ class Bot:
         return self._py_bot.block_stream()
 
     def release_python_state(self) -> None:
-        """Drop Python-side pool/token/tracker caches once Rust owns canonical state.
+        """Drop Python-side pool/token caches once Rust owns canonical state.
 
         After the Rust engine has taken ownership of all pool state (snapshots
         streamed, pools registered, backfill complete), the Python-side
-        tracker caches, snapshots, and pool/token registries are redundant —
-        the hot loop only needs the engine and the async Alloy provider
-        handle. This drops them so they stop pinning pool objects in memory.
+        pool/token registries are redundant — the hot loop only needs the
+        engine and the async Alloy provider handle. This drops them so they
+        stop pinning pool objects in memory.
 
         Idempotent; safe to call once, at the end of the startup handshake
-        (after ``build_paths`` completes). Concrete trackers that carry a
-        snapshot (e.g. ``UniswapV3StateTB``) have ``unload_snapshot()``
-        called to release the snapshot reference.
+        (after ``build_paths`` completes).
         """
         _release_python_state(self)
 
@@ -468,12 +393,11 @@ class Bot:
         """Release all Python handles owned by this Bot session.
 
         End-of-life teardown that composes :meth:`release_python_state` and
-        adds the connection teardown the Bot was previously missing: the
-        provider connection is closed, the scoped DB session is removed,
-        and the the Rust ``Bot`` engine / provider references are dropped. Idempotent —
+        closes the provider connection and drops the Rust ``Bot`` engine /
+        provider references. Idempotent —
         safe to call directly and again from a ``with`` block's ``__exit__``.
 
-        The Rust the Rust ``Bot`` engine is reference-counted; closing this Python wrapper
+        The Rust ``Bot`` engine is reference-counted; closing this Python wrapper
         only drops *this* Bot's ref. A running engine that took its own ref
         (via ``EngineRegistry(bot=bot)`` → ``ArbitrageEngine(py_bot=...)``)
         is unaffected.
@@ -496,24 +420,6 @@ class Bot:
     def __exit__(self, *exc: object) -> None:
         """Exit the context manager; release all Python handles. Never suppresses."""
         self.close()
-
-    def register_builder(
-        self,
-        pool_class: type[AbstractLiquidityPool],
-        builder: PoolBuilder,
-    ) -> None:
-        """Register a builder for a concrete pool type.
-
-        After registration, ``update()`` will use ``type(pool)`` dict lookup
-        instead of isinstance chains to find the right builder.
-
-        Args:
-            pool_class: The concrete pool class (e.g. UniswapV2Pool, AerodromeV2Pool).
-            builder: The builder instance that handles construction and updates
-                for this pool type.
-
-        """
-        self._builders[pool_class] = builder
 
     def build_erc20token(
         self,
@@ -539,19 +445,51 @@ class Bot:
         """
         return self.build_erc20token(address)
 
-    def build_pool(
+    def resolve_pool_type(self, address: str) -> PoolTypeDescriptor:
+        """Resolve a pool's type without building it.
+
+        The same resolution ``build_pool()`` performs (DB kind, then the
+        factory's registry entry, then on-chain probing): ask "what would be
+        built?" before spending a build, and compare the preview against the
+        identity a built pool binds.
+
+        Returns:
+            The resolved pool type descriptor.
+
+        Raises:
+            ApexbotValueError: If the pool's type cannot be determined.
+
+        """
+        try:
+            return _resolve_pool_type_impl(
+                get_checksum_address(address),
+                chain_id=self.chain_id,
+                io=self._io,
+            )
+        except ApexbotValueError:
+            raise
+        except Exception as exc:
+            msg = f"resolve_pool_type: cannot determine the type of {address}: {exc}"
+            raise ApexbotValueError(message=msg) from exc
+
+    def build_pool(  # ruff:ignore[too-many-locals]
         self,
         address: str,
         *,
         state_block: int | None = None,
         silent: bool = False,
-        tick_bitmap: dict[int, Any] | None = None,
-        tick_data: dict[int, Any] | None = None,
-        state_cache_depth: int = 8,
+        construction_route: ConstructionRoute | None = None,
     ) -> AbstractLiquidityPool:
         """Build a pool from an address, automatically resolving its type.
 
         V4 managed pools should use ``build_managed_pool()`` instead.
+
+        ``construction_route`` is the resolved construction-route policy the
+        core route entry walks for the V3 arm (factory rungs + the generic
+        builder); ``None`` = the generic-only route. The route is a driver
+        VALUE — the core owns the walk and classifies every failure on the
+        build-refusal taxonomy (an unsupported family raises the typed
+        ``UnsupportedPoolFamilyError`` — the loud-abort rule).
 
         Returns:
             The computed value.
@@ -567,9 +505,9 @@ class Bot:
         request = BuildPoolRequest(
             silent=silent,
             state_block=state_block,
-            state_cache_depth=state_cache_depth,
-            tick_bitmap=tick_bitmap,
-            tick_data=tick_data,
+            # state_cache_depth stays a request field; this facade entry point
+            # carries only the knobs in-tree callers actually set.
+            construction_route=construction_route,
         )
 
         # Check pool registry — return existing pool if already built
@@ -577,144 +515,237 @@ class Bot:
         if existing is not None:
             return existing
 
-        # Resolve the pool type and dispatch to the appropriate builder
-        #
-        # If type resolution fails (e.g. Curve pools lack a factory() method),
-        # fall back to the Curve builder which handles its own discovery.
+        # Resolve the pool type; every family then builds through the ONE core
+        # construction entry below. A discovery-only pool (Curve exposes no
+        # factory(), so the resolver cannot classify it) resolves to the
+        # generic Curve descriptor and takes the same ONE entry.
         try:
             pool_type = _resolve_pool_type_impl(address, chain_id=chain_id, io=io)
         except ApexbotValueError:
-            # Fallback: try Curve builder as last resort
-            return self._dispatch_build(
-                builder=self._curve_builder,
-                address=address,
+            # Discovery-only identity: Curve pools expose no `factory()`, so the
+            # type resolver cannot classify them. Route through the ONE core
+            # construction entry's generic Curve arm (never a second path).
+            pool_type = None
+
+        # The `(family, variant)` identity is what the core dispatches on. A
+        # discovery-only pool (the resolver raised — Curve exposes no
+        # `factory()`) is the generic Curve descriptor, routed through the ONE
+        # core construction entry below like every other family.
+        if pool_type is not None:
+            family = pool_type.family
+            variant = pool_type.variant
+        else:
+            family = PoolFamily.STABLESWAP
+            variant = None
+
+        is_curve = family is PoolFamily.STABLESWAP and variant != "balancer_stable"
+
+        # Resolve the snapshot block: when no explicit `state_block` is given,
+        # use the current chain head — the core fetches at this block (a `None`
+        # would otherwise degrade to `block=0`).
+        # Resolved to a concrete `int` at this seam: the `else` arm is the
+        # live chain head, so `block` is never `None` in practice — the type is
+        # narrowed here so it can be handed to the `int`-typed sinks
+        # (`construct_pool`, `CurvePoolBuilder.finalize`).
+        head = self._io.get_block_number()
+        block: int = request.state_block if request.state_block is not None else head
+
+        # DB-arm eligibility: the DB liquidity map is a CURRENT-state cache (no
+        # per-block history), so it can only seed a HEAD construction. A pinned
+        # `state_block` behind the current head is a HISTORICAL construction —
+        # the head-stamped rows would fail the core's chain-truth intake gate
+        # (any position minted or burned since the pinned block), and before
+        # that gate existed they silently produced a mixed-state pool (head
+        # tick map under historical scalars). `db=False` forces the core's
+        # Chain-arm Sparse path, which assembles the tick map from the chain
+        # at the pinned block.
+        db_seed = block >= head
+
+        # The construction route: the cockpit's resolved policy value — the core
+        # route entry walks it (route order + get-or-register + build +
+        # register) and classifies every failure on the taxonomy.
+        route = request.construction_route or ConstructionRoute()
+
+        # ONE core entry (ADR-059 D6: dispatch at the tier boundary). The
+        # `(family, variant)` identity is DATA from the resolver, never a
+        # subclass test. The core owns the per-family I/O choreography
+        # (immutables, reserves/state, DEX resolve incl. Camelot, CREATE2
+        # verify, the V3 DB-first tick map), registers into `BotState`, and
+        # echoes the construction identity. A new family is a core arm plus a
+        # species-manifest entry — never a new branch here. The V3 fork storage
+        # layout is resolved core-side from the deployment table.
+        is_concentrated_liquidity = family is PoolFamily.CONCENTRATED_LIQUIDITY
+        outcome = self._py_bot.construct_pool(
+            request_for(
+                address,
+                family=family,
+                variant=variant,
+                block=block,
+                db=db_seed,
+                factories=route.factories,
+                registries=_CURVE_REGISTRIES if is_curve else (),
+                vault=BALANCER_V2_VAULT_ADDRESS,
+                invariant_version=request.invariant_version,
+            )
+        )
+
+        # One answer carries the handle and the identity: no second registry read,
+        # no re-derivation of what the core registered.
+        _pool_id, py_pool, b_t0, b_t1, b_var = (
+            outcome.pool_id,
+            outcome.pool,
+            outcome.token0,
+            outcome.token1,
+            outcome.variant,
+        )
+
+        # Return-surface parity: the core entry echoes its own token0/token1
+        # identity, which must equal what the registered handle exposes (a
+        # divergence is a genuine core/driver seam bug — assert loudly rather
+        # than silently re-deriving). The multi-token families echo no token
+        # pair, so the guard applies only where a pair is echoed.
+        if (
+            b_t0
+            and b_t1
+            and (
+                py_pool.token0_address.casefold() != b_t0.casefold()
+                or py_pool.token1_address.casefold() != b_t1.casefold()
+            )
+        ):
+            raise ApexbotValueError(
+                message=(
+                    f"build_pool: core identity diverged from handle for "
+                    f"{address}: core token0={b_t0} token1={b_t1}, "
+                    f"handle token0={py_pool.token0_address} "
+                    f"token1={py_pool.token1_address}"
+                )
+            )
+
+        # V3: split-seed the reorg genesis anchor. Without it the Sparse pool
+        # journals nothing, so a reorg restore targeting the registration seed
+        # finds no prior state — a behavior regression for every consumer that
+        # expects the registration seed to be a known state boundary.
+        if is_concentrated_liquidity and block is not None and block > 0:
+            py_pool.seed_genesis(block_number=block)
+
+        if is_curve:
+            # The Curve companions (metapool base-pool recursion + coin /
+            # underlying / LP ERC20 builds) — the post-construction choreography
+            # the retired Curve builder drove. Construction itself ran through
+            # the ONE core entry above.
+            self._curve_builder.finalize(
+                py_pool,
                 chain_id=chain_id,
+                state_block=block,
+                silent=request.silent,
                 io=io,
+            )
+        else:
+            # The token companions iterate the outcome's FULL registered
+            # token set (ADR-085 D5) — one shape for every family, no
+            # variant branch, no family-specific handle getter.
+            self._register_delegated_tokens(
+                outcome.tokens,
+                chain_id=chain_id,
                 request=request,
             )
 
-        # Look up the concrete pool class from the registry
-        pool_class = pool_class_for_descriptor(pool_type, chain_id=chain_id)
-
-        # V2/V3 families delegate to the Rust `PoolBuilder` (T4 / 4GQWZ4 full
-        # delegation): the core builder owns ALL the io choreography (immutables,
-        # reserves/state, DEX resolve incl. Camelot, CREATE2 verify, V3
-        # tick-map DB-first) and registers directly into `BotState`. The Python
-        # side then registers the two Erc20Tokens in the same `Bot` (ADR-006 —
-        # `_from_py_pool` resolves them off the handle) and wraps the structural
-        # handle with the companion pool class.
-        #
-        # V3 wires a `tick_data_fetcher` (the legacy web3-sync fetcher) into
-        # `build_v3_pool` so swaps can lazily pull neighbouring tick words
-        # beyond the single word the Rust builder bootstraps — full parity with
-        # the retired builder's attached fetcher.
-        #
-        # Aerodrome V2 and both Balancer families delegate through the Rust
-        # PoolBuilder (their own PoolEntry families) per SSSXG6 (done);
-        # Curve keeps its Python builder. Python `update()` refresh for these
-        # families stays on the builders — update() was out of SSSXG6's
-        # build-delegation scope, so this split is the permanent design.
-        if issubclass(
-            pool_class,
-            (UniswapV2Pool, UniswapV3Pool, AerodromeV2Pool, BalancerV2Pool, BalancerV2StablePool),
+        # `from_handle` is a concrete-class classmethod (not on the base); cast
+        # to `type[Any]` so the call is type-checkable.
+        # Identity parity: the core echoes the variant it registered. Known
+        # variants contradicting the resolver's are a core/driver seam bug —
+        # never hand back a mislabeled pool. Canonical/unrecognized spellings
+        # on either side are the registry census's business, not this guard's.
+        echoed_variant = classify_pool_variant(b_var)
+        resolved_raw = pool_type.variant if pool_type is not None else None
+        resolved_variant = classify_pool_variant(resolved_raw)
+        if (
+            echoed_variant is not None
+            and resolved_variant is not None
+            and echoed_variant is not PoolVariant.UNRECOGNIZED
+            and resolved_variant is not PoolVariant.UNRECOGNIZED
+            and echoed_variant is not resolved_variant
         ):
-            return self._build_delegated(pool_class, address, chain_id, request)
+            raise ApexbotValueError(
+                message=(
+                    f"build_pool: core identity diverged from the resolver for {address}: "
+                    f"resolver variant {resolved_raw!r} vs core echo {b_var!r}"
+                )
+            )
 
-        builder = self._builders.get(pool_class)
-        if builder is None:
-            # Fallback: walk MRO of pool_class looking for a registered builder
-            for base in pool_class.__mro__:
-                builder = self._builders.get(base)
-                if builder is not None:
-                    break
+        # The wrapper class is resolved AFTER the core answers: a family the
+        # engine does not model (PoolFamily.UNMODELED — a positively probed
+        # Balancer pool outside the weighted/stable families) has no class at
+        # all, and its refusal is the construction switchboard's, not a class
+        # lookup's.
+        pool_class = (
+            pool_class_for_descriptor(pool_type, chain_id=chain_id)
+            if pool_type is not None
+            else CurveStableswapPool
+        )
+        pool = cast("type[Any]", pool_class).from_handle(py_pool)
 
-        if builder is None:
-            raise ApexbotValueError(message=f"No builder for pool class {pool_class.__name__}")
-
-        return self._dispatch_build(
-            builder=builder,
-            address=address,
-            chain_id=chain_id,
-            io=io,
-            request=request,
+        # Bind the resolved identity onto the companion (builder knowledge:
+        # the descriptor drove the class choice and the core's family/variant
+        # registration). The class label alone is not identity — sushiswap v3
+        # shares UniswapV3Pool — so the pool carries the frozen descriptor.
+        pool.bind_pool_type(
+            pool_type
+            if pool_type is not None
+            else PoolTypeDescriptor(
+                family=family,
+                variant=variant,
+                kind=derive_kind(family, variant),
+                factory=None,
+            )
+        )
+        # Idempotent register: a concurrent registration worker may have built
+        # this same shared pool first; use the canonical instance so THIS path
+        # still registers instead of being lossily skipped.
+        return cast(
+            "AbstractLiquidityPool",
+            self.pools.get_or_add(pool_address=pool.address, chain_id=chain_id, pool=pool),
         )
 
-    def _make_v3_tick_data_fetcher(
+    def pools_for_tokens(
         self,
-        pool_address: str,
-        chain_id: ChainId,
-    ) -> Callable[[int, int], FetchedTickData | None]:
-        """Create the V3 tick-data backfill fetcher for a pool address.
+        token_a: str,
+        token_b: str,
+        *,
+        pool_kinds: Sequence[PoolKind] | None = None,
+    ) -> list[PoolRef]:
+        """Discover the pools that trade a token pair, as inert identity refs.
 
-        T4 / 4GQWZ4: the legacy web3-sync fetcher factory formerly on the
-        retired `V3PoolBuilder`, relocated into this delegating shell. The
-        returned fetcher lazily pulls neighbouring tick words during swap
-        boundary-crossing (ADR-005 sparse-map parity), attached to the
-        Rust-registered pool as a `PyTickWordFetcher` so a Rust `block_on`
-        helper would not re-enter the shared runtime during swap simulation.
+        Discovery is a *database* question, not a derivation: a token pair is not
+        a pool identity (a V2 pool, a PancakeSwap V3 pool, and a V4-managed pool
+        can all trade the same pair, and V4 hashes its hooks into the PoolId). One
+        graph read over this Bot's database answers it; nothing is constructed.
+
+        The three-layer ladder:
+
+        - **discovery finds** — this method returns ``list[PoolRef]`` (identity
+          views: address/manager+pool_hash, family, tokens — no state, no handle);
+        - **the registry remembers** — ``self.pools.get(...)`` returns an already
+          built instance, or ``None``;
+        - **construction commits** — ``self.build_pool(ref.address)`` materializes
+          the pool (memoized: a registry hit is free, a miss is one loud build).
+
+        Args:
+            token_a: One token's checksummed (or lower/upper) address.
+            token_b: The other token's address.
+            pool_kinds: Optional family filter; defaults to every family.
 
         Returns:
-            A callable pulling ``{tick: (liquidity_gross, liquidity_net,
-            block)}`` for an out-of-range bitmap word, or ``None`` when the
-            pool/bitmap is unavailable.
+            The pools trading the pair, each an identity ref. Empty when either
+            token is unknown to the database or no pool trades the pair.
 
         """
-        return make_tick_data_fetcher(
-            pool_lookup=lambda _block: cast(
-                "UniswapV3Pool | None",
-                self.pools.get(
-                    chain_id=chain_id,
-                    pool_address=get_checksum_address(pool_address),
-                ),
-            ),
-            io=self._io,
-            types=TickDataTypes(
-                bitmap_at_word=BitmapAtWord,
-                liquidity_at_tick=LiquidityAtTick,
-                tick_struct_types=UniswapV3Pool.TICK_STRUCT_TYPES,
-            ),
-        )
-
-    def _make_v4_tick_data_fetcher(
-        self,
-        pool_id: bytes,
-        pool_manager_address: str,
-        state_view_address: str,
-        chain_id: ChainId,
-    ) -> Callable[[int, int], FetchedTickData | None]:
-        """Create the V4 tick-data backfill fetcher for a managed pool.
-
-        T4 / 4GQWZ4: the legacy web3-sync fetcher factory formerly on the
-        retired `V4PoolBuilder`, relocated into this delegating shell. The
-        returned fetcher lazily pulls neighbouring tick words during swap
-        boundary-crossing via the state-view (`getTickBitmap` /
-        `getTickLiquidity`), attached to the Rust-registered pool as a
-        `PyTickWordFetcher` (ADR-005 sparse-map parity).
-
-        Returns:
-            A callable pulling ``{tick: (liquidity_gross, liquidity_net,
-            block)}`` for an out-of-range bitmap word, or ``None`` when the
-            pool/bitmap is unavailable.
-
-        """
-        pool_manager_address_ = get_checksum_address(pool_manager_address)
-        return make_tick_data_fetcher(
-            pool_lookup=lambda _: cast(
-                "UniswapV4Pool | None",
-                self.managed_pools.get(
-                    chain_id=chain_id,
-                    pool_manager_address=pool_manager_address_,
-                    pool_id=pool_id,
-                ),
-            ),
-            io=self._io,
-            types=TickDataTypes(
-                bitmap_at_word=BitmapAtWord,
-                liquidity_at_tick=LiquidityAtTick,
-                tick_struct_types=("uint128", "int128"),
-            ),
-            state_view_address=state_view_address,
-            pool_id=bytes(pool_id),
+        return _pools_for_tokens(
+            self.database_path,
+            self.chain_id,
+            token_a,
+            token_b,
+            pool_kinds=pool_kinds,
         )
 
     @staticmethod
@@ -734,402 +765,139 @@ class Bot:
         """
         return builder.build(address, chain_id=chain_id, io=io, request=request)
 
-    def _build_delegated(
+    def _register_delegated_tokens(
         self,
-        pool_class: type[AbstractLiquidityPool],
-        address: str,
+        token_addresses: list[str],
+        *,
         chain_id: ChainId,
         request: BuildPoolRequest,
-    ) -> AbstractLiquidityPool:
-        """Build a V2/V3/Balancer/Aerodrome pool via the Rust PoolBuilder.
+    ) -> None:
+        """Register a delegated pool's tokens in this Bot (ADR-006).
 
-        Thin delegating shell over `the `Bot` engine.build_v2_pool`/`build_v3_pool`: the
-        core builder runs the full io choreography + registers into `BotState`
-        and returns the pool id. This shell then registers the pool's two
-        Erc20Tokens in the same `Bot` (ADR-006 — the companion's
-        ``_from_py_pool`` resolves ``get_token0/get_token1`` off the handle and
-        requires them registered) and wraps the structural handle with
-        ``pool_class``.
-
-        V3 additionally threads the legacy web3-sync `tick_data_fetcher` into
-        `build_v3_pool` (attached as a `PyTickWordFetcher` on the registered
-        pool) so swaps can lazily pull neighbouring tick words beyond the Rust
-        builder's single-word Sparse bootstrap — full parity with the retired
-        builder's attached fetcher.
-
-        Returns:
-            A ``pool_class`` companion wrapping the Rust-built pool.
-
-        Raises:
-            ApexbotValueError: If the Rust builder registered the pool but
-                the resulting handle cannot be recovered.
-            BrokenPool: If `pool_class` is a known-broken Balancer pool.
+        The token set is the construction outcome's FULL registered answer
+        (ADR-085 D5) — one shape for every family, no variant branch.
 
         """
-        # Resolve the snapshot block like the legacy builders did: when no
-        # explicit `state_block` is given, use the current chain head — the Rust
-        # `PoolBuilder` fetches at this block (a `None` would otherwise degrade
-        # to `block=0`).
-        block: int | None = (
-            request.state_block if request.state_block is not None else self._io.get_block_number()
-        )
-        builder_identity: tuple[int, str, str, str, str] | None = None
-        if issubclass(pool_class, UniswapV3Pool):
-            # The legacy web3-sync fetcher factory, relocated off the retired
-            # V3 builder (4GQWZ4 deletion).
-            fetcher = self._make_v3_tick_data_fetcher(address, chain_id)
-            # CL slot layout (VERIFY2 T4 / W32CAU): the PancakeSwap V3 fork
-            # has a divergent storage layout — pass the family explicitly so
-            # the engine's slot-index consumers (divergence probe, sim-anchor
-            # projection) never misread a fork pool.
-            slot_layout = "pancakeswap" if issubclass(pool_class, PancakeswapV3Pool) else "uniswap"
-            b_res = self._py_bot.build_v3_pool(
-                address,
-                block=block,
-                db=True,
-                tick_data_fetcher=fetcher,
-                slot_layout=slot_layout,
-            )
-            pool_id = b_res[0]
-            builder_identity = b_res
-        elif issubclass(pool_class, AerodromeV2Pool):
-            # SSSXG6: Aerodrome V2 (shared volatile/stable factory) is a
-            # distinct structural family from V2 — the Rust `build_aerodrome_v2`
-            # reads `stable()`+`getFee()` and registers into PoolEntry::AerodromeV2.
-            pool_id = self._py_bot.build_aerodrome_v2_pool(address, block=block)
-        elif issubclass(pool_class, BalancerV2Pool):
-            # SSSXG6: Balancer weighted — reads getPoolId + Vault getPoolTokens
-            # + getSwapFeePercentage + getNormalizedWeights + bytecode PowVersion
-            # + decimals() scaling factors; registers into PoolEntry::BalancerWeighted.
-            pool_id = self._py_bot.build_balancer_weighted_pool(
-                address, vault=BALANCER_V2_VAULT_ADDRESS, block=block
-            )
-        elif issubclass(pool_class, BalancerV2StablePool):
-            # SSSXG6: Balancer stable — reads getPoolId + Vault getPoolTokens +
-            # getSwapFeePercentage + getAmplificationParameter + BPT-detect +
-            # rate-provider/rate + scaling factors + invariant_version;
-            # registers into PoolEntry::BalancerStable.
-            pool_id = self._py_bot.build_balancer_stable_pool(
-                address,
-                vault=BALANCER_V2_VAULT_ADDRESS,
-                block=block,
-                invariant_version=request.invariant_version,
-            )
-        else:
-            b_res = self._py_bot.build_v2_pool(address, block=block)
-            pool_id = b_res[0]
-            builder_identity = b_res
-        py_pool = self._py_bot.get_pool(pool_id)
-        if py_pool is None:  # pragma: no cover
-            msg = f"build_pool: register returned pool_id {pool_id} with no handle"
-            raise ApexbotValueError(message=msg)
-
-        # TF7RZB-S1 return-surface parity: the builder returns the Rust core's
-        # own token0/token1 identity; it must equal what the registered handle
-        # exposes (a divergence is a genuine core/driver seam bug — assert
-        # loudly rather than silently re-deriving).
-        if builder_identity is not None:
-            _b_pid, b_t0, b_t1, _b_addr, _b_fam = builder_identity
-            if (
-                py_pool.token0_address.casefold() != b_t0.casefold()
-                or py_pool.token1_address.casefold() != b_t1.casefold()
-            ):
-                raise ApexbotValueError(
-                    message=(
-                        f"build_pool: builder identity diverged from handle for "
-                        f"{address}: builder token0={b_t0} token1={b_t1}, "
-                        f"handle token0={py_pool.token0_address} "
-                        f"token1={py_pool.token1_address}"
-                    )
-                )
-
-        # V3: split-seed the reorg genesis anchor (mirrors the retired builder's
-        # `seed_genesis(state_block)`). Without it the Sparse pool journals
-        # nothing, so `discard_states_before_block(update_block + 1)` would not
-        # raise — a behavior regression for every consumer that expects the
-        # registration seed to be a known state boundary.
-        if issubclass(pool_class, UniswapV3Pool) and block is not None and block > 0:
-            py_pool.seed_genesis(block_number=block)
-
-        # Register the pool's tokens in the same `Bot` (ADR-006): V2/V3/
-        # Aerodrome expose exactly two (`token0_address`/`token1_address`);
-        # Balancer exposes N via the family-specific token-address getter.
-        if issubclass(pool_class, (BalancerV2Pool, BalancerV2StablePool)):
-            # SSSXG6: preserve the broken-pool guard from the retired
-            # `BalancerBuilder.build` (BrokenPool) so known-bad pools fail fast.
-            if address in BROKEN_BALANCER_V2_POOLS:
-                raise BrokenPool
-            token_addresses = (
-                py_pool.balancer_token_addresses
-                if issubclass(pool_class, BalancerV2Pool)
-                else py_pool.balancer_stable_token_addresses
-            )
-            for token_address in token_addresses:
-                self._erc20_builder.build(
-                    token_address,
-                    chain_id=chain_id,
-                    silent=request.silent,
-                    io=self._io,
-                )
-        else:
+        for token_address in token_addresses:
             self._erc20_builder.build(
-                py_pool.token0_address,
+                token_address,
                 chain_id=chain_id,
                 silent=request.silent,
                 io=self._io,
             )
-            self._erc20_builder.build(
-                py_pool.token1_address,
-                chain_id=chain_id,
-                silent=request.silent,
-                io=self._io,
-            )
-
-        # `_from_py_pool` is a concrete-class classmethod (not on the base); cast
-        # to `type[Any]` so the call is type-checkable + the union of the five
-        # delegated families stays branch-free here.
-        pool = cast("type[Any]", pool_class)._from_py_pool(py_pool)  # ruff:ignore[private-member-access]
-        # Idempotent register (35NMBX Guard 1): a concurrent registration worker
-        # may have built this same shared pool first; use the canonical instance
-        # so THIS path still registers instead of being lossily skipped. (pool_id
-        # is None on this delegated path, so get_or_add returns an
-        # AbstractLiquidityPool, not a managed V4 pool.)
-        return cast(
-            "AbstractLiquidityPool",
-            self.pools.get_or_add(pool_address=pool.address, chain_id=chain_id, pool=pool),
-        )
 
     def build_managed_pool(
         self,
         address: str,
-        pool_id: str | bytes,
-        *,
-        state_block: int | None = None,
-        silent: bool = False,
-        state_cache_depth: int = 8,
-        # V4 immutable data — required if not in DB
-        state_view_address: str | None = None,
-        tokens: Sequence[str] | None = None,
-        fee: int | None = None,
-        tick_spacing: int | None = None,
-        hook_address: str | None = None,
-        # Pre-fetched tick data
-        tick_bitmap: dict[int, Any] | None = None,
-        tick_data: dict[int, Any] | None = None,
+        request: BuildManagedPoolRequest,
     ) -> UniswapV4Pool:
         """Build a V4 managed pool from a PoolManager address and pool ID.
 
-        ``address`` is the PoolManager contract. ``pool_id`` identifies the
-        pool within the manager.
+        ``address`` is the PoolManager contract; ``request`` carries the pool
+        ID plus everything the pre-fetched identity may need (silent/
+        state_block common options, the V4 immutable data, and pre-fetched
+        tick data) — see :class:`BuildManagedPoolRequest` for the per-field
+        contract: when the pool is not in the database,
+        ``state_view_address``, ``tokens``, ``fee``, ``tick_spacing`` must
+        all be provided.
 
-        When the pool is not in the database, ``state_view_address``,
-        ``tokens``, ``fee``, ``tick_spacing`` must all be provided.
+        The build is ONE delegation to the core (ADR-085 D4): the
+        ``managed_v4`` construction request resolves the identity (the DB
+        two-step, manager → v4 row → per-FK tokens, first; else the
+        request's caller-supplied overrides), fetches slot0/liquidity FRESH,
+        assembles the tick map (Db → Chain precedence), and registers into
+        ``BotState`` atomically. The fee/state-view values ride the SAME
+        head-stamped slot0 read and come back ON the registered handle, so
+        the companion never issues a second ``fetch_v4_slot0_liquidity`` per
+        pool and no per-value threading crosses the seam.
 
         Returns:
-            The computed value.
+            A `UniswapV4Pool` companion wrapping the Rust-registered pool.
+
+        Raises:
+            ApexbotValueError: If neither the DB two-step nor the request
+                overrides complete the identity.
 
         """
         address = get_checksum_address(address)
         chain_id = self.chain_id
 
         # Check managed pool registry — return existing pool if already built
-        pool_id_bytes = to_bytes(pool_id)
         existing = self.managed_pools.get(
             chain_id=chain_id,
             pool_manager_address=address,
-            pool_id=pool_id_bytes,
+            pool_id=to_bytes(request.pool_id),
         )
         if existing is not None:
             if TYPE_CHECKING:
                 assert isinstance(existing, UniswapV4Pool)
             return existing
 
-        io = self._io
-
-        request = BuildManagedPoolRequest(
-            pool_id=pool_id,
-            silent=silent,
-            state_block=state_block,
-            state_cache_depth=state_cache_depth,
-            state_view_address=state_view_address,
-            tokens=tokens,
-            fee=fee,
-            tick_spacing=tick_spacing,
-            hook_address=hook_address,
-            tick_bitmap=tick_bitmap,
-            tick_data=tick_data,
-        )
-
-        return self._build_v4_managed(
-            address,
-            chain_id=chain_id,
-            io=io,
-            request=request,
-        )
-
-    def _build_v4_managed(
-        self,
-        address: str,
-        *,
-        chain_id: ChainId,
-        io: BotIo,
-        request: BuildManagedPoolRequest,
-    ) -> UniswapV4Pool:
-        """Build a V4 managed pool via the Rust `PoolBuilder` (T4 / 4GQWZ4).
-
-        The thin delegating shell formerly `V4PoolBuilder.build()`: resolves
-        the caller-supplied V4 identity (DB two-step, else caller kwargs),
-        fetches the slot0 scalars for the Python-side companion overrides
-        (`protocol_fee`/`lp_fee`/`state_view`, which the Rust handle does not
-        expose), then delegates the actual build
-        (live scalars + Db→Chain tick assembly + admission + registration)
-        to `the `Bot` engine.build_v4_pool`.
-
-        Returns:
-            A `UniswapV4Pool` companion wrapping the Rust-registered pool.
-
-        Raises:
-            ApexbotValueError: If identity fields are missing for a pool not
-                in the database.
-
-        """
         pool_id_bytes = to_bytes(request.pool_id)
         pool_manager_address = get_checksum_address(address)
 
-        state_block = (
-            request.state_block if request.state_block is not None else io.get_block_number()
-        )
-        # The FRESH PRICE read block (two-stamp OB7UNY): the cheap slot0/price
-        # read stamps `update_block` at the live head, while the liquidity
-        # clock + assembled tick map anchor at `state_block`. When a caller
-        # pins `request.state_block`, price = that same block (no split).
-        head_block = state_block
+        head = self._io.get_block_number()
+        state_block = request.state_block if request.state_block is not None else head
 
-        # TF7RZB-S3: V4 identity resolution moves CORE-side. The Rust
-        # `resolve_v4_identity` performs the DB two-step (manager → v4 row →
-        # per-FK tokens) first, else the caller-supplied overrides, and returns
-        # the resolved identity (currency0/1, fee, tick_spacing, hook_flags,
-        # state_view). The driver no longer reads the DB nor assembles the
-        # kwargs identity itself.
-        over_tokens = request.tokens
-        over_currency0 = over_tokens[0] if over_tokens else None
-        over_currency1 = over_tokens[1] if over_tokens else None
+        # DB-arm eligibility (the `build_pool` V3 twin): the DB liquidity map
+        # is a CURRENT-state cache, so a pinned `state_block` behind the
+        # current head is a HISTORICAL construction and must skip the DB arm —
+        # `db=False` forces the core's Chain-arm Sparse path at the pinned
+        # block instead of failing the chain-truth intake gate on head-stamped
+        # rows.
+        db_seed = state_block >= head
+        # The FRESH PRICE read block (two-stamp): the cheap slot0/price
+        # read stamps `update_block` at the live head, while the liquidity
+        # clock + assembled tick map anchor at `state_block`. When the request
+        # pins `state_block`, price = that same block (no split).
+        # Identity: the core resolver performs the DB two-step (manager → v4
+        # row → per-FK tokens) first, else the request's caller-supplied
+        # overrides — the driver neither reads the DB nor assembles the
+        # identity itself.
+        # ONE construction call (ADR-085 D4): the core resolves the identity
+        # (the DB two-step first, else the request's caller-supplied
+        # overrides — the driver neither reads the DB nor assembles the
+        # identity), fetches slot0/liquidity FRESH, assembles the tick map
+        # (Db → Chain precedence), registers into `BotState` atomically, and
+        # answers the registered handle. The fee/state-view values ride the
+        # SAME head-stamped slot0 read and come back ON the handle (the
+        # handle is self-describing) — no per-value threading, and the
+        # echo-parity guard is core-side now.
+        construction_request = PoolConstructionRequest.managed_v4(
+            pool_manager_address,
+            to_0x_hex(pool_id_bytes),
+            tokens=[str(t) for t in request.tokens] if request.tokens else None,
+            fee=int(request.fee) if request.fee is not None else None,
+            tick_spacing=int(request.tick_spacing) if request.tick_spacing is not None else None,
+            hook_address=request.hook_address,
+            state_view_address=request.state_view_address,
+            block=int(state_block) if state_block is not None else None,
+            db=db_seed,
+        )
         try:
-            (
-                currency0_address,
-                currency1_address,
-                fee_for_pool,
-                tick_spacing_for_pool,
-                hook_flags,
-                hook_address,
-                state_view_hex,
-            ) = self._py_bot.resolve_v4_identity(
-                chain_id=int(chain_id),
-                pool_manager=pool_manager_address,
-                pool_id_hex=to_0x_hex(pool_id_bytes),
-                currency0=over_currency0,
-                currency1=over_currency1,
-                fee=int(request.fee) if request.fee is not None else None,
-                tick_spacing=(
-                    int(request.tick_spacing) if request.tick_spacing is not None else None
-                ),
-                hook_address=request.hook_address,
-                state_view_address=request.state_view_address,
-            )
+            outcome = self._py_bot.construct_pool(construction_request)
         except ValueError as exc:
-            # The core raises a typed `MissingIdentity` (mapped to PyValueError)
-            # when neither the DB two-step nor the overrides are complete.
+            # The core raises the typed `MissingIdentity` (mapped to
+            # PyValueError) when neither the DB two-step nor the overrides
+            # are complete.
             raise ApexbotValueError(
                 message=exc.args[0] if exc.args else "V4 identity resolution failed"
             ) from exc
-        state_view_address = get_checksum_address(state_view_hex)
+        py_pool_handle = outcome.pool
 
-        # Build both tokens — from the CORE-resolved currency addresses — in
-        # ONE batched metadata read (CDJEPJ-2): build_many collapses the two
-        # per-token fetch_erc20_metadata round-trips into a single Multicall3
-        # aggregate3 eth_call for the network-missing metadata.
+        # The pool's two tokens build in ONE batched metadata read:
+        # `build_many` collapses the two per-token fetch_erc20_metadata
+        # round-trips into a single Multicall3 aggregate3 eth_call for
+        # network-missing metadata. The currency pair is the outcome's
+        # identity echo.
         token0, token1 = self._erc20_builder.build_many(
-            [currency0_address, currency1_address],
+            [outcome.token0, outcome.token1],
             chain_id=chain_id,
             silent=request.silent,
-            io=io,
+            io=self._io,
         )
 
-        # Delegate the build to the Rust PoolBuilder: core `build_v4` fetches
-        # slot0/liquidity FRESH + assembles the tick map (Db → Chain
-        # precedence) + registers into BotState atomically, using the
-        # CORE-resolved identity above. Returns `(pool_id, coverage,
-        # identity..., protocol_fee, lp_fee)` — coverage drives the companion's
-        # sparse gate (Rust coverage is the fact, T2 FBJTUM), and the fee
-        # overrides ride back from the SAME head-stamped slot0 read, so the
-        # companion no longer issues a second fetch_v4_slot0_liquidity per
-        # pool (CDJEPJ-1).
-        (
-            pool_handle_pool_id,
-            _coverage,
-            b_cur0,
-            b_cur1,
-            b_pm,
-            b_fee,
-            b_ts,
-            b_hf,
-            b_pool_id_hex,
-            b_protocol_fee,
-            b_lp_fee,
-        ) = self._py_bot.build_v4_pool(
-            pool_manager=pool_manager_address,
-            pool_id_hex=to_0x_hex(pool_id_bytes),
-            currency0=currency0_address,
-            currency1=currency1_address,
-            fee=fee_for_pool,
-            tick_spacing=tick_spacing_for_pool,
-            # The REAL hook address (pool-ID mismatch regression, MTMPQB): the
-            # core registers it in the pool key so the identity round-trips
-            # keccak(abi.encode(pool_key)). The flag mask is derived core-side.
-            hook_address=hook_address,
-            state_view_address=state_view_address,
-            block=int(head_block) if head_block is not None else None,
-            db=True,
-            tick_data_fetcher=self._make_v4_tick_data_fetcher(
-                pool_id_bytes,
-                pool_manager_address,
-                state_view_address,
-                chain_id,
-            ),
-        )
-        # TF7RZB-S2/S3 return-surface parity: the identity the builder echoes
-        # back must match what the core resolver produced (a divergence is a
-        # real seam bug), and the pool_id must round-trip the requested hash.
-        # hook flags are derived from the same hook address on both sides.
-        b_identity_ok = all([
-            b_cur0.lower() == currency0_address.lower(),
-            b_cur1.lower() == currency1_address.lower(),
-            b_pm.lower() == pool_manager_address.lower(),
-            int(b_fee) == int(fee_for_pool),
-            int(b_ts) == int(tick_spacing_for_pool),
-            int(b_hf) == int(hook_flags),
-            b_pool_id_hex.lower() == to_0x_hex(pool_id_bytes).lower(),
-        ])
-        if not b_identity_ok:
-            raise ApexbotValueError(
-                message=(
-                    "V4 builder identity `build_v4_pool` diverged from the "
-                    "resolved identity (currency0/1, pool_manager, fee, "
-                    "tick_spacing, hook_flags, pool_id)."
-                )
-            )
-        py_pool_handle = self._py_bot.get_pool(pool_handle_pool_id)
-        assert py_pool_handle is not None, "build_v4_pool returned a pool_id with no handle"
-        pool = UniswapV4Pool._from_py_pool(py_pool_handle)  # ruff:ignore[private-member-access]
-        # Builder-supplied values the seam defaults; override from RPC.
-        pool._state_view_address = (  # ruff:ignore[private-member-access]
-            get_checksum_address(state_view_address)
-        )
-        pool.protocol_fee = ProtocolFee(
-            zero_for_one=b_protocol_fee & 0xFFF,
-            one_for_zero=b_protocol_fee >> 12,
-        )
-        pool.lp_fee = int(b_lp_fee)
+        pool = UniswapV4Pool.from_handle(py_pool_handle)
 
         # Register pool in managed pool registry
         pool = cast(
@@ -1143,103 +911,20 @@ class Bot:
         )
 
         if not request.silent:
-            logger.info(pool.name)
-            logger.info(f"• ID: {to_0x_hex(pool.pool_id)}")
-            logger.info(f"• Token 0: {token0}")
-            logger.info(f"• Token 1: {token1}")
-            logger.info(f"• Liquidity: {pool.liquidity}")
-            logger.info(f"• SqrtPrice: {pool.sqrt_price_x96}")
-            logger.info(f"• Tick: {pool.tick}")
+            self._log_v4_pool(pool, token0, token1)
 
         return pool
 
-    def get_token_balance(
-        self,
-        token: Erc20Token,
-        address: str,
-        block_identifier: BlockIdentifier | None = None,
-    ) -> int:
-        """Retrieve the ERC-20 balance for the given address.
-
-        Returns:
-            The computed integer value.
-
-        """
-        io = self._io
-        return self._erc20_builder.get_token_balance(
-            token,
-            address,
-            block_identifier=block_identifier,
-            io=io,
-        )
-
-    def get_token_approval(
-        self,
-        token: Erc20Token,
-        owner: str,
-        spender: str,
-        block_identifier: BlockIdentifier | None = None,
-    ) -> int:
-        """Retrieve the amount that can be spent by `spender` on behalf of `owner`.
-
-        Returns:
-            The computed integer value.
-
-        """
-        io = self._io
-        return self._erc20_builder.get_token_approval(
-            token,
-            owner,
-            spender,
-            block_identifier=block_identifier,
-            io=io,
-        )
-
-    def get_token_total_supply(
-        self,
-        token: Erc20Token,
-        block_identifier: BlockIdentifier | None = None,
-    ) -> int:
-        """Retrieve the total supply for this token.
-
-        Returns:
-            The computed integer value.
-
-        """
-        io = self._io
-        return self._erc20_builder.get_token_total_supply(
-            token,
-            block_identifier=block_identifier,
-            io=io,
-        )
-
-    def get_ether_balance(
-        self,
-        address: str,
-        block_identifier: BlockIdentifier | None = None,
-    ) -> int:
-        """Retrieve the native ETH balance for the given address.
-
-        Returns:
-            The computed integer value.
-
-        """
-        io = self._io
-        return self._erc20_builder.get_ether_balance(
-            self.chain_id,
-            address,
-            block_identifier=block_identifier,
-            io=io,
-        )
-
-    def get_provider(self) -> AlloyProvider:
-        """Return this Bot's single provider.
-
-        Returns:
-            The computed value.
-
-        """
-        return self.provider
+    @staticmethod
+    def _log_v4_pool(pool: UniswapV4Pool, token0: Erc20Token, token1: Erc20Token) -> None:
+        """Trace-log a freshly built V4 managed pool (the caller gates on `silent`)."""
+        logger.info(pool.name)
+        logger.info(f"• ID: {to_0x_hex(pool.pool_id)}")
+        logger.info(f"• Token 0: {token0}")
+        logger.info(f"• Token 1: {token1}")
+        logger.info(f"• Liquidity: {pool.liquidity}")
+        logger.info(f"• SqrtPrice: {pool.sqrt_price_x96}")
+        logger.info(f"• Tick: {pool.tick}")
 
     def update(
         self,
@@ -1247,64 +932,21 @@ class Bot:
         *,
         block_number: BlockIdentifier | None = None,
     ) -> bool:
-        """Fetch the current state of a pool from the chain and apply it via.
+        """Fetch the current state of a pool from the chain and apply it.
 
-        ``pool.external_update()``.
+        Delegates to the pool handle's core-owned refresh entry
+        (``pool.refresh_via`` -> ``refresh_pool``): the per-family
+        fetch/compare/apply choreography lives core-side, so this shell no
+        longer selects a builder or branches on the pool family.
 
-        Returns True if the state changed, False if unchanged.
-
-        Returns:
-            The computed boolean value.
-
-        """
-        resolved_block_number = (
-            int(block_number)
-            if block_number is not None and not isinstance(block_number, int)
-            else block_number
-        )
-        io = self._io
-        # T4 / 4GQWZ4: V2/V3/V4 refresh lives in the delegating shell
-        # (`_update_pool`), no longer on the retired builders. Aerodrome /
-        # Curve / Balancer refresh stays on their Python builders'
-        # `update()` — update() was out of SSSXG6's (done) build-delegation
-        # scope, so this split is the permanent design.
-        if isinstance(pool, (UniswapV2Pool, UniswapV3Pool, UniswapV4Pool)):
-            return _update_pool(
-                pool,
-                block_number=resolved_block_number,
-                io=io,
-            )
-        builder = self._builder_for_pool(pool)
-        return builder.update(pool, block_number=resolved_block_number, io=io)
-
-    def _builder_for_pool(
-        self,
-        pool: AbstractLiquidityPool,
-    ) -> PoolBuilder:
-        """Select the appropriate builder for the pool type.
-
-        Uses the builder registry (dict lookup on type(pool)) first, then
-        falls back to isinstance checks for subclasses not explicitly
-        registered.
+        `block_number` is a block number, one canonical tag string
+        (``"earliest"`` / ``"latest"`` / ``"pending"``), or ``None`` for the
+        chain head. A tag is handed through unchanged and resolves at the
+        handle seam that owns the RPC clock — it is never pre-coerced to a
+        number here.
 
         Returns:
-            The computed value.
-
-        Raises:
-            TypeError: See function documentation.
+            True if the state changed, False if the pool was already current.
 
         """
-        # Fast path: exact type match in the registry
-        builder = self._builders.get(type(pool))
-        if builder is not None:
-            return builder
-
-        # Slow path: subclass match (e.g. AerodromeV2Pool subclasses UniswapV2Pool).
-        # Walk the MRO looking for a registered builder.
-        for base in type(pool).__mro__:
-            builder = self._builders.get(base)
-            if builder is not None:
-                return builder
-
-        msg = f"update() not implemented for pool type {type(pool).__name__}"
-        raise TypeError(msg)
+        return pool.refresh_via(self._io, block_number=block_number)
